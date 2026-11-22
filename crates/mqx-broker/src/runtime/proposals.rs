@@ -68,6 +68,7 @@ impl Proposal {
                     | Operation::Release(..)
                     | Operation::Ack(..)
                     | Operation::ReserveOutbound(_)
+                    | Operation::ReserveOutboundWithQos0Expiry(_)
             )
         }))
     }
@@ -114,7 +115,8 @@ impl Proposal {
                         ),
                         0,
                     ),
-                    Operation::Subscribe(filters, _) => (
+                    Operation::Subscribe(filters, _)
+                    | Operation::SubscribeDollarRoot(filters, _) => (
                         filters.iter().map(|entry| 128 + entry.filter.len()).sum(),
                         32 * filters.len(),
                     ),

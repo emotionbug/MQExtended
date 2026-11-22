@@ -44,16 +44,24 @@ impl Retained {
         &mut self,
         filter: &str,
         now: Duration,
+        dollar_root: bool,
         mut visit: impl FnMut(&Arc<Message>),
     ) {
-        let root = if filter.starts_with('$') {
-            &mut self.dollar
+        let mut levels = filter.split('/');
+        if dollar_root && filter.starts_with('$') {
+            // retain.c: retain__search starts a dollar topic at level zero,
+            // where `/#` includes the parent only if it has children.
+            if let Some(branch) = self.dollar.children.get_mut(levels.next().unwrap()) {
+                branch.search(levels, false, now, &mut visit);
+            }
         } else {
-            &mut self.ordinary
-        };
-        // The ordinary hierarchy has an extra empty level in src/retain.c.
-        // Start below it, but allow `foo/#` to include the parent `foo`.
-        root.search(filter.split('/'), now, &mut visit);
+            let root = if filter.starts_with('$') {
+                &mut self.dollar
+            } else {
+                &mut self.ordinary
+            };
+            root.search(levels, true, now, &mut visit);
+        }
     }
 
     pub(crate) fn expire(&mut self, now: Duration) -> bool {
@@ -96,6 +104,7 @@ impl Branch {
     fn search(
         &mut self,
         mut levels: Split<'_, char>,
+        include_leaf_for_hash: bool,
         now: Duration,
         visit: &mut impl FnMut(&Arc<Message>),
     ) {
@@ -105,16 +114,18 @@ impl Branch {
                 for child in self.children.values_mut() {
                     child.visit_tree(now, visit);
                 }
-                self.visit_message(now, visit);
+                if include_leaf_for_hash || !self.children.is_empty() {
+                    self.visit_message(now, visit);
+                }
             }
             Some("+") => {
                 for child in self.children.values_mut() {
-                    child.search(levels.clone(), now, visit);
+                    child.search(levels.clone(), true, now, visit);
                 }
             }
             Some(level) => {
                 if let Some(child) = self.children.get_mut(level) {
-                    child.search(levels, now, visit);
+                    child.search(levels, true, now, visit);
                 }
             }
         }

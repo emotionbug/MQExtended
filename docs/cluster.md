@@ -87,7 +87,7 @@ To replace a node that died for good, do both in one change: a new id joins as a
 
 ## Upgrades
 
-Upgrade one node at a time. A node refuses log entries, snapshots and node identity files whose format version it does not know, so every node must be able to read a format before any node starts writing it:
+Use a rolling upgrade only if every running binary can replay every command that traffic can produce. A node refuses log entries, snapshots and node identity files whose format version it does not know. For a compatible rolling upgrade:
 
 1. Roll the new binary out to every node while it keeps writing the old format (`cluster_state_format 1` when coming from a release before format 2).
 2. Once every node runs the new binary, roll the setting to the new format, again one node at a time.
@@ -95,6 +95,8 @@ Upgrade one node at a time. A node refuses log entries, snapshots and node ident
 Don't change membership in the middle of an upgrade.
 
 When upgrading a build that predates the MQTT broker control API, use a cold upgrade if clients can publish to `$CONTROL/` topics. Requests to disabled or unknown endpoints also produce a replicated `BrokerControl` command that the old build cannot replay. Turning off `enable_control_api` is not a mixed-version compatibility switch. Drain clients, stop all voters, take the cold backup above and upgrade all voters before restoring traffic.
+
+Also use a cold upgrade when crossing the introduction of `SubscribeDollarRoot` and `ReserveOutboundWithQos0Expiry`. A subscription such as `$app/#`, or a QoS 0 delivery past an expired in-flight message, can emit these commands even with `cluster_state_format 1`. Drain clients and bridge traffic, stop and back up the cluster, upgrade every voter and learner, then restore traffic. New binaries replay historical `Subscribe` and `ReserveOutbound` entries with their original semantics; old binaries cannot replay the new commands.
 
 ## What clients observe when a node fails
 

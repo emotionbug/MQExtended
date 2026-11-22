@@ -406,6 +406,51 @@ async fn publication_properties_preserve_order_and_expiry_decrements_offline() {
     sink.silent().await;
 }
 
+// retain.c: retain__search's level-zero `/#` fallback is different for
+// dollar-prefixed roots, which have no leading empty hierarchy component.
+#[tokio::test(start_paused = true)]
+async fn dollar_root_retained_replay_distinguishes_a_leaf_from_a_parent() {
+    let broker = broker(BrokerConfig::default());
+    let mut sender = connected(&broker, request("sender"), false).await;
+    let retained = Publish {
+        retain: true,
+        ..publish("$device", b"parent", Q1, 1)
+    };
+    sender.send(Packet::Publish(retained.clone())).await;
+    sender
+        .expect(Packet::PubAck(ack(1, R::NO_MATCHING_SUBSCRIBERS)))
+        .await;
+
+    let mut sink = connected(&broker, request("sink"), false).await;
+    sink.subscribe(sub("$device/#", Q1), vec![]).await;
+    sink.send(Packet::PingReq).await;
+    sink.expect(Packet::PingResp).await;
+    sink.subscribe(sub("$device", Q1), vec![]).await;
+    sink.expect(Packet::Publish(retained.clone())).await;
+    sink.disconnect(R::SUCCESS, vec![]).await;
+
+    let child = Publish {
+        retain: true,
+        ..publish("$device/value", b"child", Q1, 2)
+    };
+    sender.send(Packet::Publish(child.clone())).await;
+    sender
+        .expect(Packet::PubAck(ack(2, R::NO_MATCHING_SUBSCRIBERS)))
+        .await;
+    let mut sink = connected(&broker, request("sink"), false).await;
+    sink.subscribe(sub("$device/#", Q1), vec![]).await;
+    sink.expect(Packet::Publish(Publish {
+        packet_id: Some(mid(1)),
+        ..child
+    }))
+    .await;
+    sink.expect(Packet::Publish(Publish {
+        packet_id: Some(mid(2)),
+        ..retained
+    }))
+    .await;
+}
+
 // src/handle_subscribe.c: handle__subscribe; src/subs.c: subs__process;
 // src/retain.c: retain__queue and test/broker/02-shared-qos0-v5.py.
 #[tokio::test(start_paused = true)]
@@ -619,6 +664,98 @@ async fn receive_maximum_and_rejections_keep_qos_flows_distinct() {
     sink.send(Packet::PubAck(ack(1, R::SUCCESS))).await;
     sink.expect(Packet::Publish(publish("r", b"x", Q1, 2)))
         .await;
+}
+
+// database.c: db__message_write_inflight_out_latest revisits the lone
+// predecessor when writing the new QoS 0; an expired flight returns credit.
+#[tokio::test(start_paused = true)]
+async fn qos0_write_releases_an_expired_receive_window_slot() {
+    for (session_expiry, expired) in [(0, false), (0, true), (60, false), (60, true)] {
+        let broker = broker(BrokerConfig::default());
+        let mut sink = connected(
+            &broker,
+            Connect {
+                properties: vec![
+                    P::ReceiveMaximum(1),
+                    P::SessionExpiryInterval(session_expiry),
+                ],
+                ..request("receiver")
+            },
+            false,
+        )
+        .await;
+        sink.subscribe(sub("stream", Q1), vec![]).await;
+        let mut sender = connected(&broker, request("sender"), false).await;
+        let first = Publish {
+            properties: vec![P::MessageExpiryInterval(1)],
+            ..publish("stream", b"expires", Q1, 1)
+        };
+        sender.send(Packet::Publish(first.clone())).await;
+        sender.expect(Packet::PubAck(ack(1, R::SUCCESS))).await;
+        sink.expect(Packet::Publish(first)).await;
+
+        if expired {
+            advance(Duration::from_secs(2)).await;
+        }
+        let marker = publish("stream", b"marker", Q0, 0);
+        sender.send(Packet::Publish(marker.clone())).await;
+        sink.expect(Packet::Publish(marker)).await;
+
+        let second = publish("stream", b"next", Q1, 2);
+        sender.send(Packet::Publish(second.clone())).await;
+        sender.expect(Packet::PubAck(ack(2, R::SUCCESS))).await;
+        if !expired {
+            sink.silent().await;
+            sink.send(Packet::PubAck(ack(1, R::SUCCESS))).await;
+        }
+        sink.expect(Packet::Publish(second)).await;
+    }
+}
+
+// database.c: db__expire_all_messages and db__message_reconnect_reset_outgoing.
+// Extend 03-publish-qos1-max-inflight-expire.py through the resumed QoS 2 flow.
+#[tokio::test(start_paused = true)]
+async fn resume_frees_expired_receive_window_but_keeps_qos2_until_pubcomp() {
+    let broker = broker(BrokerConfig::default());
+    let mut settings = Connect {
+        properties: vec![P::SessionExpiryInterval(60), P::ReceiveMaximum(1)],
+        ..request("receiver")
+    };
+    let mut sink = connected(&broker, settings.clone(), false).await;
+    sink.subscribe(sub("stream", Q2), vec![]).await;
+    let mut sender = connected(&broker, request("sender"), false).await;
+    let expiring = Publish {
+        properties: vec![P::MessageExpiryInterval(1)],
+        ..publish("stream", b"expires", Q1, 1)
+    };
+    sender.send(Packet::Publish(expiring.clone())).await;
+    sender.expect(Packet::PubAck(ack(1, R::SUCCESS))).await;
+    sink.expect(Packet::Publish(expiring)).await;
+
+    let second = publish("stream", b"qos 2", Q2, 2);
+    sender.send(Packet::Publish(second.clone())).await;
+    sender.expect(Packet::PubRec(ack(2, R::SUCCESS))).await;
+    sender.send(Packet::PubRel(ack(2, R::SUCCESS))).await;
+    sender.expect(Packet::PubComp(ack(2, R::SUCCESS))).await;
+    let third = publish("stream", b"qos 1", Q1, 3);
+    sender.send(Packet::Publish(third.clone())).await;
+    sender.expect(Packet::PubAck(ack(3, R::SUCCESS))).await;
+    sink.silent().await;
+    sink.disconnect(R::SUCCESS, vec![]).await;
+
+    advance(Duration::from_secs(2)).await;
+    settings.clean_start = false;
+    let mut sink = connected(&broker, settings.clone(), true).await;
+    sink.expect(Packet::Publish(second)).await;
+    sink.send(Packet::PubRec(ack(2, R::SUCCESS))).await;
+    sink.expect(Packet::PubRel(ack(2, R::SUCCESS))).await;
+    sink.disconnect(R::SUCCESS, vec![]).await;
+
+    let mut sink = connected(&broker, settings, true).await;
+    sink.expect(Packet::PubRel(ack(2, R::SUCCESS))).await;
+    sink.silent().await;
+    sink.send(Packet::PubComp(ack(2, R::SUCCESS))).await;
+    sink.expect(Packet::Publish(third)).await;
 }
 
 // 07-will-delay-reconnect.py, 07-will-disconnect-with-will.py and src/session_expiry.c.

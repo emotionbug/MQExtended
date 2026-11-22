@@ -776,7 +776,7 @@ impl Active<'_> {
                     .map(SubscriptionRequest::legacy)
                     .collect();
                 match self
-                    .act(Operation::Subscribe(filters, self.broker.now()))
+                    .act(Operation::subscribe(filters, self.broker.now()))
                     .await?
                 {
                     Reply::Subscribed(codes) if codes.is_empty() => {

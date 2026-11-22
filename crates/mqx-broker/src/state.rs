@@ -711,17 +711,23 @@ impl State {
             .is_some_and(|inbox| inbox.has_outbound(&self.config))
     }
 
-    pub(crate) fn outbound_reservation(&self, lease: &Lease, now: Duration) -> Option<Operation> {
+    pub(crate) fn outbound_reservation(
+        &self,
+        lease: &Lease,
+        clock: impl FnOnce() -> Duration,
+    ) -> Option<Operation> {
         let session = self.claimed_session(lease)?;
         let inbox = session.inbox.as_ref()?;
         if !inbox.has_outbound(&self.config) {
             return None;
         }
-        Some(if session.internal_bridge.is_none() && inbox.expired_before_qos0(now) {
+        let now = clock();
+        let operation = if session.internal_bridge.is_none() && inbox.expired_before_qos0(now) {
             Operation::ReserveOutboundWithQos0Expiry(now)
         } else {
             Operation::ReserveOutbound(now)
-        })
+        };
+        Some(operation)
     }
 
     fn claimed_session(&self, lease: &Lease) -> Option<&Session> {

@@ -567,7 +567,9 @@ impl Broker {
                     request,
                 };
                 let mut reply = log.propose_one(proposal(claim)).await?;
-                if reply == Reply::Full && let Some(mut request) = retry {
+                if reply == Reply::Full
+                    && let Some(mut request) = retry
+                {
                     // The failed claim is applied locally now. A due offline
                     // session can fill the limit until the next maintenance
                     // tick. Commit an ordinary expiry before retrying this
@@ -576,7 +578,10 @@ impl Broker {
                     let (has_capacity, expiry_due) = log.cluster.read(|machine| {
                         (
                             machine.state.has_capacity_for(&request.publisher.id),
-                            machine.state.next_session_expiry().is_some_and(|at| at <= now),
+                            machine
+                                .state
+                                .next_session_expiry()
+                                .is_some_and(|at| at <= now),
                         )
                     });
                     if has_capacity || expiry_due {
@@ -896,11 +901,11 @@ impl Broker {
             if let Some(packet) = live.pop_reserved()? {
                 return Ok(Some(packet));
             }
-            let now = self.now();
-            let Some(operation) = log
-                .cluster
-                .read(|machine| machine.state.outbound_reservation(&live.lease, now))
-            else
+            let Some(operation) = log.cluster.read(|machine| {
+                machine
+                    .state
+                    .outbound_reservation(&live.lease, || self.now())
+            }) else {
                 // A later committed delivery wakes the transport on apply.
                 return Ok(None);
             };
@@ -1774,8 +1779,10 @@ mod tests {
             internal_bridge: None,
             dynamic_security_revision: None,
         };
-        let ClaimResult::Accepted(old, false) =
-            broker.claim(&security, claim("offline"), None).await.unwrap()
+        let ClaimResult::Accepted(old, false) = broker
+            .claim(&security, claim("offline"), None)
+            .await
+            .unwrap()
         else {
             panic!("the original client should be admitted");
         };

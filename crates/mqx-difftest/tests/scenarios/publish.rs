@@ -80,11 +80,40 @@ fn dollar_topics(h: &mut Harness) {
     let wildcard = client(h, "wildcard");
     let dollar = client(h, "dollar");
     let publisher = client(h, "publisher");
+    // src/retain.c: at level zero, "$app/#" replays the parent only if
+    // retain__search also visited a child. Exact "$app" still has a value.
+    publish_from(
+        h,
+        publisher,
+        Publish {
+            retain: true,
+            ..publish("$app", b"root", Q1, 7)
+        },
+    );
     subscribe(h, wildcard, 1, &[("#", Q0), ("+/status", Q0)]);
     subscribe(h, dollar, 1, &[("$app/#", Q0)]);
+    ping(h, dollar);
     // Application-owned $ topics avoid nondeterministic broker-generated $SYS counters.
-    publish_from(h, publisher, publish("$app/status", b"app", Q0, 0));
+    publish_from(
+        h,
+        publisher,
+        Publish {
+            retain: true,
+            ..publish("$app/status", b"app", Q1, 8)
+        },
+    );
     accept_publish(h, dollar, publish("$app/status", b"app", Q0, 0));
+    subscribe(h, dollar, 2, &[("$app/#", Q0)]);
+    for (topic, value) in [("$app/status", &b"app"[..]), ("$app", &b"root"[..])] {
+        accept_publish(
+            h,
+            dollar,
+            Publish {
+                retain: true,
+                ..publish(topic, value, Q0, 0)
+            },
+        );
+    }
     ping(h, wildcard);
     publish_from(h, publisher, publish("ordinary/topic", b"ordinary", Q0, 0));
     accept_publish(h, wildcard, publish("ordinary/topic", b"ordinary", Q0, 0));

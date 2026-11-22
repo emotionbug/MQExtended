@@ -272,7 +272,7 @@ impl Active<'_> {
                             .map(|sub| (sub.filter.clone(), sub.qos))
                             .collect::<Vec<_>>()
                     });
-                match self.act(Operation::Subscribe(filters, now)).await? {
+                match self.act(Operation::subscribe(filters, now)).await? {
                     Reply::Subscribed(codes) => {
                         if let Some(logged) = logged {
                             for ((filter, qos), code) in logged.into_iter().zip(&codes) {

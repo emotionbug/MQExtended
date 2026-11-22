@@ -490,6 +490,25 @@ impl Inbox {
         Some(reserve_publish(entry))
     }
 
+    // database.c: db__message_write_inflight_out_latest starts at the head
+    // when a new QoS 0 follows the only already-written in-flight message.
+    // The write's expiry check can then free that message's send quota.
+    pub(crate) fn expired_before_qos0(&self, now: Duration) -> bool {
+        self.receive_maximum.is_some()
+            && self.next_unsent == 1
+            && self.in_flight.get(1).is_some_and(|entry| {
+                entry.phase == Phase::Publish && entry.delivery.qos == QoS::AtMostOnce
+            })
+            && self.in_flight[0].delivery.message.expired(now)
+    }
+
+    pub(crate) fn expire_before_qos0(&mut self, now: Duration) {
+        if self.expired_before_qos0(now) {
+            self.send_used = self.send_used.saturating_sub(1);
+            self.remove_flight(0);
+        }
+    }
+
     pub(crate) fn next_outbound(
         &mut self,
         config: &BrokerConfig,

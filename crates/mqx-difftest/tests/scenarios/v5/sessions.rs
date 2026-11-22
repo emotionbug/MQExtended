@@ -106,6 +106,70 @@ fn compare_expiry(expected: &Transcript, actual: &Transcript) {
     });
 }
 
+// database.c: db__message_write_inflight_out_latest revisits a lone in-flight
+// publication when a QoS 0 delivery can be written past the receive window.
+scenario!(
+    live_expired_receive_window,
+    config(ANONYMOUS),
+    compare_expiry
+);
+fn live_expired_receive_window(h: &mut Harness) {
+    let receiver = connect_with(
+        h,
+        Connect {
+            properties: vec![
+                Property::ReceiveMaximum(1),
+                Property::SessionExpiryInterval(60),
+            ],
+            ..options("window-subscriber")
+        },
+        false,
+    );
+    let sender = client(h, "window-publisher");
+    let topic = "window/expiry";
+    subscribe(h, receiver, 1, topic, Q1);
+    publish_qos1(
+        h,
+        sender,
+        Publish {
+            properties: vec![Property::MessageExpiryInterval(2)],
+            ..publication(topic, b"expires", Q1, 1)
+        },
+        R::SUCCESS,
+    );
+    let reading = read(h, receiver, RESPONSE);
+    let Reading::ReceivedV5 {
+        packet: Packet::Publish(first),
+        ..
+    } = reading
+    else {
+        panic!("expected the initial PUBLISH, got {reading:?}");
+    };
+    let [Property::MessageExpiryInterval(remaining @ 1..=2)] = first.properties.as_slice() else {
+        panic!("unexpected expiry in initial PUBLISH: {first:?}");
+    };
+    assert_eq!(
+        first,
+        &Publish {
+            properties: vec![Property::MessageExpiryInterval(*remaining)],
+            ..publication(topic, b"expires", Q1, 1)
+        }
+    );
+    // Leave packet 1 unacknowledged while its expiry deadline passes.
+    thread::sleep(Duration::from_secs(3));
+    let marker = Packet::Publish(publication(topic, b"marker", Q0, 0));
+    send(h, sender, marker.clone());
+    received(h, receiver, marker);
+    publish_qos1(h, sender, publication(topic, b"next", Q1, 2), R::SUCCESS);
+    received(
+        h,
+        receiver,
+        Packet::Publish(publication(topic, b"next", Q1, 2)),
+    );
+    send(h, receiver, Packet::PubAck(ack(2, R::SUCCESS)));
+    ping(h, receiver);
+}
+
 const WILL_TOPIC: &str = "will/events";
 const WILL_PAYLOAD: &[u8] = b"gone";
 
