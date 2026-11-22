@@ -9,6 +9,56 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-mod
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
+## Linux broker build
+
+Install a native Rust toolchain, a C compiler and linker, `pkg-config`, OpenSSL 3.x development headers and CA certificates. For Debian or Ubuntu the build packages are `build-essential`, `pkg-config`, `libssl-dev` and `ca-certificates`. The broker does not need CMake or a Mosquitto build.
+
+```sh
+cargo build --locked --release -p mqx-server --bin mqextended
+target/release/mqextended --version
+```
+
+Use `./scripts/stage-linux.sh /path/to/new-bundle` to repeat the locked release build for your native Linux target and stage the executable, sample configuration, systemd unit and `SHA256SUMS`. The parent directory must exist; staging refuses an existing destination. The output can be moved as a directory. The unit inside it assumes the installation paths in the [README](../README.md#install-a-standalone-linux-service).
+
+Build on the oldest Linux userspace you intend to support, or on the deployment distro. The executable is dynamically linked and needs a compatible C runtime and OpenSSL 3.x runtime (`libssl.so.3`, `libcrypto.so.3`). The lockfile pins the Cargo dependencies, not the native toolchain or libraries; record the source revision, `rustc -vV` and the build environment to reproduce a release.
+
+### Check a staged bundle
+
+From the repository root, stage into a temporary directory as a regular user:
+
+```sh
+work=$(mktemp -d)
+bundle="$work/bundle"
+./scripts/stage-linux.sh "$bundle"
+(cd "$bundle" && sha256sum --check --strict SHA256SUMS)
+"$bundle/bin/mqextended" --version
+"$bundle/bin/mqextended" --test-config -c "$bundle/etc/mqextended.conf"
+```
+
+Verify the unit without installing it. Only the launch paths in this temporary copy point into the bundle:
+
+```sh
+sed "s|^ExecStart=.*|ExecStart=\"$bundle/bin/mqextended\" -c \"$bundle/etc/mqextended.conf\"|" \
+    "$bundle/lib/systemd/system/mqextended.service" > "$work/mqextended-stage-check.service"
+systemd-analyze verify "$work/mqextended-stage-check.service"
+```
+
+Pick a free unprivileged port (28883 below). Run the broker with a read-only config and separate private working directory, which takes the place of systemd's state directory:
+
+```sh
+mkdir -m 0700 "$work/state"
+sed 's/^listener 1883 /listener 28883 /' "$bundle/etc/mqextended.conf" > "$work/smoke.conf"
+chmod 0444 "$work/smoke.conf"
+(
+    cd "$work/state" || exit
+    umask 077
+    unset MOSQUITTO_PERSISTENCE_LOCATION UMASK_SET NOTIFY_SOCKET
+    exec "$bundle/bin/mqextended" -c "$work/smoke.conf"
+)
+```
+
+Connect a local MQTT client to `127.0.0.1:28883`, then stop the broker with Ctrl-C. Check that it exited cleanly and that `test -s "$work/state/mqextended.db.mqx"` succeeds. This checks the broker's file access as an unprivileged user; `systemd-analyze verify` checks the unit, not the running service's sandbox.
+
 ## Mosquitto reference build
 
 Differential tests run the real Mosquitto 2.1.4. Its CMake build needs cJSON as a CMake package even when you only want the broker, and the plugin directory needs SQLite. The `password_file` and `acl_file` support you compare against is compiled into the broker from `plugins/password-file` and `plugins/acl-file` regardless of `WITH_PLUGINS`, so turning plugins off is safe.

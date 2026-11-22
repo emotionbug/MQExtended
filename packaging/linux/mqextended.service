@@ -1,0 +1,41 @@
+[Unit]
+Description=MQExtended standalone MQTT broker
+After=network.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/opt/mqextended/current/bin/mqextended -c /etc/mqextended/mqextended.conf
+Restart=on-failure
+
+DynamicUser=yes
+User=mqextended
+StateDirectory=mqextended
+StateDirectoryMode=0700
+WorkingDirectory=%S/mqextended
+UMask=0077
+UnsetEnvironment=MOSQUITTO_PERSISTENCE_LOCATION UMASK_SET
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
