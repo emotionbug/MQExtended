@@ -255,6 +255,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let mut deadline = deadline(connect.keep_alive);
+    let mut partial_bytes = 0;
     let mut delivering = !too_long;
     let mut prefer_input = false;
     let mut deferred = None;
@@ -319,6 +320,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             match wire.packet(config, connect.protocol) {
                 Ok(Some(packet)) => {
                     prefer_input = false;
+                    partial_bytes = 0;
                     deadline = self::deadline(connect.keep_alive);
                     let packet_bytes = input_bytes - wire.input.len();
                     let step = if clustered
@@ -387,6 +389,17 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         Err(error) => break Err(error),
                     }
                     continue;
+                }
+                Ok(None) if deadline.is_some() && partial_bytes != input_bytes => {
+                    // lib/packet_mosq.c: packet__read_single refreshes keepalive on
+                    // partial body reads with >1000 bytes left. An unrelated wakeup
+                    // or an incomplete fixed header is not client activity.
+                    partial_bytes = input_bytes;
+                    if frame_size(&wire.input)
+                        .is_some_and(|size| size.saturating_sub(input_bytes) > 1000)
+                    {
+                        deadline = self::deadline(connect.keep_alive);
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => break Err(error),

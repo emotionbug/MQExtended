@@ -323,6 +323,39 @@ fn qos1_roundtrip(h: &mut Harness) {
     disconnect(h, publisher);
 }
 
+// lib/packet_mosq.c: packet__read_single refreshes keepalive while the body
+// of a large packet is still arriving, not just when the packet is complete.
+scenario!(keepalive_during_large_publish, config(ANONYMOUS));
+fn keepalive_during_large_publish(h: &mut Harness) {
+    const PAYLOAD: &[u8] = &[0x5a; 16 * 1024];
+    let sub = client(h, "telemetry-reader");
+    let topic = "telemetry/sample";
+    subscribe(h, sub, 1, &[(topic, Q1)]);
+    let publisher = connect_with(
+        h,
+        Connect {
+            keep_alive: 2,
+            ..options("meter")
+        },
+        false,
+    );
+    let mut frame = BytesMut::new();
+    encode(
+        &Packet::Publish(publish(topic, PAYLOAD, Q1, 42)),
+        &mut frame,
+    )
+    .unwrap();
+    // One valid publication spread over four seconds (keepalive grace is three).
+    for (index, fragment) in frame.chunks(2048).enumerate() {
+        if index != 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        raw(h, publisher, fragment);
+    }
+    received(h, publisher, Packet::PubAck(id(42)));
+    accept_publish(h, sub, publish(topic, PAYLOAD, Q1, 1));
+}
+
 // test/broker/03-publish-b2c-qos2-len.py and data/PUBLISH.json (duplicate before PUBREL).
 scenario!(qos2_roundtrip_and_duplicate, config(ANONYMOUS));
 fn qos2_roundtrip_and_duplicate(h: &mut Harness) {

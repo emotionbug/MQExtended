@@ -42,6 +42,7 @@ The reference is **Mosquitto 2.1.4** (tag `v2.1.4`). When Mosquitto and the MQTT
 ### Broker (`mqx-broker` ← `src/handle_*.c`, `src/subs.c`, `src/database.c`)
 
 - Taking over a client id sends the old connection's will when the old or the new session is clean; persistent-to-persistent takeover discards it (`connect__on_authorised`).
+- On a slow link, a large PUBLISH may take longer than 1.5 times the Keep Alive interval. Progress receiving its body resets the timer while more than 1000 bytes remain (`lib/packet_mosq.c`: `packet__read_single`); a stalled transfer still times out.
 - MQTT 3.1 has no 23-byte client id limit, and CONNACK `session_present` stays 0 for 3.1 clients.
 - Outgoing packet ids are consumed even when a message is then dropped as a duplicate or for a full queue (`mosquitto__mid_generate`), so packet ids on the wire match Mosquitto's.
 - Connection log lines use 2.1's protocol numbers: `p3` for MQTT 3.1, `p4` for 3.1.1.
