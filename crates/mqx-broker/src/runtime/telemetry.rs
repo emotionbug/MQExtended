@@ -70,6 +70,14 @@ impl Broker {
         }
     }
 
+    /// Local WAL diagnostics, absent in standalone mode or after the WAL closes.
+    pub async fn wal_metrics(&self) -> Option<mqx_cluster::WalMetrics> {
+        match &self.0.log {
+            Log::Local { .. } => None,
+            Log::Replicated(log) => log.cluster.wal_metrics().await.ok(),
+        }
+    }
+
     /// Records a successful MQTT transport socket accept, including sockets
     /// rejected before admission (Mosquitto net.c: net__socket_accept).
     pub fn record_socket_accept(&self) {

@@ -26,14 +26,22 @@ use crate::version;
 type Entry = EntryOf<Types>;
 type Vote = VoteOf<Types>;
 
-/// Counters for the open WAL, reset when the node restarts.
+/// Metrics for the open WAL, reset when the node restarts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalMetrics {
     /// Entries accepted for append, including Raft control and lease entries.
     pub appended_entries: u64,
-    /// Filesystem-sync batches completed by the WAL worker. A batch spanning
+    /// Filesystem-sync batches attempted by the WAL worker. A batch spanning
     /// multiple WAL files can sync more than one file.
     pub sync_batches: u64,
+    /// Total time spent syncing WAL files.
+    pub sync_time: Duration,
+    /// Longest filesystem-sync phase of a completed batch.
+    pub sync_max: Duration,
+    /// Longest file-write phase of a completed batch.
+    pub write_max: Duration,
+    /// Longest wait from enqueue to the start of writing, including group wait.
+    pub queue_wait_max: Duration,
 }
 
 struct Inner {
@@ -89,9 +97,14 @@ impl Wal {
 
     pub(crate) async fn metrics(&self) -> io::Result<WalMetrics> {
         let inner = self.read().await?;
+        let flush = inner.log.stat().flush_metrics;
         Ok(WalMetrics {
             appended_entries: inner.appended_entries,
-            sync_batches: inner.log.stat().flush_metrics.sync_batch_count,
+            sync_batches: flush.sync_batch_count,
+            sync_time: Duration::from_micros(flush.sync_us),
+            sync_max: Duration::from_micros(flush.sync_max_us),
+            write_max: Duration::from_micros(flush.write_max_us),
+            queue_wait_max: Duration::from_micros(flush.queued_wait_max_us),
         })
     }
 
@@ -389,6 +402,8 @@ mod tests {
         wal.save_vote(&vote).await.unwrap();
         let voted = wal.metrics().await.unwrap();
         assert!(voted.sync_batches > initial.sync_batches);
+        assert!(voted.sync_time >= initial.sync_time);
+        assert!(voted.sync_max <= voted.sync_time);
 
         let log_id = LogId::new(
             Leadership {
@@ -411,6 +426,11 @@ mod tests {
         let appended = wal.metrics().await.unwrap();
         assert_eq!(appended.appended_entries, 1);
         assert!(appended.sync_batches > voted.sync_batches);
+        assert!(appended.sync_time >= voted.sync_time);
+        assert!(appended.sync_max >= voted.sync_max);
+        assert!(appended.sync_max <= appended.sync_time);
+        assert!(appended.write_max >= voted.write_max);
+        assert!(appended.queue_wait_max >= voted.queue_wait_max);
         wal.close().await.unwrap();
     }
 

@@ -40,4 +40,4 @@ Single-node mode uses the same layout with a one-member cluster.
 └── snapshot.mpk    # Raft snapshot metadata, node leases, application state
 ```
 
-Entries and votes are fsynced before they are acknowledged; the commit frontier is fsynced before entries are applied. A snapshot is written to a temporary file, fsynced, renamed and the directory fsynced before the log is compacted behind it. Restart restores the snapshot and replays the committed log tail.
+Entries and votes are fsynced before they are acknowledged. Commit frontiers are coalesced into the next required WAL sync, not synced separately before apply. Restart restores the snapshot and replays the locally recorded committed tail; Raft reestablishes any newer commit frontier. A snapshot is written to a temporary file, fsynced, renamed and the directory fsynced before the log is compacted behind it.

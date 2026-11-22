@@ -34,3 +34,5 @@ Access works as in Mosquitto: only `GET`; HTTP Basic credentials are checked aga
 ## Prometheus metrics
 
 `/metrics` needs the same credentials as the rest of the API. It reports this process's connections, packets, bytes and proposal latency, and gauges of the replicated state (sessions, subscriptions, retained messages, Raft indexes). Scrape every node and aggregate in Prometheus; unlike `$SYS`, these are per-node values.
+
+On cluster nodes, `mqx_raft_wal_appended_entries_total` and `mqx_raft_wal_sync_batches_total` show how many entries share a WAL sync batch. `mqx_raft_wal_sync_seconds_total` records time spent syncing WAL files. Compare `mqx_raft_wal_sync_max_seconds`, `mqx_raft_wal_write_max_seconds` and `mqx_raft_wal_queue_wait_max_seconds` with proposal latency to separate long filesystem syncs from writes or time spent waiting for the WAL worker. The maxima are for completed work since node startup, not a scrape interval.

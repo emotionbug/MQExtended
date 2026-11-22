@@ -154,7 +154,7 @@ impl HttpApi {
                 response
             }
             "/metrics" => {
-                let mut response = respond(StatusCode::OK, prometheus(broker));
+                let mut response = respond(StatusCode::OK, prometheus(broker).await);
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
                     "text/plain; version=0.0.4; charset=utf-8".parse().unwrap(),
@@ -198,7 +198,7 @@ fn cluster_status(broker: &Broker) -> serde_json::Value {
     })
 }
 
-fn prometheus(broker: &Broker) -> String {
+async fn prometheus(broker: &Broker) -> String {
     let stats = broker.metrics();
     let mut body = String::new();
     for (metric, kind, value) in [
@@ -233,6 +233,9 @@ fn prometheus(broker: &Broker) -> String {
             }
         }
     }
+    if let Some(metrics) = broker.wal_metrics().await {
+        write_wal_metrics(&mut body, metrics);
+    }
     let histogram = stats.proposal_latency;
     let name = "mqx_raft_proposal_duration_seconds";
     writeln!(body, "# TYPE {name} histogram").unwrap();
@@ -246,6 +249,28 @@ fn prometheus(broker: &Broker) -> String {
     )
     .unwrap();
     body
+}
+
+fn write_wal_metrics(body: &mut String, metrics: mqx_cluster::WalMetrics) {
+    for (name, value) in [
+        ("mqx_raft_wal_appended_entries_total", metrics.appended_entries),
+        ("mqx_raft_wal_sync_batches_total", metrics.sync_batches),
+    ] {
+        writeln!(body, "# TYPE {name} counter\n{name} {value}").unwrap();
+    }
+    for (name, kind, duration) in [
+        ("mqx_raft_wal_sync_seconds_total", "counter", metrics.sync_time),
+        ("mqx_raft_wal_sync_max_seconds", "gauge", metrics.sync_max),
+        ("mqx_raft_wal_write_max_seconds", "gauge", metrics.write_max),
+        (
+            "mqx_raft_wal_queue_wait_max_seconds",
+            "gauge",
+            metrics.queue_wait_max,
+        ),
+    ] {
+        let value = duration.as_secs_f64();
+        writeln!(body, "# TYPE {name} {kind}\n{name} {value}").unwrap();
+    }
 }
 
 fn basic_credentials(value: &[u8]) -> Option<Vec<u8>> {
@@ -334,4 +359,44 @@ async fn static_file(root: Option<&Path>, url: &str) -> Response<Body> {
         .headers_mut()
         .insert(header::CONTENT_LENGTH, metadata.len().into());
     response
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    #[test]
+    fn wal_metrics_uses_seconds_with_distinct_io_phases() {
+        let mut body = String::new();
+        write_wal_metrics(
+            &mut body,
+            mqx_cluster::WalMetrics {
+                appended_entries: 15,
+                sync_batches: 5,
+                sync_time: Duration::from_millis(2_500),
+                sync_max: Duration::from_millis(1_500),
+                write_max: Duration::from_micros(250),
+                queue_wait_max: Duration::from_millis(20),
+            },
+        );
+        for line in [
+            "mqx_raft_wal_appended_entries_total 15",
+            "mqx_raft_wal_sync_batches_total 5",
+            "# TYPE mqx_raft_wal_sync_seconds_total counter",
+            "mqx_raft_wal_sync_seconds_total 2.5",
+            "mqx_raft_wal_sync_max_seconds 1.5",
+            "mqx_raft_wal_write_max_seconds 0.00025",
+            "mqx_raft_wal_queue_wait_max_seconds 0.02",
+        ] {
+            assert!(body.lines().any(|actual| actual == line), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_scrape_has_no_wal_metrics() {
+        let broker = Broker::new(mqx_broker::BrokerConfig::default());
+        let body = prometheus(&broker).await;
+        assert!(body.contains("mqx_connections"));
+        assert!(!body.contains("mqx_raft_wal_"));
+    }
 }

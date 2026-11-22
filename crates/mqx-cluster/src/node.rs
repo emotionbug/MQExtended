@@ -459,7 +459,7 @@ impl<S: StateMachine> Cluster<S> {
         }
     }
 
-    /// Local WAL counters. Call after a read barrier to include a completed workload.
+    /// Local WAL worker metrics. A read barrier can be used to sample after a workload.
     pub async fn wal_metrics(&self) -> Result<WalMetrics, ClusterError> {
         Ok(self.0.wal.metrics().await?)
     }
