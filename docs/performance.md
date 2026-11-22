@@ -25,6 +25,31 @@ Use `--require-p99-below-ms` with a target `--rate` for release qualification. `
 
 ## Current numbers
 
+Persistent QoS 1, 200 one-to-one pairs, 256-byte payloads, 30 s of traffic and 10 s configured drain. Release brokers, mutual TLS between the three voters, all three WALs on the same consumer NVMe/ext4 device. These are local measurements under contention, **not a passing release qualification**. Reported latency is the publisher-to-subscriber histogram's p99.
+
+| Offered publishes/s | Mosquitto p99 (ms) | Standalone p99 (ms) | 3-node p99 (ms) | Cluster sent / PUBACK / delivered | Duplicates |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.221 | 0.360 | 4 295 | 3 000 / 3 000 / 3 000 | 0 |
+| 1 000 | 0.180 | 0.221 | 2 147 | 29 999 / 29 999 / 29 999 | 0 |
+
+As a diagnostic, the same three-node workload on tmpfs (10 s per rate, 3 s drain) gave p99 **5.505 ms** and **44.040 ms** at 100 and 1 000 publishes/s respectively; both passed the traffic, latency and delivery gates. Tmpfs does not provide crash-durable writes. These shorter controls isolate the storage path; they do not qualify the service or justify disabling fsync.
+
+For deployment qualification, use `load` against three separately provisioned staging voters (not `compare`, which launches all brokers locally). For example, with three authorized loopback staging endpoints:
+
+```sh
+for rate in 100 1000; do
+    target/release/mqx-bench load \
+        --endpoint 127.0.0.1:11883 --endpoint 127.0.0.1:21883 --endpoint 127.0.0.1:31883 \
+        --pattern one-to-one --publishers 200 --subscribers 200 --qos 1 --persistent \
+        --seconds 30 --drain-seconds 10 --rate "$rate" --require-p99-below-ms 50 \
+        > "persistent-$rate.json" || exit 1
+done
+```
+
+The client endpoints speak plain MQTT without credentials; use isolated test listeners or protected tunnels to staging, not an anonymous listener on the production network. Tunnels and the client host contribute to end-to-end latency. Load runs create persistent sessions; use disposable staging state.
+
+### Historical plaintext baseline
+
 Historical baseline: release builds, three nodes on one 12-thread laptop, **plaintext** loopback peer connections, WALs on a consumer NVMe (ext4), 256-byte payloads, 10-second runs. The host also ran an emulator and unrelated builds. These are observations under contention, not bounds on production latency. p99 end-to-end latency in milliseconds; every row delivered every message with no duplicates.
 
 | Workload | QoS | Mosquitto 2.1.4 | Standalone | 3-node cluster |
