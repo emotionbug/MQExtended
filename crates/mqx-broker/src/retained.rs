@@ -1,16 +1,17 @@
 use std::{str::Split, sync::Arc};
 
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::inbox::Message;
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Retained {
     ordinary: Branch,
     dollar: Branch,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Branch {
     children: IndexMap<Box<str>, Self>,
     message: Option<Arc<Message>>,

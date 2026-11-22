@@ -1,6 +1,6 @@
 use super::*;
 
-fn persistent(client_id: &str) -> Connect {
+pub(super) fn persistent(client_id: &str) -> Connect {
     Connect {
         clean_session: false,
         ..options(client_id)
@@ -230,7 +230,7 @@ fn same_id_takeover(h: &mut Harness) {
     disconnect(h, second);
 }
 
-fn with_will(client_id: &str, topic: &str) -> Connect {
+pub(super) fn with_will(client_id: &str, topic: &str) -> Connect {
     Connect {
         will: Some(LastWill {
             topic: topic.into(),

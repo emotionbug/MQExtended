@@ -1,24 +1,28 @@
 use std::{
     fmt::Display,
     future::{Future, pending},
-    io::{self, IoSlice},
+    io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
     time::Duration,
 };
 
+use mqx_proxy::{PROXY_HEADER_TIMEOUT, ProxyOptions};
+use mqx_ws::WsOptions;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{TcpListener, TcpStream, lookup_host},
+    net::{TcpListener, lookup_host},
     sync::{Semaphore, watch},
     task::JoinSet,
+    time::{Instant, timeout_at},
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::TlsAcceptor;
 
-use crate::{ListenerConfig, ListenerProtocol, ServerConfig, ServerError, SocketDomain, tls};
+use crate::{
+    ConnectionStream, ListenerConfig, ListenerProtocol, ServerConfig, ServerError, SocketDomain,
+    tls,
+    transport::{self, PeerAddress},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CertIdentity {
@@ -34,72 +38,11 @@ pub struct Connection {
     pub listener: Arc<ListenerConfig>,
     /// Position of `listener` in [`ServerConfig::listeners`].
     pub listener_index: usize,
-    pub peer_addr: SocketAddr,
+    /// Effective source address; a proxied Unix peer has no IP address.
+    pub peer_addr: Option<SocketAddr>,
+    /// The shared initial keepalive begins at TCP accept, before any upgrade.
+    pub accepted_at: Instant,
     pub cert_identity: CertIdentity,
-}
-
-#[derive(Debug)]
-pub enum ConnectionStream {
-    Tcp(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
-}
-
-impl AsyncRead for ConnectionStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for ConnectionStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
-            Self::Tls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
-        }
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        match self {
-            Self::Tcp(stream) => stream.is_write_vectored(),
-            Self::Tls(stream) => stream.is_write_vectored(),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
-        }
-    }
 }
 
 pub struct Server {
@@ -119,6 +62,8 @@ struct ListenerOptions {
     index: usize,
     limit: Option<Arc<Semaphore>>,
     tls: watch::Sender<Option<TlsAcceptor>>,
+    proxy: Option<ProxyOptions>,
+    websockets: Option<WsOptions>,
 }
 
 impl Server {
@@ -132,16 +77,12 @@ impl Server {
             );
         }
         for (index, listener) in config.listeners.iter().enumerate() {
-            if listener.protocol == ListenerProtocol::Websockets {
-                return Err(ServerError::Arguments(
-                    "Error: Unsupported configuration directive 'protocol websockets'.".into(),
-                ));
-            }
-            if listener.enable_proxy_protocol.is_some() {
-                return Err(ServerError::Arguments(
-                    "Error: Unsupported configuration directive 'enable_proxy_protocol'.".into(),
-                ));
-            }
+            let proxy = listener.proxy_options()?;
+            let websockets =
+                (listener.protocol == ListenerProtocol::Websockets).then(|| WsOptions {
+                    packet_buffer_size: config.limits.packet_buffer_size,
+                    origins: listener.websockets_origins.clone(),
+                });
             let acceptor = tls::acceptor(listener)?;
             let addresses = listener_addresses(listener, config.local_only).await?;
             let mut sockets = Vec::new();
@@ -179,6 +120,8 @@ impl Server {
                         limit: (listener.max_connections > 0)
                             .then(|| Arc::new(Semaphore::new(listener.max_connections))),
                         tls,
+                        proxy,
+                        websockets,
                     }),
                 });
             } else if !config.local_only {
@@ -416,6 +359,7 @@ impl SocketWorker {
                             continue;
                         }
                     };
+                    let accepted_at = Instant::now();
                     // Mosquitto src/net.c: net__socket_accept checks both caps before starting TLS.
                     let (Ok(local), Ok(global)) = (
                         options.limit.clone().map(Semaphore::try_acquire_owned).transpose(),
@@ -430,39 +374,55 @@ impl SocketWorker {
                         tracing::warn!("Unable to set TCP_NODELAY: {error}");
                     }
                     let handler = handler.clone();
-                    let listener = options.config.clone();
-                    let listener_index = options.index;
-                    let acceptor = options.tls.borrow().clone();
+                    let options = options.clone();
                     let mut cancel = cancel.clone();
                     connections.spawn(async move {
                         let _permits = (local, global);
-                        let (stream, cert_identity) = if let Some(acceptor) = acceptor {
-                            let handshake = tokio::select! {
+                        let acceptor = options.tls.borrow().clone();
+                        let mut peer = PeerAddress::Ip(peer_addr);
+                        let listener = &options.config;
+                        let (stream, cert_identity) = if options.proxy.is_some()
+                            || acceptor.is_some() || options.websockets.is_some()
+                        {
+                            // Mosquitto src/context.c: context__init and src/keepalive.c:
+                            // keepalive__check. Layer upgrades share one pre-CONNECT budget.
+                            let negotiated = tokio::select! {
                                 biased;
                                 _ = cancel.changed() => return,
-                                stream = acceptor.accept(stream) => stream,
+                                result = timeout_at(accepted_at + PROXY_HEADER_TIMEOUT, transport::negotiate(
+                                    stream, &mut peer, options.proxy, acceptor, &listener.tls, options.websockets.as_ref(),
+                                )) => result,
                             };
-                            let stream = match handshake {
-                                Ok(stream) => stream,
-                                Err(error) => {
+                            match negotiated {
+                                Ok(Ok(Some(transport))) => transport,
+                                Ok(Ok(None)) => return,
+                                Ok(Err(error)) => {
                                     if connection_messages {
-                                        tracing::debug!("TLS handshake from {peer_addr} failed: {error}");
+                                        tracing::debug!("Connection from {peer} ended: {error}");
                                     }
                                     return;
                                 }
-                            };
-                            let peer = stream.get_ref().1.peer_certificates().and_then(|chain| chain.first());
-                            let cert_identity = tls::identity(&listener.tls, peer);
-                            (ConnectionStream::Tls(Box::new(stream)), cert_identity)
+                                Err(_) => {
+                                    if connection_messages {
+                                        tracing::debug!("Handshake from {peer} exceeded the initial keepalive");
+                                    }
+                                    return;
+                                }
+                            }
                         } else {
-                            let identity = if listener.tls.require_certificate && listener.tls.use_identity_as_username {
-                                CertIdentity::MissingOrInvalid
-                            } else {
-                                CertIdentity::None
-                            };
-                            (ConnectionStream::Tcp(stream), identity)
+                            (ConnectionStream::tcp(stream), transport::plain_identity(&listener.tls))
                         };
-                        handler(Connection { stream, listener, listener_index, peer_addr, cert_identity }).await;
+                        if connection_messages {
+                            tracing::info!(target: "mqx::notice", "New connection from {peer} on port {}.", listener.port);
+                        }
+                        handler(Connection {
+                            stream,
+                            listener: listener.clone(),
+                            listener_index: options.index,
+                            peer_addr: peer.ip(),
+                            accepted_at,
+                            cert_identity,
+                        }).await;
                     });
                 }
             }

@@ -10,7 +10,9 @@ use mqx_codec::{
     ConnAck, Connect, ConnectReturnCode, LastWill, Packet, PacketId, ProtocolVersion, Publish, QoS,
     SubAck, Subscribe, SubscribeReturnCode, Unsubscribe, encode,
 };
-use mqx_difftest::{BrokerConfig, BrokerKind, Connection, Harness, Reading, Transcript};
+use mqx_difftest::{
+    BrokerConfig, BrokerKind, ClusterConfig, Connection, Harness, Reading, Transcript,
+};
 
 const RESPONSE: Duration = Duration::from_secs(3);
 const SILENCE: Duration = Duration::from_millis(100);
@@ -37,11 +39,22 @@ macro_rules! scenario {
                 let expected = run(BrokerKind::Mosquitto, $conf, super::$name);
                 compare(&expected, &actual);
             }
+
+            #[test]
+            #[ignore = "requires real Mosquitto 2.1.4 and cluster-enabled mqextended binaries"]
+            fn cross_cluster() {
+                let mut cluster = start_cluster($conf);
+                super::$name(&mut cluster);
+                let actual = cluster.into_transcript();
+                let expected = run(BrokerKind::Mosquitto, $conf, super::$name);
+                compare(&expected, &actual);
+            }
         }
     };
 }
 
 mod connect;
+mod failover;
 mod publish;
 mod sessions;
 
@@ -50,6 +63,11 @@ fn config(conf: &'static str) -> BrokerConfig<'static> {
         conf,
         ..BrokerConfig::default()
     }
+}
+
+fn start_cluster(conf: BrokerConfig<'_>) -> Harness {
+    Harness::start_cluster(conf, ClusterConfig::default())
+        .unwrap_or_else(|err| panic!("mqextended cluster: {err}"))
 }
 
 fn run(kind: BrokerKind, conf: BrokerConfig<'_>, scenario: fn(&mut Harness)) -> Transcript {

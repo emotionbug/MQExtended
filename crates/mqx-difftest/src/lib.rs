@@ -1,24 +1,21 @@
 //! Script MQTT 3.1/3.1.1 clients against isolated broker processes.
 
-use std::env;
-use std::fs::{self, File};
+mod process;
+
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Mutex;
-use std::thread;
+use std::net::{SocketAddr, TcpStream};
+use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use mqx_codec::{DecodeContext, DecodeError, EncodeError, Packet, ProtocolVersion, decode, encode};
-use tempfile::TempDir;
+pub use process::{ClusterConfig, Placement};
 use thiserror::Error;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+use process::Brokers;
+
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
-// Don't let two tests in this process choose the same released port before either child binds.
-static STARTUP_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy)]
 pub enum BrokerKind {
@@ -60,41 +57,14 @@ pub enum Error {
         pending: usize,
         reason: &'static str,
     },
-}
-
-impl BrokerKind {
-    fn binary(self) -> Result<PathBuf, Error> {
-        match self {
-            Self::Mosquitto => mosquitto_binary("src/mosquitto"),
-            Self::MqExtended => {
-                let path = env::var_os("MQEXTENDED_BIN").map_or_else(
-                    || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/mqextended"),
-                    PathBuf::from,
-                );
-                required_binary("MQEXTENDED_BIN", path)
-            }
-        }
-    }
-}
-
-fn required_binary(variable: &'static str, path: PathBuf) -> Result<PathBuf, Error> {
-    let resolve = || {
-        let binary = path.canonicalize()?;
-        if !binary.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
-        }
-        Ok(binary)
-    };
-    resolve().map_err(|source| Error::Binary {
-        variable,
-        path,
-        source,
-    })
-}
-
-fn mosquitto_binary(relative: &str) -> Result<PathBuf, Error> {
-    let build = env::var_os("MOSQUITTO_BUILD_DIR").ok_or(Error::MissingMosquittoBuildDir)?;
-    required_binary("MOSQUITTO_BUILD_DIR", PathBuf::from(build).join(relative))
+    #[error("node index {index} is outside 1..={nodes}")]
+    NodeIndex { index: usize, nodes: usize },
+    #[error("node {0} is stopped")]
+    NodeStopped(usize),
+    #[error("node {0} is already running")]
+    NodeRunning(usize),
+    #[error("cluster did not agree on a live Raft leader within {timeout:?}:\n{logs}")]
+    NoLeader { timeout: Duration, logs: String },
 }
 
 /// Configuration directives appended to a loopback listener in an isolated working directory.
@@ -105,102 +75,6 @@ pub struct BrokerConfig<'a> {
     pub passwords: &'a [(&'a str, &'a str)],
     /// When present, writes and configures an ACL file even if its contents are empty.
     pub acl: Option<&'a str>,
-}
-
-struct BrokerProcess {
-    child: Child,
-    dir: TempDir,
-    addr: SocketAddr,
-}
-
-impl BrokerProcess {
-    fn start(kind: BrokerKind, config: BrokerConfig<'_>) -> Result<Self, Error> {
-        let bin = kind.binary()?;
-        let dir = tempfile::tempdir()?;
-        let work_dir = dir.path();
-        let mut conf = String::new();
-        if !config.passwords.is_empty() {
-            generate_password_file(work_dir, config.passwords)?;
-            conf.push_str("password_file passwords\n");
-        }
-        if let Some(acl) = config.acl {
-            fs::write(work_dir.join("acl"), acl)?;
-            conf.push_str("acl_file acl\n");
-        }
-        conf.push_str(config.conf);
-        let log = File::create(work_dir.join("broker.log"))?;
-
-        let _startup = STARTUP_LOCK.lock().expect("broker startup lock poisoned");
-        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let addr = reservation.local_addr()?;
-        fs::write(
-            work_dir.join("mosquitto.conf"),
-            format!("listener {} 127.0.0.1\n{conf}\n", addr.port()),
-        )?;
-        let mut command = Command::new(&bin);
-        command
-            .args(["-c", "mosquitto.conf"])
-            .current_dir(work_dir)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
-        drop(reservation);
-        let child = command
-            .spawn()
-            .map_err(|source| Error::Spawn { path: bin, source })?;
-        let mut broker = Self { child, dir, addr };
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
-        let reason = loop {
-            if let Some(status) = broker.child.try_wait()? {
-                break status.to_string();
-            }
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {
-                return Ok(broker);
-            }
-            if Instant::now() >= deadline {
-                break format!("did not listen on {addr} within {STARTUP_TIMEOUT:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        Err(Error::Startup {
-            broker: kind,
-            reason,
-            log: fs::read_to_string(broker.dir.path().join("broker.log")).unwrap_or_default(),
-        })
-    }
-}
-
-impl Drop for BrokerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn generate_password_file(dir: &Path, users: &[(&str, &str)]) -> Result<(), Error> {
-    let bin = mosquitto_binary("apps/mosquitto_passwd/mosquitto_passwd")?;
-    for (index, (username, password)) in users.iter().enumerate() {
-        let mut command = Command::new(&bin);
-        command.arg("-b");
-        if index == 0 {
-            command.arg("-c");
-        }
-        let status = command
-            .args(["passwords", username, password])
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|source| Error::Spawn {
-                path: bin.clone(),
-                source,
-            })?;
-        if !status.success() {
-            return Err(Error::PasswordFile(status));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +107,18 @@ struct Client {
 }
 
 impl Client {
+    fn connect(addr: SocketAddr, protocol: ProtocolVersion, timeout: Duration) -> io::Result<Self> {
+        let socket = TcpStream::connect_timeout(&addr, timeout)?;
+        socket.set_write_timeout(Some(timeout))?;
+        socket.set_nodelay(true)?;
+        Ok(Self {
+            socket,
+            context: DecodeContext::for_client(0, Some(protocol)),
+            decode_buffer: BytesMut::new(),
+            wire_buffer: BytesMut::new(),
+        })
+    }
+
     fn receive(&mut self, connection: Connection, timeout: Duration) -> Result<Reading, Error> {
         let deadline = Instant::now() + timeout;
         let mut chunk = [0; 4096];
@@ -284,35 +170,65 @@ impl Client {
     }
 }
 
-/// Owns one broker, its scripted sockets, and its transcript in script observation order.
+/// Owns isolated broker processes, scripted sockets, and observations in script order.
 pub struct Harness {
     clients: Vec<Option<Client>>,
     transcript: Transcript,
-    broker: BrokerProcess,
+    brokers: Brokers,
 }
 
 impl Harness {
     pub fn start(kind: BrokerKind, config: BrokerConfig<'_>) -> Result<Self, Error> {
-        Ok(Self {
+        Ok(Self::with_brokers(Brokers::start(kind, config, None)?))
+    }
+
+    /// Starts the cluster and waits for an accepted CONNECT on every node.
+    pub fn start_cluster(config: BrokerConfig<'_>, cluster: ClusterConfig) -> Result<Self, Error> {
+        Ok(Self::with_brokers(Brokers::start(
+            BrokerKind::MqExtended,
+            config,
+            Some(cluster),
+        )?))
+    }
+
+    fn with_brokers(brokers: Brokers) -> Self {
+        Self {
             clients: Vec::new(),
             transcript: Vec::new(),
-            broker: BrokerProcess::start(kind, config)?,
-        })
+            brokers,
+        }
     }
 
     /// Opens a socket without sending CONNECT. `protocol` controls receive decoding.
     pub fn open(&mut self, protocol: ProtocolVersion) -> Result<Connection, Error> {
-        let socket = TcpStream::connect_timeout(&self.broker.addr, WRITE_TIMEOUT)?;
-        socket.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        socket.set_nodelay(true)?;
+        self.open_on(self.brokers.choose(self.clients.len()), protocol)
+    }
+
+    /// Opens a socket on the specified one-based node, overriding the placement policy.
+    pub fn open_on(
+        &mut self,
+        index: usize,
+        protocol: ProtocolVersion,
+    ) -> Result<Connection, Error> {
+        let client = Client::connect(self.brokers.addr(index)?, protocol, WRITE_TIMEOUT)?;
         let connection = Connection(self.clients.len());
-        self.clients.push(Some(Client {
-            socket,
-            context: DecodeContext::for_client(0, Some(protocol)),
-            decode_buffer: BytesMut::new(),
-            wire_buffer: BytesMut::new(),
-        }));
+        self.clients.push(Some(client));
         Ok(connection)
+    }
+
+    /// SIGKILLs and reaps a node. Existing connections remain readable to observe EOF.
+    pub fn kill_node(&mut self, index: usize) -> Result<(), Error> {
+        self.brokers.kill(index)
+    }
+
+    /// Starts a stopped node with the same configuration, ports and data directory.
+    pub fn restart_node(&mut self, index: usize) -> Result<(), Error> {
+        self.brokers.restart(index)
+    }
+
+    /// Waits for all running nodes to report the same live leader in their logs.
+    pub fn wait_for_leader(&mut self, timeout: Duration) -> Result<usize, Error> {
+        self.brokers.wait_for_leader(timeout)
     }
 
     pub fn send(&mut self, connection: Connection, packet: &Packet) -> Result<(), Error> {

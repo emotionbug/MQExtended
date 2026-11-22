@@ -1,6 +1,6 @@
 # Data model
 
-State is split by write rate and by what must survive the loss of a node. Both tiers live in the replicated log; they differ in how often they are written and who reads them.
+State is split by write rate and by what must survive the loss of a node. In a cluster both tiers live in the replicated log; standalone mode keeps the same state in memory.
 
 ## Tiers
 
@@ -9,7 +9,7 @@ State is split by write rate and by what must survive the loss of a node. Both t
 | 1. Metadata | client-id ownership and connection epoch; persistent-session subscriptions and settings; will messages; retained messages; node membership and leases | connect, disconnect, (un)subscribe, retained publish, node events | every node: subscription index, takeover, CONNACK `session_present`, retained delivery |
 | 2. Inbox | queued messages and in-flight state of persistent sessions | every message to a persistent subscriber, every acknowledgement | the node currently serving that session |
 
-Transient (clean-session) sessions exist only in the memory of the node serving them. Their subscriptions are still replicated so other nodes can route to them, and are removed when the connection ends.
+Transient (clean-session) sessions keep their outgoing queue in the memory of the node serving them. Their claim and subscriptions are replicated so every node can route to them, and are removed when the connection ends or the node is declared down.
 
 ## Rules
 

@@ -24,6 +24,8 @@ use tokio::{
     time::timeout,
 };
 
+mod cluster;
+
 const Q0: QoS = QoS::AtMostOnce;
 const Q1: QoS = QoS::AtLeastOnce;
 const Q2: QoS = QoS::ExactlyOnce;
@@ -1111,4 +1113,29 @@ async fn inbound_qos2_over_quota_completes_without_delivery() {
         .expect(Packet::Publish(publish("quota", b"kept", Q0, 0)))
         .await;
     observer.ping().await;
+}
+
+// context.c: context__init starts the initial timeout on socket accept,
+// before any PROXY / TLS / WebSocket handshake.
+#[tokio::test(start_paused = true)]
+async fn transport_handshake_consumes_the_initial_connect_budget() {
+    let broker = broker(BrokerConfig::default());
+    let (mut peer, stream) = tokio::io::duplex(4096);
+    let accepted = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_secs(29)).await;
+    let task = tokio::spawn(async move {
+        broker
+            .serve_accepted(stream, ConnectionInfo::default(), accepted)
+            .await
+    });
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        timeout(Duration::from_millis(1), peer.read_u8())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    task.await.unwrap().unwrap();
 }

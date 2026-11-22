@@ -8,15 +8,20 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 getrandom = "0.4"
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
 mqx-auth.workspace = true
-mqx-codec.workspace = true
+mqx-cluster = { path = "../mqx-cluster" }
+mqx-codec = { workspace = true, features = ["serde"] }
 mqx-topic.workspace = true
+rmp-serde = "1"
+serde = { version = "1", features = ["derive", "rc"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
+tempfile = "3.27"
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

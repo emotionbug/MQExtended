@@ -30,14 +30,15 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     broker: &Broker,
     stream: S,
     info: ConnectionInfo,
+    accepted_at: Instant,
 ) -> Result<(), BrokerError> {
     let config = &broker.0.config;
     let mut wire = Wire::new(stream);
     let mut shutdown = broker.0.shutdown.subscribe();
     // context.c: context__init gives peers 20 seconds of keepalive before CONNECT.
-    let initial_deadline = Instant::now() + keepalive_period(20);
+    let initial_deadline = accepted_at + keepalive_period(20);
     let mut connect = loop {
-        if *shutdown.borrow() {
+        if *shutdown.borrow() || Instant::now() >= initial_deadline {
             return Ok(());
         }
         match wire.packet(config, None) {
@@ -77,18 +78,21 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let publisher = Publisher {
         id: Arc::from(connect.client_id),
         username: identity.username.clone(),
-        security: listener.security.0.id,
+        security: 0, // Filled by the log backend before claiming the session.
     };
-    let Some((live, present)) = broker.claim(
-        &listener.security,
-        Claim {
-            publisher,
-            transient: connect.clean_session,
-            bridge: connect.is_bridge,
-            max_qos: listener.max_qos,
-            will: connect.will,
-        },
-    ) else {
+    let Some((live, present)) = broker
+        .claim(
+            &listener.security,
+            Claim {
+                publisher,
+                transient: connect.clean_session,
+                bridge: connect.is_bridge,
+                max_qos: listener.max_qos,
+                will: connect.will,
+            },
+        )
+        .await?
+    else {
         return Ok(());
     };
     let present = present && connect.protocol == ProtocolVersion::V311;
@@ -96,6 +100,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         broker,
         live,
         graceful: false,
+        detached: false,
     };
     if config.connection_messages {
         log_connected(
@@ -143,8 +148,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 break Ok(End::KeepaliveRefused);
             }
             if delivering && (!prefer_input || deferred.is_some()) {
-                match session.next_outbound() {
-                    Some(outbound) => {
+                match session.broker.next_outbound(&session.live).await {
+                    Ok(Some(outbound)) => {
                         if let Err(error) = wire.delivery(outbound, listener.mount_point.as_deref())
                         {
                             break Err(error);
@@ -152,7 +157,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         prefer_input = true;
                         continue;
                     }
-                    None => delivering = false,
+                    Ok(None) => delivering = false,
+                    Err(error) => break Err(error),
                 }
             }
             if let Some(ack) = deferred.take() {
@@ -165,7 +171,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 Ok(Some(packet)) => {
                     prefer_input = false;
                     deadline = self::deadline(connect.keep_alive);
-                    match session.process(packet, &info) {
+                    match session.process(packet, &info).await {
                         Ok(Step::Continue) => delivering = true,
                         Ok(Step::Reply(packet)) => {
                             if let Err(error) = wire.output(&packet) {
@@ -216,7 +222,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     if config.connection_messages {
         log_disconnected(info.peer_addr, &session.live.lease.id, &result);
     }
-    result.map(|_| ())
+    let detached = broker
+        .detach(session.live.lease.clone(), session.graceful)
+        .await;
+    session.detached = true;
+    result.map(|_| ()).and(detached)
 }
 
 struct Identity {
@@ -424,31 +434,24 @@ struct Active<'a> {
     broker: &'a Broker,
     live: Arc<Live>,
     graceful: bool,
+    detached: bool,
 }
 
 impl Drop for Active<'_> {
     fn drop(&mut self) {
-        self.broker.detach(&self.live, self.graceful);
+        if !self.detached {
+            self.broker
+                .detach_cancelled(self.live.lease.clone(), self.graceful);
+        }
     }
 }
 
 impl Active<'_> {
-    fn act(&self, operation: Operation) -> Reply {
-        self.broker.act(&self.live, operation)
+    async fn act(&self, operation: Operation) -> Result<Reply, BrokerError> {
+        self.broker.act(&self.live, operation).await
     }
 
-    fn next_outbound(&self) -> Option<Outbound> {
-        if let Some(inbox) = &self.live.inbox {
-            return inbox.lock().unwrap().next_outbound(&self.broker.0.config);
-        }
-        match self.act(Operation::NextOutbound) {
-            Reply::Outbound(outbound) => outbound,
-            Reply::Stale => None,
-            _ => unreachable!(),
-        }
-    }
-
-    fn process(&self, packet: Packet, info: &ConnectionInfo) -> Result<Step, BrokerError> {
+    async fn process(&self, packet: Packet, info: &ConnectionInfo) -> Result<Step, BrokerError> {
         let config = &self.broker.0.config;
         let mount_point = info.listener.mount_point.as_deref();
         let max_qos = info.listener.max_qos;
@@ -462,7 +465,7 @@ impl Active<'_> {
                         *qos = max_qos;
                     }
                 }
-                match self.act(Operation::Subscribe(sub.filters)) {
+                match self.act(Operation::Subscribe(sub.filters)).await? {
                     Reply::Subscribed(codes) if codes.is_empty() => {
                         Ok(Step::EmptySubAck(sub.packet_id))
                     }
@@ -477,7 +480,7 @@ impl Active<'_> {
                 for filter in &mut unsub.filters {
                     mount(filter, mount_point);
                 }
-                let step = action_result(self.act(Operation::Unsubscribe(unsub.filters)))?;
+                let step = action_result(self.act(Operation::Unsubscribe(unsub.filters)).await?)?;
                 Ok(step.or_reply(Packet::UnsubAck(unsub.packet_id), false))
             }
             Packet::Publish(mut publish) => {
@@ -490,7 +493,7 @@ impl Active<'_> {
                 mount(&mut publish.topic, mount_point);
                 let id = publish.packet_id;
                 let qos = publish.qos;
-                let mut reply = self.act(Operation::Receive(publish));
+                let mut reply = self.act(Operation::Receive(publish)).await?;
                 if let Reply::ReceiveLocal(message) = reply {
                     let id = id.unwrap();
                     let inbox = self.live.inbox.as_ref().unwrap();
@@ -509,7 +512,7 @@ impl Active<'_> {
                         Some(message) => {
                             let allowed = inbox.lock().unwrap().can_publish_qos1(id, config);
                             if allowed {
-                                self.act(Operation::Forward(message))
+                                self.act(Operation::Forward(message)).await?
                             } else {
                                 Reply::NoChange
                             }
@@ -524,27 +527,24 @@ impl Active<'_> {
                 })
             }
             Packet::PubRel(id) => {
-                let mut reply = self.act(Operation::Release(id));
-                if reply == Reply::LocalInbox {
-                    let message = self
-                        .live
-                        .inbox
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .release(id);
-                    reply = message.map_or(Reply::NoChange, |message| {
-                        self.act(Operation::Forward(message))
-                    });
-                }
+                let reply = if let Some(inbox) = &self.live.inbox {
+                    let message = inbox.lock().unwrap().release(id);
+                    if let Some(message) = message {
+                        self.act(Operation::Forward(message)).await?
+                    } else {
+                        Reply::NoChange
+                    }
+                } else {
+                    self.act(Operation::Release(id)).await?
+                };
                 Ok(action_result(reply)?.or_reply(Packet::PubComp(id), true))
             }
-            Packet::PubAck(id) => self.ack(id, Ack::Acknowledged),
+            Packet::PubAck(id) => self.ack(id, Ack::Acknowledged).await,
             Packet::PubRec(id) => Ok(self
-                .ack(id, Ack::Received)?
+                .ack(id, Ack::Received)
+                .await?
                 .or_reply(Packet::PubRel(id), false)),
-            Packet::PubComp(id) => self.ack(id, Ack::Completed),
+            Packet::PubComp(id) => self.ack(id, Ack::Completed).await,
             Packet::Connect(_)
             | Packet::ConnAck(_)
             | Packet::PingResp
@@ -553,24 +553,15 @@ impl Active<'_> {
         }
     }
 
-    fn ack(&self, id: mqx_codec::PacketId, ack: Ack) -> Result<Step, BrokerError> {
-        let reply = self.act(Operation::Ack(id, ack));
-        if reply == Reply::LocalInbox {
-            if self
-                .live
-                .inbox
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .ack(id, ack, &self.broker.0.config)
-            {
+    async fn ack(&self, id: mqx_codec::PacketId, ack: Ack) -> Result<Step, BrokerError> {
+        if let Some(inbox) = &self.live.inbox {
+            if inbox.lock().unwrap().ack(id, ack, &self.broker.0.config) {
                 Ok(Step::Continue)
             } else {
                 Err(BrokerError::Protocol)
             }
         } else {
-            action_result(reply)
+            action_result(self.act(Operation::Ack(id, ack)).await?)
         }
     }
 }

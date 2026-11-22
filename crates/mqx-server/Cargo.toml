@@ -12,8 +12,12 @@ path = "src/main.rs"
 [dependencies]
 mqx-auth.workspace = true
 mqx-broker.workspace = true
+mqx-cluster = { path = "../mqx-cluster" }
 mqx-codec.workspace = true
+mqx-proxy = { path = "../mqx-proxy", features = ["tokio"] }
 mqx-topic.workspace = true
+mqx-ws = { path = "../mqx-ws" }
+bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

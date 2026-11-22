@@ -1,18 +1,21 @@
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+use mqx_cluster::ClusterConfig;
 
 use crate::ServerError;
 
 const DEFAULT_PORT: u16 = 1883;
 pub(crate) const CMD_PORT_LIMIT: usize = 10;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listeners: Vec<ListenerConfig>,
     pub local_only: bool,
@@ -21,6 +24,7 @@ pub struct ServerConfig {
     pub security: SecurityConfig,
     pub limits: BrokerLimits,
     pub log: LogConfig,
+    pub cluster: Option<ClusterConfig>,
     /// Parse-time operator notices, emitted after the logging destinations are configured.
     pub notices: Vec<String>,
 }
@@ -64,8 +68,45 @@ pub struct ListenerConfig {
     pub bind_interface: Option<String>,
     pub websockets_origins: Vec<String>,
     pub http_dir: Option<PathBuf>,
+    /// Trusts source addresses and (in v2) TLS authentication from the proxy.
+    /// Restrict access to this listener to trusted proxy hosts.
     pub enable_proxy_protocol: Option<ProxyProtocol>,
     pub proxy_protocol_v2_require_tls: bool,
+}
+
+impl ListenerConfig {
+    pub(crate) fn proxy_options(&self) -> Result<Option<mqx_proxy::ProxyOptions>, ServerError> {
+        let Some(version) = self.enable_proxy_protocol else {
+            return Ok(None);
+        };
+        let options = mqx_proxy::ProxyOptions {
+            version,
+            require_tls: self.proxy_protocol_v2_require_tls,
+            require_certificate: self.tls.require_certificate,
+            use_identity_as_username: self.tls.use_identity_as_username,
+        };
+        // Mosquitto src/conf.c: config__check_proxy. V2 gets its TLS policy
+        // from the upstream proxy, not a second TLS session.
+        options
+            .validate_listener(
+                self.tls.use_subject_as_username,
+                self.tls.certfile.is_some(),
+                self.tls.keyfile.is_some(),
+            )
+            .map_err(|error| {
+                let message = match error {
+                    mqx_proxy::ProxyError::SubjectUsernameWithV2 => {
+                        "use_subject_as_username cannot be used with `enable_proxy_protocol 2`."
+                    }
+                    mqx_proxy::ProxyError::ListenerTlsWithV2 => {
+                        "certfile and keyfile cannot be used with `enable_proxy_protocol 2`."
+                    }
+                    _ => return ServerError::Arguments(format!("Error: {error}")),
+                };
+                ServerError::Arguments(format!("Error: {message}"))
+            })?;
+        Ok(Some(options))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -82,11 +123,7 @@ pub enum ListenerProtocol {
     Websockets,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProxyProtocol {
-    V1,
-    V2,
-}
+pub use mqx_proxy::ProxyVersion as ProxyProtocol;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecurityConfig {
@@ -325,6 +362,7 @@ struct Parser {
     persistence_file_seen: bool,
     persistence_location_seen: bool,
     persistence_enabled_at: Option<(PathBuf, usize, &'static str)>,
+    cluster: Option<((PathBuf, usize), ClusterSection)>,
 }
 
 impl Default for Parser {
@@ -338,6 +376,7 @@ impl Default for Parser {
                 security: SecurityConfig::default(),
                 limits: BrokerLimits::default(),
                 log: LogConfig::default(),
+                cluster: None,
                 notices: Vec::new(),
             },
             default_listener: None,
@@ -349,6 +388,7 @@ impl Default for Parser {
             persistence_file_seen: false,
             persistence_location_seen: false,
             persistence_enabled_at: None,
+            cluster: None,
         }
     }
 }
@@ -358,21 +398,12 @@ impl Parser {
         if let Some((path, line, directive)) = self.persistence_enabled_at {
             return Err(unsupported(directive, "on-disk persistence").at(&path, line));
         }
+        if let Some(((path, line), section)) = self.cluster {
+            self.config.cluster = Some(section.finish().map_err(|error| error.at(&path, line))?);
+        }
         for listener in &self.config.listeners {
             let tls = &listener.tls;
-            // Mosquitto src/conf.c: config__check_proxy.
-            if listener.enable_proxy_protocol == Some(ProxyProtocol::V2) {
-                let message = if tls.use_subject_as_username {
-                    Some("use_subject_as_username cannot be used with `enable_proxy_protocol 2`.")
-                } else if tls.certfile.is_some() || tls.keyfile.is_some() {
-                    Some("certfile and keyfile cannot be used with `enable_proxy_protocol 2`.")
-                } else {
-                    None
-                };
-                if let Some(message) = message {
-                    return Err(ServerError::Arguments(format!("Error: {message}")));
-                }
-            }
+            listener.proxy_options()?;
             let message = match (&tls.certfile, &tls.keyfile) {
                 (Some(_), None) | (None, Some(_)) => {
                     "Both certfile and keyfile must be provided to enable a TLS listener."
@@ -469,6 +500,11 @@ impl Parser {
                             },
                         )
                     });
+            } else if name.starts_with("cluster_") {
+                let (_, section) = self
+                    .cluster
+                    .get_or_insert_with(|| ((path.into(), index + 1), ClusterSection::default()));
+                section.directive(Value { name, value }).map_err(err)?;
             } else {
                 self.directive(Value { name, value }, &mut current)
                     .map_err(err)?;
@@ -662,11 +698,10 @@ impl Parser {
                         })?);
                     }
                     "enable_proxy_protocol" => {
-                        listener.enable_proxy_protocol = Some(match v.integer()? {
-                            1 => ProxyProtocol::V1,
-                            2 => ProxyProtocol::V2,
-                            _ => return Err("enable_proxy_protocol must be 1 or 2.".into()),
-                        })
+                        listener.enable_proxy_protocol =
+                            Some(ProxyProtocol::try_from(v.integer()?).map_err(|_| {
+                                ParseError::from("enable_proxy_protocol must be 1 or 2.")
+                            })?);
                     }
                     "proxy_protocol_v2_require_tls" => {
                         listener.proxy_protocol_v2_require_tls = v.boolean()?
@@ -1039,6 +1074,137 @@ impl Parser {
         };
         self.config.log.types.insert(kind);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ClusterSection {
+    node_id: Option<u64>,
+    bind: Option<SocketAddr>,
+    peers: BTreeMap<u64, SocketAddr>,
+    data_dir: Option<PathBuf>,
+    heartbeat: Option<Duration>,
+    election: Option<(Duration, Duration)>,
+    lease_interval: Option<Duration>,
+    lease_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+}
+
+impl ClusterSection {
+    fn directive(&mut self, value: Value<'_>) -> ParseResult<()> {
+        let name = value.name;
+        let positive = |word: &str| -> ParseResult<u64> {
+            word.parse()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| invalid(name, word))
+        };
+        let duration = |word| positive(word).map(Duration::from_millis);
+        let address = |word: &str| -> ParseResult<SocketAddr> {
+            word.parse::<SocketAddr>()
+                .ok()
+                .filter(|addr| addr.port() != 0)
+                .ok_or_else(|| invalid(name, word))
+        };
+        if name == "cluster_data_dir" {
+            self.data_dir = Some(PathBuf::from(value.unique_string(self.data_dir.is_some())?));
+            return Ok(());
+        }
+        let count = match name {
+            "cluster_peer" | "cluster_election_timeout" => 2,
+            "cluster_node_id"
+            | "cluster_bind"
+            | "cluster_heartbeat_interval"
+            | "cluster_lease_interval"
+            | "cluster_lease_timeout"
+            | "cluster_request_timeout" => 1,
+            _ => return Err(format!("Unknown configuration variable '{name}'.").into()),
+        };
+        let mut words = value.words().take_while(|word| !word.starts_with('#'));
+        let first = words.next().ok_or_else(|| empty(name))?;
+        let second = words.next();
+        if second.is_some() != (count == 2) || words.next().is_some() {
+            return Err(format!("'{name}' requires {count} value(s).").into());
+        }
+        let duplicate = || ParseError(format!("Duplicate '{name}' value in configuration."));
+        match name {
+            "cluster_node_id" if self.node_id.is_none() => self.node_id = Some(positive(first)?),
+            "cluster_bind" if self.bind.is_none() => self.bind = Some(address(first)?),
+            "cluster_peer" => {
+                let id = positive(first)?;
+                let addr = address(second.expect("two arguments"))?;
+                if addr.ip().is_unspecified() {
+                    return Err(format!("'cluster_peer' address {addr} must be routable.").into());
+                }
+                if self.peers.contains_key(&id) {
+                    return Err(format!("Duplicate 'cluster_peer' node id {id}.").into());
+                }
+                if self.peers.values().any(|other| *other == addr) {
+                    return Err(format!("Duplicate 'cluster_peer' address {addr}.").into());
+                }
+                self.peers.insert(id, addr);
+            }
+            "cluster_heartbeat_interval" if self.heartbeat.is_none() => {
+                self.heartbeat = Some(duration(first)?)
+            }
+            "cluster_election_timeout" if self.election.is_none() => {
+                self.election = Some((duration(first)?, duration(second.expect("two arguments"))?));
+            }
+            "cluster_lease_interval" if self.lease_interval.is_none() => {
+                self.lease_interval = Some(duration(first)?)
+            }
+            "cluster_lease_timeout" if self.lease_timeout.is_none() => {
+                self.lease_timeout = Some(duration(first)?)
+            }
+            "cluster_request_timeout" if self.request_timeout.is_none() => {
+                self.request_timeout = Some(duration(first)?)
+            }
+            _ => return Err(duplicate()),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> ParseResult<ClusterConfig> {
+        let requires = |option| ParseError(format!("Cluster configuration requires '{option}'."));
+        let id = self.node_id.ok_or_else(|| requires("cluster_node_id"))?;
+        let bind = self.bind.ok_or_else(|| requires("cluster_bind"))?;
+        let data_dir = self.data_dir.ok_or_else(|| requires("cluster_data_dir"))?;
+        if !self.peers.contains_key(&id) {
+            return Err(format!(
+                "Cluster configuration requires a 'cluster_peer' entry for node {id}."
+            )
+            .into());
+        }
+        let mut config = ClusterConfig::new(id, bind, self.peers, data_dir);
+        if let Some(interval) = self.heartbeat {
+            config.heartbeat_interval = interval;
+        }
+        if let Some((min, max)) = self.election {
+            config.election_timeout_min = min;
+            config.election_timeout_max = max;
+        }
+        if config.election_timeout_min >= config.election_timeout_max {
+            return Err("'cluster_election_timeout' minimum must be less than its maximum.".into());
+        }
+        if config.election_timeout_min <= config.heartbeat_interval {
+            return Err(
+                "'cluster_election_timeout' minimum must exceed 'cluster_heartbeat_interval'."
+                    .into(),
+            );
+        }
+        if let Some(interval) = self.lease_interval {
+            config.lease_interval = interval;
+        }
+        if let Some(timeout) = self.lease_timeout {
+            config.lease_timeout = timeout;
+        }
+        if config.lease_timeout <= config.lease_interval {
+            return Err("'cluster_lease_timeout' must exceed 'cluster_lease_interval'.".into());
+        }
+        if let Some(timeout) = self.request_timeout {
+            config.request_timeout = timeout;
+        }
+        Ok(config)
     }
 }
 

@@ -7,7 +7,7 @@ Use these terms in code, comments, docs and commit messages. No synonyms.
 - **Node** — One MQExtended process. Nodes of a cluster are equals; any of them accepts any client.
 - **Cluster** — The set of nodes sharing one replicated log.
 - **Replicated log** — The ordered, majority-committed command log every node applies to the same state machine. Implemented with Raft; single-node mode is a one-member log.
-- **Mesh** — Direct node-to-node RPC for forwarding messages and handing over live connections. Not replicated.
+- **Mesh** — Direct, unreplicated node-to-node RPC offered by `mqx-cluster`. Message delivery does not use it: every node delivers to its own clients from the replicated log.
 - **Node lease** — Replicated proof that a node is alive. Expiry triggers node removal, will publication and orphaning of its sessions.
 
 ## Sessions

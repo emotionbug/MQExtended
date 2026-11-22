@@ -2,6 +2,7 @@ mod config;
 mod listener;
 mod logging;
 mod tls;
+mod transport;
 
 use std::{io, path::PathBuf};
 
@@ -10,8 +11,9 @@ pub use config::{
     ProxyProtocol, SecurityConfig, ServerConfig, SocketDomain, TlsConfig, TlsVersion,
     parse_command_line_port,
 };
-pub use listener::{CertIdentity, Connection, ConnectionStream, Server};
+pub use listener::{CertIdentity, Connection, Server};
 pub use logging::init_logging;
+pub use transport::ConnectionStream;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -56,4 +58,6 @@ pub enum ServerError {
     Signal(#[source] io::Error),
     #[error("initialize logging: {0}")]
     Logging(#[source] tracing::subscriber::SetGlobalDefaultError),
+    #[error("Cluster broker: {0}")]
+    Cluster(#[source] mqx_broker::BrokerError),
 }

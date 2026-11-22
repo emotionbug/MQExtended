@@ -1,6 +1,7 @@
 use std::{fs, io, net::SocketAddr, sync::Arc, time::Duration};
 
-use mqx_server::{CertIdentity, ConnectionStream, Server, ServerConfig};
+use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy};
+use mqx_server::{CertIdentity, Server, ServerConfig};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, CertificateRevocationListParams,
     CertifiedIssuer, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod,
@@ -34,10 +35,10 @@ async fn listener_limit_refuses_extra_tcp_connections_before_dispatch() {
         move |connection| {
             let accepted = accepted.clone();
             async move {
-                let ConnectionStream::Tcp(mut stream) = connection.stream else {
-                    panic!("not TCP");
-                };
-                accepted.send(stream.nodelay().unwrap()).unwrap();
+                let mut stream = connection.stream;
+                accepted
+                    .send(stream.as_tcp_stream().unwrap().nodelay().unwrap())
+                    .unwrap();
                 assert_eq!(stream.read_u8().await.unwrap(), 7);
             }
         },
@@ -70,17 +71,300 @@ async fn listener_limit_refuses_extra_tcp_connections_before_dispatch() {
     serving.await.unwrap().unwrap();
 }
 
+const CONNECT: &[u8] = b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev";
+const ACCEPT: [u8; 4] = [0x20, 2, 0, 0];
+const V1: &[u8] = b"PROXY TCP4 192.0.2.7 127.0.0.1 47568 1888\r\n";
+const V2_LOCAL: &[u8] = b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0";
+const V2_PREFIX: &[u8] = b"\r\n\r\n\0\r\nQUIT\n\x21\x11";
+const UPGRADE: &[u8] = b"GET /mqtt HTTP/1.1\r\nHost: localhost\r\n\
+    Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: mqtt\r\n\
+    Origin: https://device.example\r\n\r\n";
+
+fn v2(tlv: &[u8], leftover: &[u8]) -> Vec<u8> {
+    let mut input = V2_PREFIX.to_vec();
+    input.extend_from_slice(&(12 + tlv.len() as u16).to_be_bytes());
+    input.extend_from_slice(&[192, 0, 2, 7, 127, 0, 0, 1, 0xb9, 0xd0, 0x07, 0x60]);
+    input.extend_from_slice(tlv);
+    input.extend_from_slice(leftover);
+    input
+}
+
+struct RunningBroker {
+    addr: SocketAddr,
+    observed: mpsc::UnboundedReceiver<(Option<SocketAddr>, CertIdentity)>,
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<Result<(), mqx_server::ServerError>>,
+}
+
+impl RunningBroker {
+    async fn start(config: &ServerConfig) -> Self {
+        let server = Server::bind(config).await.unwrap();
+        let addr = server.local_addrs().next().unwrap().unwrap();
+        // The handler sends observations but always drives the actual MQTT broker.
+        let broker = Broker::new(BrokerConfig::default());
+        let listener = Arc::new(ListenerPolicy {
+            allow_anonymous: Some(config.allow_anonymous_for(&config.listeners[0])),
+            ..ListenerPolicy::default()
+        });
+        let shutdown = broker.clone();
+        let (accepted, observed) = mpsc::unbounded_channel();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(server.run_until(
+            move |connection| {
+                let broker = broker.clone();
+                let listener = listener.clone();
+                let accepted = accepted.clone();
+                async move {
+                    accepted
+                        .send((connection.peer_addr, connection.cert_identity.clone()))
+                        .unwrap();
+                    let cert_identity = match connection.cert_identity {
+                        CertIdentity::None => mqx_broker::CertIdentity::None,
+                        CertIdentity::Username(name) => mqx_broker::CertIdentity::Username(name),
+                        CertIdentity::MissingOrInvalid => {
+                            mqx_broker::CertIdentity::MissingOrInvalid
+                        }
+                    };
+                    broker
+                        .serve_accepted(
+                            connection.stream,
+                            ConnectionInfo {
+                                peer_addr: connection.peer_addr,
+                                listener,
+                                cert_identity,
+                            },
+                            connection.accepted_at,
+                        )
+                        .await
+                        .unwrap();
+                }
+            },
+            async {
+                stopped.await.unwrap();
+            },
+            move || shutdown.shutdown(),
+        ));
+        Self {
+            addr,
+            observed,
+            stop,
+            task,
+        }
+    }
+
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap().unwrap();
+    }
+
+    async fn observed(&mut self) -> (Option<SocketAddr>, CertIdentity) {
+        timeout(DEADLINE, self.observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+async fn read_ack(io: &mut (impl AsyncReadExt + Unpin)) -> [u8; 4] {
+    let mut ack = [0; 4];
+    timeout(DEADLINE, io.read_exact(&mut ack))
+        .await
+        .unwrap()
+        .unwrap();
+    ack
+}
+
+async fn read_upgrade(io: &mut (impl AsyncReadExt + Unpin)) {
+    let mut reply = Vec::new();
+    timeout(DEADLINE, async {
+        while !reply.ends_with(b"\r\n\r\n") {
+            reply.push(io.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        reply.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"),
+        "{reply:?}"
+    );
+    assert!(
+        String::from_utf8(reply)
+            .unwrap()
+            .contains("Sec-WebSocket-Protocol: mqtt\r\n")
+    );
+}
+
+async fn websocket_connect(io: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin)) {
+    // RFC6455 masked binary client frame carrying exactly one MQTT CONNECT.
+    let mask = [1, 2, 3, 4];
+    let mut frame = vec![0x82, 0x80 | CONNECT.len() as u8];
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        CONNECT
+            .iter()
+            .enumerate()
+            .map(|(i, byte)| byte ^ mask[i % 4]),
+    );
+    io.write_all(&frame).await.unwrap();
+    io.flush().await.unwrap();
+    let mut actual = [0; 6];
+    timeout(DEADLINE, io.read_exact(&mut actual))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&actual[..2], &[0x82, 4]);
+    assert_eq!(actual[2..], ACCEPT);
+}
+
 #[tokio::test]
-async fn unsupported_transport_cannot_bind_as_plain_mqtt() {
-    for (option, diagnostic) in [
-        ("protocol websockets", "protocol websockets"),
-        ("enable_proxy_protocol 1", "enable_proxy_protocol"),
+async fn tcp_proxy_overread_is_forwarded_to_mqtt_and_reports_the_source() {
+    // Mosquitto test/broker/21-proxy-v1-success.py and 21-proxy-v2-ipv4.py.
+    for (version, input) in [(1, [V1, CONNECT].concat()), (2, v2(&[], CONNECT))] {
+        let config = local_config(&format!(
+            "allow_anonymous true\nenable_proxy_protocol {version}"
+        ));
+        let mut broker = RunningBroker::start(&config).await;
+        let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+        // The header reader can read the MQTT packet in the same syscall.
+        stream.write_all(&input).await.unwrap();
+        assert_eq!(read_ack(&mut stream).await, ACCEPT);
+        assert_eq!(
+            broker.observed().await,
+            (Some("192.0.2.7:47568".parse().unwrap()), CertIdentity::None)
+        );
+        broker.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn proxy_v2_local_and_unverified_certificate_never_reach_mqtt() {
+    let config = local_config(
+        "allow_anonymous true\nenable_proxy_protocol 2\nproxy_protocol_v2_require_tls true\nrequire_certificate true",
+    );
+    let mut broker = RunningBroker::start(&config).await;
+    for input in [
+        [V2_LOCAL, CONNECT].concat(),
+        v2(&[], CONNECT),
+        v2(b"\x20\x00\x05\x05\x00\x00\x00\x01", CONNECT),
     ] {
-        let result = Server::bind(&local_config(option)).await;
-        let Err(error) = result else {
-            panic!("{option} unexpectedly started");
+        let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+        stream.write_all(&input).await.unwrap();
+        let error = timeout(DEADLINE, stream.read_u8())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+        ));
+    }
+    assert!(broker.observed.try_recv().is_err());
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_v2_verified_common_name_is_used_instead_of_mqtt_credentials() {
+    // Mosquitto test/broker/21-proxy-v2-ssl-common-name-{success,failure}.py.
+    let config = local_config(
+        "enable_proxy_protocol 2\nproxy_protocol_v2_require_tls true\nrequire_certificate true\nuse_identity_as_username true",
+    );
+    let mut broker = RunningBroker::start(&config).await;
+    let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+    // SSL flag 0x01 | certificate from session flag 0x04; verify result 0.
+    let ssl_with_cn = b"\x20\x00\x0e\x05\x00\x00\x00\x00\x22\x00\x06device";
+    stream.write_all(&v2(ssl_with_cn, CONNECT)).await.unwrap();
+    assert_eq!(read_ack(&mut stream).await, ACCEPT);
+    assert_eq!(
+        broker.observed().await.1,
+        CertIdentity::Username("device".into())
+    );
+    let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+    let ssl_without_cn = b"\x20\x00\x05\x05\x00\x00\x00\x00";
+    stream
+        .write_all(&v2(ssl_without_cn, CONNECT))
+        .await
+        .unwrap();
+    assert_eq!(read_ack(&mut stream).await, [0x20, 2, 0, 4]);
+    assert_eq!(broker.observed().await.1, CertIdentity::MissingOrInvalid);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn tls_websocket_dispatches_mqtt_with_and_without_a_proxy_v1_prefix() {
+    let pki = TestPki::new();
+    for proxy in ["", "enable_proxy_protocol 1\n"] {
+        let config = pki.server_config(&format!(
+            "allow_anonymous true\n\
+            protocol websockets\nwebsockets_origin https://device.example\n{proxy}"
+        ));
+        let mut broker = RunningBroker::start(&config).await;
+        let mut tcp = TcpStream::connect(broker.addr).await.unwrap();
+        let source = if proxy.is_empty() {
+            tcp.local_addr().unwrap()
+        } else {
+            tcp.write_all(V1).await.unwrap();
+            "192.0.2.7:47568".parse().unwrap()
         };
-        assert!(error.to_string().contains(diagnostic));
+        let tls = TlsConnector::from(Arc::new(pki.client_config(false)));
+        let mut stream = timeout(
+            DEADLINE,
+            tls.connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        stream.write_all(UPGRADE).await.unwrap();
+        stream.flush().await.unwrap();
+        read_upgrade(&mut stream).await;
+        websocket_connect(&mut stream).await;
+        assert_eq!(broker.observed().await, (Some(source), CertIdentity::None));
+        broker.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn proxy_v2_can_pass_a_pipelined_http_upgrade_to_websocket() {
+    // Mosquitto test/broker/21-proxy-v2-websockets.py.
+    let config = local_config(
+        "allow_anonymous true\nenable_proxy_protocol 2\nprotocol websockets\npacket_buffer_size 512",
+    );
+    let mut broker = RunningBroker::start(&config).await;
+    let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+    stream.write_all(&v2(&[], UPGRADE)).await.unwrap();
+    read_upgrade(&mut stream).await;
+    websocket_connect(&mut stream).await;
+    assert_eq!(
+        broker.observed().await.0,
+        Some("192.0.2.7:47568".parse().unwrap())
+    );
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn websocket_listener_applies_origin_and_http_buffer_limits_before_mqtt() {
+    for rule in [
+        "websockets_origin https://other.example",
+        "websockets_headers_size 32",
+    ] {
+        let config = local_config(&format!(
+            "allow_anonymous true\nprotocol websockets\n{rule}"
+        ));
+        let mut broker = RunningBroker::start(&config).await;
+        let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+        stream.write_all(UPGRADE).await.unwrap();
+        // Built-in Mosquitto waits for EOF when the HTTP buffer fills.
+        stream.shutdown().await.unwrap();
+        let error = timeout(DEADLINE, stream.read_u8())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+        ));
+        assert!(broker.observed.try_recv().is_err());
+        broker.stop().await;
     }
 }
 

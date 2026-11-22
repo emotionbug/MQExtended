@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,8 @@ pub struct NodeEvent {
     pub index: u64,
     pub node_id: u64,
     pub status: NodeStatus,
+    /// Time since the Unix epoch on the proposing leader, not on the applying replica.
+    pub occurred_at: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -25,6 +28,7 @@ pub(crate) struct Stamp {
     // Monotonic milliseconds since the proposing process started. Only compare
     // values within one leadership; other clocks are not synchronized.
     pub(crate) millis: u64,
+    pub(crate) occurred_at: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -147,6 +151,7 @@ impl Leases {
             index: log_id.index,
             node_id,
             status,
+            occurred_at: stamp.occurred_at,
         })
     }
 }
@@ -171,17 +176,20 @@ mod tests {
             term: 2,
             node_id: 1,
         };
-        let stamp = |millis| Stamp { leader, millis };
+        let stamp = |millis| Stamp {
+            leader,
+            millis,
+            occurred_at: Duration::from_secs(1_000_000) + Duration::from_millis(millis),
+        };
         let id = |index| LogId::new(leader, index);
         let heartbeat = |millis| LeaseCommand::Heartbeat {
             node_id: 2,
             stamp: stamp(millis),
         };
         let mut leases = Leases::new([1, 2].into_iter());
-        assert_eq!(
-            leases.apply(id(1), heartbeat(100)).unwrap().status,
-            NodeStatus::Alive
-        );
+        let alive = leases.apply(id(1), heartbeat(100)).unwrap();
+        assert_eq!(alive.status, NodeStatus::Alive);
+        assert_eq!(alive.occurred_at, stamp(100).occurred_at);
 
         let expired = leases.expired(stamp(200), 100)[0];
         assert_eq!(leases.apply(id(2), heartbeat(190)), None);
@@ -189,10 +197,9 @@ mod tests {
         assert_eq!(leases.statuses()[&2], NodeStatus::Alive);
 
         let expired = leases.expired(stamp(300), 100)[0];
-        assert_eq!(
-            leases.apply(id(4), expired).unwrap().status,
-            NodeStatus::Down
-        );
+        let down = leases.apply(id(4), expired).unwrap();
+        assert_eq!(down.status, NodeStatus::Down);
+        assert_eq!(down.occurred_at, stamp(300).occurred_at);
         assert_eq!(leases.apply(id(5), expired), None);
         assert_eq!(leases.apply(id(6), heartbeat(299)), None);
         assert_eq!(

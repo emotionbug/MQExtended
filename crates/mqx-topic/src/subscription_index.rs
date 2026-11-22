@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::Split};
+use std::{collections::BTreeMap, str::Split};
 
 use crate::{TopicError, validate_topic_filter, validate_topic_name};
 
@@ -12,14 +12,14 @@ pub struct SubscriptionIndex<K, V> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Branch<K, V> {
-    children: HashMap<Box<str>, Self>,
+    children: BTreeMap<Box<str>, Self>,
     entries: Vec<(K, V)>,
 }
 
 impl<K, V> Default for Branch<K, V> {
     fn default() -> Self {
         Self {
-            children: HashMap::new(),
+            children: BTreeMap::new(),
             entries: Vec::new(),
         }
     }

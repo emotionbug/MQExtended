@@ -1,21 +1,22 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
 
 use bytes::Bytes;
 use mqx_codec::{PacketId, QoS};
+use serde::{Deserialize, Serialize};
 
 use crate::BrokerConfig;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Publisher {
     pub(crate) id: Arc<str>,
     pub(crate) username: Option<Arc<str>>,
     pub(crate) security: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Message {
     pub(crate) source: Publisher,
     pub(crate) topic: Box<str>,
@@ -24,7 +25,7 @@ pub(crate) struct Message {
     pub(crate) retain: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Delivery {
     pub(crate) message: Arc<Message>,
     pub(crate) qos: QoS,
@@ -32,7 +33,7 @@ pub(crate) struct Delivery {
     pub(crate) dedup_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Outbound {
     Publish {
         delivery: Delivery,
@@ -42,14 +43,14 @@ pub(crate) enum Outbound {
     Release(PacketId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Ack {
     Received,
     Acknowledged,
     Completed,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Phase {
     Publish,
     AwaitAck,
@@ -58,7 +59,7 @@ enum Phase {
     AwaitComp,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Outgoing {
     delivery: Delivery,
     id: Option<PacketId>,
@@ -66,7 +67,7 @@ struct Outgoing {
     phase: Phase,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Counters {
     count: usize,
     bytes: usize,
@@ -95,7 +96,7 @@ impl Counters {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Inbox {
     last_mid: u16,
     last_delivered: Option<u64>,
@@ -105,12 +106,12 @@ pub(crate) struct Inbox {
     queue_stats: Counters,
     next_unsent: usize,
     dropped: bool,
-    incoming: HashMap<PacketId, Incoming>,
+    incoming: BTreeMap<PacketId, Incoming>,
     incoming_bytes: usize,
     incoming_slots: usize,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Incoming {
     message: Arc<Message>,
     repeated: bool,
@@ -238,6 +239,17 @@ impl Inbox {
         }
     }
 
+    pub(crate) fn has_outbound(&self, config: &BrokerConfig) -> bool {
+        self.in_flight
+            .iter()
+            .skip(self.next_unsent)
+            .any(|entry| matches!(entry.phase, Phase::Publish | Phase::Release))
+            || self
+                .queued
+                .front()
+                .is_some_and(|entry| self.flight_available(entry.delivery.qos, config))
+    }
+
     pub(crate) fn next_outbound(&mut self, config: &BrokerConfig) -> Option<Outbound> {
         self.promote(config);
         loop {
@@ -310,12 +322,7 @@ impl Inbox {
         entry
     }
 
-    // database.c: db__message_reconnect_reset and db__check_acl_of_all_messages.
-    pub(crate) fn resume(
-        &mut self,
-        mut allowed: impl FnMut(&str, bool) -> bool,
-        config: &BrokerConfig,
-    ) {
+    pub(crate) fn reset_outbound(&mut self) {
         self.dropped = false;
         self.next_unsent = 0;
         for entry in &mut self.in_flight {
@@ -325,6 +332,15 @@ impl Inbox {
                 Phase::Publish
             };
         }
+    }
+
+    // database.c: db__message_reconnect_reset and db__check_acl_of_all_messages.
+    pub(crate) fn resume(
+        &mut self,
+        mut allowed: impl FnMut(&str, bool) -> bool,
+        config: &BrokerConfig,
+    ) {
+        self.reset_outbound();
         self.promote(config);
         self.in_flight.retain(|entry| {
             let allowed = allowed(&entry.delivery.message.topic, false);

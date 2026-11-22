@@ -29,7 +29,7 @@ struct Reply {
 struct Durable {
     values: BTreeMap<String, String>,
     writes: Vec<u64>,
-    events: Vec<(u64, u64, NodeStatus)>,
+    events: Vec<(u64, u64, NodeStatus, Duration)>,
 }
 
 #[derive(Default)]
@@ -55,7 +55,7 @@ impl StateMachine for Kv {
     fn on_node_event(&mut self, event: NodeEvent) {
         self.durable
             .events
-            .push((event.index, event.node_id, event.status));
+            .push((event.index, event.node_id, event.status, event.occurred_at));
     }
 
     fn snapshot(&self) -> Vec<u8> {
@@ -237,6 +237,13 @@ async fn concurrent_bootstrap_forwarding_failover_and_rejoining() {
         .values()
         .find(|node| node.node_id() != old_leader)
         .unwrap();
+    assert!(
+        follower
+            .submit_if_leader(Insert("leader only".into(), "must not be forwarded".into()))
+            .await
+            .unwrap()
+            .is_none()
+    );
     let first = put(follower, "key", "before failover").await;
     for node in nodes.values() {
         let durable = node
@@ -291,6 +298,12 @@ async fn concurrent_bootstrap_forwarding_failover_and_rejoining() {
     assert!(started.elapsed() < configs[&caller].request_timeout);
     let new_leader = elected(&nodes).await;
     assert_ne!(new_leader, old_leader);
+    let leader_only = nodes[&new_leader]
+        .submit_if_leader(Insert("leader only".into(), "after failover".into()))
+        .await
+        .unwrap()
+        .expect("the new leader accepts local-only writes");
+    assert_eq!(leader_only.previous, None);
     assert!(
         matches!(follower.mesh().request(old_leader, Bytes::new()).await, Err(ClusterError::Unreachable { node_id, .. }) if node_id == old_leader)
     );
@@ -323,25 +336,30 @@ async fn concurrent_bootstrap_forwarding_failover_and_rejoining() {
         .linearizable_read(|kv| kv.durable.clone())
         .await
         .unwrap();
-    assert_eq!(expected.writes, [first.index, second.index]);
+    assert_eq!(
+        expected.writes,
+        [first.index, second.index, leader_only.index]
+    );
     assert_eq!(
         expected
             .events
             .iter()
-            .filter(|(_, id, status)| *id == old_leader && *status == NodeStatus::Down)
+            .filter(|(_, id, status, _)| *id == old_leader && *status == NodeStatus::Down)
             .count(),
         1
     );
-    assert!(
-        expected
-            .events
-            .contains(&(down.index, old_leader, NodeStatus::Down))
-    );
-    assert!(
-        expected
-            .events
-            .contains(&(alive.index, old_leader, NodeStatus::Alive))
-    );
+    assert!(expected.events.contains(&(
+        down.index,
+        old_leader,
+        NodeStatus::Down,
+        down.occurred_at,
+    )));
+    assert!(expected.events.contains(&(
+        alive.index,
+        old_leader,
+        NodeStatus::Alive,
+        alive.occurred_at,
+    )));
     nodes.insert(old_leader, restarted);
     stop(nodes).await;
 

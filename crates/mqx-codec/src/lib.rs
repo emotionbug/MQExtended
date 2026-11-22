@@ -18,6 +18,7 @@ pub const MAX_REMAINING_LENGTH: usize = 268_435_455;
 
 pub type PacketId = std::num::NonZeroU16;
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolVersion {
     V31,
@@ -33,6 +34,7 @@ impl ProtocolVersion {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum QoS {
@@ -52,6 +54,7 @@ impl QoS {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
     Connect(Connect),
@@ -70,6 +73,7 @@ pub enum Packet {
     Disconnect,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connect {
     pub protocol: ProtocolVersion,
@@ -85,6 +89,7 @@ pub struct Connect {
     pub password: Option<Bytes>,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastWill {
     pub topic: String,
@@ -93,12 +98,14 @@ pub struct LastWill {
     pub retain: bool,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnAck {
     pub session_present: bool,
     pub code: ConnectReturnCode,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConnectReturnCode {
@@ -124,6 +131,7 @@ impl ConnectReturnCode {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publish {
     pub dup: bool,
@@ -134,18 +142,21 @@ pub struct Publish {
     pub payload: Bytes,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscribe {
     pub packet_id: PacketId,
     pub filters: Vec<(String, QoS)>,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubAck {
     pub packet_id: PacketId,
     pub return_codes: Vec<SubscribeReturnCode>,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscribeReturnCode {
     Success(QoS),
@@ -174,6 +185,7 @@ impl SubscribeReturnCode {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unsubscribe {
     pub packet_id: PacketId,

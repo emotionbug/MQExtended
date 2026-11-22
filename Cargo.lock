@@ -650,6 +650,8 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -763,8 +765,13 @@ dependencies = [
  "getrandom 0.4.3",
  "indexmap",
  "mqx-auth",
+ "mqx-cluster",
  "mqx-codec",
  "mqx-topic",
+ "proptest",
+ "rmp-serde",
+ "serde",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -793,6 +800,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "proptest",
+ "serde",
  "thiserror 2.0.21",
 ]
 
@@ -822,11 +830,15 @@ dependencies = [
 name = "mqx-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "mqx-auth",
  "mqx-broker",
+ "mqx-cluster",
  "mqx-codec",
+ "mqx-proxy",
  "mqx-topic",
+ "mqx-ws",
  "nix",
  "rcgen",
  "ring",

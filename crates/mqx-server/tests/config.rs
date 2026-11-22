@@ -341,7 +341,7 @@ fn unsupported_features_are_not_silently_ignored() {
 }
 
 #[test]
-fn later_transport_options_are_preserved_in_configuration() {
+fn websocket_and_proxy_transport_options_are_preserved_in_configuration() {
     let config = ServerConfig::parse("websockets_headers_size 8192\nlistener 1888\nprotocol websockets\nwebsockets_origin https://first.example\nwebsockets_origin https://second.example\nhttp_dir .\nenable_proxy_protocol 2\nproxy_protocol_v2_require_tls true\n").unwrap();
     let listener = &config.listeners[0];
     assert_eq!(listener.protocol, ListenerProtocol::Websockets);
@@ -370,4 +370,137 @@ fn log_none_clears_previous_selections_but_not_following_selections() {
         ]
     );
     assert!(!config.log.connection_messages);
+}
+
+const CLUSTER: &str = "cluster_node_id 18446744073709551615\n\
+    cluster_bind [::]:9001\n\
+    cluster_peer 2 192.0.2.2:9002\n\
+    cluster_peer 18446744073709551615 [::1]:9001\n\
+    cluster_data_dir raft storage\n";
+
+#[test]
+fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
+    assert!(ServerConfig::default().cluster.is_none());
+    let config = ServerConfig::parse(CLUSTER).unwrap().cluster.unwrap();
+    assert_eq!(config.node_id, u64::MAX);
+    assert_eq!(config.raft_addr, "[::]:9001".parse().unwrap());
+    assert_eq!(config.peers[&2], "192.0.2.2:9002".parse().unwrap());
+    assert_eq!(config.peers[&u64::MAX], "[::1]:9001".parse().unwrap());
+    assert_eq!(config.data_dir, Path::new("raft storage"));
+    assert_eq!(config.heartbeat_interval, Duration::from_millis(100));
+    assert_eq!(config.election_timeout_min, Duration::from_millis(400));
+    assert_eq!(config.election_timeout_max, Duration::from_millis(800));
+    assert_eq!(config.lease_interval, Duration::from_millis(1000));
+    assert_eq!(config.lease_timeout, Duration::from_millis(5000));
+    assert_eq!(config.request_timeout, Duration::from_millis(5000));
+    let custom = format!(
+        "{CLUSTER}cluster_heartbeat_interval 150\n\
+        cluster_election_timeout 360 700\n\
+        cluster_lease_interval 1700\n\
+        cluster_lease_timeout 4800\n\
+        cluster_request_timeout 6900\n"
+    );
+    let config = ServerConfig::parse(&custom).unwrap().cluster.unwrap();
+    assert_eq!(config.heartbeat_interval, Duration::from_millis(150));
+    assert_eq!(config.election_timeout_min, Duration::from_millis(360));
+    assert_eq!(config.election_timeout_max, Duration::from_millis(700));
+    assert_eq!(config.lease_interval, Duration::from_millis(1700));
+    assert_eq!(config.lease_timeout, Duration::from_millis(4800));
+    assert_eq!(config.request_timeout, Duration::from_millis(6900));
+}
+
+#[test]
+fn partial_or_conflicting_cluster_configuration_fails_at_startup() {
+    for (input, message) in [
+        ("cluster_lease_timeout 8000", "requires 'cluster_node_id'"),
+        ("cluster_node_id 0", "Invalid 'cluster_node_id'"),
+        (
+            "cluster_node_id 18446744073709551616",
+            "Invalid 'cluster_node_id'",
+        ),
+        ("cluster_node_id 2", "requires 'cluster_bind'"),
+        (
+            "cluster_node_id 2\ncluster_bind localhost:9002",
+            "Invalid 'cluster_bind'",
+        ),
+        (
+            "cluster_node_id 2\ncluster_bind [::]:0",
+            "Invalid 'cluster_bind'",
+        ),
+        (
+            "cluster_node_id 2\ncluster_bind 127.0.0.1:9002",
+            "requires 'cluster_data_dir'",
+        ),
+        (
+            "cluster_node_id 2\ncluster_bind 127.0.0.1:9002\ncluster_data_dir state",
+            "'cluster_peer' entry for node 2",
+        ),
+        (
+            "cluster_node_id 2\ncluster_bind 127.0.0.1:9002\ncluster_data_dir state\ncluster_peer 3 127.0.0.1:9003",
+            "'cluster_peer' entry for node 2",
+        ),
+        ("cluster_peer 0 [::1]:9002", "Invalid 'cluster_peer'"),
+        ("cluster_peer 2 0.0.0.0:9002", "must be routable"),
+        (
+            "cluster_election_timeout 100",
+            "'cluster_election_timeout' requires 2",
+        ),
+        (
+            "cluster_request_timeout 0",
+            "Invalid 'cluster_request_timeout'",
+        ),
+        (
+            "cluster_unknown 1",
+            "Unknown configuration variable 'cluster_unknown'",
+        ),
+    ] {
+        let error = ServerConfig::parse(input).unwrap_err().to_string();
+        assert!(
+            error.starts_with("Error: ") && error.contains(message),
+            "{input}: {error}"
+        );
+    }
+    for (extra, message) in [
+        (
+            "cluster_peer 2 192.0.2.3:9002",
+            "Duplicate 'cluster_peer' node id",
+        ),
+        (
+            "cluster_peer 3 192.0.2.2:9002",
+            "Duplicate 'cluster_peer' address",
+        ),
+        ("cluster_bind 127.0.0.1:9001", "Duplicate 'cluster_bind'"),
+        (
+            "cluster_lease_interval 5000",
+            "'cluster_lease_timeout' must exceed",
+        ),
+        (
+            "cluster_heartbeat_interval 400",
+            "minimum must exceed 'cluster_heartbeat_interval'",
+        ),
+        (
+            "cluster_election_timeout 400 400",
+            "minimum must be less than its maximum",
+        ),
+    ] {
+        let input = format!("{CLUSTER}{extra}");
+        let error = ServerConfig::parse(&input).unwrap_err().to_string();
+        assert!(error.contains(message), "{extra}: {error}");
+    }
+}
+
+#[test]
+fn cluster_section_can_span_the_main_file_and_an_included_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("01-node.conf"),
+        "cluster_peer 1 127.0.0.1:9001\n",
+    )
+    .unwrap();
+    let input = format!(
+        "cluster_node_id 1\ncluster_bind 127.0.0.1:9001\ncluster_data_dir raft\ninclude_dir {}\n",
+        dir.path().display()
+    );
+    let config = ServerConfig::parse(&input).unwrap().cluster.unwrap();
+    assert_eq!(config.peers[&1], config.raft_addr);
 }

@@ -22,6 +22,7 @@ The reference is **Mosquitto 2.1.4** (tag `v2.1.4`). When Mosquitto and the MQTT
 - Every MQTT string goes through `mosquitto_validate_utf8`: besides malformed UTF-8 it rejects NUL, control characters U+0001–U+001F and U+007F–U+009F, and non-characters.
 - Zero-length strings and binary fields read as absent (`packet__read_binary`). An empty username is anonymous; an empty password is no password.
 - Reserved fixed-header flags are checked for MQTT 3.1.1 only; MQTT 3.1 (`MQIsdp`) clients get Mosquitto's leniency, e.g. a username flag without a username is ignored.
+- MQTT 5 (`mqx_codec::v5`) follows Mosquitto's separate rules for header and property variable-byte integers, property order and duplicates, and the per-packet allowed property sets (`property__read_all`, `mosquitto_property_check_all`).
 
 ### Authentication (`mqx-auth` ← `plugins/password-file`, `libcommon/password_common.c`)
 
@@ -37,6 +38,20 @@ The reference is **Mosquitto 2.1.4** (tag `v2.1.4`). When Mosquitto and the MQTT
 - `deny` entries are checked before all others. The first matching entry that grants the requested access wins.
 - With any `pattern` line present, a client id or username containing `+` or `#` is denied everything.
 - Lines are split on spaces only; tabs are part of a token, and an indented `#` is not a comment.
+
+### Broker (`mqx-broker` ← `src/handle_*.c`, `src/subs.c`, `src/database.c`)
+
+- Taking over a client id sends the old connection's will when the old or the new session is clean; persistent-to-persistent takeover discards it (`connect__on_authorised`).
+- MQTT 3.1 has no 23-byte client id limit, and CONNACK `session_present` stays 0 for 3.1 clients.
+- Outgoing packet ids are consumed even when a message is then dropped as a duplicate or for a full queue (`mosquitto__mid_generate`), so packet ids on the wire match Mosquitto's.
+- Connection log lines use 2.1's protocol numbers: `p3` for MQTT 3.1, `p4` for 3.1.1.
+
+### Transports (`mqx-proxy` ← `src/proxy_v1.c`, `src/proxy_v2.c`; `mqx-ws` ← `lib/net_ws.c`, `src/http_serv.c`)
+
+- PROXY v2 `LOCAL` is a health check: the connection closes without MQTT. v1 `UNKNOWN` falls back to the socket's peer address. The CRC32C TLV is ignored, as Mosquitto does.
+- Behind `enable_proxy_protocol 2`, the forwarded certificate CN becomes the username only when both `require_certificate` and `use_identity_as_username` are set; a missing CN is refused at CONNECT with bad credentials.
+- The built-in WebSocket upgrade accepts any request path, does not require `Host`, and accepts a subprotocol that is a case-sensitive prefix of `mqtt` or `mqttv3.1`. A present `Origin` must be a prefix of a configured `websockets_origin`. Rejections close silently. `http_dir` is accepted but never served on a WebSocket listener.
+- Incoming WebSocket close frames are ignored; the broker sends close 1000 when it ends the connection.
 
 ## Defaults
 

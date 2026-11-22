@@ -1,6 +1,11 @@
-use std::{ffi::OsString, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::Arc,
+};
 
-use mqx_auth::{AclFile, PasswordFile};
+use mqx_auth::{AclFileError, PasswordFile};
 use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, SecurityHandle};
 use mqx_codec::QoS;
 use mqx_server::{
@@ -109,26 +114,32 @@ async fn run() -> Result<(), ServerError> {
             })
             .collect(),
     );
-    let broker = Broker::new(broker_config(&config));
-    let log_connections = config.log.connection_messages;
+    let server = Server::bind(&config).await?;
+    let cluster = config.cluster.take();
+    let clustered = cluster.is_some();
+    let broker = if let Some(cluster) = cluster {
+        let broker = Broker::clustered(broker_config(&config), cluster)
+            .await
+            .map_err(ServerError::Cluster)?;
+        if let Err(error) = security.register(&broker).await {
+            if let Err(error) = broker.shutdown_cluster().await {
+                tracing::error!("Cluster shutdown failed: {error}");
+            }
+            return Err(error);
+        }
+        broker
+    } else {
+        Broker::new(broker_config(&config))
+    };
     let serving = broker.clone();
-    Server::bind(&config)
-        .await?
+    let result = server
         .run_with_shutdown(
             move |connection| {
                 let broker = serving.clone();
                 let policies = policies.clone();
                 async move {
-                    if log_connections {
-                        // Mosquitto src/net.c: net__socket_accept.
-                        tracing::info!(
-                            "New connection from {} on port {}.",
-                            connection.peer_addr,
-                            connection.listener.port
-                        );
-                    }
                     let info = ConnectionInfo {
-                        peer_addr: Some(connection.peer_addr),
+                        peer_addr: connection.peer_addr,
                         listener: policies[connection.listener_index].clone(),
                         cert_identity: match connection.cert_identity {
                             CertIdentity::None => mqx_broker::CertIdentity::None,
@@ -140,19 +151,38 @@ async fn run() -> Result<(), ServerError> {
                             }
                         },
                     };
-                    if let Err(error) = broker.serve(connection.stream, info).await {
-                        tracing::debug!("Connection from {} ended: {error}", connection.peer_addr);
+                    if let Err(error) = broker
+                        .serve_accepted(connection.stream, info, connection.accepted_at)
+                        .await
+                    {
+                        tracing::debug!(
+                            "Connection from {:?} ended: {error}",
+                            connection.peer_addr
+                        );
                     }
                 }
             },
             || async {
                 // Mosquitto src/signals.c: SIGHUP rereads the credential files even when their
                 // paths are unchanged; a malformed file stops the broker (exit 3).
-                security.reload(&config)
+                security.reload(&config)?;
+                if clustered {
+                    security.register(&broker).await?;
+                }
+                Ok::<_, ServerError>(())
             },
             || broker.shutdown(),
         )
-        .await
+        .await;
+    if clustered {
+        return result.and(
+            broker
+                .shutdown_cluster()
+                .await
+                .map_err(ServerError::Cluster),
+        );
+    }
+    result
 }
 
 fn broker_config(config: &ServerConfig) -> BrokerConfig {
@@ -225,8 +255,18 @@ impl SecurityHandles {
 
     fn reload(&self, config: &ServerConfig) -> Result<(), ServerError> {
         let fresh = load_credentials(config)?;
-        for (handle, (password, acl)) in self.handles.iter().zip(fresh) {
-            handle.replace(password, acl);
+        for (handle, credentials) in self.handles.iter().zip(fresh) {
+            credentials.install(|password, acl| handle.replace_text(password, acl))?;
+        }
+        Ok(())
+    }
+
+    async fn register(&self, broker: &Broker) -> Result<(), ServerError> {
+        for handle in &self.handles {
+            broker
+                .register_security(handle)
+                .await
+                .map_err(ServerError::Cluster)?;
         }
         Ok(())
     }
@@ -236,16 +276,43 @@ fn security_handles(config: &ServerConfig) -> Result<SecurityHandles, ServerErro
     Ok(SecurityHandles {
         handles: load_credentials(config)?
             .into_iter()
-            .map(|(password, acl)| SecurityHandle::new(password, acl))
-            .collect(),
+            .enumerate()
+            .map(|(index, credentials)| {
+                credentials.install(|password, acl| {
+                    // Listeners use the same security IDs on every cluster node. Zero is reserved.
+                    SecurityHandle::with_id(index as u64 + 1, password, acl)
+                })
+            })
+            .collect::<Result<_, _>>()?,
         per_listener: config.per_listener_settings,
     })
 }
 
-type Credentials = (Option<PasswordFile>, Option<AclFile>);
+struct Credentials<'a> {
+    password: Option<PasswordFile>,
+    acl: Option<(&'a Path, Vec<u8>)>,
+}
 
-fn load_credentials(config: &ServerConfig) -> Result<Vec<Credentials>, ServerError> {
-    let load = |security: &SecurityConfig| {
+impl Credentials<'_> {
+    fn install<R>(
+        self,
+        import: impl FnOnce(Option<PasswordFile>, Option<Vec<u8>>) -> Result<R, AclFileError>,
+    ) -> Result<R, ServerError> {
+        let (path, acl) = match self.acl {
+            Some((path, text)) => (Some(path), Some(text)),
+            None => (None, None),
+        };
+        import(self.password, acl).map_err(|source| ServerError::AclFile {
+            path: path
+                .expect("ACL parsing failed only when an ACL was supplied")
+                .into(),
+            source,
+        })
+    }
+}
+
+fn load_credentials(config: &ServerConfig) -> Result<Vec<Credentials<'_>>, ServerError> {
+    fn load(security: &SecurityConfig) -> Result<Credentials<'_>, ServerError> {
         let password = security
             .password_file
             .as_ref()
@@ -258,16 +325,21 @@ fn load_credentials(config: &ServerConfig) -> Result<Vec<Credentials>, ServerErr
             .transpose()?;
         let acl = security
             .acl_file
-            .as_ref()
+            .as_deref()
             .map(|path| {
-                AclFile::load(path).map_err(|source| ServerError::AclFile {
-                    path: path.clone(),
-                    source,
-                })
+                std::fs::read(path)
+                    .map(|data| (path, data))
+                    .map_err(|source| ServerError::AclFile {
+                        path: path.into(),
+                        source: AclFileError::Io {
+                            path: path.into(),
+                            source,
+                        },
+                    })
             })
             .transpose()?;
-        Ok((password, acl))
-    };
+        Ok(Credentials { password, acl })
+    }
     if config.per_listener_settings {
         config
             .listeners

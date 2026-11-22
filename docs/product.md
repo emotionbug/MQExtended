@@ -26,5 +26,5 @@ Each milestone ends with passing tests — unit, parity tables and differential 
 | --- | --- | --- |
 | M1 Foundation | `mqx-topic`, `mqx-codec`, `mqx-auth` | Mosquitto's topic unit tests, `mosquitto_passwd` vectors and a real `mosquitto_pub` session all pass against our crates |
 | M2 Single-node broker | Sessions, QoS 0/1/2, retained, will, keepalive, takeover; `mqx-server` reading the relevant `mosquitto.conf` subset; TCP and TLS | Real `mosquitto_pub`/`mosquitto_sub` scenarios give the same results against MQExtended and Mosquitto |
-| M3 Cluster | Replicated metadata, node mesh forwarding, cross-node takeover, node leases and wills on node loss | Any-node pub/sub and takeover pass; killing one of three nodes keeps subscriptions and retained messages |
-| M4 BifroMQ parity | Replicated inbox, WebSocket, PROXY protocol, admin API, metrics, MQTT 5 | Queued messages of persistent sessions survive node loss; operational surface matches BifroMQ's |
+| M3 Cluster | Raft-replicated broker state, delivery from each node's own apply, cross-node takeover, node leases and wills on node loss, replicated persistent inboxes | The 37 differential scenarios stay byte-identical to Mosquitto with clients spread over three nodes; killing a node keeps subscriptions, retained and queued messages |
+| M4 BifroMQ parity | WebSocket and PROXY protocol listeners, MQTT 5, `$SYS` tree and Mosquitto's HTTP API, metrics and cluster status, throughput measurement | MQTT 5 differential scenarios match Mosquitto; operators get the monitoring surface of Mosquitto plus cluster health |

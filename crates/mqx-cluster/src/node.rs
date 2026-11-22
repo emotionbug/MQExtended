@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use openraft::alias::{LeaderIdOf, LogIdOf, VoteOf};
@@ -202,11 +202,7 @@ impl<S: StateMachine> Cluster<S> {
     ///
     /// The MessagePack command must fit in 8 MiB.
     pub async fn submit(&self, command: S::Command) -> Result<S::Response, ClusterError> {
-        let body: Bytes = encode(&command)?.into();
-        drop(command);
-        if body.len() > MAX_COMMAND {
-            return Err(invalid_data("encoded application command exceeds 8 MiB").into());
-        }
+        let body = encode_command(command)?;
         let core = &self.0.core;
         let deadline = Instant::now() + core.request_timeout;
         let mut hint = None;
@@ -214,9 +210,7 @@ impl<S: StateMachine> Cluster<S> {
             core.check_running()?;
             let target = core.target(hint.take());
             let response = if target == self.node_id() {
-                timeout_at(deadline, core.write(Command::App(body.clone())))
-                    .await
-                    .map_err(|_| ClusterError::WriteUncertain("local proposal timed out".into()))?
+                core.write_local(body.clone(), deadline).await?
             } else {
                 let mut stream = match core.connect(target, deadline).await {
                     Ok(stream) => stream,
@@ -238,20 +232,31 @@ impl<S: StateMachine> Cluster<S> {
                 .map_err(|error| ClusterError::WriteUncertain(error.to_string()))?
             };
             match response {
-                Route::Value(Some(response)) => {
-                    return decode(&response)
-                        .map_err(|error| ClusterError::WriteUncertain(error.to_string()));
-                }
-                Route::Value(None) => {
-                    return Err(ClusterError::WriteUncertain(
-                        "leader returned no application response".into(),
-                    ));
-                }
+                Route::Value(response) => return decode_response(response),
                 Route::Redirect(leader) => hint = leader,
                 Route::Retry => {}
                 Route::Failed(error) => return Err(ClusterError::WriteUncertain(error)),
             }
             core.retry_pause(deadline).await?;
+        }
+    }
+
+    /// Submit a command only on the local node. Return `Ok(None)` if Raft
+    /// rejects it before append because this node is not the leader. Do not
+    /// forward or retry. `WriteUncertain` means the command may have committed.
+    pub async fn submit_if_leader(
+        &self,
+        command: S::Command,
+    ) -> Result<Option<S::Response>, ClusterError> {
+        let core = &self.0.core;
+        core.check_running()?;
+        let body = encode_command(command)?;
+        let deadline = Instant::now() + core.request_timeout;
+        match core.write_local(body, deadline).await? {
+            Route::Value(response) => decode_response(response).map(Some),
+            Route::Redirect(_) => Ok(None),
+            Route::Retry => Err(ClusterError::Deadline),
+            Route::Failed(error) => Err(ClusterError::WriteUncertain(error)),
         }
     }
 
@@ -414,6 +419,16 @@ impl<S: StateMachine> Core<S> {
         Ok(())
     }
 
+    async fn write_local(
+        &self,
+        body: Bytes,
+        deadline: Instant,
+    ) -> Result<Route<Option<Bytes>>, ClusterError> {
+        timeout_at(deadline, self.write(Command::App(body)))
+            .await
+            .map_err(|_| ClusterError::WriteUncertain("local proposal timed out".into()))
+    }
+
     async fn write(&self, command: Command) -> Route<Option<Bytes>> {
         match self.raft.client_write(command).await {
             Ok(response) => match response.data {
@@ -469,6 +484,9 @@ impl<S: StateMachine> Core<S> {
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX),
+            occurred_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
         }
     }
 
@@ -666,4 +684,21 @@ impl<S: StateMachine> Core<S> {
             }
         }
     }
+}
+
+fn encode_command(command: impl Serialize) -> Result<Bytes, ClusterError> {
+    let body = encode(&command)?;
+    if body.len() > MAX_COMMAND {
+        return Err(invalid_data("encoded application command exceeds 8 MiB").into());
+    }
+    Ok(body.into())
+}
+
+fn decode_response<R: serde::de::DeserializeOwned>(
+    response: Option<Bytes>,
+) -> Result<R, ClusterError> {
+    let body = response.ok_or_else(|| {
+        ClusterError::WriteUncertain("leader returned no application response".into())
+    })?;
+    decode(&body).map_err(|error| ClusterError::WriteUncertain(error.to_string()))
 }
