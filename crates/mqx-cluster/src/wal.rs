@@ -95,6 +95,14 @@ impl Wal {
         })
     }
 
+    /// Check for preexisting Raft state on the blocking startup thread.
+    pub(crate) fn has_raft_state(&self) -> bool {
+        self.inner.blocking_read().as_ref().is_some_and(|inner| {
+            let state = inner.log.log_state();
+            state.vote().is_some() || state.last().is_some() || state.committed().is_some()
+        })
+    }
+
     pub(crate) async fn metrics(&self) -> io::Result<WalMetrics> {
         let inner = self.read().await?;
         let flush = inner.log.stat().flush_metrics;
@@ -248,13 +256,22 @@ impl RaftLogStorage<Types> for Wal {
     }
 
     async fn truncate_after(&mut self, last: Option<LogId>) -> io::Result<()> {
-        let mut log = self.write().await?;
-        let first_removed = last.next_index();
-        if first_removed < log.log.log_state().last().map(|id| id.0).next_index() {
+        let rx = {
+            let mut log = self.write().await?;
+            let first_removed = last.next_index();
+            if first_removed >= log.log.log_state().last().map(|id| id.0).next_index() {
+                return Ok(());
+            }
+            log.record_commit()?;
             log.log.truncate(first_removed)?;
-        }
-        // If the truncation is lost to a crash before the next append, Raft can repeat it.
-        Ok(())
+            // OpenRaft can publish a snapshot after truncating a conflicting
+            // suffix, without an intervening append. Persist the truncation
+            // before that snapshot can become the recovery point.
+            let (tx, rx) = oneshot::channel();
+            log.log.flush(true, Some(Flushed::Await(tx)))?;
+            rx
+        };
+        rx.await.map_err(io::Error::other)?
     }
 
     async fn purge(&mut self, id: LogId) -> io::Result<()> {
@@ -431,6 +448,46 @@ mod tests {
         assert!(appended.sync_max <= appended.sync_time);
         assert!(appended.write_max >= voted.write_max);
         assert!(appended.queue_wait_max >= voted.queue_wait_max);
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conflicting_suffix_is_truncated_before_a_snapshot_can_be_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), crate::DEFAULT_MAX_APPEND_SIZE, 2).unwrap();
+        let id = |term, index| LogId::new(Leadership { term, node_id: 1 }, index);
+        let kept = id(1, 0);
+        let (tx, rx) = Types::oneshot();
+        wal.append(
+            [kept, id(2, 1), id(2, 2)].map(|log_id| Entry {
+                log_id,
+                payload: openraft::alias::EntryPayloadOf::<Types>::Blank,
+            }),
+            IOFlushed::signal(tx),
+        )
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+        wal.save_committed(Some(kept)).await.unwrap();
+        let initial = wal.metrics().await.unwrap();
+        wal.truncate_after(Some(kept)).await.unwrap();
+        assert!(wal.metrics().await.unwrap().sync_batches > initial.sync_batches);
+
+        // Capture the disk image immediately, without letting shutdown or a
+        // later purge flush the removed suffix out of the WAL.
+        let copied = tempfile::tempdir().unwrap();
+        for entry in dir.path().read_dir().unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), copied.path().join(entry.file_name())).unwrap();
+        }
+        let mut reopened = Wal::open(copied.path(), crate::DEFAULT_MAX_APPEND_SIZE, 2).unwrap();
+        assert_eq!(
+            reopened.get_log_state().await.unwrap().last_log_id,
+            Some(kept)
+        );
+        assert_eq!(reopened.read_committed().await.unwrap(), Some(kept));
+        assert!(reopened.try_get_log_entries(1..).await.unwrap().is_empty());
+        reopened.close().await.unwrap();
         wal.close().await.unwrap();
     }
 

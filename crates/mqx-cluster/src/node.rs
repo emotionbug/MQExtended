@@ -29,7 +29,8 @@ use crate::membership::{Desired, MemberRole, MembershipControl, Serving, validat
 use crate::mtls::Tls;
 use crate::mux::{CallError, Response, write_responses};
 use crate::snapshot::{
-    RETIRED_FILE, Snapshot, SnapshotMeta, Store, atomic_write, open_private_file, prepare_dir,
+    RETIRED_FILE, Snapshot, SnapshotMeta, Store, TEMP_FILE_PREFIX, atomic_write, open_private_file,
+    prepare_dir,
 };
 use crate::snapshot_file::SnapshotData;
 use crate::transport::{
@@ -173,15 +174,33 @@ impl<S: StateMachine> Cluster<S> {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            if join
-                && !data_dir.join(IDENTITY_FILE).exists()
-                && data_dir.read_dir()?.next().is_some()
-            {
-                return Err(ClusterError::InvalidConfig(
-                    "a new joining node needs an empty data directory".into(),
-                ));
+            let new_join = join && !data_dir.join(IDENTITY_FILE).exists();
+            if new_join {
+                for entry in data_dir.read_dir()? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let kind = entry.file_type()?;
+                    // A crash before the node identity's rename can leave its
+                    // temporary file and a WAL without any Raft state.
+                    if (name == "wal" && kind.is_dir())
+                        || (name
+                            .as_encoded_bytes()
+                            .starts_with(TEMP_FILE_PREFIX.as_bytes())
+                            && kind.is_file())
+                    {
+                        continue;
+                    }
+                    return Err(ClusterError::InvalidConfig(
+                        "a new joining node needs an empty data directory".into(),
+                    ));
+                }
             }
             let wal = Wal::open(&data_dir.join("wal"), max_append_size, state_format)?;
+            if new_join && wal.has_raft_state() {
+                return Err(ClusterError::InvalidConfig(
+                    "a new joining node cannot adopt a WAL without a node identity".into(),
+                ));
+            }
             let (initial, digest, existing) =
                 load_identity(&data_dir, node_id, &peers, join, membership_generation)?;
             let store = Store::open(state_machine, data_dir.clone(), state_format)?;
@@ -680,20 +699,12 @@ impl<S: StateMachine> Core<S> {
                     .filter_lease_renewals
                     .load(std::sync::atomic::Ordering::Acquire)
             });
-            let renewed = match leader {
-                Some(leader) if leader == node_id => {
-                    matches!(
-                        timeout_at(deadline, self.heartbeat(node_id)).await,
-                        Ok(Route::Value(_))
-                    )
-                }
-                Some(leader) => self
-                    .rpc(leader, Op::Lease, Bytes::new(), deadline)
+            let renewed = if let Some(leader) = leader {
+                timeout_at(deadline, self.renew_lease(leader, deadline))
                     .await
-                    .is_ok_and(|body| {
-                        matches!(decode::<Route<Option<Bytes>>>(&body), Ok(Route::Value(_)))
-                    }),
-                None => false,
+                    .unwrap_or(false)
+            } else {
+                false
             };
             if renewed && self.is_voter(node_id) {
                 last_renewal = Instant::now();
@@ -734,6 +745,32 @@ impl<S: StateMachine> Core<S> {
                     self.lease_interval
                 };
         }
+    }
+
+    async fn renew_lease(&self, leader: u64, deadline: Instant) -> bool {
+        if leader == self.mesh.endpoint.node_id {
+            // A local proposal already waits for local apply.
+            return matches!(self.heartbeat(leader).await, Route::Value(_));
+        }
+        let renewed = self
+            .rpc(leader, Op::Lease, Bytes::new(), deadline)
+            .await
+            .is_ok_and(|body| matches!(decode::<Route<Option<Bytes>>>(&body), Ok(Route::Value(_))));
+        if !renewed || *self.serving.borrow() != Serving::Waiting {
+            return renewed;
+        }
+
+        // A leader can renew our lease while this replica is still reading
+        // its pre-restart state. Fence admission on a fresh quorum read and
+        // apply through that index locally before first serving again.
+        let Ok(Route::Value(index)) = self.read_remote(leader, deadline).await else {
+            return false;
+        };
+        self.raft
+            .wait(None)
+            .applied_index_at_least(Some(index), "lease recovery read index")
+            .await
+            .is_ok()
     }
 
     fn is_voter(&self, node_id: u64) -> bool {
@@ -1549,7 +1586,7 @@ mod tests {
     use super::*;
     use crate::{ClusterSecurity, SnapshotPolicy};
     use openraft::alias::EntryOf;
-    use openraft::storage::RaftStateMachine;
+    use openraft::storage::{RaftLogStorage, RaftStateMachine};
 
     #[derive(Default)]
     struct Counter(u64);
@@ -1574,7 +1611,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_isolated_lease_holder_self_fences_before_the_leader_fences_it() {
+    async fn a_join_interrupted_before_writing_identity_can_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserve.local_addr().unwrap();
+        let peers = BTreeMap::from([(1, address), (2, "127.0.0.1:1".parse().unwrap())]);
+        drop(reserve);
+        let mut config = ClusterConfig::new(
+            1,
+            address,
+            peers,
+            root.path().join("data"),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        config.join = true;
+        Wal::open(&config.data_dir.join("wal"), config.max_append_size, 2)
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        crate::snapshot::private_tempfile(&config.data_dir)
+            .unwrap()
+            .keep()
+            .unwrap();
+
+        let node = Cluster::start(config.clone(), Counter::default())
+            .await
+            .unwrap();
+        assert!(config.data_dir.join(IDENTITY_FILE).is_file());
+        assert!(node.members().is_empty());
+        node.shutdown().await.unwrap();
+
+        config.data_dir = root.path().join("unidentified");
+        let mut wal = Wal::open(&config.data_dir.join("wal"), config.max_append_size, 2).unwrap();
+        wal.save_vote(&VoteOf::<Types>::new_committed(1, 1))
+            .await
+            .unwrap();
+        wal.close().await.unwrap();
+        assert!(matches!(
+            Cluster::start(config.clone(), Counter::default()).await,
+            Err(ClusterError::InvalidConfig(_))
+        ));
+        assert!(!config.data_dir.join(IDENTITY_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn an_isolated_lease_holder_self_fences_and_catches_up_before_serving_again() {
         let root = tempfile::tempdir().unwrap();
         let reserves: Vec<_> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -1645,6 +1727,61 @@ mod tests {
         .await
         .unwrap();
         assert!(membership.lease_valid_until().is_none());
+        let mut serving = isolated.0.core.serving.subscribe();
+        drop(
+            timeout(wait, serving.wait_for(|state| *state == Serving::Waiting))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+
+        // Pause replication's apply worker, without blocking the lease or
+        // readiness tasks. The leader can renew our lease but we still have
+        // the state from before the missed write, as on a stale restart.
+        let (paused, sm_paused) = tokio::sync::oneshot::channel();
+        let (resume, sm_resume) = tokio::sync::oneshot::channel();
+        isolated
+            .0
+            .core
+            .raft
+            .external_state_machine_request(move |_| {
+                Box::pin(async move {
+                    let _ = paused.send(());
+                    let _ = sm_resume.await;
+                })
+            })
+            .await
+            .unwrap();
+        timeout(wait, sm_paused).await.unwrap().unwrap();
+        let (index, _) = leader.submit(1).await.unwrap();
+        isolated
+            .0
+            .core
+            .filter_lease_renewals
+            .store(false, std::sync::atomic::Ordering::Release);
+        timeout(wait, async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.node_id == isolated.node_id() && event.status == NodeStatus::Alive {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), membership.wait_serving())
+                .await
+                .is_err()
+        );
+        assert_eq!(isolated.read(|counter| counter.0), 0);
+        resume.send(()).unwrap();
+        timeout(wait, membership.wait_serving())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(isolated.metrics().applied_index.unwrap() >= index);
+        assert_eq!(isolated.read(|counter| counter.0), 1);
         for node in &nodes {
             node.shutdown().await.unwrap();
         }

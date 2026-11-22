@@ -24,6 +24,7 @@ use crate::{NodeEvent, StateMachine, version};
 
 const SNAPSHOT_FILE: &str = "snapshot.mpk";
 pub(crate) const RETIRED_FILE: &str = "removed";
+pub(crate) const TEMP_FILE_PREFIX: &str = ".mqx-";
 
 pub(crate) type Snapshot = SnapshotOf<Types, SnapshotData>;
 pub(crate) type SnapshotMeta = SnapshotMetaOf<Types>;
@@ -398,7 +399,7 @@ impl<S> Store<S> {
 
 pub(crate) fn private_tempfile(dir: &Path) -> io::Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".mqx-");
+    builder.prefix(TEMP_FILE_PREFIX);
     #[cfg(unix)]
     builder.permissions(fs::Permissions::from_mode(0o600));
     builder.tempfile_in(dir)

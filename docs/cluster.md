@@ -59,6 +59,8 @@ Issue node certificates from a CA used only for the cluster, one per node, with 
 
 Start all nodes with identical `cluster_peer` lines and no `cluster_membership_generation`, in any order. The first start bootstraps the cluster exactly once; later starts rejoin from `cluster_data_dir`, and from then on the replicated membership, not the config file, decides who the members are. Never reuse a data directory under a different `cluster_node_id`, and never copy one node's data directory to another.
 
+After a restart or loss of its lease, a follower only admits MQTT clients after renewing its lease and applying through a fresh quorum-confirmed read index. Keep it out of the load balancer until `/api/v1/mqx/ready` returns `200`; an open TCP port or an `Alive` membership entry alone is not sufficient.
+
 ### Cold backup and restore
 
 1. Drain client traffic and stop **all** nodes. Confirm each process has exited successfully before taking the first copy. Independent copies of live WALs are not a cluster backup.
