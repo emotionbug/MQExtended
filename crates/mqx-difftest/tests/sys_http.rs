@@ -589,4 +589,18 @@ fn cluster_http_reports_members_and_raft_progress() {
         line.strip_prefix("mqx_raft_proposal_duration_seconds_count ")
             .is_some_and(|count| count.parse::<u64>().unwrap() > 0)
     }));
+    let readiness = || request(http[leader], "GET", "/api/v1/mqx/ready", None).unwrap();
+    assert_eq!(readiness().status, 200);
+    for (i, process) in processes.iter_mut().enumerate() {
+        if i != leader {
+            process.0.kill().unwrap();
+            process.0.wait().unwrap();
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while readiness().status != 503 {
+        assert!(Instant::now() < deadline, "isolated voter remained ready");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(request(http[leader], "GET", "/api/v1/mqx/cluster", None).unwrap().status, 200);
 }

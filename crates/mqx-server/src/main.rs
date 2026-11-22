@@ -408,6 +408,10 @@ async fn run_broker(
     });
     let serving_membership = membership.clone();
     let serving_registered = registered.clone();
+    let ready = Arc::new(move || {
+        serving_registered.load(Ordering::Acquire)
+            && serving_membership.as_ref().is_none_or(|m| m.lease_valid_until().is_some())
+    });
     // retain.c: retain__queue rechecks the source with an ordinary context
     // and no listener, even if the live publication came from a bridge.
     let bridge_security = if config.per_listener_settings {
@@ -427,7 +431,7 @@ async fn run_broker(
     broker.start_sys_tree(config.sys_interval);
     let log_topics = tokio::spawn(log_topics.serve(broker.clone()));
     let serving = broker.clone();
-    let http = HttpApi::new(&config, &server);
+    let http = Arc::new(HttpApi::new(&config, &server));
     let http_inventory = http.clone();
     let result = server
         .with_broker_observation(broker.clone())
@@ -436,20 +440,17 @@ async fn run_broker(
                 let broker = serving.clone();
                 let policies = policies.clone();
                 let http = http.clone();
-                let mqtt_ready = serving_membership
-                    .as_ref()
-                    .is_none_or(|membership| membership.is_serving())
-                    && serving_registered.load(Ordering::Acquire);
+                let ready = ready.clone();
                 async move {
                     if connection.listener.protocol == ListenerProtocol::HttpApi {
                         let policy = &policies[connection.listener_index];
-                        if let Err(error) = http.serve(connection, &broker, &policy.security).await
+                        if let Err(error) = http.serve(connection, &broker, &policy.security, &*ready).await
                         {
                             tracing::debug!("HTTP connection ended: {error}");
                         }
                         return;
                     }
-                    if !mqtt_ready {
+                    if !ready() {
                         return;
                     }
                     let info = ConnectionInfo {

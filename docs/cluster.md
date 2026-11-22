@@ -52,6 +52,7 @@ Issue node certificates from a CA used only for the cluster, one per node, with 
 
 - Keep `cluster_bind` on a private network even with TLS. With `cluster_insecure_plaintext true` peer traffic is neither authenticated nor encrypted, and anyone who can reach the port can rewrite broker state; use it only on an isolated network or for tests.
 - The MQTT listeners sit behind your load balancer. Any node can serve any client, so the balancer needs no stickiness; least-connections spreads reconnect storms best.
+- Probe `GET /api/v1/mqx/ready` on an HTTP API listener, with credentials and a read ACL for just that path. It checks the same gate as MQTT admission: security registration and an unexpired quorum-backed voter lease. A partition may remain ready until that lease expires. A TCP connect or a successful cluster-status query only proves the process is up.
 - Run an odd number of nodes. Three nodes tolerate one failure; writes stop while a majority is unreachable.
 
 ## Bootstrap and restart

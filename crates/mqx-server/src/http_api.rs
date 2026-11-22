@@ -92,6 +92,7 @@ impl HttpApi {
         connection: Connection,
         broker: &Broker,
         security: &SecurityHandle,
+        ready: &(impl Fn() -> bool + Sync),
     ) -> Result<(), hyper::Error> {
         let root = connection.listener.http_dir.as_deref();
         let anonymous = self.anonymous[connection.listener_index];
@@ -102,7 +103,7 @@ impl HttpApi {
                 TokioIo::new(connection.stream),
                 service_fn(|request| async move {
                     Ok::<_, Infallible>(
-                        self.request(request, broker, security, anonymous, root)
+                        self.request(request, broker, security, anonymous, root, ready)
                             .await,
                     )
                 }),
@@ -117,6 +118,7 @@ impl HttpApi {
         security: &SecurityHandle,
         anonymous: bool,
         root: Option<&Path>,
+        ready: &(impl Fn() -> bool + Sync),
     ) -> Response<Body> {
         // src/http_api.c: http_api_handler checks method before credentials.
         if request.method() != Method::GET {
@@ -162,6 +164,15 @@ impl HttpApi {
                 }
                 data.push_str("\n}");
                 api_response(data)
+            }
+            "/api/v1/mqx/ready" => {
+                let mut response = if ready() {
+                    respond(StatusCode::OK, "ready\n")
+                } else {
+                    respond(StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
+                };
+                response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+                response
             }
             "/api/v1/mqx/cluster" => {
                 let data = cluster_status(broker);
