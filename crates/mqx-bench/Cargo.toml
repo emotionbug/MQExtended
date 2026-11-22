@@ -13,6 +13,7 @@ path = "src/main.rs"
 bytes.workspace = true
 clap = { version = "4.6", features = ["derive"] }
 mqx-codec.workspace = true
+rcgen = "0.14.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

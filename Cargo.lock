@@ -1007,6 +1007,7 @@ dependencies = [
  "bytes",
  "clap",
  "mqx-codec",
+ "rcgen",
  "serde",
  "serde_json",
  "tempfile",

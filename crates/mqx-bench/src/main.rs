@@ -160,6 +160,7 @@ impl Traffic {
 
 #[derive(Serialize)]
 struct Report<'a> {
+    cluster_peer_transport: &'static str,
     broker_workers: usize,
     state_dir: &'a Path,
     results: &'a [Comparison],
@@ -262,6 +263,7 @@ async fn run(command: Command) -> Result<(), Box<dyn error::Error>> {
             };
             let results = compare(&options, &workloads).await?;
             let report = Report {
+                cluster_peer_transport: "mtls",
                 broker_workers,
                 state_dir: &options.state_dir,
                 results: &results,

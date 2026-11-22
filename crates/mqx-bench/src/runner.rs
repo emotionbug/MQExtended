@@ -9,6 +9,10 @@ use std::{
     time::Duration,
 };
 
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair,
+};
 use serde::Serialize;
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep, timeout};
@@ -177,6 +181,31 @@ impl Drop for Node {
     }
 }
 
+// A fresh CA for each comparison cluster. Its signing key never leaves memory.
+fn cluster_ca(dir: &Path) -> io::Result<CertifiedIssuer<'static, KeyPair>> {
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let key = KeyPair::generate().map_err(io::Error::other)?;
+    let ca = CertifiedIssuer::self_signed(params, key).map_err(io::Error::other)?;
+    fs::write(dir.join("ca.pem"), ca.pem())?;
+    Ok(ca)
+}
+
+fn node_credentials(dir: &Path, node: usize, ca: &CertifiedIssuer<'_, KeyPair>) -> io::Result<()> {
+    let mut params = CertificateParams::default();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("mqx-node-{node}"));
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ClientAuth,
+        ExtendedKeyUsagePurpose::ServerAuth,
+    ];
+    let key = KeyPair::generate().map_err(io::Error::other)?;
+    let leaf = params.signed_by(&key, ca).map_err(io::Error::other)?;
+    fs::write(dir.join("cert.pem"), leaf.pem())?;
+    fs::write(dir.join("key.pem"), key.serialize_pem())
+}
+
 struct Processes {
     nodes: Vec<Node>,
     addresses: Vec<SocketAddr>,
@@ -202,9 +231,15 @@ impl Processes {
             .iter()
             .map(TcpListener::local_addr)
             .collect::<io::Result<Vec<_>>>()?;
-        let state = tempfile::Builder::new()
-            .prefix("mqx-bench-")
-            .tempdir_in(&options.state_dir)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("mqx-bench-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let state = builder.tempdir_in(&options.state_dir)?;
+        let ca = (nodes == 3).then(|| cluster_ca(state.path())).transpose()?;
         let mut processes = Self {
             nodes: Vec::with_capacity(nodes),
             addresses: binds[..nodes].to_vec(),
@@ -219,10 +254,11 @@ impl Processes {
                 "listener {} 127.0.0.1\nallow_anonymous true\npersistence false\nconnection_messages false\nlog_type warning\nlog_type error\n",
                 address.port()
             );
-            if nodes == 3 {
+            if let Some(ca) = &ca {
+                node_credentials(&dir, node, ca)?;
                 writeln!(
                     config,
-                    "cluster_node_id {node}\ncluster_bind {}\ncluster_data_dir raft\ncluster_insecure_plaintext true",
+                    "cluster_node_id {node}\ncluster_bind {}\ncluster_data_dir raft\ncluster_cafile ../ca.pem\ncluster_certfile cert.pem\ncluster_keyfile key.pem",
                     binds[nodes + idx]
                 )
                 .unwrap();

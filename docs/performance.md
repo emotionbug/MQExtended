@@ -15,11 +15,13 @@ target/release/mqx-bench compare --pattern one-to-one --publishers 200 --subscri
     --qos 1 --persistent --rate 1000 --seconds 10
 ```
 
-Each payload carries a send timestamp, so latency is end to end (publisher to subscriber). The report counts lost and duplicated messages per workload; a QoS 0 "loss" counts messages not delivered by the drain deadline. `--state-dir` puts the cluster's WALs on a chosen filesystem; keep it on the disk type you will run in production.
+Run the comparison as an unprivileged user. MQTT clients connect over loopback TCP. Cluster peers use mutual TLS with a fresh CA and distinct node keys per run. The JSON report records the peer transport; older reports without this field used plaintext. `--state-dir` puts the three WALs on a chosen filesystem; use the disk type you will run in production.
+
+Each payload carries a send timestamp, so latency is end to end (publisher to subscriber). Loss counts expected deliveries still missing after drain; duplicates are counted separately.
 
 ## Current numbers
 
-Release builds, three nodes on one 12-thread laptop, loopback mTLS, WALs on a consumer NVMe (ext4), 256-byte payloads, 10-second runs. The host was not idle (an emulator and unrelated builds were running), so treat tails as upper bounds. p99 end-to-end latency in milliseconds; every row delivered every message with no duplicates.
+Historical baseline: release builds, three nodes on one 12-thread laptop, **plaintext** loopback peer connections, WALs on a consumer NVMe (ext4), 256-byte payloads, 10-second runs. The host also ran an emulator and unrelated builds. These are observations under contention, not bounds on production latency. p99 end-to-end latency in milliseconds; every row delivered every message with no duplicates.
 
 | Workload | QoS | Mosquitto 2.1.4 | Standalone | 3-node cluster |
 | --- | ---: | ---: | ---: | ---: |
