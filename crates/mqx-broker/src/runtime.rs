@@ -1,4 +1,5 @@
 mod bridge;
+mod control;
 mod dynamic_security;
 mod proposals;
 mod telemetry;
@@ -9,7 +10,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     net::IpAddr,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -45,6 +46,7 @@ pub struct Broker(pub(super) Arc<Inner>);
 pub(super) struct Inner {
     pub(super) config: Arc<BrokerConfig>,
     connection_messages: AtomicBool,
+    control_inventory: OnceLock<crate::ControlInventory>,
     pub(super) shutdown: watch::Sender<bool>,
     pub(super) traffic: Traffic,
     sys_interval: watch::Sender<Option<u16>>,
@@ -183,6 +185,7 @@ impl Broker {
         Self(Arc::new(Inner {
             config: config.clone(),
             connection_messages: AtomicBool::new(config.connection_messages),
+            control_inventory: OnceLock::new(),
             shutdown: watch::Sender::new(false),
             traffic: Traffic::default(),
             sys_interval: watch::Sender::new(None),
@@ -240,6 +243,7 @@ impl Broker {
         .await?;
         let broker = Self(Arc::new(Inner {
             connection_messages: AtomicBool::new(config.connection_messages),
+            control_inventory: OnceLock::new(),
             config,
             runtime,
             shutdown: watch::Sender::new(false),
@@ -628,8 +632,8 @@ impl Broker {
             Metric::PayloadReceived,
             publication.packet.payload.len() as i64,
         );
-        if publication.packet.topic == mqx_auth::DYNSEC_CONTROL_TOPIC {
-            return self.receive_dynamic_control(live, publication).await;
+        if publication.packet.topic.starts_with(crate::control::PREFIX) {
+            return self.receive_control(live, publication).await;
         }
         let admitted_local = publication.packet.qos == QoS::AtLeastOnce
             && live
@@ -686,7 +690,7 @@ impl Broker {
                 Metric::PayloadReceived,
                 publication.packet.payload.len() as i64,
             );
-            if publication.packet.topic == mqx_auth::DYNSEC_CONTROL_TOPIC {
+            if publication.packet.topic.starts_with(crate::control::PREFIX) {
                 if !durable.is_empty() {
                     responses.extend(
                         log.propose(live.lease.clone(), std::mem::take(&mut durable))
@@ -696,7 +700,7 @@ impl Broker {
                         return Ok(responses);
                     }
                 }
-                let reply = self.receive_dynamic_control(live, publication).await?;
+                let reply = self.receive_control(live, publication).await?;
                 let stop = reply == Reply::Stale || live.taken.load(Ordering::Acquire);
                 responses.push(reply);
                 if stop {

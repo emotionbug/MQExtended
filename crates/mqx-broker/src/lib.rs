@@ -1,6 +1,7 @@
 //! MQTT 3.1, 3.1.1 and 5 broker with Mosquitto 2.1.4 session semantics.
 
 mod connection;
+mod control;
 mod fast;
 mod inbox;
 mod persistence;
@@ -26,6 +27,7 @@ use mqx_codec::{DecodeError, EncodeError, QoS};
 use thiserror::Error;
 use tokio::sync::watch;
 
+pub use control::{ControlInventory, ControlListener};
 pub use persistence::{PersistenceCounts, PersistentState};
 use runtime::Live;
 pub use runtime::{BridgeAck, BridgeIdentity, BridgeSession, Broker, SocketObservation};

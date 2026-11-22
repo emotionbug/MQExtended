@@ -211,21 +211,12 @@ impl Broker {
                 }),
             ),
         };
-        // Raft may retain policy even after this node stops enabling the
-        // plugin. Only a locally registered endpoint can originate commands.
-        let endpoint_registered = self
-            .0
-            .runtime
-            .lock()
-            .unwrap()
-            .dynamic_security_path
-            .is_some();
         if admission == Err(Reply::Stale) {
             return Ok(Reply::Stale);
         }
         // Never hash passwords from publications that fail the local WRITE ACL,
         // and never replicate the unprepared payload, including on rejection.
-        let request = if endpoint_registered && admission.is_ok() {
+        let request = if admission.is_ok() {
             let request = tokio::task::spawn_blocking(move || DynsecRequest::prepare(&payload))
                 .await
                 .map_err(io::Error::other)?
@@ -256,23 +247,14 @@ impl Broker {
             .submit(Command::DynamicSecurityControl(DynamicControl {
                 origin,
                 lease: live.lease.clone(),
-                endpoint_registered,
+                endpoint_registered: true,
                 request,
                 payload_len,
                 qos,
                 now: publication.now,
             }))
             .await?;
-        if let Some(inbox) = &live.inbox {
-            let mut inbox = inbox.lock().unwrap();
-            if (qos == QoS::AtLeastOnce && reply != Reply::Stale)
-                || (qos == QoS::ExactlyOnce
-                    && inbox.receive_maximum.is_some()
-                    && matches!(reply, Reply::PublishReason(_)))
-            {
-                inbox.credit_incoming();
-            }
-        }
+        live.credit_control(qos, &reply);
         Ok(reply)
     }
 }

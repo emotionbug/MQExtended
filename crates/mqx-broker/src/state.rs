@@ -1,9 +1,11 @@
 //! Deterministic metadata and persistent inbox commands. Transport and clocks
 //! are outside the log; command inputs carry the observed time and ACL data.
 
+mod control;
 mod dynamic_security;
 mod persistence;
 mod telemetry;
+pub(crate) use control::{BrokerControl, ControlResponse};
 pub(crate) use dynamic_security::DynamicControl;
 use dynamic_security::DynamicPolicy;
 pub(crate) use telemetry::Store;
@@ -85,6 +87,7 @@ pub(crate) enum Command {
     },
     InitDynamicSecurity(Arc<DynamicSecurity>),
     DynamicSecurityControl(DynamicControl),
+    BrokerControl(BrokerControl),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -771,6 +774,7 @@ impl State {
                 }
             }
             Command::DynamicSecurityControl(control) => self.dynamic_control(control, &mut effects),
+            Command::BrokerControl(control) => self.broker_control(control, &mut effects),
             Command::Boot {
                 owner,
                 previous,
@@ -1753,13 +1757,26 @@ fn publish_rejection(
     source: &Session,
     publish: &Publish,
 ) -> Option<R> {
+    check_publish(config, acl, source, &publish.topic, publish.payload.len()).or_else(|| {
+        publish
+            .topic
+            .starts_with(crate::control::PREFIX)
+            .then_some(R::IMPLEMENTATION_SPECIFIC_ERROR)
+    })
+}
+
+fn check_publish(
+    config: &BrokerConfig,
+    acl: Acls<'_>,
+    source: &Session,
+    topic: &str,
+    payload_len: usize,
+) -> Option<R> {
     // handle_publish.c: handle__publish checks size before write ACL.
-    if config.message_size_limit != 0 && publish.payload.len() > config.message_size_limit {
+    if config.message_size_limit != 0 && payload_len > config.message_size_limit {
         Some(R::PACKET_TOO_LARGE)
-    } else if !acl.session_allowed(source, &publish.topic, Access::Write) {
+    } else if !acl.session_allowed(source, topic, Access::Write) {
         Some(R::NOT_AUTHORIZED)
-    } else if publish.topic.starts_with("$CONTROL/") {
-        Some(R::IMPLEMENTATION_SPECIFIC_ERROR)
     } else {
         None
     }

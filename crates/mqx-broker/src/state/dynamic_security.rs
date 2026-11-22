@@ -45,20 +45,8 @@ impl State {
         lease: &Lease,
         payload_len: usize,
     ) -> Result<(), Reply> {
-        let Some(session) = self
-            .sessions
-            .get(&lease.id)
-            .filter(|session| session.owner == Some(origin) && session.epoch == lease.epoch)
-        else {
-            return Err(Reply::Stale);
-        };
-        // handle_publish.c: handle__publish checks size and WRITE before dispatching control.
-        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
-        if self.config.message_size_limit != 0 && payload_len > self.config.message_size_limit {
-            Err(Reply::PublishReason(R::PACKET_TOO_LARGE.0))
-        } else if !acl.allowed(&session.publisher, DYNSEC_CONTROL_TOPIC, Access::Write) {
-            Err(Reply::PublishReason(R::NOT_AUTHORIZED.0))
-        } else if self.dynamic_security.is_none() {
+        self.check_control(origin, lease, DYNSEC_CONTROL_TOPIC, payload_len)?;
+        if self.dynamic_security.is_none() {
             Err(Reply::PublishReason(R::IMPLEMENTATION_SPECIFIC_ERROR.0))
         } else {
             Ok(())

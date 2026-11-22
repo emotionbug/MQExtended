@@ -11,6 +11,7 @@ use std::{
 #[cfg(unix)]
 use std::{fs, path::PathBuf, sync::Mutex};
 
+use mqx_broker::{ControlInventory, ControlListener};
 use mqx_proxy::{PROXY_HEADER_TIMEOUT, ProxyOptions};
 use mqx_ws::WsOptions;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -252,6 +253,50 @@ impl Server {
             .iter()
             .find(|listener| listener.options.index == index)
             .map_or(0, |listener| listener.sockets.len())
+    }
+
+    /// Snapshot of the listeners and plugins the broker control API can expose.
+    pub fn control_inventory(&self, config: &ServerConfig) -> ControlInventory {
+        let mut listeners = Vec::with_capacity(self.listeners.len());
+        for bound in &self.listeners {
+            let listener = &bound.options.config;
+            // src/listeners.c: listeners__start_local_only adds a config entry
+            // for each successful IPv4 or IPv6 loopback socket.
+            if config.local_only && listener.protocol == ListenerProtocol::Mqtt {
+                for address in bound.sockets.iter().filter_map(|socket| match socket {
+                    ListeningSocket::Tcp(socket) => socket.local_addr().ok(),
+                    #[cfg(unix)]
+                    ListeningSocket::Unix { .. } => None,
+                }) {
+                    listeners.push(ControlListener {
+                        port: address.port(),
+                        protocol: Some("mqtt"),
+                        bind_address: Some(address.ip().to_string()),
+                        socket_path: None,
+                        tls: false,
+                    });
+                }
+                continue;
+            }
+            // src/broker_control.c: add_listener reports ssl_ctx, not whether
+            // an HTTP listener serves HTTPS through its separate TLS stack.
+            let protocol = match listener.protocol {
+                ListenerProtocol::Mqtt => Some("mqtt"),
+                ListenerProtocol::Websockets => Some("mqtt+websockets"),
+                ListenerProtocol::HttpApi => None,
+            };
+            listeners.push(ControlListener {
+                port: listener.port,
+                protocol,
+                bind_address: listener.host.clone(),
+                socket_path: listener
+                    .unix_socket_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                tls: protocol.is_some() && bound.options.tls.borrow().is_some(),
+            });
+        }
+        ControlInventory::new(listeners, config.dynamic_security.is_some())
     }
 
     pub async fn run<H, F, R, RF, E>(self, handler: H, reload: R) -> Result<(), ServerError>

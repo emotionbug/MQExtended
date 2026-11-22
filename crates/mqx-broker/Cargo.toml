@@ -15,6 +15,7 @@ mqx-codec = { workspace = true, features = ["serde"] }
 mqx-topic.workspace = true
 rmp-serde = "1"
 serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 tempfile = "3.27"

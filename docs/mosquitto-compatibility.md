@@ -46,6 +46,7 @@ The reference is **Mosquitto 2.1.4** (tag `v2.1.4`). When Mosquitto and the MQTT
 - Outgoing packet ids are consumed even when a message is then dropped as a duplicate or for a full queue (`mosquitto__mid_generate`), so packet ids on the wire match Mosquitto's.
 - Connection log lines use 2.1's protocol numbers: `p3` for MQTT 3.1, `p4` for 3.1.1.
 - MQTT 5 follows the same handlers' v5 branches: `max_topic_alias` and `max_topic_alias_broker`, `accept_protocol_versions` including `5`, and the listener's `disable_protocol_v5`. A CONNECT whose protocol name is `MQTT` followed by a NUL byte is accepted at levels 4 and 5, and `MQIsdp` at level 5 gets the legacy refusal `20 02 00 01` (`handle__connect`'s `strncmp` comparisons).
+- With `enable_control_api true`, `$CONTROL/broker/v1` provides the read-only listener and plugin inventory (`src/broker_control.c`); see [monitoring](monitoring.md#mqtt-broker-control-api) for permissions and SIGHUP behavior.
 
 ### Transports (`mqx-proxy` ← `src/proxy_v1.c`, `src/proxy_v2.c`; `mqx-ws` ← `lib/net_ws.c`, `src/http_serv.c`)
 
@@ -99,4 +100,4 @@ These directives make `mqextended` refuse to start, naming the directive, rather
 | `tls_engine`, `tls_engine_kpass_sha1`, `tls_keyform engine` | OpenSSL engines |
 | `plugin`, `auth_plugin`, `plugin_opt_*` for plugins other than dynamic security | C plugins cannot be loaded |
 | `memory_limit` above 0 | No process-wide allocation limit |
-| `enable_control_api true`, `disable_client_cert_date_checks true` | Not implemented |
+| `disable_client_cert_date_checks true` | Not implemented |

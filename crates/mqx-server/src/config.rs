@@ -33,6 +33,7 @@ pub struct ServerConfig {
     pub user: String,
     pub pid_file: Option<PathBuf>,
     pub sys_interval: u16,
+    pub enable_control_api: bool,
     pub persistence: PersistenceConfig,
     pub cluster: Option<ClusterConfig>,
     /// Parse-time operator notices, emitted after the logging destinations are configured.
@@ -466,6 +467,7 @@ impl Default for Parser {
                 user: "mosquitto".into(),
                 pid_file: None,
                 sys_interval: 10,
+                enable_control_api: false,
                 persistence: PersistenceConfig::default(),
                 cluster: None,
                 notices: Vec::new(),
@@ -1117,10 +1119,9 @@ impl Parser {
                     return Err(unsupported(name, "a process-wide allocation limit"));
                 }
             }
-            "enable_control_api" | "disable_client_cert_date_checks" => {
-                if name == "disable_client_cert_date_checks" {
-                    require_listener(*current, name)?;
-                }
+            "enable_control_api" => self.config.enable_control_api = v.boolean()?,
+            "disable_client_cert_date_checks" => {
+                require_listener(*current, name)?;
                 if v.boolean()? {
                     return Err(unsupported(name, "enabling this feature"));
                 }

@@ -1,6 +1,6 @@
 # Monitoring
 
-What MQExtended exposes for monitoring: Mosquitto's `$SYS` topics and HTTP API, unchanged, plus a cluster status endpoint and Prometheus metrics.
+MQExtended provides Mosquitto's `$SYS` topics, MQTT broker control API and HTTP API, plus a cluster status endpoint and Prometheus metrics.
 
 ## `$SYS` topics
 
@@ -11,6 +11,20 @@ What MQExtended exposes for monitoring: Mosquitto's `$SYS` topics and HTTP API, 
 - `$SYS/broker/heap/*` is not published. Mosquitto only has it in builds with memory tracking; MQExtended has no equivalent allocator counter.
 
 In a cluster the tree describes the whole cluster, not the node a subscriber happens to be connected to. The Raft leader publishes each sample through the log: client, subscription and retained counts come from replicated state, message and byte counters are the sum of every node's counters collected over the mesh. A node that dies keeps its last reported totals, so counters never step backwards; current socket counts include only nodes that answered. The latest tree is part of the replicated state, so retained `$SYS` values survive a leader change instead of flapping between nodes.
+
+## MQTT broker control API
+
+Set `enable_control_api true` before starting the broker to expose the read-only endpoint. As in Mosquitto 2.1.4, SIGHUP reloads other settings but does not change whether this endpoint is enabled. In a cluster, configure each node that should accept these requests.
+
+Subscribe to `$CONTROL/broker/v1/response` and publish to `$CONTROL/broker/v1`, for example:
+
+```json
+{"commands":[{"command":"listListeners","correlationData":"inventory-1"},{"command":"listPlugins"}]}
+```
+
+`listListeners` reports the accepting node's bound listener configuration. `listPlugins` reports registered plugin names and control endpoints, not configuration paths, credentials or plugin options. The `responses` array has one result per processed command and echoes any JSON string `correlationData`.
+
+Grant write access to the request topic only to clients allowed to query the broker. Replies are non-retained QoS 0 publications, visible to every subscriber with read access to the response topic, not just the requester. If an authorized request targets a disabled or unknown endpoint, only the requester gets `{"error": "endpoint not available"}`, without needing a subscription.
 
 ## HTTP API
 

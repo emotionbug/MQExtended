@@ -429,6 +429,10 @@ async fn run_broker(
     bridges.start(std::mem::take(&mut config.bridges));
     let bridges = std::cell::RefCell::new(bridges);
     broker.start_sys_tree(config.sys_interval);
+    if config.enable_control_api {
+        // conf.c: config__copy does not copy enable_control_api on SIGHUP.
+        broker.register_control_api(server.control_inventory(&config));
+    }
     let log_topics = tokio::spawn(log_topics.serve(broker.clone()));
     let serving = broker.clone();
     let http = Arc::new(HttpApi::new(&config, &server));
