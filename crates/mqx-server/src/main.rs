@@ -493,7 +493,7 @@ async fn run_broker(
                 // standalone persistence is disabled.
                 BrokerSignal::Backup => {
                     if let Some(persistence) = &persistence {
-                        persistence.backup(&broker, false).await;
+                        let _ = persistence.backup(&broker, false).await;
                     }
                 }
                 BrokerSignal::Diagnostics => {
@@ -513,9 +513,11 @@ async fn run_broker(
     }
     broker.shutdown();
     bridges.into_inner().shutdown().await;
-    if let Some(persistence) = &persistence {
-        persistence.backup(&broker, true).await;
-    }
+    let result = if let Some(persistence) = &persistence {
+        result.and(persistence.backup(&broker, true).await.map(|_| ()))
+    } else {
+        result
+    };
     log_topics.abort();
     if let Some(task) = membership_watch {
         task.abort();

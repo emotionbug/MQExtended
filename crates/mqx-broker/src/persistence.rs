@@ -185,9 +185,13 @@ impl PersistentState {
         writer.flush()?;
         drop(writer);
         temporary.as_file().sync_all()?;
+        // Open the directory before replacement so a failed open leaves the
+        // old image intact, and a later rename of the directory cannot redirect sync.
+        #[cfg(unix)]
+        let directory = File::open(parent)?;
         temporary.persist(path)?;
         #[cfg(unix)]
-        File::open(parent)?.sync_all()?;
+        directory.sync_all()?;
         Ok(())
     }
 

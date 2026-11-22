@@ -11,6 +11,8 @@ use tokio::{
     time::{self, Instant},
 };
 
+const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 pub(super) struct Persistence {
     config: watch::Sender<PersistenceConfig>,
     writer: Mutex<()>,
@@ -68,26 +70,33 @@ impl Persistence {
         Ok(())
     }
 
-    pub(super) async fn backup(&self, broker: &Broker, shutdown: bool) -> Option<u64> {
+    pub(super) async fn backup(
+        &self,
+        broker: &Broker,
+        shutdown: bool,
+    ) -> Result<Option<u64>, ServerError> {
         let _write = self.writer.lock().await;
         let path = {
             let config = self.config.borrow();
             if !config.enabled {
-                return None;
+                return Ok(None);
             }
             snapshot_path(&config)
         };
-        let (changes, state) = broker.persistence_snapshot(shutdown)?;
-        if let Err(error) = write_snapshot(path, state).await {
-            tracing::error!("{error}");
-        }
-        Some(changes)
+        let Some((changes, state)) = broker.persistence_snapshot(shutdown) else {
+            return Ok(None);
+        };
+        write_snapshot(path, state)
+            .await
+            .inspect_err(|error| tracing::error!("{error}"))?;
+        Ok(Some(changes))
     }
 
     pub(super) async fn autosave(&self, broker: &Broker, mut stop: watch::Receiver<bool>) {
         let mut config = self.config.subscribe();
         let mut last_backup = Instant::now();
         let mut last_changes = 0;
+        let mut retry_at = None;
         let mut changes = None;
         loop {
             let (threshold, by_changes, enabled) = {
@@ -116,6 +125,9 @@ impl Persistence {
                         });
                         let _ = changes.wait_for(|&current| current - last_changes >= u64::from(threshold))
                             .await.expect("standalone broker is still running");
+                        if let Some(deadline) = retry_at {
+                            time::sleep_until(deadline).await;
+                        }
                     } else {
                         // src/loop.c: mosquitto__main_loop compares whole seconds with >.
                         time::sleep_until(last_backup + Duration::from_secs(u64::from(threshold) + 1)).await;
@@ -124,9 +136,18 @@ impl Persistence {
                     if !by_changes {
                         last_backup = Instant::now();
                     }
-                    if let Some(count) = self.backup(broker, false).await && by_changes {
-                        // src/loop.c: only automatic backups reset the count.
-                        last_changes = count;
+                    match self.backup(broker, false).await {
+                        Ok(Some(count)) if by_changes => {
+                            // src/loop.c: only automatic backups reset the count.
+                            last_changes = count;
+                            retry_at = None;
+                        }
+                        Err(_) if by_changes => {
+                            // The threshold is still met. Back off without waiting
+                            // for new MQTT traffic or blocking reload/shutdown.
+                            retry_at = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                        }
+                        _ => {}
                     }
                 }
             }

@@ -472,6 +472,100 @@ async fn root_only_identity_mapping_and_privilege_drop_order() {
     assert!(!stderr.contains("Opening ipv4 listen socket"));
 }
 
+const SAVE_ERROR: &str = "Error during saving in-memory database";
+
+fn persistence_command(dir: &Path, address: SocketAddr, autosave: &str) -> Command {
+    fs::write(
+        dir.join("broker.conf"),
+        format!(
+            "{}persistence true\nlog_dest file broker.log\nlog_type all\n{autosave}\n",
+            config(address)
+        ),
+    )
+    .unwrap();
+    let mut command = command(BIN, dir);
+    command
+        .args(["-c", "broker.conf"])
+        .env("NOTIFY_SOCKET", dir.join("notify"));
+    command
+}
+
+#[tokio::test]
+async fn persistence_retries_failed_change_save_without_more_client_traffic() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn exchange<const N: usize>(stream: &mut TcpStream, request: &[u8], response: &[u8; N]) {
+        timeout(WAIT, async {
+            stream.write_all(request).await.unwrap();
+            let mut received = [0; N];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, response);
+        })
+        .await
+        .unwrap();
+    }
+
+    const CONNECT: &[u8] = b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev";
+    const CONNACK: &[u8; 4] = b"\x20\x02\x00\x00";
+    let dir = tempfile::tempdir().unwrap();
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let address = listen_address();
+    let mut command = persistence_command(
+        dir.path(),
+        address,
+        "autosave_interval 1\nautosave_on_changes true",
+    );
+    let mut child = command.spawn().unwrap();
+    ready(&notify).await;
+    let snapshot = dir.path().join("mosquitto.db.mqx");
+    let log = dir.path().join("broker.log");
+    // A directory blocks atomic replacement even if the test runs as root.
+    fs::create_dir(&snapshot).unwrap();
+    let mut publisher = TcpStream::connect(address).await.unwrap();
+    exchange(&mut publisher, CONNECT, CONNACK).await;
+    exchange(
+        &mut publisher,
+        b"\x33\x0d\x00\x04keep\x00\x01value",
+        b"\x40\x02\x00\x01",
+    )
+    .await;
+    eventually(|| fs::read_to_string(&log).unwrap().contains(SAVE_ERROR)).await;
+    fs::remove_dir(&snapshot).unwrap();
+    eventually(|| snapshot.is_file()).await;
+
+    // Do not let a final backup hide a missed autosave.
+    child.kill().await.unwrap();
+    let mut child = command.spawn().unwrap();
+    ready(&notify).await;
+    let mut subscriber = TcpStream::connect(address).await.unwrap();
+    exchange(&mut subscriber, CONNECT, CONNACK).await;
+    exchange(
+        &mut subscriber,
+        b"\x82\x09\x00\x01\x00\x04keep\x01",
+        b"\x90\x03\x00\x01\x01\x33\x0d\x00\x04keep\x00\x01value",
+    )
+    .await;
+    stop(&mut child).await;
+}
+
+#[tokio::test]
+async fn persistence_failed_final_save_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let mut child = persistence_command(dir.path(), listen_address(), "autosave_interval 0")
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+    let snapshot = dir.path().join("mosquitto.db.mqx");
+    fs::create_dir(&snapshot).unwrap();
+    kill(id(&child), Signal::SIGTERM).unwrap();
+    let status = timeout(WAIT, child.wait()).await.unwrap().unwrap();
+    assert!(matches!(status.code(), Some(code) if code != 0), "{status}");
+    let log = fs::read_to_string(dir.path().join("broker.log")).unwrap();
+    let (_, after_termination) = log.split_once(TERMINATING).unwrap();
+    assert!(after_termination.contains(SAVE_ERROR), "{log}");
+}
+
 fn reference(var: &str) -> PathBuf {
     PathBuf::from(
         std::env::var_os(var)

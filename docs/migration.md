@@ -56,6 +56,8 @@ With `persistence true`, MQExtended reads Mosquitto's own `mosquitto.db` on its 
 - **Standalone:** stop Mosquitto (it saves the database on a clean stop), then start MQExtended with the same configuration.
 - **Cluster:** give only the node with the lowest id `persistence true` and the Mosquitto `persistence_location`/`persistence_file` on its first start. It imports through the replicated log before it accepts clients, so every node gets the same state. On the other nodes, and after bootstrap, `persistence true` changes nothing; cluster state is always durable. The same node imports `dynamic-security.json` if you use [dynamic security](dynamic-security.md#in-a-cluster).
 
+For standalone brokers, a failed by-changes autosave leaves the changes pending and retries after a one-second delay without waiting for more client traffic. A failed final save is logged and makes the process exit nonzero; do not treat that shutdown as a successful backup.
+
 Without a persistence file, copy retained messages instead, right before switching: subscribe to `#` on Mosquitto with a user that may read everything, collect every message delivered with the retain flag, and publish each one with retain to MQExtended. Copying after the switch would overwrite values that clients already updated. Persistent sessions then start empty.
 
 ## 6. Cut over
