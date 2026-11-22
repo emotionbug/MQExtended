@@ -11,9 +11,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use mqx_codec::{Packet, PacketId, Publish, QoS};
 use tokio::{
-    sync::watch,
     task::JoinSet,
-    time::{Instant, sleep, sleep_until, timeout, timeout_at},
+    time::{Instant, sleep_until, timeout, timeout_at},
 };
 
 use crate::{
@@ -199,11 +198,10 @@ pub async fn load(addresses: &[SocketAddr], config: &Load) -> Result<LoadResult,
     }
     let connections = (publishers.len() + subscribers.len()) as u64;
     let window = Window::new(config.duration)?;
-    let publisher_deadline = window
+    let drain_deadline = window
         .end
         .checked_add(config.drain)
         .ok_or(Error::Configuration("drain duration overflows the clock"))?;
-    let (stop, stopped) = watch::channel(false);
     let mut receivers = JoinSet::new();
     let qos = config.qos.into();
     let shared = match config.pattern {
@@ -234,7 +232,7 @@ pub async fn load(addresses: &[SocketAddr], config: &Load) -> Result<LoadResult,
             coverage,
             stats: Deliveries::default(),
         };
-        receivers.spawn(sub.receive(stopped.clone()));
+        receivers.spawn(sub.receive(drain_deadline));
     }
     let mut senders = JoinSet::new();
     for (index, publisher) in publishers.into_iter().enumerate() {
@@ -249,7 +247,7 @@ pub async fn load(addresses: &[SocketAddr], config: &Load) -> Result<LoadResult,
             run,
             index,
             pace: Pace::new(window, index, config.publishers, config.rate),
-            deadline: publisher_deadline,
+            deadline: drain_deadline,
             payload_bytes: config.payload_bytes,
             inflight: usize::from(config.inflight),
         };
@@ -263,9 +261,6 @@ pub async fn load(addresses: &[SocketAddr], config: &Load) -> Result<LoadResult,
         sent[index] = published;
         acknowledged += acked;
     }
-    sleep_until(window.end).await;
-    sleep(config.drain).await;
-    stop.send_replace(true);
     let delivered = timeout(HANDSHAKE_TIMEOUT, async {
         let mut delivered = Deliveries::default();
         while let Some(job) = receivers.join_next().await {
@@ -380,13 +375,15 @@ impl Receiver {
 
     async fn receive(
         mut self,
-        mut stop: watch::Receiver<bool>,
+        deadline: Instant,
     ) -> Result<(Coverage, Deliveries), Error> {
         let mut incoming = HashMap::<PacketId, Bytes>::new();
+        let end = sleep_until(deadline);
+        tokio::pin!(end);
         loop {
             let packet = tokio::select! {
                 biased;
-                _ = stop.changed() => break,
+                () = &mut end => break,
                 packet = self.client.recv() => packet?,
             };
             let arrival = Instant::now();
