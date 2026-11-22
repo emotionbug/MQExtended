@@ -92,6 +92,8 @@ Upgrade one node at a time. A node refuses log entries, snapshots and node ident
 
 Don't change membership in the middle of an upgrade.
 
+When upgrading a build that predates the MQTT broker control API, use a cold upgrade if clients can publish to `$CONTROL/` topics. Requests to disabled or unknown endpoints also produce a replicated `BrokerControl` command that the old build cannot replay. Turning off `enable_control_api` is not a mixed-version compatibility switch. Drain clients, stop all voters, take the cold backup above and upgrade all voters before restoring traffic.
+
 ## What clients observe when a node fails
 
 - Clients connected to the failed node lose their connection and reconnect through the load balancer to a surviving node.
