@@ -108,6 +108,10 @@ struct Traffic {
     /// Aggregate publishes per second. Omit for max-throughput mode.
     #[arg(long)]
     rate: Option<u64>,
+    /// Fail after reporting if p99 misses this bound, <99% of the rate is sent,
+    /// or a delivery or acknowledgement is missing or duplicated.
+    #[arg(long, requires = "rate", value_parser = clap::value_parser!(u64).range(1..))]
+    require_p99_below_ms: Option<u64>,
     #[arg(long, default_value_t = 30)]
     seconds: u64,
     #[arg(long, default_value_t = 2)]
@@ -155,6 +159,36 @@ impl Traffic {
                 .map(|qos| self.workload(pattern, publishers, subscribers, qos))
         })
         .collect()
+    }
+
+    fn qualify(&self, result: &mqx_bench::LoadResult) -> Result<(), String> {
+        let Some(limit) = self.require_p99_below_ms else {
+            return Ok(());
+        };
+        let requested =
+            u128::from(self.rate.expect("clap requires --rate")) * u128::from(self.seconds);
+        let rate_ok = u128::from(result.published) >= requested - requested / 100;
+        if rate_ok
+            && result.lost == 0
+            && result.duplicates == 0
+            && result
+                .acknowledged
+                .is_none_or(|count| count == result.published)
+            && result
+                .delivery_latency
+                .p99_ns
+                .is_some_and(|ns| u128::from(ns) < u128::from(limit) * 1_000_000)
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "qualification failed: published {}/{requested}, acked {:?}, lost {}, duplicates {}, p99 {:?} ns (required < {limit} ms)",
+            result.published,
+            result.acknowledged,
+            result.lost,
+            result.duplicates,
+            result.delivery_latency.p99_ns
+        ))
     }
 }
 
@@ -225,6 +259,7 @@ async fn run(command: Command) -> Result<(), Box<dyn error::Error>> {
         } => {
             let result = load(&endpoints.endpoint, &shape.workload(&traffic, pattern)).await?;
             write_json(io::stdout().lock(), &result)?;
+            traffic.qualify(&result)?;
         }
         Command::Storm {
             endpoints,
@@ -270,6 +305,14 @@ async fn run(command: Command) -> Result<(), Box<dyn error::Error>> {
             };
             write_json(BufWriter::new(File::create(json)?), &report)?;
             print_table(&mut io::stdout().lock(), &results)?;
+            for row in &results {
+                traffic.qualify(&row.result).map_err(|error| {
+                    format!(
+                        "{} {:?}/{:?}: {error}",
+                        row.broker, row.workload.pattern, row.workload.qos
+                    )
+                })?;
+            }
         }
     }
     Ok(())
