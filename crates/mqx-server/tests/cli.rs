@@ -5,21 +5,21 @@ const BIN: &str = env!("CARGO_BIN_EXE_mqextended");
 const PERSISTENT_CONNECT: &[u8] = b"\x10\x0f\x00\x04MQTT\x04\x00\x00\x3c\x00\x03dev";
 
 #[cfg(unix)]
-async fn connect_and_read_ack(addr: std::net::SocketAddr) -> [u8; 4] {
-    use std::time::Duration;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
-        time::{sleep, timeout},
-    };
+async fn wait_ready(socket: &tokio::net::UnixDatagram) {
+    let mut packet = [0; 32];
+    let len = tokio::time::timeout(std::time::Duration::from_secs(10), socket.recv(&mut packet))
+        .await
+        .expect("broker did not send READY=1")
+        .unwrap();
+    assert_eq!(&packet[..len], b"READY=1");
+}
 
-    timeout(Duration::from_secs(10), async {
-        let mut socket = loop {
-            match TcpStream::connect(addr).await {
-                Ok(socket) => break socket,
-                Err(_) => sleep(Duration::from_millis(10)).await,
-            }
-        };
+#[cfg(unix)]
+async fn connect_and_read_ack(addr: std::net::SocketAddr) -> [u8; 4] {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
         socket.write_all(PERSISTENT_CONNECT).await.unwrap();
         let mut ack = [0; 4];
         socket.read_exact(&mut ack).await.unwrap();
@@ -130,12 +130,7 @@ async fn invalid_credentials_on_sighup_stop_the_broker() {
             .spawn()
             .unwrap();
         let pid = Pid::from_raw(child.id().unwrap() as i32);
-        let mut ready = [0; 7];
-        let length = timeout(Duration::from_secs(5), notify.recv(&mut ready))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&ready[..length], b"READY=1");
+        wait_ready(&notify).await;
         assert_eq!(connect_and_read_ack(addr).await, [0x20, 2, 0, 0]);
         fs::write(&rules, bad).unwrap();
         kill(pid, Signal::SIGHUP).unwrap();
@@ -172,6 +167,8 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
     let mqtt_addr = mqtt.local_addr().unwrap();
     let raft_addr = raft.local_addr().unwrap();
     let directory = tempfile::tempdir().unwrap();
+    let notify_path = directory.path().join("notify");
+    let notify = tokio::net::UnixDatagram::bind(&notify_path).unwrap();
     let path = directory.path().join("broker.conf");
     let storage = directory.path().join("raft state");
     let acl = directory.path().join("acl");
@@ -217,11 +214,13 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
         let child = tokio::process::Command::new(BIN)
             .arg("-c")
             .arg(&path)
+            .env("NOTIFY_SOCKET", &notify_path)
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
         let pid = Pid::from_raw(child.id().unwrap() as i32);
+        wait_ready(&notify).await;
         assert_eq!(
             connect_and_read_ack(mqtt_addr).await,
             [0x20, 2, session_present, 0]
@@ -290,15 +289,6 @@ async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
         .unwrap_or_else(|_| panic!("MQTT listener {addr} never served a CONNECT"))
     }
 
-    async fn wait_ready(socket: UnixDatagram) {
-        let mut packet = [0; 32];
-        let len = timeout(Duration::from_secs(10), socket.recv(&mut packet))
-            .await
-            .expect("broker did not send READY=1")
-            .unwrap();
-        assert_eq!(&packet[..len], b"READY=1");
-    }
-
     let sockets: [_; 4] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
     let [mqtt1, raft1, mqtt2, raft2] = sockets.each_ref().map(|s| s.local_addr().unwrap());
     let directory = tempfile::tempdir().unwrap();
@@ -340,10 +330,10 @@ async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
     let (mut first, first_ready) = start(&first_config);
     let pid = Pid::from_raw(first.id().unwrap().try_into().unwrap());
     let wait = Duration::from_secs(10);
-    wait_ready(first_ready).await;
+    wait_ready(&first_ready).await;
     assert_eq!(wait_serving(mqtt1).await.1, [0x20, 2, 0, 0]);
     let (mut second, second_ready) = start(&second_config);
-    wait_ready(second_ready).await;
+    wait_ready(&second_ready).await;
     let unpromoted = timeout(wait, connect(mqtt2))
         .await
         .expect("unpromoted learner did not refuse the connection")
