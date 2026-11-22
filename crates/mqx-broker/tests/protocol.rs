@@ -324,6 +324,53 @@ async fn certificate_replaces_credentials_and_empty_credentials_are_anonymous() 
         .await;
 }
 
+// proxy_v2.c sets the username; handle_connect.c discards the CONNECT
+// credentials but still performs mosquitto_basic_auth on a PROXY listener.
+#[tokio::test]
+async fn forwarded_certificate_names_still_require_basic_authentication() {
+    let broker = Broker::new(BrokerConfig::default());
+    let file = PasswordFile::parse(b"test:$6$njERlZMi/7DzNB9E$iiavfuXvUm8iyDZArTy7smTxh07GXXOrOsqxfW6gkOYVXHGk+W+i/8d3xDxrMwEPygEBhoA8A/gjQC0N2M4Lkw==\n").unwrap();
+    let with_passwords = SecurityHandle::new(Some(file), None);
+    let without_passwords = SecurityHandle::default();
+    for (security, anonymous, cn, code) in [
+        (&with_passwords, false, "test", Code::NotAuthorized),
+        (&with_passwords, true, "test", Code::NotAuthorized),
+        (&with_passwords, true, "unknown", Code::NotAuthorized),
+        (&without_passwords, false, "test", Code::NotAuthorized),
+        (&without_passwords, true, "test", Code::Accepted),
+        (&without_passwords, true, "", Code::BadUserNameOrPassword),
+    ] {
+        let (mut client, _) = Client::spawn(
+            &broker,
+            ConnectionInfo {
+                cert_identity: CertIdentity::ForwardedUsername(cn.into()),
+                listener: Arc::new(ListenerPolicy {
+                    allow_anonymous: Some(anonymous),
+                    security: security.clone(),
+                    ..ListenerPolicy::default()
+                }),
+                ..ConnectionInfo::default()
+            },
+        );
+        client
+            .connect(
+                Connect {
+                    username: Some("test".into()),
+                    password: Some(Bytes::from_static(b"test")),
+                    ..request("forwarded", true)
+                },
+                code,
+                false,
+            )
+            .await;
+        if code == Code::Accepted {
+            client.disconnect().await;
+        } else {
+            assert_eq!(client.recv().await, None);
+        }
+    }
+}
+
 // test/broker/01-connect-max-keepalive.py and keepalive.c: keepalive__check.
 #[tokio::test(start_paused = true)]
 async fn keepalive_rejects_zero_above_cap_and_resets_on_packets() {

@@ -157,6 +157,10 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
         sys::signal::{Signal, kill},
         unistd::Pid,
     };
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
+        IsCa, KeyPair,
+    };
     use std::{fs, net::TcpListener, process::Stdio, time::Duration};
 
     let mqtt = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -168,14 +172,37 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
     let storage = directory.path().join("raft state");
     let acl = directory.path().join("acl");
     fs::write(&acl, "topic readwrite a/#\n").unwrap();
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::default();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "mqx-node-1");
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let cert = params.signed_by(&key, &ca).unwrap();
+    let ca_path = directory.path().join("cluster-ca.pem");
+    let cert_path = directory.path().join("cluster-cert.pem");
+    let key_path = directory.path().join("cluster-key.pem");
+    fs::write(&ca_path, ca.pem()).unwrap();
+    fs::write(&cert_path, cert.pem()).unwrap();
+    fs::write(&key_path, key.serialize_pem()).unwrap();
     fs::write(
         &path,
         format!(
             "listener {} 127.0.0.1\nallow_anonymous true\nacl_file {}\ncluster_node_id 1\n\
-        cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\ncluster_data_dir {}\n",
+        cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\ncluster_data_dir {}\n\
+        cluster_cafile {}\ncluster_certfile {}\ncluster_keyfile {}\n",
             mqtt_addr.port(),
             acl.display(),
-            storage.display()
+            storage.display(),
+            ca_path.display(),
+            cert_path.display(),
+            key_path.display(),
         ),
     )
     .unwrap();

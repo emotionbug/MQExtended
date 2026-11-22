@@ -1,27 +1,33 @@
+mod proposals;
+
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use mqx_auth::AclFile;
-use mqx_cluster::{Cluster, ClusterConfig, ClusterError, NodeEvent, StateMachine};
-use mqx_codec::QoS;
+use mqx_cluster::{Cluster, ClusterConfig, ClusterError, NodeEvent, NodeStatus, StateMachine};
+use mqx_codec::{QoS, v5::ReasonCode as R};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::{Notify, OnceCell, mpsc, watch},
+    sync::{Notify, OnceCell, mpsc, oneshot, watch},
     time::{Instant, MissedTickBehavior},
 };
 
 use crate::{
     BrokerConfig, BrokerError, ConnectionInfo, SECURITY_REVISION, Security, SecurityHandle,
-    connection,
-    inbox::{Inbox, Offer, Outbound},
-    state::{Claim, ClaimToken, Command, Effect, Epoch, Lease, Operation, Owner, Reply, State},
+    connection, fast,
+    inbox::{Delivery, Inbox, Offer, Outbound},
+    state::{
+        BatchEntry, Claim, ClaimToken, Command, Effect, Epoch, Lease, Mutations, Operation, Owner,
+        Publication, Reply, State,
+    },
 };
 
 /// Shared MQTT broker. Each active transport is driven by one `serve` call.
@@ -51,6 +57,12 @@ struct ReplicatedLog {
     applied: watch::Receiver<u64>,
     boot: OnceCell<()>,
     timeout: Duration,
+    fence_timeout: Duration,
+    // MeshSend only confirms a socket write; waiting for each peer's
+    // handler response prevents a later connection overtaking this one.
+    peer_lanes: BTreeMap<u64, tokio::sync::Mutex<()>>,
+    proposals: mpsc::Sender<proposals::Proposal>,
+    batch_limits: proposals::Limits,
 }
 
 struct LocalLog {
@@ -71,6 +83,7 @@ struct Runtime {
 
 struct Pending {
     transient: bool,
+    receive_maximum: Option<u16>,
     live: Option<Arc<Live>>,
 }
 
@@ -79,6 +92,7 @@ pub(super) struct Live {
     pub(super) inbox: Option<Mutex<Inbox>>,
     pub(super) taken: AtomicBool,
     pub(super) ready: Notify,
+    sequence: AtomicU64,
 }
 
 pub(super) enum ClaimResult {
@@ -88,12 +102,17 @@ pub(super) enum ClaimResult {
 }
 
 impl Live {
-    fn new(lease: Lease, transient: bool) -> Self {
+    fn new(lease: Lease, transient: bool, receive_maximum: Option<u16>) -> Self {
         Self {
             lease,
-            inbox: transient.then(Mutex::default),
+            inbox: transient.then(|| {
+                let mut inbox = Inbox::default();
+                inbox.receive_maximum = receive_maximum;
+                Mutex::new(inbox)
+            }),
             taken: AtomicBool::new(false),
             ready: Notify::new(),
+            sequence: AtomicU64::new(0),
         }
     }
 
@@ -139,8 +158,12 @@ impl Broker {
         let runtime = Arc::new(Mutex::new(Runtime::default()));
         let (applied_tx, applied) = watch::channel(0);
         let (abandoned, cleanup) = mpsc::unbounded_channel();
+        let (proposals, proposal_rx) = mpsc::channel(128);
         let tick = cluster.heartbeat_interval;
         let timeout = cluster.request_timeout;
+        let fence_timeout = timeout.saturating_add(cluster.lease_timeout);
+        let batch_limits =
+            proposals::Limits::new(cluster.max_command_size, cluster.max_append_size);
         let cluster = Cluster::start(
             cluster,
             Machine {
@@ -153,6 +176,13 @@ impl Broker {
             },
         )
         .await?;
+        let peer_lanes = cluster
+            .members()
+            .keys()
+            .copied()
+            .filter(|id| *id != owner.node)
+            .map(|id| (id, tokio::sync::Mutex::new(())))
+            .collect();
         let broker = Self(Arc::new(Inner {
             config,
             runtime,
@@ -163,8 +193,24 @@ impl Broker {
                 applied,
                 boot: OnceCell::new(),
                 timeout,
+                fence_timeout,
+                peer_lanes,
+                proposals,
+                batch_limits,
             }),
         }));
+        let Log::Replicated(log) = &broker.0.log else {
+            unreachable!()
+        };
+        let inner = Arc::downgrade(&broker.0);
+        log.cluster.mesh().register_handler(move |from, body| {
+            let inner = inner.clone();
+            async move {
+                let inner = inner.upgrade().ok_or(ClusterError::Shutdown)?;
+                Broker(inner).receive_mesh(from, body).await
+            }
+        })?;
+        tokio::spawn(proposals::run(Arc::downgrade(&broker.0), proposal_rx));
         tokio::spawn(cluster_maintenance(
             Arc::downgrade(&broker.0),
             tick,
@@ -284,6 +330,10 @@ impl Broker {
         mut claim: Claim,
     ) -> Result<ClaimResult, BrokerError> {
         let transient = claim.local_inbox();
+        let receive_maximum = claim
+            .v5
+            .as_ref()
+            .map(|v5| v5.outgoing_maximum(&self.0.config));
         claim.now = self.now();
         match &self.0.log {
             Log::Local { started, .. } => {
@@ -315,7 +365,7 @@ impl Broker {
                     Reply::Stale => return Ok(ClaimResult::Stale),
                     _ => unreachable!(),
                 };
-                let live = Arc::new(Live::new(lease, transient));
+                let live = Arc::new(Live::new(lease, transient, receive_maximum));
                 runtime.live.insert(live.lease.epoch, live.clone());
                 self.schedule_local_expiry(&mut runtime);
                 Ok(ClaimResult::Accepted(live, present))
@@ -330,6 +380,7 @@ impl Broker {
                         token,
                         Pending {
                             transient,
+                            receive_maximum,
                             live: None,
                         },
                     );
@@ -340,7 +391,7 @@ impl Broker {
                     finished: false,
                 };
                 let reply = log
-                    .submit(Command::Claim {
+                    .propose_one(BatchEntry::Claim {
                         owner: log.owner,
                         token,
                         request: claim,
@@ -368,7 +419,7 @@ impl Broker {
                         if !machine.state.owns(log.owner, &lease) {
                             return None;
                         }
-                        let live = Arc::new(Live::new(lease, transient));
+                        let live = Arc::new(Live::new(lease, transient, receive_maximum));
                         runtime.live.insert(live.lease.epoch, live.clone());
                         Some(live)
                     })
@@ -379,6 +430,10 @@ impl Broker {
                 }))
             }
         }
+    }
+
+    pub(super) fn is_clustered(&self) -> bool {
+        matches!(self.0.log, Log::Replicated(_))
     }
 
     pub(super) fn now(&self) -> Duration {
@@ -395,6 +450,200 @@ impl Broker {
     ) -> Result<Reply, BrokerError> {
         self.submit(Command::Act(live.lease.clone(), operation))
             .await
+    }
+
+    pub(super) async fn receive(
+        &self,
+        live: &Live,
+        publication: Publication,
+    ) -> Result<Reply, BrokerError> {
+        let admitted_local = publication.packet.qos == QoS::AtLeastOnce
+            && live
+                .inbox
+                .as_ref()
+                .is_some_and(|inbox| inbox.lock().unwrap().simple_qos1());
+        if let Log::Replicated(log) = &self.0.log
+            && let Some((index, route)) = log.plan(live, &publication, admitted_local)
+        {
+            return self
+                .forward_fast(log, live, index, route, publication)
+                .await;
+        }
+        self.act(
+            live,
+            if admitted_local {
+                Operation::ReceiveAdmitted(publication)
+            } else {
+                Operation::Receive(publication)
+            },
+        )
+        .await
+    }
+
+    // Only a publisher with no possible self-delivery may aggregate PUBACKs:
+    // Mosquitto can deliver a self-publication before its corresponding ACK.
+    pub(super) fn can_pipeline(&self, live: &Live) -> bool {
+        let Log::Replicated(log) = &self.0.log else {
+            return false;
+        };
+        log.cluster
+            .read(|machine| machine.state.publisher_only(&live.lease))
+            && live.inbox.as_ref().is_none_or(|inbox| {
+                let inbox = inbox.lock().unwrap();
+                inbox.simple_qos1() && !inbox.has_outbound(&self.0.config)
+            })
+    }
+
+    pub(super) async fn receive_many(
+        &self,
+        live: &Live,
+        publications: Vec<Publication>,
+    ) -> Result<Vec<Reply>, BrokerError> {
+        let Log::Replicated(log) = &self.0.log else {
+            unreachable!()
+        };
+        let mut responses = Vec::with_capacity(publications.len());
+        let mut durable = Vec::new();
+        for publication in publications {
+            let local = publication.packet.qos == QoS::AtLeastOnce && live.inbox.is_some();
+            let mut plan = log.plan(live, &publication, local);
+            if plan.is_some() && !durable.is_empty() {
+                responses.extend(
+                    log.propose(live.lease.clone(), std::mem::take(&mut durable))
+                        .await?,
+                );
+                if matches!(responses.last(), Some(Reply::Stale | Reply::ProtocolError)) {
+                    return Ok(responses);
+                }
+                // Re-read after a durable predecessor. In particular, the
+                // mesh fence must include its committed retained delivery.
+                plan = log.plan(live, &publication, local);
+            }
+            if let Some((index, route)) = plan {
+                responses.push(
+                    self.forward_fast(log, live, index, route, publication)
+                        .await?,
+                );
+                if matches!(responses.last(), Some(Reply::Stale)) {
+                    return Ok(responses);
+                }
+            } else {
+                durable.push(if local {
+                    Operation::ReceiveAdmitted(publication)
+                } else {
+                    Operation::Receive(publication)
+                });
+            }
+        }
+        if !durable.is_empty() {
+            responses.extend(log.propose(live.lease.clone(), durable).await?);
+        }
+        Ok(responses)
+    }
+
+    async fn forward_fast(
+        &self,
+        log: &ReplicatedLog,
+        live: &Live,
+        index: u64,
+        route: fast::Route,
+        publication: Publication,
+    ) -> Result<Reply, BrokerError> {
+        if live.taken.load(Ordering::Acquire) {
+            return Ok(Reply::Stale);
+        }
+        let reason = if route.matched {
+            R::SUCCESS
+        } else {
+            R::NO_MATCHING_SUBSCRIBERS
+        };
+        if !route.targets.is_empty() {
+            self.route_fast(log, live, index, route, publication)
+                .await?;
+        }
+        Ok(if live.taken.load(Ordering::Acquire) {
+            Reply::Stale
+        } else {
+            Reply::PublishReason(reason.0)
+        })
+    }
+
+    async fn route_fast(
+        &self,
+        log: &ReplicatedLog,
+        live: &Live,
+        index: u64,
+        route: fast::Route,
+        publication: Publication,
+    ) -> Result<(), BrokerError> {
+        let sequence = live.sequence.fetch_add(1, Ordering::Relaxed);
+        let message = publication.into_message(route.source);
+        let mut by_node: BTreeMap<u64, Vec<fast::Target>> = BTreeMap::new();
+        for (node, target) in route.targets {
+            by_node.entry(node).or_default().push(target);
+        }
+        for (node, targets) in by_node {
+            let publication = fast::Publication {
+                index,
+                epoch: live.lease.epoch,
+                sequence,
+                message: message.clone(),
+                targets,
+            };
+            if node == log.owner.node {
+                self.deliver_owned_fast(log, node, publication);
+            } else {
+                let _ordered = log.peer_lanes[&node].lock().await;
+                // Do not retry an uncertain send: it may already be in a
+                // recipient's inbox, especially for QoS 0.
+                if let Err(error) = log
+                    .request(node, &fast::Request::Publish(publication))
+                    .await
+                {
+                    // A transient sink cannot survive a lost peer, and its
+                    // transport failure must not close the publishing client.
+                    tracing::debug!(%error, node, "transient mesh delivery was not confirmed");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn receive_mesh(&self, from: u64, body: Bytes) -> Result<Bytes, ClusterError> {
+        let Log::Replicated(log) = &self.0.log else {
+            unreachable!()
+        };
+        let request: fast::Request = rmp_serde::from_slice(&body)
+            .map_err(|error| ClusterError::MeshHandler(error.to_string()))?;
+        match request {
+            fast::Request::Fence(index) => log.wait_applied(index).await?,
+            fast::Request::Publish(publication) => {
+                // Any earlier retained publish or QoS 2 release from this
+                // sender is already enqueued here before this direct delivery.
+                log.wait_applied(publication.index).await?;
+                self.deliver_owned_fast(log, from, publication);
+            }
+        }
+        Ok(Bytes::new())
+    }
+
+    fn deliver_owned_fast(&self, log: &ReplicatedLog, from: u64, publication: fast::Publication) {
+        log.cluster.read(|machine| {
+            if machine
+                .state
+                .owns_peer(from, &publication.message.source.id, publication.epoch)
+            {
+                self.deliver_fast(publication);
+            }
+        });
+    }
+
+    fn deliver_fast(&self, publication: fast::Publication) {
+        let config = &self.0.config;
+        let mut runtime = self.0.runtime.lock().unwrap();
+        for (epoch, packet) in publication.deliveries(!config.allow_duplicate_messages) {
+            runtime.deliver(epoch, packet, config);
+        }
     }
 
     pub(super) async fn next_outbound(&self, live: &Live) -> Result<Option<Outbound>, BrokerError> {
@@ -431,7 +680,16 @@ impl Broker {
                 }
                 Ok(reply)
             }
-            Log::Replicated(log) => log.submit(command).await,
+            Log::Replicated(log) => match command {
+                Command::Act(lease, operation) => {
+                    log.propose_one(BatchEntry::Act(Mutations {
+                        lease,
+                        operations: vec![operation],
+                    }))
+                    .await
+                }
+                command => log.submit(command).await,
+            },
         }
     }
 
@@ -537,25 +795,124 @@ impl Broker {
 }
 
 impl ReplicatedLog {
+    fn plan(
+        &self,
+        live: &Live,
+        publication: &Publication,
+        admitted_local: bool,
+    ) -> Option<(u64, fast::Route)> {
+        self.cluster.leader()?;
+        self.cluster.read(|machine| {
+            machine
+                .state
+                .fast_route(self.owner, &live.lease, &publication.packet, admitted_local)
+                .map(|route| (machine.state.applied, route))
+        })
+    }
+
+    async fn propose(
+        &self,
+        lease: Lease,
+        operations: Vec<Operation>,
+    ) -> Result<Vec<Reply>, ClusterError> {
+        self.enqueue(BatchEntry::Act(Mutations { lease, operations }))
+            .await
+    }
+
+    async fn propose_one(&self, entry: BatchEntry) -> Result<Reply, BrokerError> {
+        Ok(self
+            .enqueue(entry)
+            .await?
+            .pop()
+            .expect("single proposal reply"))
+    }
+
+    async fn enqueue(&self, entry: BatchEntry) -> Result<Vec<Reply>, ClusterError> {
+        let (result, replies) = oneshot::channel();
+        self.proposals
+            .send(proposals::Proposal { entry, result })
+            .await
+            .map_err(|_| ClusterError::Shutdown)?;
+        replies.await.map_err(|_| ClusterError::Shutdown)?
+    }
+
     async fn submit(&self, command: Command) -> Result<Reply, BrokerError> {
+        let fence = match &command {
+            Command::SetAcl { .. } => true,
+            Command::Act(_, operation) => operation.needs_fence(),
+            Command::Batch(batch) => batch.iter().any(BatchEntry::needs_fence),
+            _ => false,
+        };
         // Cluster::submit follows definitive redirects, but never retries an
         // ambiguous write. Propagation closes the MQTT connection on uncertainty.
         let applied = self.cluster.submit(command).await?;
-        let mut observer = self.applied.clone();
-        tokio::time::timeout(
-            self.timeout,
-            observer.wait_for(|index| *index >= applied.index),
-        )
-        .await
-        .map_err(|_| {
-            ClusterError::WriteUncertain(
-                "committed command did not apply on the local broker before its deadline".into(),
-            )
-        })?
-        .map_err(|_| {
-            ClusterError::WriteUncertain("local broker stopped after the command committed".into())
-        })?;
+        self.wait_applied(applied.index).await?;
+        if fence {
+            self.fence_peers(applied.index).await?;
+        }
         Ok(applied.reply)
+    }
+
+    async fn wait_applied(&self, index: u64) -> Result<(), ClusterError> {
+        let mut observer = self.applied.clone();
+        tokio::time::timeout(self.timeout, observer.wait_for(|applied| *applied >= index))
+            .await
+            .map_err(|_| {
+                ClusterError::WriteUncertain(
+                    "committed command did not apply on the local broker before its deadline"
+                        .into(),
+                )
+            })?
+            .map_err(|_| {
+                ClusterError::WriteUncertain(
+                    "local broker stopped after the command committed".into(),
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn request(&self, node: u64, request: &fast::Request) -> Result<(), ClusterError> {
+        let body = rmp_serde::to_vec(request)
+            .map_err(|error| ClusterError::MeshHandler(error.to_string()))?;
+        self.cluster.mesh().request(node, Bytes::from(body)).await?;
+        Ok(())
+    }
+
+    async fn fence_peers(&self, index: u64) -> Result<(), ClusterError> {
+        // An acknowledged subscription (or ACL change) must already be
+        // visible to any existing publisher's local routing replica. A down
+        // node cannot host an active session until its next committed Boot.
+        let deadline = Instant::now() + self.fence_timeout;
+        for &node in self.peer_lanes.keys() {
+            loop {
+                if self.cluster.node_statuses().get(&node) == Some(&NodeStatus::Down) {
+                    break;
+                }
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.request(node, &fast::Request::Fence(index)),
+                )
+                .await
+                {
+                    Ok(Ok(())) => break,
+                    Ok(Err(ClusterError::Shutdown)) => return Err(ClusterError::Shutdown),
+                    Ok(Err(_)) if Instant::now() < deadline => {
+                        // A failed TCP attempt does not fence the old owner:
+                        // allow Raft time to declare it durably Down.
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    _ => {
+                        if self.cluster.node_statuses().get(&node) == Some(&NodeStatus::Down) {
+                            break;
+                        }
+                        return Err(ClusterError::WriteUncertain(format!(
+                            "routing fence did not reach node {node}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_boot(&self) -> Result<(), BrokerError> {
@@ -719,7 +1076,8 @@ impl Runtime {
                     lease,
                 } if owner == here => {
                     if let Some(pending) = self.pending.get_mut(&token) {
-                        let live = Arc::new(Live::new(lease, pending.transient));
+                        let live =
+                            Arc::new(Live::new(lease, pending.transient, pending.receive_maximum));
                         self.live.insert(live.lease.epoch, live.clone());
                         pending.live = Some(live);
                     } else if let Some(abandoned) = abandoned {
@@ -729,22 +1087,7 @@ impl Runtime {
                     }
                 }
                 Effect::Attach { .. } => {}
-                Effect::Deliver { owner, packet } => {
-                    if let Some(live) = self.live.get(&owner) {
-                        let result = live.inbox.as_ref().unwrap().lock().unwrap().offer(
-                            packet,
-                            true,
-                            QoS::ExactlyOnce,
-                            config,
-                        );
-                        if result == Offer::FirstDrop {
-                            report_drop(&live.lease.id);
-                        }
-                        if result == Offer::Ready {
-                            live.ready.notify_one();
-                        }
-                    }
-                }
+                Effect::Deliver { owner, packet } => self.deliver(owner, packet, config),
                 Effect::Ready(owner) => {
                     if let Some(live) = self.live.get(&owner) {
                         live.ready.notify_one();
@@ -758,6 +1101,25 @@ impl Runtime {
                 Effect::Expired(id) => tracing::info!("Expiring client {id} due to timeout."),
                 Effect::QueueFull(id) => report_drop(&id),
             }
+        }
+    }
+
+    fn deliver(&mut self, epoch: Epoch, packet: Delivery, config: &BrokerConfig) {
+        let Some(live) = self.live.get(&epoch) else {
+            return;
+        };
+        let Some(inbox) = &live.inbox else {
+            return;
+        };
+        let result = inbox
+            .lock()
+            .unwrap()
+            .offer(packet, true, QoS::ExactlyOnce, config);
+        if result == Offer::FirstDrop {
+            report_drop(&live.lease.id);
+        }
+        if result == Offer::Ready {
+            live.ready.notify_one();
         }
     }
 }

@@ -270,6 +270,10 @@ fn broker_dispatches_connect_without_waiting_for_the_payload() {
         (b"\x10\x80\x02\0\x06MQIsdp\x83".as_slice(), 0x83),
         (b"\x10\x20\0\x04MQTT\x04", 4),
         (b"\x10\x20\0\x04MQTT\x05", 5),
+        (b"\x10\x20\0\x06MQTT\0X\x05", 5),
+        (b"\x10\x20\0\x06MQTT\0X\x04", 4),
+        (b"\x10\x20\0\x06MQTT\0X\x03", 3),
+        (b"\x10\x20\0\x06MQIsdp\x05", 5),
     ] {
         for i in 0..prefix.len() {
             assert_eq!(peek_connect_protocol_level(&prefix[..i]).unwrap(), None);
@@ -282,6 +286,47 @@ fn broker_dispatches_connect_without_waiting_for_the_payload() {
         peek_connect_protocol_level(b"\x30").unwrap_err().kind,
         E::ExpectedConnect(0x30)
     ));
+}
+
+#[test]
+fn connect_protocol_name_is_compared_as_a_c_string() {
+    // src/handle_connect.c: read_protocol_name consumes the full six bytes,
+    // but read_and_verify_protocol_version stops comparing at NUL.
+    let embedded_nul = b"\x10\x11\0\x06MQTT\0X\x05\x02\0<\0\0\x02c1";
+    let canonical = b"\x10\x0f\0\x04MQTT\x05\x02\0<\0\0\x02c1";
+    let packet = read(embedded_nul, BROKER);
+    assert_eq!(packet, read(canonical, BROKER));
+    assert_eq!(wire(&packet), &canonical[..]);
+    reject(
+        b"\x10\x11\0\x06MQTTXX\x05\x02\0<\0\0\x02c1",
+        BROKER,
+        E::UnknownProtocolName,
+        None,
+    );
+}
+
+#[test]
+fn mqtt_31_protocol_name_with_level_5_requests_a_legacy_connack() {
+    // src/handle_connect.c: read_and_verify_protocol_version sends the refusal
+    // before setting the negotiated protocol to MQTT 5.
+    let raw = b"\x10\x11\0\x06MQIsdp\x05\x02\0<\0\0\x02c1";
+    let mut input = BytesMut::from(raw.as_slice());
+    let error = decode(&mut input, BROKER).unwrap_err();
+    assert_eq!(error.kind, E::UnacceptableProtocolVersion(5));
+    let Some(ErrorResponse::LegacyConnAck(code)) = error.response else {
+        panic!("expected a legacy CONNACK, got {:?}", error.response);
+    };
+    assert_eq!(input, raw.as_slice());
+    let mut response = BytesMut::new();
+    mqx_codec::encode(
+        &mqx_codec::Packet::ConnAck(mqx_codec::ConnAck {
+            session_present: false,
+            code,
+        }),
+        &mut response,
+    )
+    .unwrap();
+    assert_eq!(response, &b"\x20\x02\0\x01"[..]);
 }
 
 #[test]

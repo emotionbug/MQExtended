@@ -222,7 +222,7 @@ impl Processes {
             if nodes == 3 {
                 writeln!(
                     config,
-                    "cluster_node_id {node}\ncluster_bind {}\ncluster_data_dir raft",
+                    "cluster_node_id {node}\ncluster_bind {}\ncluster_data_dir raft\ncluster_insecure_plaintext true",
                     binds[nodes + idx]
                 )
                 .unwrap();

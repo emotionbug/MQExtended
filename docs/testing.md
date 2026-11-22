@@ -56,4 +56,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-CI runs fmt, clippy and the workspace tests; it does not build Mosquitto, so differential tests run locally before a milestone commit.
+CI runs fmt, clippy and the workspace tests in one job, and in a second job builds the Mosquitto references (cached) and runs every differential and failover test. `mqx-bench`'s ignored test needs release builds and runs locally.

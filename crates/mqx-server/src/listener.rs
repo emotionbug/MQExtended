@@ -27,9 +27,23 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CertIdentity {
     None,
+    /// Identity from the client's certificate on the locally verified TLS connection.
     Username(String),
+    /// Common Name asserted by the upstream PROXY peer, not locally authenticated.
+    ForwardedUsername(String),
     /// The transport is valid, but the broker must refuse CONNECT as bad credentials.
     MissingOrInvalid,
+}
+
+impl From<CertIdentity> for mqx_broker::CertIdentity {
+    fn from(identity: CertIdentity) -> Self {
+        match identity {
+            CertIdentity::None => Self::None,
+            CertIdentity::Username(name) => Self::Username(name),
+            CertIdentity::ForwardedUsername(name) => Self::ForwardedUsername(name),
+            CertIdentity::MissingOrInvalid => Self::MissingOrInvalid,
+        }
+    }
 }
 
 #[derive(Debug)]

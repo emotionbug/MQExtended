@@ -34,11 +34,15 @@ Lower crates never depend on higher ones. `mqx-codec`, `mqx-topic`, `mqx-auth` a
 ## Request flows
 
 - **CONNECT on node B.** Authenticate with `mqx-auth`, then commit a claim for the client id with a new connection epoch. Every node applies it; the node holding an older epoch closes that connection (session takeover). B answers CONNACK with `session_present` from the applied state, then pulls any pending inbox state itself instead of waiting for effects that its own apply may have dispatched before the connection registered.
-- **PUBLISH on node X.** X commits the message to the log (QoS 0/1: one commit; QoS 2: receive and release commits). Every node applies it, matches its copy of the subscription index and delivers to the subscribers connected to it, after the per-subscriber ACL `read` check. Delivery across nodes therefore needs no forwarding: node B reaches its subscribers through its own apply. Persistent subscribers get the message in their replicated inbox; the outbound state transition and the acknowledgement are commits too.
+- **PUBLISH on node X.** Two paths, chosen per message and subscriber:
+  - *Fast path* — QoS 0/1 messages to clean-session subscribers. X matches its copy of the replicated subscription index and sends the message over the ordered mesh stream to each node that hosts a matching subscriber (itself included); that node checks ACL `read` and delivers. No consensus round: a clean session dies with its node anyway. Per-peer FIFO streams keep each publisher's messages in order for every subscriber.
+  - *Replicated path* — everything whose state must outlive a node: retained updates, persistent subscribers' inboxes, shared subscriptions (so the round-robin choice is identical everywhere), QoS 2, session and will timers. X commits the command; every node applies it and acts for its own clients. The outbound cursor and acknowledgements of persistent sessions are commits too, batched per proposal.
+
+  SUBSCRIBE, UNSUBSCRIBE and ACL changes are committed and then fenced: the reply waits until every live node has applied them, so the fast path never routes on a stale index. A peer that stops answering is waited out until its lease expires rather than failing the client.
 - **Node loss.** Node leases are replicated state. When a lease expires, the cluster commits the node's `Down` event; every node applies it at the same index, publishes the wills of the lost node's clients once, removes their transient sessions and keeps their persistent sessions for reconnection elsewhere.
 - **Uncertain writes.** When a commit may or may not have happened (leader lost mid-request), the broker closes that client's connection instead of retrying. MQTT's own resend rules (DUP on reconnect) then decide, so a retry can never deliver a QoS 0 message twice.
 
-Standalone mode (no `cluster_*` directives) applies the same state machine to an in-memory log, matching Mosquitto's default `persistence false`. Persistent sessions are always inbox-backed, so in a cluster which node held a session stops mattering after failover. The state itself is described in [data model](data-model.md).
+Standalone mode (no `cluster_*` directives) applies the same state machine to an in-memory log, matching Mosquitto's default `persistence false`. Persistent sessions are always inbox-backed, so in a cluster which node held a session stops mattering after failover. The state itself is described in [data model](data-model.md). Measured latency and throughput are in [performance](performance.md).
 
 ## Why Raft first
 

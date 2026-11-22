@@ -1,36 +1,43 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io::{self, Write};
-use std::net::SocketAddr;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use openraft::alias::{LeaderIdOf, LogIdOf, VoteOf};
+use openraft::alias::{EntryPayloadOf, LeaderIdOf, LogIdOf, MembershipOf, VoteOf};
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::{ClientWriteError, InitializeError, LinearizableReadError, RaftError};
-use openraft::raft::StreamAppendResult;
+use openraft::raft::{
+    AppendEntriesRequest, StreamAppendResult, TransferLeaderRequest, VoteRequest,
+};
 use openraft::{BasicNode, Raft, ReadPolicy, ServerState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, timeout, timeout_at};
 
+use crate::admission::Admission;
 use crate::lease::{LeaseCommand, Leases, Stamp};
-use crate::snapshot::{Snapshot, SnapshotData, SnapshotMeta, Store, atomic_write};
+use crate::mtls::Tls;
+use crate::mux::{CallError, Response, write_responses};
+use crate::snapshot::{
+    Snapshot, SnapshotMeta, Store, atomic_write, open_private_file, prepare_dir,
+};
+use crate::snapshot_file::SnapshotData;
 use crate::transport::{
-    Endpoint, MAX_COMMAND, MAX_FRAME, MAX_SNAPSHOT, Network, Op, decode, encode, invalid_data,
-    read_frame, read_message, write_frame, write_message,
+    Connection, Endpoint, Frame, Limits, Network, Op, decode, encode, invalid_data, write_control,
 };
 use crate::wal::Wal;
 use crate::{ClusterConfig, ClusterError, Mesh, NodeEvent, NodeStatus, StateMachine};
 
 const IDENTITY_FILE: &str = "node.mpk";
-const MAX_CONNECTIONS: usize = 512;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_WINDOW: usize = 256;
 pub(crate) type Leadership = LeaderIdOf<Types>;
 pub(crate) type LogId = LogIdOf<Types>;
 type WriteResponse = Result<Option<Bytes>, String>;
@@ -96,6 +103,7 @@ struct Core<S: StateMachine> {
     raft: Raft<Types, Store<S>>,
     store: Store<S>,
     mesh: Mesh,
+    membership: MembershipOf<Types>,
     request_timeout: Duration,
     snapshot_timeout: Duration,
     lease_interval: Duration,
@@ -112,25 +120,43 @@ impl<S: StateMachine> Cluster<S> {
         let ClusterConfig {
             node_id,
             data_dir,
+            security,
             peers,
             request_timeout,
             snapshot_timeout,
+            max_snapshot_size,
+            max_command_size,
+            max_append_size,
+            max_mesh_size,
             lease_interval,
             lease_timeout,
             ..
         } = config;
         let peer_bytes = encode(&peers)?;
         let membership_digest = Sha256::digest(&peer_bytes).into();
-        let endpoint = Arc::new(Endpoint {
-            node_id,
-            peers,
-            membership_digest,
-        });
-        let storage_endpoint = endpoint.clone();
-        let (wal, store) = tokio::task::spawn_blocking(move || {
-            let wal = Wal::open(&data_dir.join("wal"))?;
+        let (endpoint, wal, store) = tokio::task::spawn_blocking(move || {
+            let tls = Tls::load(&security, node_id)?;
+            let limits = Limits {
+                command: max_command_size,
+                append: max_append_size,
+                mesh: max_mesh_size,
+            };
+            let endpoint = Arc::new(Endpoint::new(
+                node_id,
+                peers,
+                membership_digest,
+                tls,
+                max_snapshot_size,
+                limits,
+            ));
+            prepare_dir(&data_dir, false)?;
+            let wal = Wal::open(&data_dir.join("wal"), max_append_size)?;
             let identity = encode(&(1u8, node_id, Bytes::from(peer_bytes)))?;
-            match fs::read(data_dir.join(IDENTITY_FILE)) {
+            match open_private_file(&data_dir.join(IDENTITY_FILE)).and_then(|mut file| {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data)?;
+                Ok(data)
+            }) {
                 Ok(existing) if existing == identity => {}
                 Ok(_) => {
                     return Err(ClusterError::InvalidConfig(
@@ -142,8 +168,8 @@ impl<S: StateMachine> Cluster<S> {
                 }
                 Err(error) => return Err(error.into()),
             }
-            let leases = Leases::new(storage_endpoint.peers.keys().copied());
-            Ok((wal, Store::open(state_machine, data_dir, leases)?))
+            let leases = Leases::new(endpoint.peers.keys().copied());
+            Ok((endpoint, wal, Store::open(state_machine, data_dir, leases)?))
         })
         .await
         .map_err(io::Error::other)??;
@@ -156,10 +182,24 @@ impl<S: StateMachine> Cluster<S> {
         )
         .await
         .map_err(|error| ClusterError::Raft(error.to_string()))?;
+        let voters: BTreeMap<_, _> = endpoint
+            .peers
+            .iter()
+            .map(|(&id, address)| {
+                (
+                    id,
+                    BasicNode {
+                        addr: address.to_string(),
+                    },
+                )
+            })
+            .collect();
+        let membership = MembershipOf::<Types>::from(voters);
         let core = Arc::new(Core {
             raft,
             store,
             mesh: Mesh::new(endpoint, request_timeout),
+            membership: membership.clone(),
             request_timeout,
             snapshot_timeout,
             lease_interval,
@@ -172,21 +212,9 @@ impl<S: StateMachine> Cluster<S> {
             core,
             driver: Mutex::new(Some(driver)),
         }));
-        let members: BTreeMap<_, _> = cluster
-            .members()
-            .iter()
-            .map(|(&id, address)| {
-                (
-                    id,
-                    BasicNode {
-                        addr: address.to_string(),
-                    },
-                )
-            })
-            .collect();
         // OpenRaft permits concurrent initialization with identical membership. A vote,
         // snapshot or WAL entry from a previous run fences out another initialization.
-        match cluster.0.core.raft.initialize(members).await {
+        match cluster.0.core.raft.initialize(membership).await {
             Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => Ok(cluster),
             Err(error) => {
                 let _ = cluster.shutdown().await;
@@ -200,9 +228,9 @@ impl<S: StateMachine> Cluster<S> {
     /// A lost reply or interrupted in-flight proposal returns `WriteUncertain`; retry
     /// only if the application command is idempotent or has a replicated deduplication key.
     ///
-    /// The MessagePack command must fit in 8 MiB.
+    /// The encoded command must fit in `ClusterConfig::max_command_size`.
     pub async fn submit(&self, command: S::Command) -> Result<S::Response, ClusterError> {
-        let body = encode_command(command)?;
+        let body = encode_command(command, self.0.core.mesh.endpoint.limits.command)?;
         let core = &self.0.core;
         let deadline = Instant::now() + core.request_timeout;
         let mut hint = None;
@@ -212,29 +240,23 @@ impl<S: StateMachine> Cluster<S> {
             let response = if target == self.node_id() {
                 core.write_local(body.clone(), deadline).await?
             } else {
-                let mut stream = match core.connect(target, deadline).await {
-                    Ok(stream) => stream,
-                    Err(_) => {
+                match core.rpc(target, Op::Write, body.clone(), deadline).await {
+                    Ok(response) => decode(&response)
+                        .map_err(|error| ClusterError::WriteUncertain(error.to_string()))?,
+                    Err(CallError::Unsent(_)) => {
                         core.retry_pause(deadline).await?;
                         continue;
                     }
-                };
-                timeout_at(deadline, async {
-                    core.mesh
-                        .endpoint
-                        .header(&mut stream, target, Op::Write)
-                        .await?;
-                    write_frame(&mut stream, &body, MAX_COMMAND).await?;
-                    read_message(&mut stream).await
-                })
-                .await
-                .map_err(|_| ClusterError::WriteUncertain("forwarded proposal timed out".into()))?
-                .map_err(|error| ClusterError::WriteUncertain(error.to_string()))?
+                    Err(CallError::Uncertain(error) | CallError::Remote(error)) => {
+                        return Err(ClusterError::WriteUncertain(error.to_string()));
+                    }
+                }
             };
             match response {
                 Route::Value(response) => return decode_response(response),
                 Route::Redirect(leader) => hint = leader,
                 Route::Retry => {}
+                Route::Rejected => return Err(ClusterError::WriteRejected),
                 Route::Failed(error) => return Err(ClusterError::WriteUncertain(error)),
             }
             core.retry_pause(deadline).await?;
@@ -250,12 +272,13 @@ impl<S: StateMachine> Cluster<S> {
     ) -> Result<Option<S::Response>, ClusterError> {
         let core = &self.0.core;
         core.check_running()?;
-        let body = encode_command(command)?;
+        let body = encode_command(command, core.mesh.endpoint.limits.command)?;
         let deadline = Instant::now() + core.request_timeout;
         match core.write_local(body, deadline).await? {
             Route::Value(response) => decode_response(response).map(Some),
             Route::Redirect(_) => Ok(None),
             Route::Retry => Err(ClusterError::Deadline),
+            Route::Rejected => Err(ClusterError::WriteRejected),
             Route::Failed(error) => Err(ClusterError::WriteUncertain(error)),
         }
     }
@@ -287,7 +310,7 @@ impl<S: StateMachine> Cluster<S> {
             match response {
                 Route::Value(index) => break index,
                 Route::Redirect(leader) => hint = leader,
-                Route::Retry | Route::Failed(_) => {}
+                Route::Retry | Route::Failed(_) | Route::Rejected => {}
             }
             core.retry_pause(deadline).await?;
         };
@@ -365,6 +388,7 @@ enum Route<T> {
     Redirect(Option<u64>),
     Retry,
     Failed(String),
+    Rejected,
 }
 
 impl<S: StateMachine> Core<S> {
@@ -390,15 +414,18 @@ impl<S: StateMachine> Core<S> {
         self.raft.metrics().borrow_watched().current_leader
     }
 
-    async fn connect(&self, target: u64, deadline: Instant) -> io::Result<TcpStream> {
-        // A stale leader with an unreachable address must not consume the whole
-        // deadline while newer leader information is arriving through Raft.
+    async fn rpc(
+        &self,
+        target: u64,
+        op: Op,
+        body: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, CallError> {
+        // A stale leader's unreachable address must not consume the entire deadline.
+        let connect = deadline.min(Instant::now() + Duration::from_millis(200));
         self.mesh
             .endpoint
-            .connect(
-                target,
-                deadline.min(Instant::now() + self.lease_interval.min(Duration::from_millis(200))),
-            )
+            .call(target, op, body, deadline, connect)
             .await
     }
 
@@ -454,16 +481,10 @@ impl<S: StateMachine> Core<S> {
     }
 
     async fn read_remote(&self, target: u64, deadline: Instant) -> io::Result<Route<u64>> {
-        let mut stream = self.connect(target, deadline).await?;
-        timeout_at(deadline, async {
-            self.mesh
-                .endpoint
-                .header(&mut stream, target, Op::ReadIndex)
-                .await?;
-            read_message(&mut stream).await
-        })
-        .await
-        .map_err(|_| io::ErrorKind::TimedOut)?
+        let response = self
+            .rpc(target, Op::ReadIndex, Bytes::new(), deadline)
+            .await?;
+        decode(&response)
     }
 
     fn leadership(&self) -> Option<Leadership> {
@@ -511,15 +532,8 @@ impl<S: StateMachine> Core<S> {
             let deadline = Instant::now() + self.lease_interval;
             if leader == node_id {
                 let _ = timeout_at(deadline, self.heartbeat(node_id)).await;
-            } else if let Ok(mut stream) = self.connect(leader, deadline).await {
-                let _ = timeout_at(deadline, async {
-                    self.mesh
-                        .endpoint
-                        .header(&mut stream, leader, Op::Lease)
-                        .await?;
-                    read_message::<Route<Option<Bytes>>>(&mut stream).await
-                })
-                .await;
+            } else {
+                let _ = self.rpc(leader, Op::Lease, Bytes::new(), deadline).await;
             }
         }
     }
@@ -562,6 +576,7 @@ impl<S: StateMachine> Core<S> {
             }
         });
         let result = self.raft.try_shutdown().await;
+        self.mesh.endpoint.close().await;
         self.store.close().await?;
         wal.close().await?;
         result.map_err(|error| ClusterError::Raft(error.to_string()))
@@ -569,6 +584,7 @@ impl<S: StateMachine> Core<S> {
 
     async fn serve(self: &Arc<Self>, listener: TcpListener) {
         let mut handlers = JoinSet::new();
+        let admission = Arc::new(Admission::default());
         let mut stop = self.mesh.stop.subscribe();
         loop {
             tokio::select! {
@@ -577,14 +593,19 @@ impl<S: StateMachine> Core<S> {
                 Some(done) = handlers.join_next(), if !handlers.is_empty() => {
                     if let Err(error) = done { tracing::debug!(%error, "cluster RPC task stopped"); }
                 }
-                accepted = listener.accept(), if handlers.len() < MAX_CONNECTIONS => {
-                    let core = self.clone();
+                accepted = listener.accept() => {
                     match accepted {
-                        Ok((stream, _)) => { handlers.spawn(async move {
-                            if let Err(error) = core.connection(stream).await {
-                                tracing::debug!(%error, "cluster RPC failed");
-                            }
-                        }); }
+                        Ok((stream, source)) => {
+                            let Some(idle) = admission.idle() else { continue; };
+                            let core = self.clone();
+                            let admission = admission.clone();
+                            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                            handlers.spawn(async move {
+                                if let Err(error) = core.connection(stream, source.ip().to_canonical(), deadline, &admission, idle).await {
+                                    tracing::trace!(%error, "cluster RPC rejected or failed");
+                                }
+                            });
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "cluster TCP accept failed");
                             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -597,99 +618,291 @@ impl<S: StateMachine> Core<S> {
         handlers.shutdown().await;
     }
 
-    async fn connection(&self, mut stream: TcpStream) -> io::Result<()> {
-        stream.set_nodelay(true)?;
-        let (from, op) = timeout(
-            self.request_timeout,
-            self.mesh.endpoint.accept_header(&mut stream),
-        )
+    async fn connection(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        source: IpAddr,
+        deadline: Instant,
+        admission: &Admission,
+        idle: OwnedSemaphorePermit,
+    ) -> io::Result<()> {
+        let (mut stream, from, op) = timeout_at(deadline, async {
+            stream.readable().await?;
+            let _handshake = admission
+                .handshake(source)
+                .ok_or(io::ErrorKind::WouldBlock)?;
+            drop(idle);
+            self.mesh.endpoint.accept(stream).await
+        })
         .await
         .map_err(|_| io::ErrorKind::TimedOut)??;
-        let budget = if matches!(op, Op::Snapshot) {
-            self.snapshot_timeout
-        } else {
-            self.request_timeout
-        };
-        timeout(budget, self.dispatch(&mut stream, from, op))
+        let _rpc = admission.rpc().ok_or(io::ErrorKind::WouldBlock)?;
+        match op {
+            Op::Session => self.run_session(stream, from, deadline).await,
+            Op::Snapshot => timeout(self.snapshot_timeout, async {
+                self.receive_snapshot(&mut stream, from).await?;
+                stream.flush().await
+            })
             .await
-            .map_err(|_| io::ErrorKind::TimedOut)?
+            .map_err(|_| io::ErrorKind::TimedOut)?,
+            _ => Err(invalid_data("RPC requires an established cluster session")),
+        }
     }
 
-    async fn dispatch(&self, stream: &mut TcpStream, from: u64, op: Op) -> io::Result<()> {
-        match op {
-            Op::Append => {
-                let result = self
-                    .raft
-                    .append_entries(read_message(stream).await?)
-                    .await
-                    .map(|result| -> StreamAppendResult<Types> { result.map_err(Into::into) });
-                write_message(stream, &result).await
+    async fn run_session(
+        self: &Arc<Self>,
+        mut stream: Connection,
+        from: u64,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        // A successor connection cannot overtake mesh work already being handled
+        // on the previous connection. The old reader and ordered worker both exit
+        // before this guard is released.
+        let _session = self.mesh.endpoint.accept_session(from)?;
+        timeout_at(deadline, async {
+            stream.write_u8(0).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut)??;
+        let (reader, writer) = tokio::io::split(stream);
+        let (responses, replies) = mpsc::channel(SESSION_WINDOW);
+        let (mesh, mesh_rx) = mpsc::channel(SESSION_WINDOW);
+        let (append, append_rx) = mpsc::channel(SESSION_WINDOW);
+        tokio::select! {
+            result = write_responses(writer, replies, self.request_timeout) => result,
+            result = self.read_calls(reader, from, &responses, mesh, append) => result,
+            () = self.run_ordered(from, mesh_rx, &responses) => Ok(()),
+            () = self.run_ordered(from, append_rx, &responses) => Ok(()),
+        }
+    }
+
+    async fn read_calls(
+        self: &Arc<Self>,
+        mut reader: impl AsyncReadExt + Unpin,
+        from: u64,
+        responses: &mpsc::Sender<Response>,
+        mesh: mpsc::Sender<Request>,
+        append: mpsc::Sender<Request>,
+    ) -> io::Result<()> {
+        let limits = self.mesh.endpoint.limits;
+        let mut workers = JoinSet::new();
+        let mut latest = 0u64;
+        loop {
+            while let Some(result) = workers.try_join_next() {
+                result.map_err(io::Error::other)?;
             }
-            Op::Vote => {
-                let result = self.raft.vote(read_message(stream).await?).await;
-                write_message(stream, &result).await
-            }
-            Op::PreVote => {
-                let result = self.raft.pre_vote(read_message(stream).await?).await;
-                write_message(stream, &result).await
-            }
-            Op::Transfer => {
-                let result = self
-                    .raft
-                    .handle_transfer_leader(read_message(stream).await?)
-                    .await;
-                write_message(stream, &result).await
-            }
-            Op::Snapshot => {
-                let (vote, meta): (VoteOf<Types>, SnapshotMeta) = read_message(stream).await?;
-                let leases = read_frame(stream, MAX_FRAME).await?;
-                let app = read_frame(stream, MAX_SNAPSHOT).await?;
-                let result = self
-                    .raft
-                    .install_full_snapshot(
-                        vote,
-                        Snapshot {
-                            meta,
-                            snapshot: SnapshotData { leases, app },
-                        },
-                    )
-                    .await;
-                write_message(stream, &result).await
-            }
-            Op::Write => {
-                let body = read_frame(stream, MAX_COMMAND).await?;
-                write_message(stream, &self.write(Command::App(body)).await).await
-            }
-            Op::ReadIndex => write_message(stream, &self.read_index().await).await,
-            Op::Lease => write_message(stream, &self.heartbeat(from).await).await,
-            Op::MeshRequest | Op::MeshSend => {
-                let body = read_frame(stream, MAX_FRAME).await?;
-                let result = self.mesh.handle(from, body).await;
-                if matches!(op, Op::MeshSend) {
-                    if let Err(error) = result {
-                        tracing::debug!(%error, from, "mesh send handler failed");
-                    }
-                    return Ok(());
+            // Idle sessions are normal. Once a frame begins, bound its receive time.
+            let mut id = [0; 8];
+            id[0] = reader.read_u8().await?;
+            let request = timeout(self.request_timeout, async {
+                reader.read_exact(&mut id[1..]).await?;
+                let id = u64::from_be_bytes(id);
+                let op = Op::try_from(reader.read_u8().await?)?;
+                if id <= latest || matches!(op, Op::Session | Op::Snapshot) {
+                    return Err(invalid_data("invalid cluster session request"));
                 }
-                match result {
-                    Ok(body) => {
-                        stream.write_u8(0).await?;
-                        write_frame(stream, &body, MAX_FRAME).await
+                let frame = limits
+                    .read_frame(&mut reader, limits.request(op), matches!(op, Op::Append))
+                    .await?;
+                Ok(Request { id, op, frame })
+            })
+            .await
+            .map_err(|_| io::ErrorKind::TimedOut)??;
+            latest = request.id;
+            match request.op {
+                Op::MeshRequest | Op::MeshSend => mesh
+                    .try_send(request)
+                    .map_err(|_| io::ErrorKind::WouldBlock)?,
+                Op::Append => append
+                    .try_send(request)
+                    .map_err(|_| io::ErrorKind::WouldBlock)?,
+                _ => {
+                    if workers.len() >= SESSION_WINDOW {
+                        return Err(io::ErrorKind::WouldBlock.into());
                     }
-                    Err(error) => {
-                        stream.write_u8(1).await?;
-                        write_frame(stream, error.to_string().as_bytes(), MAX_FRAME).await
-                    }
+                    let core = self.clone();
+                    let responses = responses.clone();
+                    workers.spawn(async move { core.process_rpc(from, request, &responses).await });
                 }
             }
         }
     }
+
+    async fn run_ordered(
+        &self,
+        from: u64,
+        mut calls: mpsc::Receiver<Request>,
+        responses: &mpsc::Sender<Response>,
+    ) {
+        while let Some(request) = calls.recv().await {
+            self.process_rpc(from, request, responses).await;
+        }
+    }
+
+    async fn process_rpc(&self, from: u64, request: Request, responses: &mpsc::Sender<Response>) {
+        let body = timeout(
+            self.request_timeout,
+            self.dispatch(from, request.op, &request.frame),
+        )
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))
+        .and_then(|result| result);
+        if matches!(request.op, Op::MeshSend) {
+            if let Err(error) = body {
+                tracing::debug!(%error, from, "mesh send handler failed");
+            }
+        } else {
+            let body = body.and_then(|body| {
+                if body.len() > self.mesh.endpoint.limits.response(request.op) {
+                    return Err(invalid_data(
+                        "cluster RPC response exceeds configured limit",
+                    ));
+                }
+                Ok(body)
+            });
+            let _ = responses
+                .send(Response {
+                    id: request.id,
+                    body,
+                })
+                .await;
+        }
+    }
+
+    async fn dispatch(&self, from: u64, op: Op, frame: &Frame) -> io::Result<Bytes> {
+        match op {
+            Op::Append => {
+                let request: AppendEntriesRequest<Types> = decode(frame)?;
+                check_vote_sender(request.vote, from)?;
+                for entry in &request.entries {
+                    if let EntryPayloadOf::<Types>::Membership(membership) = &entry.payload
+                        && *membership != self.membership
+                    {
+                        return Err(invalid_data(
+                            "Raft log membership must match the static cluster",
+                        ));
+                    }
+                }
+                let result = self
+                    .raft
+                    .append_entries(request)
+                    .await
+                    .map(|result| -> StreamAppendResult<Types> { result.map_err(Into::into) });
+                encode(&result).map(Bytes::from)
+            }
+            Op::Vote | Op::PreVote => {
+                let request: VoteRequest<Types> = decode(frame)?;
+                check_vote_sender(request.vote, from)?;
+                let result = if matches!(op, Op::Vote) {
+                    self.raft.vote(request).await
+                } else {
+                    self.raft.pre_vote(request).await
+                };
+                encode(&result).map(Bytes::from)
+            }
+            Op::Transfer => {
+                let request: TransferLeaderRequest<Types> = decode(frame)?;
+                check_vote_sender(*request.from_leader(), from)?;
+                encode(&self.raft.handle_transfer_leader(request).await).map(Bytes::from)
+            }
+            Op::Write => {
+                encode(&self.write_remote(from, frame.bytes.clone()).await).map(Bytes::from)
+            }
+            Op::ReadIndex => encode(&self.read_index().await).map(Bytes::from),
+            Op::Lease => encode(&self.heartbeat(from).await).map(Bytes::from),
+            Op::MeshRequest | Op::MeshSend => self
+                .mesh
+                .handle(from, frame.bytes.clone())
+                .await
+                .map_err(io::Error::other),
+            Op::Session | Op::Snapshot => Err(invalid_data("invalid cluster session request")),
+        }
+    }
+
+    async fn receive_snapshot(&self, stream: &mut Connection, from: u64) -> io::Result<()> {
+        let endpoint = &self.mesh.endpoint;
+        let (vote, meta): (VoteOf<Types>, SnapshotMeta) =
+            endpoint.limits.read_control(stream).await?;
+        self.check_snapshot_meta(vote, from, &meta)?;
+        let (stored, data) = SnapshotData::receive(
+            stream,
+            self.store.dir().to_path_buf(),
+            endpoint.max_snapshot_size,
+        )
+        .await?;
+        if stored != meta {
+            return Err(invalid_data(
+                "snapshot metadata does not match the transfer header",
+            ));
+        }
+        self.store.validate_snapshot(&data)?;
+        let result = self
+            .raft
+            .install_full_snapshot(
+                vote,
+                Snapshot {
+                    meta,
+                    snapshot: data,
+                },
+            )
+            .await;
+        write_control(stream, &result).await
+    }
+
+    async fn write_remote(&self, from: u64, body: Bytes) -> Route<Option<Bytes>> {
+        if decode::<S::Command>(&body).is_err() {
+            tracing::warn!(from, "rejected undecodable cluster application command");
+            return Route::Rejected;
+        }
+        self.write(Command::App(body)).await
+    }
+
+    fn check_snapshot_meta(
+        &self,
+        vote: VoteOf<Types>,
+        from: u64,
+        meta: &SnapshotMeta,
+    ) -> io::Result<()> {
+        check_vote_sender(vote, from)?;
+        let last = meta
+            .last_log_id
+            .ok_or_else(|| invalid_data("missing snapshot log id"))?;
+        let membership_log = meta
+            .last_membership
+            .log_id()
+            .ok_or_else(|| invalid_data("missing snapshot membership log id"))?;
+        if !vote.committed
+            || last.leader_id > vote.leader_id
+            || last.index < membership_log.index
+            || last < membership_log
+            || !self
+                .mesh
+                .endpoint
+                .peers
+                .contains_key(&last.leader_id.node_id)
+            || *meta.last_membership.membership() != self.membership
+        {
+            return Err(invalid_data(
+                "snapshot metadata is inconsistent with the leader or membership",
+            ));
+        }
+        Ok(())
+    }
 }
 
-fn encode_command(command: impl Serialize) -> Result<Bytes, ClusterError> {
+struct Request {
+    id: u64,
+    op: Op,
+    frame: Frame,
+}
+
+fn encode_command(command: impl Serialize, max: usize) -> Result<Bytes, ClusterError> {
     let body = encode(&command)?;
-    if body.len() > MAX_COMMAND {
-        return Err(invalid_data("encoded application command exceeds 8 MiB").into());
+    if body.len() > max {
+        return Err(
+            invalid_data("encoded application command exceeds configured size limit").into(),
+        );
     }
     Ok(body.into())
 }
@@ -701,4 +914,105 @@ fn decode_response<R: serde::de::DeserializeOwned>(
         ClusterError::WriteUncertain("leader returned no application response".into())
     })?;
     decode(&body).map_err(|error| ClusterError::WriteUncertain(error.to_string()))
+}
+
+fn check_vote_sender(vote: VoteOf<Types>, from: u64) -> io::Result<()> {
+    if vote.leader_id.node_id != from {
+        return Err(invalid_data(
+            "Raft request vote does not belong to the sending member",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClusterSecurity, SnapshotPolicy};
+    use openraft::alias::EntryOf;
+    use openraft::storage::RaftStateMachine;
+
+    #[derive(Default)]
+    struct Counter(u64);
+
+    impl StateMachine for Counter {
+        type Command = u64;
+        type Response = (u64, u64);
+
+        fn apply(&mut self, index: u64, increment: u64) -> Self::Response {
+            self.0 += increment;
+            (index, self.0)
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            encode(&self.0).unwrap()
+        }
+
+        fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
+            self.0 = decode(bytes)?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_schema_mismatch_is_rejected_before_proposal() {
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserve.local_addr().unwrap();
+        drop(reserve);
+        let root = tempfile::tempdir().unwrap();
+        let mut config = ClusterConfig::new(
+            1,
+            address,
+            BTreeMap::from([(1, address)]),
+            root.path().join("data"),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        config.snapshot_policy = SnapshotPolicy::Never;
+        config.lease_interval = Duration::from_secs(60);
+        config.lease_timeout = Duration::from_secs(120);
+        let node = Cluster::start(config, Counter::default()).await.unwrap();
+        let (index, total) = node.submit(1).await.unwrap();
+        assert_eq!(total, 1);
+        let core = &node.0.core;
+        let response = core
+            .write_remote(1, encode(&"not a counter command").unwrap().into())
+            .await;
+        assert!(matches!(response, Route::Rejected));
+        assert_eq!(node.submit(2).await.unwrap(), (index + 1, 3));
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_existing_undecodable_entry_does_not_stop_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(
+            Counter::default(),
+            root.path().to_path_buf(),
+            Leases::new([1].into_iter()),
+        )
+        .unwrap();
+        let leader = Leadership {
+            term: 1,
+            node_id: 1,
+        };
+        let entry = |index, body: Vec<u8>| {
+            Ok((
+                EntryOf::<Types> {
+                    log_id: LogId::new(leader, index),
+                    payload: EntryPayloadOf::<Types>::Normal(Command::App(body.into())),
+                },
+                None,
+            ))
+        };
+        store
+            .apply(futures_util::stream::iter([
+                entry(1, encode(&1u64).unwrap()),
+                entry(2, encode(&"older incompatible command").unwrap()),
+                entry(3, encode(&2u64).unwrap()),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(store.applied_state().await.unwrap().0.unwrap().index, 3);
+        assert_eq!(store.state.read().unwrap().app.0, 3);
+    }
 }

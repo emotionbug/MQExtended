@@ -9,8 +9,7 @@ use mqx_auth::{AclFileError, PasswordFile};
 use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, SecurityHandle};
 use mqx_codec::QoS;
 use mqx_server::{
-    CertIdentity, ListenerConfig, SecurityConfig, Server, ServerConfig, ServerError,
-    parse_command_line_port,
+    ListenerConfig, SecurityConfig, Server, ServerConfig, ServerError, parse_command_line_port,
 };
 
 const USAGE: &str =
@@ -129,7 +128,17 @@ async fn run() -> Result<(), ServerError> {
     let server = Server::bind(&config).await?;
     let cluster = config.cluster.take();
     let clustered = cluster.is_some();
-    let broker = if let Some(cluster) = cluster {
+    let broker = if let Some(mut cluster) = cluster {
+        let limits = &config.limits;
+        let packet_limit = if limits.max_packet_size == 0 {
+            0
+        } else {
+            limits.max_packet_size.max(limits.message_size_limit)
+        };
+        cluster
+            .set_packet_limit(packet_limit)
+            .map_err(mqx_broker::BrokerError::from)
+            .map_err(ServerError::Cluster)?;
         let broker = Broker::clustered(broker_config(&config), cluster)
             .await
             .map_err(ServerError::Cluster)?;
@@ -153,15 +162,7 @@ async fn run() -> Result<(), ServerError> {
                     let info = ConnectionInfo {
                         peer_addr: connection.peer_addr,
                         listener: policies[connection.listener_index].clone(),
-                        cert_identity: match connection.cert_identity {
-                            CertIdentity::None => mqx_broker::CertIdentity::None,
-                            CertIdentity::Username(name) => {
-                                mqx_broker::CertIdentity::Username(name)
-                            }
-                            CertIdentity::MissingOrInvalid => {
-                                mqx_broker::CertIdentity::MissingOrInvalid
-                            }
-                        },
+                        cert_identity: connection.cert_identity.into(),
                     };
                     if let Err(error) = broker
                         .serve_accepted(connection.stream, info, connection.accepted_at)

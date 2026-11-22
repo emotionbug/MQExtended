@@ -1,6 +1,7 @@
 use std::{fs, io, net::SocketAddr, sync::Arc, time::Duration};
 
-use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy};
+use mqx_auth::PasswordFile;
+use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, SecurityHandle};
 use mqx_server::{CertIdentity, Server, ServerConfig};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, CertificateRevocationListParams,
@@ -103,8 +104,14 @@ impl RunningBroker {
         let addr = server.local_addrs().next().unwrap().unwrap();
         // The handler sends observations but always drives the actual MQTT broker.
         let broker = Broker::new(BrokerConfig::default());
+        let password = config
+            .security_for(&config.listeners[0])
+            .password_file
+            .as_deref()
+            .map(|path| PasswordFile::load(path).unwrap());
         let listener = Arc::new(ListenerPolicy {
             allow_anonymous: Some(config.allow_anonymous_for(&config.listeners[0])),
+            security: SecurityHandle::new(password, None),
             ..ListenerPolicy::default()
         });
         let shutdown = broker.clone();
@@ -119,20 +126,13 @@ impl RunningBroker {
                     accepted
                         .send((connection.peer_addr, connection.cert_identity.clone()))
                         .unwrap();
-                    let cert_identity = match connection.cert_identity {
-                        CertIdentity::None => mqx_broker::CertIdentity::None,
-                        CertIdentity::Username(name) => mqx_broker::CertIdentity::Username(name),
-                        CertIdentity::MissingOrInvalid => {
-                            mqx_broker::CertIdentity::MissingOrInvalid
-                        }
-                    };
                     broker
                         .serve_accepted(
                             connection.stream,
                             ConnectionInfo {
                                 peer_addr: connection.peer_addr,
                                 listener,
-                                cert_identity,
+                                cert_identity: connection.cert_identity.into(),
                             },
                             connection.accepted_at,
                         )
@@ -267,7 +267,7 @@ async fn proxy_v2_local_and_unverified_certificate_never_reach_mqtt() {
 async fn proxy_v2_verified_common_name_is_used_instead_of_mqtt_credentials() {
     // Mosquitto test/broker/21-proxy-v2-ssl-common-name-{success,failure}.py.
     let config = local_config(
-        "enable_proxy_protocol 2\nproxy_protocol_v2_require_tls true\nrequire_certificate true\nuse_identity_as_username true",
+        "enable_proxy_protocol 2\nproxy_protocol_v2_require_tls true\nrequire_certificate true\nuse_identity_as_username true\nallow_anonymous true",
     );
     let mut broker = RunningBroker::start(&config).await;
     let mut stream = TcpStream::connect(broker.addr).await.unwrap();
@@ -277,7 +277,7 @@ async fn proxy_v2_verified_common_name_is_used_instead_of_mqtt_credentials() {
     assert_eq!(read_ack(&mut stream).await, ACCEPT);
     assert_eq!(
         broker.observed().await.1,
-        CertIdentity::Username("device".into())
+        CertIdentity::ForwardedUsername("device".into())
     );
     let mut stream = TcpStream::connect(broker.addr).await.unwrap();
     let ssl_without_cn = b"\x20\x00\x05\x05\x00\x00\x00\x00";
@@ -287,6 +287,57 @@ async fn proxy_v2_verified_common_name_is_used_instead_of_mqtt_credentials() {
         .unwrap();
     assert_eq!(read_ack(&mut stream).await, [0x20, 2, 0, 4]);
     assert_eq!(broker.observed().await.1, CertIdentity::MissingOrInvalid);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn forwarded_common_name_cannot_bypass_password_file_but_local_mtls_can() {
+    let pki = TestPki::with_common_name("test");
+    let path = pki.dir.path().join("passwords");
+    // Mosquitto test/broker/09-pwfile-parse-invalid.py: user and password "test".
+    fs::write(&path, "test:$6$njERlZMi/7DzNB9E$iiavfuXvUm8iyDZArTy7smTxh07GXXOrOsqxfW6gkOYVXHGk+W+i/8d3xDxrMwEPygEBhoA8A/gjQC0N2M4Lkw==\n").unwrap();
+    let basic_auth = format!("allow_anonymous false\npassword_file {}", path.display());
+    let correct_password =
+        b"\x10\x1b\x00\x04MQTT\x04\xc2\x00\x3c\x00\x03dev\x00\x04test\x00\x04test";
+    let plain = RunningBroker::start(&local_config(&basic_auth)).await;
+    let mut stream = TcpStream::connect(plain.addr).await.unwrap();
+    stream.write_all(correct_password).await.unwrap();
+    assert_eq!(read_ack(&mut stream).await, ACCEPT);
+    plain.stop().await;
+
+    let auth = format!("require_certificate true\nuse_identity_as_username true\n{basic_auth}");
+    let proxy = local_config(&format!("enable_proxy_protocol 2\n{auth}"));
+    let mut broker = RunningBroker::start(&proxy).await;
+    let cn = b"\x20\x00\x0c\x05\x00\x00\x00\x00\x22\x00\x04test";
+    for connect in [CONNECT, correct_password.as_slice()] {
+        let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+        stream.write_all(&v2(cn, connect)).await.unwrap();
+        // Even correctly supplied MQTT credentials are discarded with a forwarded CN.
+        assert_eq!(read_ack(&mut stream).await, [0x20, 2, 0, 5]);
+        assert_eq!(
+            broker.observed().await.1,
+            CertIdentity::ForwardedUsername("test".into())
+        );
+    }
+    broker.stop().await;
+
+    let mut broker = RunningBroker::start(&pki.server_config(&auth)).await;
+    let tcp = TcpStream::connect(broker.addr).await.unwrap();
+    let tls = TlsConnector::from(Arc::new(pki.client_config(true)));
+    let mut stream = timeout(
+        DEADLINE,
+        tls.connect(ServerName::try_from("localhost").unwrap(), tcp),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    stream.write_all(CONNECT).await.unwrap();
+    stream.flush().await.unwrap();
+    assert_eq!(read_ack(&mut stream).await, ACCEPT);
+    assert_eq!(
+        broker.observed().await.1,
+        CertIdentity::Username("test".into())
+    );
     broker.stop().await;
 }
 
@@ -377,6 +428,10 @@ struct TestPki {
 
 impl TestPki {
     fn new() -> Self {
+        Self::with_common_name(" Néw+device ")
+    }
+
+    fn with_common_name(common_name: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -399,7 +454,7 @@ impl TestPki {
             .push(DnType::OrganizationName, "Mosquitto, Test");
         params
             .distinguished_name
-            .push(DnType::CommonName, " Néw+device ");
+            .push(DnType::CommonName, common_name);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         let client_key = KeyPair::generate().unwrap();
         let client = params.signed_by(&client_key, &ca).unwrap();

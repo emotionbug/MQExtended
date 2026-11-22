@@ -389,6 +389,25 @@ fn connect_protocol_errors_are_distinct() {
 }
 
 #[test]
+fn embedded_nul_preserves_the_legacy_connect_name_and_level_rules() {
+    // src/handle_connect.c: read_and_verify_protocol_version accepts the MQTT
+    // name at level 4, but after strcmp it still requires MQIsdp at level 3.
+    let embedded_nul = b"\x10\x10\0\x06MQTT\0X\x04\x02\0<\0\x02c1";
+    let canonical = b"\x10\x0e\0\x04MQTT\x04\x02\0<\0\x02c1";
+    assert_eq!(decoded(embedded_nul, NEW), decoded(canonical, NEW));
+    rejected(
+        b"\x10\x10\0\x06MQTT\0X\x03\x02\0<\0\x02c1",
+        NEW,
+        DecodeError::UnacceptableProtocolVersion { level: 3 },
+    );
+    rejected(
+        b"\x10\x10\0\x06MQIs\0p\x03\x02\0<\0\x02c1",
+        NEW,
+        DecodeError::UnknownProtocolName,
+    );
+}
+
+#[test]
 fn protocol_specific_connect_flags_and_trailing_data() {
     let client_id = b"\0\x02c1";
     let v31 = ProtocolVersion::V31;

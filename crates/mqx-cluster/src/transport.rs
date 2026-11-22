@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Cursor};
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_util::future::BoxFuture;
+use futures_util::stream::{BoxStream, Stream, StreamExt, unfold};
 use openraft::alias::VoteOf;
 use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::v2::RaftNetworkV2;
@@ -15,22 +19,31 @@ use openraft::raft::{
     TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit, watch};
 use tokio::time::{Instant, timeout_at};
+use tokio_rustls::TlsStream;
 
 use crate::ClusterError;
+use crate::mtls::{Tls, certificate_node, node_name};
+use crate::mux::{CallError, Client};
 use crate::node::Types;
-use crate::snapshot::{Snapshot, SnapshotData};
+use crate::snapshot::Snapshot;
+use crate::snapshot_file::SnapshotData;
 
-const MAGIC: &[u8; 4] = b"MQX1";
+const MAGIC: &[u8; 4] = b"MQX3";
 const HEADER_LEN: usize = 53;
-pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_COMMAND: usize = 8 * 1024 * 1024;
-// Leave space for MessagePack entry headers and Raft metadata in each frame.
-pub(crate) const MAX_APPEND_ENTRIES: u64 = 4;
-pub(crate) const MAX_SNAPSHOT: usize = u32::MAX as usize;
+pub(crate) const MAX_APPEND_ENTRIES: u64 = 128;
+pub(crate) const MAX_CONTROL_FRAME: usize = 64 * 1024;
+const MAX_BODY_CAPACITY: usize = 3 * (crate::MAX_PACKET_SIZE + 2 * crate::PACKET_ENVELOPE);
+const BODY_CAPACITY: usize = if MAX_BODY_CAPACITY < Semaphore::MAX_PERMITS {
+    MAX_BODY_CAPACITY
+} else {
+    Semaphore::MAX_PERMITS
+};
+static BODY_BUDGET: Semaphore = Semaphore::const_new(BODY_CAPACITY);
+static CONTROL_RESERVE: Semaphore = Semaphore::const_new(1024 * 1024);
 
 pub(crate) fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
@@ -41,7 +54,13 @@ pub(crate) fn encode<T: Serialize>(body: &T) -> io::Result<Vec<u8>> {
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(body: &[u8]) -> io::Result<T> {
-    rmp_serde::from_slice(body).map_err(invalid_data)
+    let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(body));
+    deserializer.set_max_depth(64);
+    let value = T::deserialize(&mut deserializer).map_err(invalid_data)?;
+    if deserializer.position() != body.len() as u64 {
+        return Err(invalid_data("trailing data in MessagePack frame"));
+    }
+    Ok(value)
 }
 
 #[repr(u8)]
@@ -57,6 +76,7 @@ pub(crate) enum Op {
     Lease,
     MeshRequest,
     MeshSend,
+    Session,
 }
 
 impl TryFrom<u8> for Op {
@@ -74,49 +94,208 @@ impl TryFrom<u8> for Op {
             8 => Ok(Self::Lease),
             9 => Ok(Self::MeshRequest),
             10 => Ok(Self::MeshSend),
+            11 => Ok(Self::Session),
             _ => Err(invalid_data("unknown cluster RPC")),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Limits {
+    pub(crate) command: usize,
+    pub(crate) append: usize,
+    pub(crate) mesh: usize,
+}
+
+impl Limits {
+    pub(crate) fn request(self, op: Op) -> usize {
+        match op {
+            Op::Append => self.append,
+            Op::Write => self.command,
+            Op::MeshRequest | Op::MeshSend => self.mesh,
+            _ => MAX_CONTROL_FRAME,
+        }
+    }
+
+    pub(crate) fn response(self, op: Op) -> usize {
+        match op {
+            Op::Write => self.append,
+            Op::MeshRequest | Op::MeshSend => self.mesh,
+            _ => MAX_CONTROL_FRAME,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PeerSlot {
+    outgoing: Mutex<Option<Arc<Client>>>,
+    incoming: Mutex<()>,
 }
 
 pub(crate) struct Endpoint {
     pub(crate) node_id: u64,
     pub(crate) peers: BTreeMap<u64, SocketAddr>,
     pub(crate) membership_digest: [u8; 32],
+    pub(crate) tls: Option<Tls>,
+    pub(crate) max_snapshot_size: u64,
+    pub(crate) limits: Limits,
+    slots: BTreeMap<u64, PeerSlot>,
 }
 
 impl Endpoint {
-    pub(crate) async fn connect(&self, target: u64, deadline: Instant) -> io::Result<TcpStream> {
+    pub(crate) fn new(
+        node_id: u64,
+        peers: BTreeMap<u64, SocketAddr>,
+        membership_digest: [u8; 32],
+        tls: Option<Tls>,
+        max_snapshot_size: u64,
+        limits: Limits,
+    ) -> Self {
+        let slots = peers.keys().map(|&id| (id, PeerSlot::default())).collect();
+        Self {
+            node_id,
+            peers,
+            membership_digest,
+            tls,
+            max_snapshot_size,
+            limits,
+            slots,
+        }
+    }
+
+    async fn session(&self, node_id: u64, deadline: Instant) -> io::Result<Arc<Client>> {
+        let slot = self
+            .slots
+            .get(&node_id)
+            .ok_or_else(|| invalid_data("unknown peer"))?;
+        timeout_at(deadline, async {
+            let mut session = slot.outgoing.lock().await;
+            if let Some(live) = session.as_ref().filter(|client| !client.is_closed()) {
+                return Ok(live.clone());
+            }
+            let mut stream = self.connect(node_id, deadline).await?;
+            self.header(&mut stream, node_id, Op::Session).await?;
+            stream.flush().await?;
+            if stream.read_u8().await? != 0 {
+                return Err(invalid_data("cluster peer refused session"));
+            }
+            let live = Client::start(stream, self.limits);
+            *session = Some(live.clone());
+            Ok(live)
+        })
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut)?
+    }
+
+    pub(crate) async fn call(
+        &self,
+        node_id: u64,
+        op: Op,
+        body: Bytes,
+        deadline: Instant,
+        connect_deadline: Instant,
+    ) -> Result<Bytes, CallError> {
+        if body.len() > self.limits.request(op) {
+            return Err(CallError::Unsent(invalid_data(
+                "cluster request exceeds the configured size limit",
+            )));
+        }
+        self.session(node_id, connect_deadline)
+            .await
+            .map_err(CallError::Unsent)?
+            .call(op, body, deadline)
+            .await
+    }
+
+    pub(crate) fn accept_session(&self, from: u64) -> io::Result<MutexGuard<'_, ()>> {
+        self.slots[&from]
+            .incoming
+            .try_lock()
+            .map_err(|_| io::ErrorKind::WouldBlock.into())
+    }
+
+    pub(crate) async fn close(&self) {
+        for slot in self.slots.values() {
+            if let Some(client) = slot.outgoing.lock().await.take() {
+                client.close();
+            }
+        }
+    }
+
+    pub(crate) async fn connect(&self, target: u64, deadline: Instant) -> io::Result<Connection> {
         let address = self
             .peers
             .get(&target)
             .ok_or_else(|| invalid_data("unknown peer"))?;
-        let stream = timeout_at(deadline, TcpStream::connect(address))
-            .await
-            .map_err(|_| io::ErrorKind::TimedOut)??;
+        timeout_at(deadline, async {
+            let stream = TcpStream::connect(address).await?;
+            stream.set_nodelay(true)?;
+            Ok(match &self.tls {
+                Some(tls) => {
+                    Connection::Tls(tls.client.connect(node_name(target)?, stream).await?.into())
+                }
+                None => Connection::Plain(stream),
+            })
+        })
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut)?
+    }
+
+    pub(crate) async fn accept(&self, stream: TcpStream) -> io::Result<(Connection, u64, Op)> {
         stream.set_nodelay(true)?;
-        Ok(stream)
+        let (mut stream, authenticated) = if let Some(tls) = &self.tls {
+            let stream = tls.server.accept(stream).await?;
+            let node_id = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .and_then(certificate_node)
+                .filter(|id| self.peers.contains_key(id))
+                .ok_or_else(|| {
+                    invalid_data("TLS certificate does not identify a configured cluster member")
+                })?;
+            (Connection::Tls(stream.into()), Some(node_id))
+        } else {
+            (Connection::Plain(stream), None)
+        };
+        // TLS authentication and member authorization precede reading any header bytes.
+        let mut header = [0; HEADER_LEN];
+        stream.read_exact(&mut header).await?;
+        let (from, op) = self.check_header(&header, authenticated)?;
+        Ok((stream, from, op))
     }
 
     pub(crate) async fn header(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut Connection,
         target: u64,
         op: Op,
     ) -> io::Result<()> {
+        stream.write_all(&self.rpc_header(target, op)).await
+    }
+
+    fn rpc_header(&self, target: u64, op: Op) -> [u8; HEADER_LEN] {
         let mut header = [0; HEADER_LEN];
         header[..4].copy_from_slice(MAGIC);
         header[4..36].copy_from_slice(&self.membership_digest);
         header[36..44].copy_from_slice(&self.node_id.to_be_bytes());
         header[44..52].copy_from_slice(&target.to_be_bytes());
         header[52] = op as u8;
-        stream.write_all(&header).await
+        header
     }
 
-    pub(crate) async fn accept_header(&self, stream: &mut TcpStream) -> io::Result<(u64, Op)> {
-        let mut header = [0; HEADER_LEN];
-        stream.read_exact(&mut header).await?;
+    fn check_header(
+        &self,
+        header: &[u8; HEADER_LEN],
+        authenticated: Option<u64>,
+    ) -> io::Result<(u64, Op)> {
         let from = u64::from_be_bytes(header[36..44].try_into().unwrap());
+        if authenticated.is_some_and(|id| id != from) {
+            return Err(invalid_data(
+                "cluster header does not match the TLS peer identity",
+            ));
+        }
         if &header[..4] != MAGIC
             || header[4..36] != self.membership_digest
             || header[44..52] != self.node_id.to_be_bytes()
@@ -128,38 +307,132 @@ impl Endpoint {
     }
 }
 
-pub(crate) async fn write_frame(stream: &mut TcpStream, body: &[u8], max: usize) -> io::Result<()> {
-    if body.len() > max {
-        return Err(invalid_data("cluster frame exceeds the size limit"));
-    }
-    stream.write_u32(body.len() as u32).await?;
-    stream.write_all(body).await
+// Inline to avoid a heap allocation for each short-lived Raft connection.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Connection {
+    Plain(TcpStream),
+    Tls(TlsStream<TcpStream>),
 }
 
-pub(crate) async fn read_frame(stream: &mut TcpStream, max: usize) -> io::Result<Bytes> {
-    let len = stream.read_u32().await? as usize;
-    if len > max {
-        return Err(invalid_data("cluster frame exceeds the size limit"));
-    }
-    let mut buf = Vec::with_capacity(len.min(64 * 1024));
-    let mut body = stream.take(len as u64);
-    while body.limit() != 0 {
-        if body.read_buf(&mut buf).await? == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
+impl AsyncRead for Connection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
-    Ok(buf.into())
 }
 
-pub(crate) async fn write_message<T: Serialize>(
-    stream: &mut TcpStream,
+impl AsyncWrite for Connection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+pub(crate) async fn write_control<T: Serialize>(
+    stream: &mut Connection,
     message: &T,
 ) -> io::Result<()> {
-    write_frame(stream, &encode(message)?, MAX_FRAME).await
+    let body = encode(message)?;
+    if body.len() > MAX_CONTROL_FRAME {
+        return Err(invalid_data("cluster control frame exceeds the size limit"));
+    }
+    stream.write_u32(body.len() as u32).await?;
+    stream.write_all(&body).await
 }
 
-pub(crate) async fn read_message<T: DeserializeOwned>(stream: &mut TcpStream) -> io::Result<T> {
-    decode(&read_frame(stream, MAX_FRAME).await?)
+pub(crate) struct Frame {
+    pub(crate) bytes: Bytes,
+    _budget: SemaphorePermit<'static>,
+}
+
+impl Deref for Frame {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+pub(crate) async fn read_length(
+    stream: &mut (impl AsyncRead + Unpin),
+    max: u64,
+) -> io::Result<u32> {
+    let len = stream.read_u32().await?;
+    if u64::from(len) > max {
+        return Err(invalid_data("cluster frame exceeds the size limit"));
+    }
+    Ok(len)
+}
+
+impl Limits {
+    pub(crate) async fn read_frame(
+        self,
+        stream: &mut (impl AsyncRead + Unpin),
+        max: usize,
+        append: bool,
+    ) -> io::Result<Frame> {
+        let len = read_length(stream, max as u64).await?;
+        // The process-wide budget grows with configured packet sizes. Leave room
+        // for one AppendEntries batch so admitted client writes can commit.
+        let total = (self.append.max(self.mesh) * 3).clamp(32 * 1024 * 1024, BODY_CAPACITY);
+        let ceiling = if append { total } else { total - self.append };
+        let budget = BODY_BUDGET
+            .try_acquire_many(len)
+            .ok()
+            .filter(|_| BODY_CAPACITY - BODY_BUDGET.available_permits() <= ceiling)
+            .or_else(|| {
+                (len as usize <= MAX_CONTROL_FRAME)
+                    .then(|| CONTROL_RESERVE.try_acquire_many(len).ok())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "cluster frame budget exhausted")
+            })?;
+        let mut buf = BytesMut::with_capacity(len as usize);
+        let mut limited = stream.take(u64::from(len));
+        while limited.limit() > 0 {
+            if limited.read_buf(&mut buf).await? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+        Ok(Frame {
+            bytes: buf.freeze(),
+            _budget: budget,
+        })
+    }
+
+    pub(crate) async fn read_control<T: DeserializeOwned>(
+        self,
+        stream: &mut Connection,
+    ) -> io::Result<T> {
+        decode(&self.read_frame(stream, MAX_CONTROL_FRAME, false).await?)
+    }
 }
 
 pub(crate) struct Network(pub(crate) Arc<Endpoint>);
@@ -193,20 +466,25 @@ impl Peer {
         Err: DeserializeOwned + std::error::Error + 'static,
     {
         let deadline = Instant::now() + option.soft_ttl();
-        let mut stream = self
+        let body = encode(req).map_err(unreachable)?;
+        let response = self
             .endpoint
-            .connect(self.target, deadline)
+            .call(self.target, op, body.into(), deadline, deadline)
             .await
-            .map_err(unreachable)?;
-        let result: Result<Res, Err> = timeout_at(deadline, async {
-            self.endpoint.header(&mut stream, self.target, op).await?;
-            write_message(&mut stream, req).await?;
-            read_message(&mut stream).await
-        })
-        .await
-        .map_err(|_| unreachable(io::ErrorKind::TimedOut.into()))?
-        .map_err(unreachable)?;
+            .map_err(|error| unreachable(error.into()))?;
+        let result: Result<Res, Err> = decode(&response).map_err(unreachable)?;
         result.map_err(|error| RPCError::Unreachable(Unreachable::new(&error)))
+    }
+
+    async fn append(
+        &self,
+        request: AppendEntriesRequest<Types>,
+        option: &RPCOption,
+    ) -> Result<AppendResult<Types>, RPCError<Types>> {
+        let reply: StreamAppendResult<Types> = self
+            .call::<_, _, openraft::errors::RaftError<Types>>(Op::Append, &request, option)
+            .await?;
+        Ok(reply.map_err(Into::into))
     }
 }
 
@@ -222,10 +500,41 @@ impl RaftNetworkV2<Types> for Peer {
         req: AppendEntriesRequest<Types>,
         option: RPCOption,
     ) -> Result<AppendResult<Types>, RPCError<Types>> {
-        let reply: StreamAppendResult<Types> = self
-            .call::<_, _, openraft::errors::RaftError<Types>>(Op::Append, &req, &option)
-            .await?;
-        Ok(reply.map_err(Into::into))
+        self.append(req, &option).await
+    }
+
+    fn stream_append<'s, S>(
+        &'s mut self,
+        input: S,
+        option: RPCOption,
+    ) -> BoxFuture<
+        's,
+        Result<BoxStream<'s, Result<AppendResult<Types>, RPCError<Types>>>, RPCError<Types>>,
+    >
+    where
+        S: Stream<Item = AppendEntriesRequest<Types>> + Send + Unpin + 'static,
+    {
+        let peer = &*self;
+        Box::pin(async move {
+            // The server queues append frames by session order. Buffer replies in
+            // that order and stop at the first failed or partial acknowledgement.
+            let pipeline = input
+                .map(move |request| {
+                    let option = option.clone();
+                    async move {
+                        let last = request.last_log_id();
+                        (peer.append(request, &option).await, last)
+                    }
+                })
+                .buffered(8);
+            let output = unfold(Some(Box::pin(pipeline)), |state| async {
+                let mut pipeline = state?;
+                let (result, last) = pipeline.next().await?;
+                let fully_acked = matches!(&result, Ok(Ok(acked)) if *acked == last);
+                Some((result, fully_acked.then_some(pipeline)))
+            });
+            Ok(Box::pin(output) as BoxStream<'s, _>)
+        })
     }
 
     async fn vote(
@@ -268,13 +577,18 @@ impl RaftNetworkV2<Types> for Peer {
             self.endpoint
                 .header(&mut stream, self.target, Op::Snapshot)
                 .await?;
-            write_message(&mut stream, &(vote, snapshot.meta)).await?;
-            write_frame(&mut stream, &snapshot.snapshot.leases, MAX_FRAME).await?;
-            write_frame(&mut stream, &snapshot.snapshot.app, MAX_SNAPSHOT).await?;
-            read_message::<Result<SnapshotResponse<Types>, openraft::errors::Fatal<Types>>>(
-                &mut stream,
-            )
-            .await
+            write_control(&mut stream, &(vote, snapshot.meta)).await?;
+            snapshot
+                .snapshot
+                .send(&mut stream, self.endpoint.max_snapshot_size)
+                .await?;
+            stream.flush().await?;
+            self.endpoint
+                .limits
+                .read_control::<Result<SnapshotResponse<Types>, openraft::errors::Fatal<Types>>>(
+                    &mut stream,
+                )
+                .await
         };
         tokio::select! {
             closed = cancel => Err(StreamingError::Closed(closed)),
@@ -321,55 +635,42 @@ impl Mesh {
             .map_err(|_| ClusterError::MeshHandlerRegistered)
     }
 
+    /// Mesh calls to the same peer are handled in the order queued by the sending node.
     pub async fn request(&self, node_id: u64, body: Bytes) -> Result<Bytes, ClusterError> {
-        let deadline = Instant::now() + self.timeout;
-        let mut stream = self.open(node_id, deadline).await?;
-        timeout_at(deadline, async {
-            self.endpoint
-                .header(&mut stream, node_id, Op::MeshRequest)
-                .await?;
-            write_frame(&mut stream, &body, MAX_FRAME).await?;
-            let status = stream.read_u8().await?;
-            let response = read_frame(&mut stream, MAX_FRAME).await?;
-            if status == 0 {
-                Ok(response)
-            } else {
-                Err(ClusterError::MeshHandler(
-                    String::from_utf8_lossy(&response).into_owned(),
-                ))
-            }
-        })
-        .await
-        .map_err(|_| ClusterError::MeshTimeout(node_id))?
+        self.call(node_id, Op::MeshRequest, body).await
     }
 
-    /// Send without waiting for a handler result. Success means the bytes were handed
-    /// to TCP; it does not prove that the handler ran or that delivery can be retried safely.
+    /// Send without waiting for the handler. Success means the bytes were handed
+    /// to the socket; it does not prove the handler ran or make retries safe.
     pub async fn send(&self, node_id: u64, body: Bytes) -> Result<(), ClusterError> {
-        let deadline = Instant::now() + self.timeout;
-        let mut stream = self.open(node_id, deadline).await?;
-        timeout_at(deadline, async {
-            self.endpoint
-                .header(&mut stream, node_id, Op::MeshSend)
-                .await?;
-            write_frame(&mut stream, &body, MAX_FRAME).await
-        })
-        .await
-        .map_err(|_| ClusterError::MeshTimeout(node_id))??;
-        Ok(())
+        self.call(node_id, Op::MeshSend, body).await.map(drop)
     }
 
-    async fn open(&self, node_id: u64, deadline: Instant) -> Result<TcpStream, ClusterError> {
+    async fn call(&self, node_id: u64, op: Op, body: Bytes) -> Result<Bytes, ClusterError> {
         if *self.stop.borrow() {
             return Err(ClusterError::Shutdown);
         }
         if !self.endpoint.peers.contains_key(&node_id) {
             return Err(ClusterError::UnknownNode(node_id));
         }
+        if body.len() > self.endpoint.limits.mesh {
+            return Err(invalid_data("mesh body exceeds the cluster mesh limit").into());
+        }
+        let deadline = Instant::now() + self.timeout;
         self.endpoint
-            .connect(node_id, deadline)
+            .call(node_id, op, body, deadline, deadline)
             .await
-            .map_err(|source| ClusterError::Unreachable { node_id, source })
+            .map_err(|error| match error {
+                CallError::Unsent(source) if source.kind() != io::ErrorKind::TimedOut => {
+                    ClusterError::Unreachable { node_id, source }
+                }
+                CallError::Unsent(_) => ClusterError::MeshTimeout(node_id),
+                CallError::Uncertain(source) if source.kind() == io::ErrorKind::TimedOut => {
+                    ClusterError::MeshTimeout(node_id)
+                }
+                CallError::Uncertain(source) => ClusterError::Unreachable { node_id, source },
+                CallError::Remote(source) => ClusterError::MeshHandler(source.to_string()),
+            })
     }
 
     pub(crate) async fn handle(&self, from: u64, body: Bytes) -> Result<Bytes, ClusterError> {
@@ -378,5 +679,35 @@ impl Mesh {
             .get()
             .ok_or_else(|| ClusterError::MeshHandler("not registered".into()))?;
         handler(from, body).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_header_sender_is_bound_to_the_authenticated_identity() {
+        let peers = BTreeMap::from([
+            (1, "127.0.0.1:1234".parse().unwrap()),
+            (2, "127.0.0.1:1235".parse().unwrap()),
+        ]);
+        let endpoint = |node_id| {
+            Endpoint::new(
+                node_id,
+                peers.clone(),
+                [42; 32],
+                None,
+                1,
+                Limits {
+                    command: 1024,
+                    append: 128 * 1024,
+                    mesh: 1024,
+                },
+            )
+        };
+        let header = endpoint(1).rpc_header(2, Op::ReadIndex);
+        assert!(endpoint(2).check_header(&header, Some(1)).is_ok());
+        assert!(endpoint(2).check_header(&header, Some(2)).is_err());
     }
 }

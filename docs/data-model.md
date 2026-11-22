@@ -23,7 +23,7 @@ Transient (clean-session) sessions keep their outgoing queue in the memory of th
 - **Apply runs on every node, in log order.** Side effects of an applied command (closing a taken-over connection, publishing a will) must check whether this node is the one that should act; the state itself is identical everywhere.
 - **`submit` can be uncertain.** When a proposal may have committed but the reply was lost, `submit` returns `WriteUncertain`. Commands therefore carry the identity needed to be applied idempotently (client id + epoch, message id), so a retry cannot double-apply.
 - **Node `Down` is liveness, not membership.** A lease expiry commits a `Down` event at one log index on every node; the node stays a Raft voter. A restarted node renews its lease and is marked `Alive`.
-- **Peer traffic is unauthenticated.** The Raft/mesh port must live on a trusted private network.
+- **Peers authenticate with mutual TLS.** Node certificates carry Common Name `mqx-node-<id>`; a peer may only speak for the id in its certificate. Plaintext peer traffic is an explicit opt-in ([cluster](cluster.md#network)).
 
 ## On-disk layout
 

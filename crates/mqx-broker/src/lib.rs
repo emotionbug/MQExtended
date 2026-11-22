@@ -1,6 +1,7 @@
 //! MQTT 3.1, 3.1.1 and 5 broker with Mosquitto 2.1.4 session semantics.
 
 mod connection;
+mod fast;
 mod inbox;
 mod retained;
 mod runtime;
@@ -230,12 +231,15 @@ fn parse_acl(acl: Option<Vec<u8>>) -> Result<(Option<AclFile>, Option<Bytes>), A
     Ok((parsed, acl.map(Bytes::from)))
 }
 
-/// Certificate identity mapping, as resolved by the listener's TLS layer.
+/// Certificate identity mapping, as resolved by the listener transport.
 #[derive(Debug, Clone, Default)]
 pub enum CertIdentity {
     #[default]
     None,
+    /// Username from a locally verified TLS client certificate.
     Username(String),
+    /// Username asserted by PROXY v2; it does not satisfy basic authentication.
+    ForwardedUsername(String),
     MissingOrInvalid,
 }
 

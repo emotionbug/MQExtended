@@ -1,5 +1,6 @@
 use std::{fs, path::Path, time::Duration};
 
+use mqx_cluster::{ClusterSecurity, DEFAULT_MAX_SNAPSHOT_SIZE, MAX_SNAPSHOT_SIZE};
 use mqx_server::{
     ListenerProtocol, LogDestination, LogType, ProxyProtocol, ServerConfig, parse_command_line_port,
 };
@@ -409,15 +410,34 @@ const CLUSTER: &str = "cluster_node_id 18446744073709551615\n\
     cluster_peer 18446744073709551615 [::1]:9001\n\
     cluster_data_dir raft storage\n";
 
+const CLUSTER_TLS: &str = "cluster_cafile secrets/cluster CA.pem\n\
+    cluster_certfile secrets/node.pem\n\
+    cluster_keyfile secrets/node.key\n";
+
 #[test]
 fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
     assert!(ServerConfig::default().cluster.is_none());
-    let config = ServerConfig::parse(CLUSTER).unwrap().cluster.unwrap();
+    let config = ServerConfig::parse(&format!("{CLUSTER}{CLUSTER_TLS}"))
+        .unwrap()
+        .cluster
+        .unwrap();
     assert_eq!(config.node_id, u64::MAX);
     assert_eq!(config.raft_addr, "[::]:9001".parse().unwrap());
     assert_eq!(config.peers[&2], "192.0.2.2:9002".parse().unwrap());
     assert_eq!(config.peers[&u64::MAX], "[::1]:9001".parse().unwrap());
     assert_eq!(config.data_dir, Path::new("raft storage"));
+    let ClusterSecurity::Tls {
+        ca_file,
+        cert_file,
+        key_file,
+    } = config.security
+    else {
+        panic!("TLS configuration was not preserved");
+    };
+    assert_eq!(ca_file, Path::new("secrets/cluster CA.pem"));
+    assert_eq!(cert_file, Path::new("secrets/node.pem"));
+    assert_eq!(key_file, Path::new("secrets/node.key"));
+    assert_eq!(config.max_snapshot_size, DEFAULT_MAX_SNAPSHOT_SIZE);
     assert_eq!(config.heartbeat_interval, Duration::from_millis(100));
     assert_eq!(config.election_timeout_min, Duration::from_millis(400));
     assert_eq!(config.election_timeout_max, Duration::from_millis(800));
@@ -425,11 +445,11 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
     assert_eq!(config.lease_timeout, Duration::from_millis(5000));
     assert_eq!(config.request_timeout, Duration::from_millis(5000));
     let custom = format!(
-        "{CLUSTER}cluster_heartbeat_interval 150\n\
+        "{CLUSTER}{CLUSTER_TLS}cluster_heartbeat_interval 150\n\
         cluster_election_timeout 360 700\n\
         cluster_lease_interval 1700\n\
         cluster_lease_timeout 4800\n\
-        cluster_request_timeout 6900\n"
+        cluster_request_timeout 6900\ncluster_max_snapshot_size 123456\n"
     );
     let config = ServerConfig::parse(&custom).unwrap().cluster.unwrap();
     assert_eq!(config.heartbeat_interval, Duration::from_millis(150));
@@ -438,6 +458,7 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
     assert_eq!(config.lease_interval, Duration::from_millis(1700));
     assert_eq!(config.lease_timeout, Duration::from_millis(4800));
     assert_eq!(config.request_timeout, Duration::from_millis(6900));
+    assert_eq!(config.max_snapshot_size, 123456);
 }
 
 #[test]
@@ -514,7 +535,7 @@ fn partial_or_conflicting_cluster_configuration_fails_at_startup() {
             "minimum must be less than its maximum",
         ),
     ] {
-        let input = format!("{CLUSTER}{extra}");
+        let input = format!("{CLUSTER}{CLUSTER_TLS}{extra}");
         let error = ServerConfig::parse(&input).unwrap_err().to_string();
         assert!(error.contains(message), "{extra}: {error}");
     }
@@ -525,7 +546,7 @@ fn cluster_section_can_span_the_main_file_and_an_included_file() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("01-node.conf"),
-        "cluster_peer 1 127.0.0.1:9001\n",
+        "cluster_peer 1 127.0.0.1:9001\ncluster_insecure_plaintext true\n",
     )
     .unwrap();
     let input = format!(
@@ -534,4 +555,86 @@ fn cluster_section_can_span_the_main_file_and_an_included_file() {
     );
     let config = ServerConfig::parse(&input).unwrap().cluster.unwrap();
     assert_eq!(config.peers[&1], config.raft_addr);
+    assert!(matches!(
+        config.security,
+        ClusterSecurity::InsecurePlaintext
+    ));
+}
+
+#[test]
+fn cluster_configuration_requires_explicit_transport_security() {
+    for (options, message) in [
+        ("", "Common Name mqx-node-<id>"),
+        (
+            "cluster_insecure_plaintext false\n",
+            "Common Name mqx-node-<id>",
+        ),
+        (
+            "cluster_cafile ca.pem\n",
+            "cluster_cafile', 'cluster_certfile', and 'cluster_keyfile",
+        ),
+        (
+            "cluster_cafile ca.pem\ncluster_insecure_plaintext true\n",
+            "cluster_cafile', 'cluster_certfile', and 'cluster_keyfile",
+        ),
+        (
+            "cluster_insecure_plaintext true\n",
+            "wildcard 'cluster_bind'",
+        ),
+        (
+            "cluster_insecure_plaintext yes\n",
+            "Invalid 'cluster_insecure_plaintext'",
+        ),
+    ] {
+        let error = ServerConfig::parse(&format!("{CLUSTER}{options}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("Error: ") && error.contains(message),
+            "{error}"
+        );
+    }
+    let err = ServerConfig::parse(&format!(
+        "{CLUSTER}{CLUSTER_TLS}cluster_insecure_plaintext true"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("cannot be used with cluster TLS files"),
+        "{err}"
+    );
+    let secure = format!("{CLUSTER}{CLUSTER_TLS}cluster_insecure_plaintext false");
+    assert!(matches!(
+        ServerConfig::parse(&secure)
+            .unwrap()
+            .cluster
+            .unwrap()
+            .security,
+        ClusterSecurity::Tls { .. }
+    ));
+    let wildcard_v4 = CLUSTER.replace("[::]:9001", "0.0.0.0:9001");
+    let err = ServerConfig::parse(&format!("{wildcard_v4}cluster_insecure_plaintext true"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("wildcard 'cluster_bind'"), "{err}");
+}
+
+#[test]
+fn snapshot_size_limit_matches_the_cluster_storage_bounds() {
+    for size in [1, MAX_SNAPSHOT_SIZE] {
+        let input = format!("{CLUSTER}{CLUSTER_TLS}cluster_max_snapshot_size {size}");
+        assert_eq!(
+            ServerConfig::parse(&input)
+                .unwrap()
+                .cluster
+                .unwrap()
+                .max_snapshot_size,
+            size
+        );
+    }
+    for size in [0, MAX_SNAPSHOT_SIZE + 1] {
+        let input = format!("{CLUSTER}{CLUSTER_TLS}cluster_max_snapshot_size {size}");
+        let error = ServerConfig::parse(&input).unwrap_err().to_string();
+        assert!(error.contains("cluster_max_snapshot_size"), "{error}");
+    }
 }

@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  MOSQUITTO_VERSION: v2.1.4
 
 jobs:
   check:
@@ -18,5 +19,44 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+
+  differential:
+    # Runs the #[ignore]d differential tests against real Mosquitto builds;
+    # see docs/testing.md#differential-tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Mosquitto reference builds
+        id: mosquitto-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/cjson-install
+            /tmp/mosquitto
+          key: mosquitto-${{ env.MOSQUITTO_VERSION }}-${{ runner.os }}-v1
+      - name: Build Mosquitto references
+        if: steps.mosquitto-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libssl-dev
+          git clone --depth 1 https://github.com/DaveGamble/cJSON.git /tmp/cJSON
+          cmake -S /tmp/cJSON -B /tmp/cJSON/build -DCMAKE_INSTALL_PREFIX=/tmp/cjson-install \
+            -DENABLE_CJSON_TEST=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build /tmp/cJSON/build -j"$(nproc)" && cmake --install /tmp/cJSON/build
+          git clone --depth 1 -b "$MOSQUITTO_VERSION" https://github.com/eclipse-mosquitto/mosquitto.git /tmp/mosquitto
+          common="-DCMAKE_PREFIX_PATH=/tmp/cjson-install -DWITH_DOCS=OFF -DWITH_TESTS=OFF -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release"
+          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build $common -DWITH_WEBSOCKETS=OFF
+          cmake --build /tmp/mosquitto/build -j"$(nproc)"
+          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-ws $common -DWITH_WEBSOCKETS=ON -DWITH_WEBSOCKETS_BUILTIN=ON
+          cmake --build /tmp/mosquitto/build-ws -j"$(nproc)"
+      - run: cargo build -p mqx-server
+      - name: Differential and failover tests
+        env:
+          MOSQUITTO_BUILD_DIR: /tmp/mosquitto/build
+          MOSQUITTO_WS_BUILD_DIR: /tmp/mosquitto/build-ws
+          MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
+        # mqx-bench's ignored test needs release builds; run it locally.
+        run: cargo test --workspace --exclude mqx-bench --all-features -- --ignored

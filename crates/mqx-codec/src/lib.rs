@@ -252,6 +252,12 @@ const CLEAN_SESSION_FLAG: u8 = 0x02;
 const DUP_FLAG: u8 = 0x08;
 const RETAIN_FLAG: u8 = 0x01;
 
+// src/handle_connect.c: read_protocol_name reads four or six bytes;
+// read_and_verify_protocol_version compares them with strcmp.
+fn connect_protocol_name(name: &[u8]) -> &[u8] {
+    name.split(|&byte| byte == 0).next().unwrap_or(name)
+}
+
 const fn remaining_length_bytes(length: usize) -> usize {
     match length {
         0..=127 => 1,

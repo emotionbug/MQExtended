@@ -180,11 +180,13 @@ pub(crate) async fn negotiate(
                     if let (Some(version), Some(cipher)) = (tls.version, tls.cipher) {
                         tracing::info!(target: "mqx::notice", "Connection from {peer} negotiated {version} cipher {cipher}");
                     }
-                    // The PROXY reader enforces require_certificate and validates the CN.
+                    // Mosquitto src/handle_connect.c: handle_username_from_cert_options
+                    // uses the forwarded CN but still runs basic auth without a local SSL context.
                     if options.uses_forwarded_username() {
-                        identity = tls
-                            .common_name
-                            .map_or(CertIdentity::MissingOrInvalid, CertIdentity::Username);
+                        identity = tls.common_name.map_or(
+                            CertIdentity::MissingOrInvalid,
+                            CertIdentity::ForwardedUsername,
+                        );
                     }
                 }
             }

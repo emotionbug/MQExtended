@@ -83,9 +83,16 @@ pub(crate) struct Delivery {
     pub(crate) message: Arc<Message>,
     pub(crate) qos: QoS,
     pub(crate) retain: bool,
-    pub(crate) dedup_id: Option<u64>,
+    pub(crate) dedup_id: Option<DedupId>,
     #[serde(default)]
     pub(crate) subscription_identifier: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum DedupId {
+    Log(u64),
+    Peer([u64; 2]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +163,7 @@ impl Counters {
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Inbox {
     last_mid: u16,
-    last_delivered: Option<u64>,
+    last_delivered: Option<DedupId>,
     in_flight: VecDeque<Outgoing>,
     queued: VecDeque<Outgoing>,
     flight_stats: Counters,
@@ -519,6 +526,13 @@ impl Inbox {
         } else {
             Receive::Quota
         }
+    }
+
+    // A QoS 1 PUBLISH is immediately acknowledged and has no incoming
+    // state of its own. Only pending QoS 2 handshakes can make it change
+    // the inbox or its receive quota (handle_publish.c: handle__accepted_publish).
+    pub(crate) fn simple_qos1(&self) -> bool {
+        self.incoming.is_empty() && self.incoming_slots == 0
     }
 
     pub(crate) fn can_publish_qos1(&mut self, id: PacketId, config: &BrokerConfig) -> bool {

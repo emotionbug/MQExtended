@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use mqx_cluster::ClusterConfig;
+use mqx_cluster::{ClusterConfig, ClusterSecurity, MAX_SNAPSHOT_SIZE};
 
 use crate::ServerError;
 
@@ -1111,6 +1111,11 @@ struct ClusterSection {
     lease_interval: Option<Duration>,
     lease_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
+    cafile: Option<PathBuf>,
+    certfile: Option<PathBuf>,
+    keyfile: Option<PathBuf>,
+    insecure_plaintext: Option<bool>,
+    max_snapshot_size: Option<u64>,
 }
 
 impl ClusterSection {
@@ -1129,8 +1134,15 @@ impl ClusterSection {
                 .filter(|addr| addr.port() != 0)
                 .ok_or_else(|| invalid(name, word))
         };
-        if name == "cluster_data_dir" {
-            self.data_dir = Some(PathBuf::from(value.unique_string(self.data_dir.is_some())?));
+        let path = match name {
+            "cluster_data_dir" => Some(&mut self.data_dir),
+            "cluster_cafile" => Some(&mut self.cafile),
+            "cluster_certfile" => Some(&mut self.certfile),
+            "cluster_keyfile" => Some(&mut self.keyfile),
+            _ => None,
+        };
+        if let Some(path) = path {
+            *path = Some(PathBuf::from(value.unique_string(path.is_some())?));
             return Ok(());
         }
         let count = match name {
@@ -1140,7 +1152,9 @@ impl ClusterSection {
             | "cluster_heartbeat_interval"
             | "cluster_lease_interval"
             | "cluster_lease_timeout"
-            | "cluster_request_timeout" => 1,
+            | "cluster_request_timeout"
+            | "cluster_insecure_plaintext"
+            | "cluster_max_snapshot_size" => 1,
             _ => return Err(format!("Unknown configuration variable '{name}'.").into()),
         };
         let mut words = value.words().take_while(|word| !word.starts_with('#'));
@@ -1182,6 +1196,19 @@ impl ClusterSection {
             "cluster_request_timeout" if self.request_timeout.is_none() => {
                 self.request_timeout = Some(duration(first)?)
             }
+            "cluster_insecure_plaintext" if self.insecure_plaintext.is_none() => {
+                self.insecure_plaintext = Some(value.boolean()?);
+            }
+            "cluster_max_snapshot_size" if self.max_snapshot_size.is_none() => {
+                let size = positive(first)?;
+                if size > MAX_SNAPSHOT_SIZE {
+                    return Err(format!(
+                        "'{name}' must be between 1 and {MAX_SNAPSHOT_SIZE} bytes."
+                    )
+                    .into());
+                }
+                self.max_snapshot_size = Some(size);
+            }
             _ => return Err(duplicate()),
         }
         Ok(())
@@ -1198,7 +1225,34 @@ impl ClusterSection {
             )
             .into());
         }
-        let mut config = ClusterConfig::new(id, bind, self.peers, data_dir);
+        let allow_plaintext = self.insecure_plaintext == Some(true);
+        let security = match (self.cafile, self.certfile, self.keyfile) {
+            (Some(_), Some(_), Some(_)) if allow_plaintext => {
+                return Err(
+                    "'cluster_insecure_plaintext true' cannot be used with cluster TLS files."
+                        .into(),
+                );
+            }
+            (Some(ca_file), Some(cert_file), Some(key_file)) => ClusterSecurity::Tls {
+                ca_file,
+                cert_file,
+                key_file,
+            },
+            (None, None, None) if allow_plaintext => {
+                // A plaintext opt-in is not an opt-in to exposing it on every interface.
+                if bind.ip().to_canonical().is_unspecified() {
+                    return Err("A wildcard 'cluster_bind' requires cluster TLS.".into());
+                }
+                ClusterSecurity::InsecurePlaintext
+            }
+            (None, None, None) => {
+                return Err("Cluster transport requires 'cluster_cafile', 'cluster_certfile', and 'cluster_keyfile'. Use peer certificates with Common Name mqx-node-<id>, or explicitly set 'cluster_insecure_plaintext true' on an isolated network.".into());
+            }
+            _ => {
+                return Err("Cluster TLS requires 'cluster_cafile', 'cluster_certfile', and 'cluster_keyfile' together.".into());
+            }
+        };
+        let mut config = ClusterConfig::new(id, bind, self.peers, data_dir, security);
         if let Some(interval) = self.heartbeat {
             config.heartbeat_interval = interval;
         }
@@ -1226,6 +1280,9 @@ impl ClusterSection {
         }
         if let Some(timeout) = self.request_timeout {
             config.request_timeout = timeout;
+        }
+        if let Some(size) = self.max_snapshot_size {
+            config.max_snapshot_size = size;
         }
         Ok(config)
     }

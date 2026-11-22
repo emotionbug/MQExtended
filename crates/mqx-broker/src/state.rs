@@ -60,6 +60,29 @@ pub(crate) enum Command {
     },
     Act(Lease, Operation),
     Expire(Duration),
+    Batch(Vec<BatchEntry>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum BatchEntry {
+    Claim {
+        owner: Owner,
+        token: ClaimToken,
+        request: Claim,
+    },
+    Act(Mutations),
+}
+
+impl BatchEntry {
+    pub(crate) fn needs_fence(&self) -> bool {
+        matches!(self, Self::Act(entry) if entry.operations.iter().any(Operation::needs_fence))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Mutations {
+    pub(crate) lease: Lease,
+    pub(crate) operations: Vec<Operation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +100,7 @@ pub(crate) struct Claim {
 
 impl Claim {
     pub(crate) fn local_inbox(&self) -> bool {
-        self.v5.is_none() && self.clean_start
+        self.clean_start && self.v5.as_ref().is_none_or(|v5| v5.session_expiry == 0)
     }
 }
 
@@ -88,6 +111,13 @@ pub(crate) struct SessionSettings {
     pub(crate) will_delay: u32,
     pub(crate) will_expiry: u32,
     pub(crate) will_properties: Vec<PublishProperty>,
+}
+
+impl SessionSettings {
+    pub(crate) fn outgoing_maximum(&self, config: &BrokerConfig) -> u16 {
+        self.receive_maximum
+            .unwrap_or_else(|| config.max_inflight_messages.try_into().unwrap_or(u16::MAX))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +160,18 @@ impl Publication {
             now,
         }
     }
+
+    pub(crate) fn into_message(self, source: Publisher) -> Arc<Message> {
+        Arc::new(Message {
+            source,
+            topic: self.packet.topic.into_boxed_str(),
+            payload: self.packet.payload,
+            qos: self.packet.qos,
+            retain: self.packet.retain,
+            properties: self.properties,
+            expires: self.expires,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +189,14 @@ pub(crate) enum Operation {
     Forward(Arc<Message>, Duration),
     Ack(PacketId, Ack),
     NextOutbound(Duration),
+    /// Local transient incoming state cannot influence this particular QoS 1.
+    ReceiveAdmitted(Publication),
+}
+
+impl Operation {
+    pub(crate) fn needs_fence(&self) -> bool {
+        matches!(self, Self::Subscribe(..) | Self::Unsubscribe(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,11 +208,12 @@ pub(crate) enum Reply {
     ProtocolError,
     Claimed { lease: Lease, present: bool },
     Subscribed(Vec<SubscribeReturnCode>),
-    ReceiveLocal(Option<Arc<Message>>),
+    ReceiveLocal(Option<Arc<Message>>, u8),
     LocalInbox,
     Outbound(Option<Outbound>),
     PublishReason(u8),
     Unsubscribed(Vec<u8>),
+    Batched(Vec<Vec<Reply>>),
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,6 +362,89 @@ impl State {
             .get(&lease.id)
             .is_some_and(|session| session.owner == Some(owner) && session.epoch == lease.epoch)
     }
+    pub(crate) fn publisher_only(&self, lease: &Lease) -> bool {
+        self.sessions.get(&lease.id).is_some_and(|session| {
+            session.epoch == lease.epoch
+                && session.filters.is_empty()
+                && session
+                    .inbox
+                    .as_ref()
+                    .is_none_or(|inbox| !inbox.has_outbound(&self.config))
+        })
+    }
+
+    pub(crate) fn owns_peer(&self, node: u64, id: &str, epoch: Epoch) -> bool {
+        self.sessions.get(id).is_some_and(|session| {
+            session.epoch == epoch && session.owner.is_some_and(|owner| owner.node == node)
+        })
+    }
+
+    pub(crate) fn fast_route(
+        &self,
+        owner: Owner,
+        lease: &Lease,
+        publish: &Publish,
+        admitted_local: bool,
+    ) -> Option<crate::fast::Route> {
+        if publish.retain || publish.qos == QoS::ExactlyOnce || !self.owns(owner, lease) {
+            return None;
+        }
+        let source = &self.sessions[&lease.id];
+        if publish.qos == QoS::AtLeastOnce
+            && !admitted_local
+            && source
+                .inbox
+                .as_ref()
+                .is_none_or(|inbox| !inbox.simple_qos1())
+        {
+            return None;
+        }
+        if publish_rejection(&self.config, &self.acls, &source.publisher, publish).is_some() {
+            return None;
+        }
+        // Rotating the selected leaf is cluster-wide shared subscription state.
+        if !publish.topic.starts_with('$') {
+            let mut shared = false;
+            self.shared
+                .for_each_match(&publish.topic, |_, _| shared = true)
+                .ok()?;
+            if shared {
+                return None;
+            }
+        }
+        let mut targets = Vec::new();
+        let mut matched = false;
+        let mut durable = false;
+        self.normal
+            .for_each_match(&publish.topic, |id, sub| {
+                matched = true;
+                if durable {
+                    return;
+                }
+                let session = &self.sessions[id];
+                if !can_deliver(&self.acls, session, *sub, &lease.id, &publish.topic, false) {
+                    return;
+                }
+                if session.inbox.is_some() {
+                    durable = true;
+                } else if let Some(owner) = session.owner {
+                    targets.push((
+                        owner.node,
+                        crate::fast::Target {
+                            epoch: session.epoch,
+                            qos: outgoing_qos(publish.qos, sub.qos, &self.config),
+                            identifier: sub.identifier,
+                        },
+                    ));
+                }
+            })
+            .ok()?;
+        (!durable).then(|| crate::fast::Route {
+            source: source.publisher.clone(),
+            matched,
+            targets,
+        })
+    }
 
     pub(crate) fn has_outbound(&self, lease: &Lease) -> bool {
         self.sessions
@@ -422,6 +556,30 @@ impl State {
                 Reply::NoChange
             }
             Command::Act(lease, action) => self.act(lease, action, &mut effects),
+            Command::Batch(batch) => Reply::Batched(
+                batch
+                    .into_iter()
+                    .map(|entry| match entry {
+                        BatchEntry::Claim {
+                            owner,
+                            token,
+                            request,
+                        } => vec![self.claim(owner, token, request, &mut effects)],
+                        BatchEntry::Act(entry) => {
+                            let mut replies = Vec::with_capacity(entry.operations.len());
+                            for operation in entry.operations {
+                                let reply = self.act(entry.lease.clone(), operation, &mut effects);
+                                let stop = matches!(reply, Reply::Stale | Reply::ProtocolError);
+                                replies.push(reply);
+                                if stop {
+                                    break;
+                                }
+                            }
+                            replies
+                        }
+                    })
+                    .collect(),
+            ),
         };
         Outcome { reply, effects }
     }
@@ -625,14 +783,10 @@ impl State {
         session.bridge = claim.bridge;
         session.max_qos = claim.max_qos;
         if let Some(inbox) = &mut session.inbox {
-            inbox.receive_maximum = session.v5.as_ref().map(|v5| {
-                v5.receive_maximum.unwrap_or_else(|| {
-                    self.config
-                        .max_inflight_messages
-                        .try_into()
-                        .unwrap_or(u16::MAX)
-                })
-            });
+            inbox.receive_maximum = session
+                .v5
+                .as_ref()
+                .map(|v5| v5.outgoing_maximum(&self.config));
         }
         if present {
             let publisher = &session.publisher;
@@ -668,6 +822,7 @@ impl State {
         else {
             return Reply::Stale;
         };
+        let admitted_local = matches!(&operation, Operation::ReceiveAdmitted(_));
         match operation {
             Operation::Disconnect {
                 graceful,
@@ -721,58 +876,30 @@ impl State {
                 }
                 Reply::Unsubscribed(reasons)
             }
-            Operation::Receive(publication) => {
-                let Publication {
-                    packet: publish,
-                    properties,
-                    expires,
-                    now,
-                } = publication;
-                // handle_publish.c: handle__publish checks size before write
-                // ACL, and process_bad_message acknowledges without storing.
-                let rejection = if self.config.message_size_limit != 0
-                    && publish.payload.len() > self.config.message_size_limit
-                {
-                    Some(R::PACKET_TOO_LARGE)
-                } else if !allowed(
-                    &self.acls,
-                    &session.publisher,
-                    &publish.topic,
-                    Access::Write,
-                ) {
-                    Some(R::NOT_AUTHORIZED)
-                } else if publish.topic.starts_with("$CONTROL/") {
-                    Some(R::IMPLEMENTATION_SPECIFIC_ERROR)
-                } else {
-                    None
-                };
+            Operation::Receive(publication) | Operation::ReceiveAdmitted(publication) => {
+                let publish = &publication.packet;
+                let rejection =
+                    publish_rejection(&self.config, &self.acls, &session.publisher, publish);
+                let qos = publish.qos;
+                let id = publish.packet_id;
                 if let Some(reason) = rejection {
-                    if publish.qos == QoS::AtLeastOnce
-                        || (publish.qos == QoS::ExactlyOnce && session.v5.is_some())
+                    if qos == QoS::AtLeastOnce || (qos == QoS::ExactlyOnce && session.v5.is_some())
                     {
                         if let Some(inbox) = &mut session.inbox {
                             inbox.credit_incoming();
-                        } else {
-                            return Reply::ReceiveLocal(None);
+                        } else if !admitted_local {
+                            return Reply::ReceiveLocal(None, reason.0);
                         }
                     }
                     return Reply::PublishReason(reason.0);
                 }
-                let topic = publish.topic.into_boxed_str();
-                let message = Arc::new(Message {
-                    source: session.publisher.clone(),
-                    topic,
-                    payload: publish.payload,
-                    qos: publish.qos,
-                    retain: publish.retain,
-                    properties,
-                    expires,
-                });
-                if let Some(id) = publish.packet_id {
+                let now = publication.now;
+                let message = publication.into_message(session.publisher.clone());
+                if let Some(id) = id.filter(|_| !admitted_local) {
                     let Some(inbox) = &mut session.inbox else {
-                        return Reply::ReceiveLocal(Some(message));
+                        return Reply::ReceiveLocal(Some(message), R::SUCCESS.0);
                     };
-                    if publish.qos == QoS::ExactlyOnce {
+                    if qos == QoS::ExactlyOnce {
                         return match inbox.receive(id, message, &self.config) {
                             Receive::Accepted => Reply::NoChange,
                             Receive::Quota => {
@@ -805,8 +932,11 @@ impl State {
                 Reply::NoChange
             }
             Operation::Forward(message, now) => {
-                self.publish(message, now, effects);
-                Reply::NoChange
+                Reply::PublishReason(if self.publish(message, now, effects) {
+                    R::SUCCESS.0
+                } else {
+                    R::NO_MATCHING_SUBSCRIBERS.0
+                })
             }
             Operation::Ack(id, ack) => {
                 let Some(inbox) = &mut session.inbox else {
@@ -1057,9 +1187,14 @@ impl Router<'_> {
         self.matched = true;
         let session = self.sessions.get_mut(id).unwrap();
         let message = self.message;
-        if (!shared && (sub.bridge || sub.no_local) && *id == message.source.id)
-            || !allowed(self.acls, &session.publisher, &message.topic, Access::Read)
-        {
+        if !can_deliver(
+            self.acls,
+            session,
+            sub,
+            &message.source.id,
+            &message.topic,
+            shared,
+        ) {
             return;
         }
         let retain = (sub.bridge || sub.retain_as_published) && message.retain;
@@ -1068,7 +1203,8 @@ impl Router<'_> {
             message: message.clone(),
             qos,
             retain,
-            dedup_id: (!retain && !self.config.allow_duplicate_messages).then_some(self.id),
+            dedup_id: (!retain && !self.config.allow_duplicate_messages)
+                .then_some(crate::inbox::DedupId::Log(self.id)),
             subscription_identifier: sub.identifier,
         };
         deliver(session, delivery, self.config, self.effects);
@@ -1092,6 +1228,36 @@ fn deliver(
             owner: session.epoch,
             packet,
         });
+    }
+}
+
+fn can_deliver(
+    acls: &BTreeMap<u64, Arc<AclFile>>,
+    session: &Session,
+    sub: Subscription,
+    source: &str,
+    topic: &str,
+    shared: bool,
+) -> bool {
+    (shared || !(sub.bridge || sub.no_local) || session.publisher.id.as_ref() != source)
+        && allowed(acls, &session.publisher, topic, Access::Read)
+}
+
+fn publish_rejection(
+    config: &BrokerConfig,
+    acls: &BTreeMap<u64, Arc<AclFile>>,
+    source: &Publisher,
+    publish: &Publish,
+) -> Option<R> {
+    // handle_publish.c: handle__publish checks size before write ACL.
+    if config.message_size_limit != 0 && publish.payload.len() > config.message_size_limit {
+        Some(R::PACKET_TOO_LARGE)
+    } else if !allowed(acls, source, &publish.topic, Access::Write) {
+        Some(R::NOT_AUTHORIZED)
+    } else if publish.topic.starts_with("$CONTROL/") {
+        Some(R::IMPLEMENTATION_SPECIFIC_ERROR)
+    } else {
+        None
     }
 }
 

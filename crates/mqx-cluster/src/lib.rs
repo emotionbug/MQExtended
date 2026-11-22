@@ -1,11 +1,15 @@
 //! Durable static-membership Raft and a direct application mesh.
 //!
-//! The peer port carries trusted cluster traffic. Bind it to an isolated private network;
-//! it does not authenticate peers or encrypt traffic.
+//! Use a dedicated cluster CA. An authenticated configured peer is trusted to
+//! participate in consensus and submit application commands.
 
+mod admission;
 mod lease;
+mod mtls;
+mod mux;
 mod node;
 mod snapshot;
+mod snapshot_file;
 mod transport;
 mod wal;
 
@@ -24,6 +28,31 @@ pub use lease::{NodeEvent, NodeStatus};
 pub use node::{Cluster, ClusterMetrics};
 pub use openraft::SnapshotPolicy;
 pub use transport::Mesh;
+
+/// Largest configurable snapshot transfer, including the encoded metadata.
+pub const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
+/// Default maximum snapshot transfer size.
+pub const DEFAULT_MAX_SNAPSHOT_SIZE: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_COMMAND_SIZE: usize = 2 * 1024 * 1024;
+pub const DEFAULT_MAX_APPEND_SIZE: usize = 9 * 1024 * 1024;
+pub const DEFAULT_MAX_MESH_SIZE: usize = DEFAULT_MAX_COMMAND_SIZE;
+
+const MAX_PACKET_SIZE: usize = 268_435_460; // MQTT Remaining Length plus fixed header.
+const PACKET_ENVELOPE: usize = 64 * 1024;
+
+/// Transport security for the peer listener and all outgoing Raft and mesh RPCs.
+#[derive(Clone, Debug)]
+pub enum ClusterSecurity {
+    /// PEM credentials. The leaf must have exactly one Common Name, `mqx-node-<id>`,
+    /// and be valid for both TLS server and client authentication.
+    Tls {
+        ca_file: PathBuf,
+        cert_file: PathBuf,
+        key_file: PathBuf,
+    },
+    /// No peer authentication or encryption. Use only on a trusted isolated network.
+    InsecurePlaintext,
+}
 
 /// The initial state must be identical on all nodes. A restored node must only rely on
 /// application state stored in the snapshot and in subsequently applied log entries.
@@ -57,6 +86,7 @@ pub struct ClusterConfig {
     /// The identical static configuration on every node, including self.
     pub peers: BTreeMap<u64, SocketAddr>,
     pub data_dir: PathBuf,
+    pub security: ClusterSecurity,
     pub heartbeat_interval: Duration,
     pub election_timeout_min: Duration,
     pub election_timeout_max: Duration,
@@ -65,6 +95,14 @@ pub struct ClusterConfig {
     pub lease_interval: Duration,
     pub lease_timeout: Duration,
     pub snapshot_timeout: Duration,
+    /// Maximum encoded snapshot transfer size in bytes (default 64 MiB, maximum 256 MiB).
+    pub max_snapshot_size: u64,
+    /// Maximum MessagePack application command size. Use identical limits on all peers.
+    pub max_command_size: usize,
+    /// Maximum encoded AppendEntries body, including its entries and Raft metadata.
+    pub max_append_size: usize,
+    /// Maximum unreplicated mesh request or response body.
+    pub max_mesh_size: usize,
     pub snapshot_policy: SnapshotPolicy,
     pub snapshot_log_retention: u64,
 }
@@ -75,12 +113,14 @@ impl ClusterConfig {
         raft_addr: SocketAddr,
         peers: BTreeMap<u64, SocketAddr>,
         data_dir: PathBuf,
+        security: ClusterSecurity,
     ) -> Self {
         Self {
             node_id,
             raft_addr,
             peers,
             data_dir,
+            security,
             heartbeat_interval: Duration::from_millis(100),
             election_timeout_min: Duration::from_millis(400),
             election_timeout_max: Duration::from_millis(800),
@@ -88,12 +128,47 @@ impl ClusterConfig {
             lease_interval: Duration::from_secs(1),
             lease_timeout: Duration::from_secs(5),
             snapshot_timeout: Duration::from_secs(120),
+            max_snapshot_size: DEFAULT_MAX_SNAPSHOT_SIZE,
+            max_command_size: DEFAULT_MAX_COMMAND_SIZE,
+            max_append_size: DEFAULT_MAX_APPEND_SIZE,
+            max_mesh_size: DEFAULT_MAX_MESH_SIZE,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(5000),
             snapshot_log_retention: 1000,
         }
     }
 
+    /// Raise RPC limits to fit an MQTT packet plus a broker command or mesh envelope.
+    /// The server should use the effective broker `max_packet_size` shared by all
+    /// members; zero means MQTT's wire maximum. Default limits are never lowered.
+    pub fn set_packet_limit(&mut self, max_packet_size: usize) -> Result<(), ClusterError> {
+        let packet = if max_packet_size == 0 {
+            MAX_PACKET_SIZE
+        } else {
+            max_packet_size.min(MAX_PACKET_SIZE)
+        };
+        self.max_command_size = self.max_command_size.max(packet + PACKET_ENVELOPE);
+        self.max_mesh_size = self.max_mesh_size.max(packet + PACKET_ENVELOPE);
+        self.max_append_size = self
+            .max_append_size
+            .max(self.max_command_size.saturating_add(PACKET_ENVELOPE));
+        self.check_frame_limits()
+    }
+
+    fn check_frame_limits(&self) -> Result<(), ClusterError> {
+        if !(1..=MAX_PACKET_SIZE + PACKET_ENVELOPE).contains(&self.max_command_size)
+            || !(1..=MAX_PACKET_SIZE + PACKET_ENVELOPE).contains(&self.max_mesh_size)
+            || self.max_append_size > MAX_PACKET_SIZE + 2 * PACKET_ENVELOPE
+            || self.max_append_size < self.max_command_size + PACKET_ENVELOPE
+        {
+            return Err(ClusterError::InvalidConfig(
+                "invalid cluster frame sizes: AppendEntries must fit a maximum command plus 64 KiB of Raft metadata".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn raft_config(&self) -> Result<openraft::Config, ClusterError> {
+        self.check_frame_limits()?;
         let invalid = ClusterError::InvalidConfig;
         if !self.peers.contains_key(&self.node_id) {
             return Err(invalid("peers must contain node_id".into()));
@@ -106,6 +181,11 @@ impl ClusterConfig {
         {
             return Err(invalid(
                 "peer addresses must be distinct and routable".into(),
+            ));
+        }
+        if !(1..=MAX_SNAPSHOT_SIZE).contains(&self.max_snapshot_size) {
+            return Err(invalid(
+                "max_snapshot_size must be between 1 byte and 256 MiB".into(),
             ));
         }
         if self.data_dir.as_os_str().is_empty()
@@ -131,6 +211,8 @@ impl ClusterConfig {
             election_timeout_max: millis(self.election_timeout_max)?,
             install_snapshot_timeout: millis(self.snapshot_timeout)?,
             max_payload_entries: transport::MAX_APPEND_ENTRIES,
+            // OpenRaft's entry-count cap complements the byte cap in Wal::limited_get_log_entries.
+            api_batch_linger_ms: Some(1),
             snapshot_policy: self.snapshot_policy.clone(),
             max_in_snapshot_log_to_keep: self.snapshot_log_retention,
             purge_batch_size: 1,
@@ -154,6 +236,8 @@ pub enum ClusterError {
     Deadline,
     #[error("write may already have committed: {0}")]
     WriteUncertain(String),
+    #[error("peer rejected the application write before proposal")]
+    WriteRejected,
     #[error("cluster node is shut down")]
     Shutdown,
     #[error("no cluster member with ID {0}")]

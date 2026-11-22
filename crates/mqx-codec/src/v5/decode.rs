@@ -9,7 +9,10 @@ use super::{
     ReasonCode, ReasonProperties, RetainHandling, Subscribe, Subscription, SubscriptionAck,
     Unsubscribe, valid_publish_ack_reason, valid_shared_filter,
 };
-use crate::{Utf8Error, remaining_length_bytes, valid_topic, validate_utf8};
+use crate::{
+    ConnectReturnCode, Utf8Error, connect_protocol_name, remaining_length_bytes, valid_topic,
+    validate_utf8,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecodeContext {
@@ -68,6 +71,8 @@ impl DecodeContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorResponse {
     ConnAck(ReasonCode),
+    /// A protocol-name/level mismatch can be refused before Mosquitto selects MQTT 5.
+    LegacyConnAck(ConnectReturnCode),
     Disconnect(ReasonCode),
 }
 
@@ -266,9 +271,9 @@ impl Header {
     }
 }
 
-/// Read a buffered CONNECT's raw protocol level (3, 4, 5, or another level, with
-/// the high bit preserved). Returns `None` until that byte arrives; does not
-/// wait for the payload, consume bytes, or validate the rest of CONNECT.
+/// Read a buffered CONNECT's raw protocol level (with the high bit preserved).
+/// Returns `None` until the byte arrives. Checks that the protocol name is
+/// recognized, but does not validate its pairing with the level or the payload.
 pub fn peek_connect_protocol_level(src: &[u8]) -> Result<Option<u8>, DecodeError> {
     if let Some(&command) = src.first()
         && command & 0xf0 != crate::CONNECT
@@ -295,7 +300,7 @@ pub fn peek_connect_protocol_level(src: &[u8]) -> Result<Option<u8>, DecodeError
     let Some(name) = body.get(2..2 + length) else {
         return Ok(None);
     };
-    if !matches!(name, b"MQTT" | b"MQIsdp") {
+    if !matches!(connect_protocol_name(name), b"MQTT" | b"MQIsdp") {
         return Err(Fault::UnknownProtocolName.without_reply());
     }
     Ok(body.get(2 + length).copied())
@@ -524,13 +529,23 @@ fn read_connect(
         .take(name_len, "protocol name")
         .map_err(Fault::without_reply)?;
     let level = cur.byte("protocol level").map_err(Fault::without_reply)?;
-    if cur.bytes[name] != *b"MQTT" {
-        return Err(Fault::UnknownProtocolName.without_reply());
+    let version = level & 0x7f;
+    let wrong_level = Fault::UnacceptableProtocolVersion(level);
+    if !matches!(version, 3..=5) {
+        return Err(wrong_level.connack(R::UNSUPPORTED_PROTOCOL_VERSION));
     }
-    if level & 0x7f != 5 {
-        return Err(
-            Fault::UnacceptableProtocolVersion(level).connack(R::UNSUPPORTED_PROTOCOL_VERSION)
-        );
+    match (connect_protocol_name(&cur.bytes[name]), version) {
+        (b"MQTT", 5) => {}
+        (b"MQTT", 4) | (b"MQIsdp", 3) => return Err(wrong_level.without_reply()),
+        (b"MQTT" | b"MQIsdp", _) => {
+            return Err(DecodeError {
+                kind: wrong_level,
+                response: Some(ErrorResponse::LegacyConnAck(
+                    ConnectReturnCode::UnacceptableProtocolVersion,
+                )),
+            });
+        }
+        _ => return Err(Fault::UnknownProtocolName.without_reply()),
     }
     if command != PacketType::Connect.command() {
         return Err(Fault::InvalidFixedHeaderFlags(command).without_reply());

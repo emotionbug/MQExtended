@@ -5,7 +5,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::future::try_join_all;
 use mqx_cluster::{
-    Cluster, ClusterConfig, ClusterError, NodeEvent, NodeStatus, SnapshotPolicy, StateMachine,
+    Cluster, ClusterConfig, ClusterError, ClusterSecurity, NodeEvent, NodeStatus, SnapshotPolicy,
+    StateMachine,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -84,8 +85,13 @@ fn configs(
     peers
         .iter()
         .map(|(&id, &address)| {
-            let mut config =
-                ClusterConfig::new(id, address, peers.clone(), root.path().join(id.to_string()));
+            let mut config = ClusterConfig::new(
+                id,
+                address,
+                peers.clone(),
+                root.path().join(id.to_string()),
+                ClusterSecurity::InsecurePlaintext,
+            );
             config.heartbeat_interval = Duration::from_millis(35);
             config.election_timeout_min = Duration::from_millis(140);
             config.election_timeout_max = Duration::from_millis(260);
@@ -191,6 +197,23 @@ async fn snapshot_and_log_tail_rebuild_standalone_before_election() {
             .filter(|index| *index >= included)
     })
     .await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (path, expected) in [
+            (cfg.data_dir.clone(), 0o700),
+            (cfg.data_dir.join("wal"), 0o700),
+            (cfg.data_dir.join("node.mpk"), 0o600),
+            (cfg.data_dir.join("snapshot.mpk"), 0o600),
+        ] {
+            assert_eq!(
+                path.metadata().unwrap().permissions().mode() & 0o777,
+                expected,
+                "{}",
+                path.display()
+            );
+        }
+    }
     let initial = node.read(|kv| kv.durable.clone());
     node.shutdown().await.unwrap();
 
@@ -419,5 +442,249 @@ async fn follower_installs_snapshot_when_its_missing_prefix_has_been_purged() {
         .unwrap();
     assert!(returned.metrics().snapshot_index.unwrap() >= important.index);
     nodes.insert(follower_id, returned);
+    stop(nodes).await;
+}
+
+fn with_tls(root: &tempfile::TempDir, configs: &mut BTreeMap<u64, ClusterConfig>) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    };
+    let mut ca = CertificateParams::default();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let key = KeyPair::generate().unwrap();
+    let ca_cert = ca.self_signed(&key).unwrap();
+    let issuer = Issuer::new(ca, key);
+    let ca_file = root.path().join("ca.pem");
+    std::fs::write(&ca_file, ca_cert.pem()).unwrap();
+    for (&id, cfg) in configs {
+        // Node identity comes from the CN, not from a DNS SAN.
+        let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, format!("mqx-node-{id}"));
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = KeyPair::generate().unwrap();
+        let leaf = params.signed_by(&key, &issuer).unwrap();
+        let cert_file = root.path().join(format!("{id}-cert.pem"));
+        let key_file = root.path().join(format!("{id}-key.pem"));
+        std::fs::write(&cert_file, leaf.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+        cfg.security = ClusterSecurity::Tls {
+            ca_file: ca_file.clone(),
+            cert_file,
+            key_file,
+        };
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutually_authenticated_cluster_replicates_and_serves_mesh() {
+    let root = tempfile::tempdir().unwrap();
+    let mut configs = configs(&root, 3, SnapshotPolicy::Never);
+    with_tls(&root, &mut configs);
+    let mut nodes = start(&configs).await;
+    let leader = elected(&nodes).await;
+    let follower = nodes
+        .values()
+        .find(|node| node.node_id() != leader)
+        .unwrap();
+    let written = put(follower, "key", "via TLS").await;
+    for node in nodes.values() {
+        assert_eq!(
+            node.linearizable_read(|kv| kv.durable.writes.clone())
+                .await
+                .unwrap(),
+            [written.index]
+        );
+    }
+    let expected = follower.node_id();
+    let handled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = handled.clone();
+    nodes[&leader]
+        .mesh()
+        .register_handler(move |from, bytes| {
+            assert_eq!(from, expected);
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move { Ok(bytes) }
+        })
+        .unwrap();
+    let greeting = Bytes::from_static(b"hello over TLS");
+    assert_eq!(
+        follower
+            .mesh()
+            .request(leader, greeting.clone())
+            .await
+            .unwrap(),
+        greeting
+    );
+    nodes.remove(&expected).unwrap().shutdown().await.unwrap();
+    let mut cfg = configs[&expected].clone();
+    cfg.security = ClusterSecurity::InsecurePlaintext;
+    let plaintext = Cluster::start(cfg, Kv::default()).await.unwrap();
+    assert!(plaintext.mesh().request(leader, greeting).await.is_err());
+    assert_eq!(handled.load(std::sync::atomic::Ordering::Relaxed), 1);
+    plaintext.shutdown().await.unwrap();
+    stop(nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_stays_fifo_without_blocking_raft_on_its_peer_connection() {
+    let root = tempfile::tempdir().unwrap();
+    let mut configs = configs(&root, 3, SnapshotPolicy::Never);
+    with_tls(&root, &mut configs);
+    let nodes = start(&configs).await;
+    let leader = elected(&nodes).await;
+    let follower = nodes
+        .values()
+        .find(|node| node.node_id() != leader)
+        .unwrap();
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let gate = release.clone();
+    let (entered, mut arrivals) = mpsc::unbounded_channel();
+    nodes[&leader]
+        .mesh()
+        .register_handler(move |_, body| {
+            let entered = entered.clone();
+            let gate = gate.clone();
+            async move {
+                entered.send(body.clone()).unwrap();
+                if body == "first" {
+                    gate.notified().await;
+                }
+                Ok(body)
+            }
+        })
+        .unwrap();
+    follower
+        .mesh()
+        .send(leader, Bytes::from_static(b"first"))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(WAIT, arrivals.recv()).await.unwrap().unwrap(),
+        "first"
+    );
+    let mesh = follower.mesh().clone();
+    let next =
+        tokio::spawn(async move { mesh.request(leader, Bytes::from_static(b"second")).await });
+    assert_eq!(
+        put(follower, "while mesh is blocked", "Raft still commits")
+            .await
+            .previous,
+        None
+    );
+    assert!(
+        timeout(Duration::from_millis(50), arrivals.recv())
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    assert_eq!(next.await.unwrap().unwrap(), "second");
+    assert_eq!(
+        timeout(WAIT, arrivals.recv()).await.unwrap().unwrap(),
+        "second"
+    );
+    stop(nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_packet_limit_carries_large_forwarded_commands_and_mesh_payloads() {
+    let root = tempfile::tempdir().unwrap();
+    let mut configs = configs(&root, 3, SnapshotPolicy::Never);
+    for cfg in configs.values_mut() {
+        cfg.set_packet_limit(3 * 1024 * 1024).unwrap();
+    }
+    let nodes = start(&configs).await;
+    let leader = elected(&nodes).await;
+    let follower = nodes
+        .values()
+        .find(|node| node.node_id() != leader)
+        .unwrap();
+    let value = "v".repeat(2 * 1024 * 1024 + 128);
+    let written = put(follower, "large", &value).await;
+    for node in nodes.values() {
+        assert!(
+            node.linearizable_read(
+                |kv| kv.durable.values["large"] == value && kv.durable.writes == [written.index]
+            )
+            .await
+            .unwrap()
+        );
+    }
+    nodes[&leader]
+        .mesh()
+        .register_handler(|_, body| async move { Ok(body) })
+        .unwrap();
+    let payload = Bytes::from(value);
+    assert_eq!(
+        follower
+            .mesh()
+            .request(leader, payload.clone())
+            .await
+            .unwrap(),
+        payload
+    );
+    stop(nodes).await;
+}
+
+/// `cargo test --release -p mqx-cluster --test cluster -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual local filesystem and mTLS throughput benchmark"]
+async fn three_node_mtls_commit_throughput() {
+    const CLIENTS: usize = 64;
+    const OPERATIONS: usize = 32;
+    let root = tempfile::tempdir().unwrap();
+    let mut configs = configs(&root, 3, SnapshotPolicy::Never);
+    with_tls(&root, &mut configs);
+    for cfg in configs.values_mut() {
+        cfg.request_timeout = Duration::from_secs(15);
+        cfg.lease_interval = Duration::from_secs(1);
+        cfg.lease_timeout = Duration::from_secs(5);
+        cfg.heartbeat_interval = Duration::from_millis(100);
+        cfg.election_timeout_min = Duration::from_millis(500);
+        cfg.election_timeout_max = Duration::from_secs(1);
+    }
+    let nodes = start(&configs).await;
+    elected(&nodes).await;
+    for node in nodes.values() {
+        put(node, "warm-up", "ready").await;
+    }
+    let start = Instant::now();
+    let jobs = (0..CLIENTS)
+        .map(|client| {
+            let node = nodes[&((client % nodes.len()) as u64 + 1)].clone();
+            tokio::spawn(async move {
+                let key = format!("client-{client}");
+                let mut samples = Vec::with_capacity(OPERATIONS);
+                for _ in 0..OPERATIONS {
+                    let started = Instant::now();
+                    put(&node, &key, "payload").await;
+                    samples.push(started.elapsed());
+                }
+                samples
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut samples: Vec<_> = try_join_all(jobs)
+        .await
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
+    let elapsed = start.elapsed();
+    samples.sort_unstable();
+    let p = |percent: usize| samples[(samples.len() - 1) * percent / 100].as_secs_f64() * 1000.0;
+    println!(
+        "mTLS, 3 nodes, {CLIENTS} clients: {} commits in {:.3}s, {:.1} commits/s; latency p50 {:.2}ms p95 {:.2}ms p99 {:.2}ms",
+        samples.len(),
+        elapsed.as_secs_f64(),
+        samples.len() as f64 / elapsed.as_secs_f64(),
+        p(50),
+        p(95),
+        p(99),
+    );
     stop(nodes).await;
 }

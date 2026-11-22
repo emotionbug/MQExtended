@@ -18,13 +18,16 @@ impl ClusterFixture {
             .zip(sockets.iter().map(|socket| socket.local_addr().unwrap()))
             .collect();
         let storage = tempfile::tempdir().unwrap();
+        let packet_limit = config.max_packet_size;
         let make = |id| {
             let mut config = ClusterConfig::new(
                 id,
                 peers[&id],
                 peers.clone(),
                 storage.path().join(id.to_string()),
+                mqx_cluster::ClusterSecurity::InsecurePlaintext,
             );
+            config.set_packet_limit(packet_limit).unwrap();
             config.heartbeat_interval = Duration::from_millis(25);
             config.election_timeout_min = Duration::from_millis(100);
             config.election_timeout_max = Duration::from_millis(175);
@@ -64,7 +67,7 @@ impl ClusterFixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replicated_apply_routes_all_qos_to_another_nodes_transient_subscription() {
+async fn ordered_mesh_routes_qos0_and_qos1_and_raft_routes_retained_qos2() {
     let cluster = ClusterFixture::new(BrokerConfig::default()).await;
     let [a, b, c] = &cluster.brokers;
     let mut source = connected(a, "source", true, false).await;
@@ -115,6 +118,95 @@ async fn replicated_apply_routes_all_qos_to_another_nodes_transient_subscription
     source.disconnect().await;
     sink.disconnect().await;
     third.disconnect().await;
+    cluster.shutdown().await;
+}
+
+// MQTT ACK order follows the input stream. A retained update also publishes
+// live, so later mesh delivery must wait for it on every destination peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_publishers_keep_order_across_peer_and_raft_deliveries() {
+    let cluster = ClusterFixture::new(BrokerConfig::default()).await;
+    let [a, b, c] = &cluster.brokers;
+    let mut first = connected(b, "first", true, false).await;
+    let mut second = connected(c, "second", true, false).await;
+    let mut durable = connected(c, "durable", false, false).await;
+    first.subscribe(&[("live", Q1)], &[Q1]).await;
+    second.subscribe(&[("live", Q1)], &[Q1]).await;
+    durable.subscribe(&[("inbox", Q1)], &[Q1]).await;
+    let mut source = connected(a, "source", true, false).await;
+    let mut input = BytesMut::new();
+    for publish in [
+        publish("live", b"first", Q1, 21),
+        Publish {
+            retain: true,
+            ..publish("live", b"second", Q1, 22)
+        },
+        publish("inbox", b"replicated", Q1, 23),
+        publish("live", b"third", Q0, 0),
+        publish("live", b"fourth", Q1, 24),
+    ] {
+        encode(&Packet::Publish(publish), &mut input).unwrap();
+    }
+    encode(&Packet::PingReq, &mut input).unwrap();
+    source.io.write_all(&input).await.unwrap();
+    for id in 21..=24 {
+        source.expect(Packet::PubAck(mid(id))).await;
+    }
+    source.expect(Packet::PingResp).await;
+    for sink in [&mut first, &mut second] {
+        for packet in [
+            publish("live", b"first", Q1, 1),
+            publish("live", b"second", Q1, 2),
+            publish("live", b"third", Q0, 0),
+            publish("live", b"fourth", Q1, 3),
+        ] {
+            sink.expect(Packet::Publish(packet)).await;
+        }
+    }
+    first.disconnect().await;
+    second.disconnect().await;
+    durable
+        .expect(Packet::Publish(publish("inbox", b"replicated", Q1, 1)))
+        .await;
+    durable.disconnect().await;
+    source.disconnect().await;
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raised_packet_limit_reaches_both_mesh_and_durable_inboxes() {
+    let cluster = ClusterFixture::new(BrokerConfig {
+        max_packet_size: 3_000_000,
+        ..BrokerConfig::default()
+    })
+    .await;
+    let [a, b, c] = &cluster.brokers;
+    let mut source = connected(a, "source", true, false).await;
+    let mut live = connected(b, "live", true, false).await;
+    let mut durable = connected(c, "durable", false, false).await;
+    live.subscribe(&[("wide/live", Q1)], &[Q1]).await;
+    durable.subscribe(&[("wide/durable", Q1)], &[Q1]).await;
+
+    let bytes = Bytes::from(vec![b'!'; 2_200_000]);
+    for (topic, recipient) in [("wide/live", &mut live), ("wide/durable", &mut durable)] {
+        source
+            .send(Packet::Publish(Publish {
+                payload: bytes.clone(),
+                ..publish(topic, b"", Q1, 42)
+            }))
+            .await;
+        source.expect(Packet::PubAck(mid(42))).await;
+        recipient
+            .expect(Packet::Publish(Publish {
+                payload: bytes.clone(),
+                ..publish(topic, b"", Q1, 1)
+            }))
+            .await;
+        recipient.send(Packet::PubAck(mid(1))).await;
+    }
+    source.disconnect().await;
+    live.disconnect().await;
+    durable.disconnect().await;
     cluster.shutdown().await;
 }
 

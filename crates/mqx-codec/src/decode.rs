@@ -8,7 +8,8 @@ use super::{
     DUP_FLAG, LastWill, PASSWORD_FLAG, PINGREQ, PINGRESP, PUBACK, PUBCOMP, PUBLISH, PUBREC, PUBREL,
     Packet, PacketId, ProtocolVersion, Publish, QoS, RETAIN_FLAG, SUBACK, SUBSCRIBE, SubAck,
     Subscribe, SubscribeReturnCode, UNSUBACK, UNSUBSCRIBE, USERNAME_FLAG, Unsubscribe, Utf8Error,
-    WILL_FLAG, WILL_QOS_MASK, WILL_RETAIN_FLAG, remaining_length_bytes, valid_topic, validate_utf8,
+    WILL_FLAG, WILL_QOS_MASK, WILL_RETAIN_FLAG, connect_protocol_name, remaining_length_bytes,
+    valid_topic, validate_utf8,
 };
 
 /// The caller supplies the negotiated version; CONNECT always uses its own version.
@@ -261,8 +262,7 @@ fn check_command(command: u8, expected: u8) -> Result<(), DecodeError> {
 fn decode_connect(src: &mut BytesMut, frame: &Frame) -> Result<Packet, DecodeError> {
     let mut cursor = frame.cursor(src);
     let name_len = usize::from(cursor.word("protocol name length")?);
-    // src/handle_connect.c: read_protocol_name reads raw bytes with a fixed length;
-    // read_and_verify_protocol_version then compares a NUL-terminated C string.
+    // src/handle_connect.c: read_protocol_name accepts only four or six bytes.
     if !matches!(name_len, 4 | 6) {
         return Err(DecodeError::UnknownProtocolName);
     }
@@ -272,11 +272,7 @@ fn decode_connect(src: &mut BytesMut, frame: &Frame) -> Result<Packet, DecodeErr
     if !matches!(version, 3..=5) {
         return Err(DecodeError::UnacceptableProtocolVersion { level });
     }
-    let protocol = match &name[..name
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(name.len())]
-    {
+    let protocol = match connect_protocol_name(name) {
         b"MQIsdp" if version == 3 => ProtocolVersion::V31,
         b"MQTT" if version == 4 => ProtocolVersion::V311,
         b"MQIsdp" | b"MQTT" => return Err(DecodeError::UnacceptableProtocolVersion { level }),

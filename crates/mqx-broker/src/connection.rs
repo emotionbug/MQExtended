@@ -1,3 +1,4 @@
+mod pipeline;
 mod v5;
 
 use std::{
@@ -84,6 +85,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     && !matches!(error.kind, codec5::DecodeErrorKind::PacketTooLarge { .. })
                 {
                     R::UNSUPPORTED_PROTOCOL_VERSION
+                } else if let Some(codec5::ErrorResponse::LegacyConnAck(code)) = error.response {
+                    return refuse(&mut wire, &mut shutdown, code).await;
                 } else if let Some(codec5::ErrorResponse::ConnAck(reason)) = error.response {
                     reason
                 } else {
@@ -230,6 +233,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut delivering = !too_long;
     let mut prefer_input = false;
     let mut deferred = None;
+    let clustered = broker.is_clustered();
     let result = 'active: loop {
         if session.live.taken.load(Ordering::Acquire) {
             break Ok(End::Takeover);
@@ -247,7 +251,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 break Ok(End::KeepaliveRefused);
             }
             if delivering && (!prefer_input || deferred.is_some()) {
-                match session.broker.next_outbound(&session.live).await {
+                let next = session.broker.next_outbound(&session.live);
+                let next = if clustered {
+                    wire.prefetch(next).await
+                } else {
+                    next.await
+                };
+                match next {
                     Ok(Some(outbound)) => {
                         match wire.delivery(outbound, listener.mount_point.as_deref(), broker.now())
                         {
@@ -272,21 +282,53 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 continue;
             }
+            let input_bytes = wire.input.len();
             match wire.packet(config, connect.protocol) {
                 Ok(Some(packet)) => {
                     prefer_input = false;
                     deadline = self::deadline(connect.keep_alive);
-                    let step = match packet {
-                        Frame::Legacy(packet) => session.process(packet, &info).await,
-                        Frame::V5(packet) => {
-                            session
-                                .process_v5(
+                    let packet_bytes = input_bytes - wire.input.len();
+                    let step = if clustered
+                        && packet_bytes < pipeline::PREFETCH_BYTES
+                        && wire.input.first().is_some_and(|byte| byte >> 4 == 3)
+                        && pipeline::eligible(&packet, listener, config)
+                        && broker.can_pipeline(&session.live)
+                    {
+                        pipeline::publish(
+                            &session,
+                            &mut wire,
+                            packet,
+                            listener,
+                            connect.protocol,
+                            pipeline::PREFETCH_BYTES - packet_bytes,
+                        )
+                        .await
+                    } else {
+                        match packet {
+                            Frame::Legacy(packet) => {
+                                let step = session.process(packet, &info);
+                                if clustered {
+                                    wire.prefetch(step).await
+                                } else {
+                                    step.await
+                                }
+                            }
+                            Frame::V5(packet) => {
+                                let mut aliases = wire.v5.take().unwrap();
+                                let step = session.process_v5(
                                     packet,
                                     &info,
-                                    wire.v5.as_mut().unwrap(),
+                                    &mut aliases,
                                     options.as_ref().unwrap().session_expiry,
-                                )
-                                .await
+                                );
+                                let step = if clustered {
+                                    wire.prefetch(step).await
+                                } else {
+                                    step.await
+                                };
+                                wire.v5 = Some(aliases);
+                                step
+                            }
                         }
                     };
                     match step {
@@ -502,13 +544,21 @@ fn prepare(
         }
         mount(&mut will.topic, listener.mount_point.as_deref());
     }
-    // handle_connect.c: handle_username_from_cert_options ignores the MQTT
-    // credentials entirely when a mapped TLS identity is required.
+    // proxy_v2.c and handle_connect.c: handle_username_from_cert_options
+    // discard MQTT credentials for both certificate sources, but only a
+    // locally verified TLS identity bypasses mosquitto_basic_auth.
     let (username, password, certificate) = match &info.cert_identity {
         CertIdentity::Username(username) if !username.contains('\0') => {
             (Some(username.clone()), None, true)
         }
-        CertIdentity::Username(_) | CertIdentity::MissingOrInvalid => {
+        CertIdentity::ForwardedUsername(username)
+            if !username.is_empty() && !username.contains('\0') =>
+        {
+            (Some(username.clone()), None, false)
+        }
+        CertIdentity::Username(_)
+        | CertIdentity::ForwardedUsername(_)
+        | CertIdentity::MissingOrInvalid => {
             return Ok(Preparation::Refused(
                 Code::BadUserNameOrPassword,
                 R::BAD_USERNAME_OR_PASSWORD,
@@ -735,8 +785,8 @@ impl Active<'_> {
         let id = publication.packet.packet_id;
         let now = publication.now;
         let config = &self.broker.0.config;
-        let message = match self.act(Operation::Receive(publication)).await? {
-            Reply::ReceiveLocal(message) => message,
+        let (message, reason) = match self.broker.receive(&self.live, publication).await? {
+            Reply::ReceiveLocal(message, reason) => (message, reason),
             reply => return Ok(reply),
         };
         let id = id.unwrap();
@@ -744,11 +794,16 @@ impl Active<'_> {
         Ok(match message {
             None => {
                 inbox.lock().unwrap().credit_incoming();
-                Reply::NoChange
+                Reply::PublishReason(reason)
             }
             Some(message) if qos == QoS::ExactlyOnce => {
-                match inbox.lock().unwrap().receive(id, message, config) {
+                let mut inbox = inbox.lock().unwrap();
+                match inbox.receive(id, message, config) {
                     Receive::Duplicate => Reply::ProtocolError,
+                    Receive::Quota if inbox.receive_maximum.is_some() => {
+                        inbox.credit_incoming();
+                        Reply::PublishReason(R::QUOTA_EXCEEDED.0)
+                    }
                     Receive::Accepted | Receive::Quota => Reply::NoChange,
                 }
             }
@@ -757,7 +812,7 @@ impl Active<'_> {
                 if allowed {
                     self.act(Operation::Forward(message, now)).await?
                 } else {
-                    Reply::NoChange
+                    Reply::PublishReason(R::QUOTA_EXCEEDED.0)
                 }
             }
         })
@@ -842,6 +897,7 @@ struct Wire<S> {
     flush: bool,
     eof: bool,
     v5: Option<v5::WireState>,
+    pending_error: Option<BrokerError>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
@@ -854,6 +910,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             flush: false,
             eof: false,
             v5: None,
+            pending_error: None,
         }
     }
 
@@ -893,6 +950,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         config: &BrokerConfig,
         legacy_protocol: ProtocolVersion,
     ) -> Result<Option<Frame>, BrokerError> {
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
         let Some(v5) = &self.v5 else {
             if self
                 .input
@@ -1082,6 +1142,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             Poll::Ready(true)
         })
         .await
+    }
+
+    // Continue consuming transport input while a mesh or Raft operation is
+    // outstanding. The next QoS 0/1 run can then enter the proposal lane as a
+    // batch, without executing any subsequent MQTT packet out of order.
+    async fn prefetch<T>(
+        &mut self,
+        request: impl Future<Output = Result<T, BrokerError>>,
+    ) -> Result<T, BrokerError> {
+        let mut request = pin!(request);
+        while !self.eof
+            && self.pending_error.is_none()
+            && self.input.len() < pipeline::PREFETCH_BYTES
+        {
+            tokio::select! {
+                biased;
+                reply = &mut request => return reply,
+                result = self.progress(true) => result?,
+            }
+        }
+        request.await
     }
 
     // Drive both halves without splitting the transport or letting another
