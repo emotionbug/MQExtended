@@ -131,6 +131,8 @@ struct Security {
     password: Option<PasswordFile>,
     acl: Option<Arc<AclFile>>,
     text: Option<Bytes>,
+    // Effective listener settings installed with the credential files at reload.
+    anonymous: Box<[bool]>,
     reload: bool,
 }
 
@@ -218,7 +220,7 @@ static SECURITY_REVISION: AtomicU64 = AtomicU64::new(0);
 /// Reloadable security callbacks. Listeners sharing password/ACL files share a
 /// handle; dynamic security state is owned by the broker, not by the handle.
 #[derive(Clone)]
-pub struct SecurityHandle(Arc<SharedSecurity>, Option<bool>);
+pub struct SecurityHandle(Arc<SharedSecurity>, Option<bool>, usize);
 
 impl std::fmt::Debug for SecurityHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -266,10 +268,12 @@ impl SecurityHandle {
                     password,
                     acl: acl.map(Arc::new),
                     text,
+                    anonymous: Box::default(),
                     reload: false,
                 })),
             }),
             None,
+            0,
         )
     }
 
@@ -280,21 +284,36 @@ impl SecurityHandle {
         self
     }
 
+    /// Select this listener's anonymous setting when sharing a credential store.
+    pub fn for_listener(mut self, index: usize) -> Self {
+        self.2 = index;
+        self
+    }
+
+    fn anonymous(&self, snapshot: &Security, initial: bool) -> bool {
+        if snapshot.anonymous.is_empty() {
+            initial
+        } else {
+            snapshot.anonymous.get(self.2).copied().unwrap_or(false)
+        }
+    }
+
     /// Replaces policy files loaded by the caller. In cluster mode follow
     /// this with [`Broker::register_security`] to commit the changed ACL.
     pub fn replace_text(
         &self,
         password: Option<PasswordFile>,
         acl: Option<Vec<u8>>,
+        anonymous: Box<[bool]>,
     ) -> Result<(), AclFileError> {
         let (parsed, text) = parse_acl(acl)?;
-        self.replace_inner(password, parsed, text);
+        self.replace_inner(password, parsed, text, anonymous);
         Ok(())
     }
 
     /// Replaces both files together and causes connected clients to reauthenticate.
     pub fn replace(&self, password: Option<PasswordFile>, acl: Option<AclFile>) {
-        self.replace_inner(password, acl, None);
+        self.replace_inner(password, acl, None, Box::default());
     }
 
     fn replace_inner(
@@ -302,11 +321,13 @@ impl SecurityHandle {
         password: Option<PasswordFile>,
         acl: Option<AclFile>,
         text: Option<Bytes>,
+        anonymous: Box<[bool]>,
     ) {
         self.0.snapshots.send_replace(Arc::new(Security {
             password,
             acl: acl.map(Arc::new),
             text,
+            anonymous,
             reload: true,
         }));
         SECURITY_REVISION.fetch_add(1, Ordering::Release);

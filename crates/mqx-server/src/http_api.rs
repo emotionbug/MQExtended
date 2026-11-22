@@ -26,16 +26,43 @@ type Body = UnsyncBoxBody<Bytes, Error>;
 /// create MQTT sessions or increment counters when serving HTTP requests.
 #[derive(Clone)]
 pub struct HttpApi {
-    listeners: Bytes,
+    listeners: tokio::sync::watch::Sender<Bytes>,
+    copies: Arc<[usize]>,
     anonymous: Arc<[bool]>,
 }
 
 impl HttpApi {
     pub fn new(config: &ServerConfig, server: &Server) -> Self {
+        let copies: Arc<[_]> = config
+            .listeners
+            .iter()
+            .enumerate()
+            .map(|(i, listener)| {
+                if config.local_only && listener.protocol == ListenerProtocol::Mqtt {
+                    server.listener_socket_count(i)
+                } else {
+                    1
+                }
+            })
+            .collect();
+        let anonymous: Arc<[_]> = config
+            .listeners
+            .iter()
+            .map(|listener| config.allow_anonymous_for(listener))
+            .collect();
+        let listeners = tokio::sync::watch::Sender::new(Self::inventory(config, &copies, &anonymous));
+        Self { listeners, anonymous, copies }
+    }
+
+    pub fn reload_access(&self, bound: &ServerConfig, fresh: &ServerConfig) {
+        let anonymous: Vec<_> = fresh.listeners.iter().map(|l| fresh.allow_anonymous_for(l)).collect();
+        self.listeners.send_replace(Self::inventory(bound, &self.copies, &anonymous));
+    }
+
+    fn inventory(config: &ServerConfig, copies: &[usize], anonymous: &[bool]) -> Bytes {
         // src/http_api.c: http_api__process_listeners reports config order,
         // including its own endpoint, and tests cert/key presence, not handshakes.
         let mut response = String::from("{\n\t\"listeners\":\t[");
-        let mut anonymous = Vec::with_capacity(config.listeners.len());
         let mut first = true;
         for (index, listener) in config.listeners.iter().enumerate() {
             let protocol = match listener.protocol {
@@ -43,18 +70,12 @@ impl HttpApi {
                 ListenerProtocol::Websockets => "websockets",
                 ListenerProtocol::HttpApi => "httpapi",
             };
-            let allowed = config.allow_anonymous_for(listener);
-            anonymous.push(allowed);
+            let allowed = anonymous[index];
             let tls = listener.tls.certfile.is_some() && listener.tls.keyfile.is_some();
             let mtls = listener.tls.require_certificate;
             // listeners__start_local_only adds a distinct config entry for each
             // MQTT loopback socket that actually opened.
-            let copies = if config.local_only && listener.protocol == ListenerProtocol::Mqtt {
-                server.listener_socket_count(index)
-            } else {
-                1
-            };
-            for _ in 0..copies {
+            for _ in 0..copies[index] {
                 if !first {
                     response.push_str(", ");
                 }
@@ -63,10 +84,7 @@ impl HttpApi {
             }
         }
         response.push_str("]\n}");
-        Self {
-            listeners: Bytes::from(response),
-            anonymous: anonymous.into(),
-        }
+        Bytes::from(response)
     }
 
     pub async fn serve(
@@ -131,7 +149,7 @@ impl HttpApi {
         }
         match path.as_ref() {
             "/api/v1/version" => api_response(MOSQUITTO_VERSION),
-            "/api/v1/listeners" => api_response(self.listeners.clone()),
+            "/api/v1/listeners" => api_response(self.listeners.borrow().clone()),
             "/api/v1/systree" => {
                 // src/http_api.c: http_api__process_systree; json_help.c:
                 // cJSON_AddIntToObject prints signed integer literals without f64 rounding.

@@ -148,6 +148,7 @@ impl Broker {
         let username = username.map(Arc::<str>::from);
         let password = password.map(Bytes::copy_from_slice);
         let file = security.0.snapshots.borrow().clone();
+        let allow_anonymous = security.anonymous(&file, allow_anonymous);
         let dynamic = security.1.zip(
             self.dynamic_policy_snapshot(security)
                 .map(|(_, policy)| policy),

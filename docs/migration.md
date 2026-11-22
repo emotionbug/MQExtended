@@ -47,7 +47,8 @@ Then restart Mosquitto once in a quiet period and watch two things:
 - It sends systemd `READY=1` when its listeners are open, so `Type=notify` units work.
 - Started as root, it drops to `user` (default `mosquitto`) right after reading the config, before opening certificates, credential files or listeners, honouring `PUID`/`PGID` as Mosquitto does. Ports below 1024 then need the same capability setup as for Mosquitto.
 - `-d` daemonises, `pid_file` is written and removed as Mosquitto does, `UMASK_SET` applies.
-- SIGHUP reloads, SIGUSR1 saves the persistence file, SIGRTMIN reopens log files.
+- `--version` prints the MQExtended release without opening listeners; use this to identify the binary rather than the Mosquitto compatibility version in `$SYS`.
+- SIGHUP rereads credential paths, ACLs and `allow_anonymous` for bound listeners. Existing MQTT clients are reauthenticated; HTTP requests use the refreshed policy too. Adding or removing a listener, or changing `per_listener_settings`, requires a restart. SIGUSR1 saves the persistence file; SIGRTMIN reopens log files.
 
 ## 5. Carry state over
 

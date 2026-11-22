@@ -231,13 +231,7 @@ fn report_startup(file: Option<&Path>) {
     }
 }
 
-async fn run_broker(
-    cli: &Cli,
-    mut config: ServerConfig,
-    logging: &Logging,
-    log_topics: LogTopics,
-    shutdown: &mut ShutdownLog,
-) -> Result<(), ServerError> {
+fn add_local_http(config: &mut ServerConfig) {
     if config.local_only {
         // Mosquitto src/listeners.c: listeners__start_local_only adds
         // the HTTP endpoint after default MQTT listeners, including with -p.
@@ -256,6 +250,40 @@ async fn run_broker(
             ..ListenerConfig::default()
         });
     }
+}
+
+fn reload_config(path: &Path, cli: &Cli, bound: &ServerConfig) -> Result<ServerConfig, ServerError> {
+    let mut fresh = ServerConfig::load(path)?.with_command_line_ports(&cli.ports);
+    add_local_http(&mut fresh);
+    if let Some(location) = std::env::var_os("MOSQUITTO_PERSISTENCE_LOCATION") {
+        fresh.persistence.location = Some(location.into());
+    }
+    let changed_layout = || ServerError::Arguments(
+        "Changing listeners or per_listener_settings requires a restart.".into()
+    );
+    if bound.per_listener_settings != fresh.per_listener_settings || bound.listeners.len() != fresh.listeners.len() {
+        return Err(changed_layout());
+    }
+    // conf.c: config__read_file_core matches a reloaded listener by endpoint,
+    // not file order. Keep listener indices (including replicated ACL ids) stable.
+    for (i, old) in bound.listeners.iter().enumerate() {
+        let offset = fresh.listeners[i..].iter().position(|l|
+            (l.port, &l.host, &l.unix_socket_path, l.protocol)
+                == (old.port, &old.host, &old.unix_socket_path, old.protocol)
+        ).ok_or_else(changed_layout)?;
+        fresh.listeners.swap(i, i + offset);
+    }
+    Ok(fresh)
+}
+
+async fn run_broker(
+    cli: &Cli,
+    mut config: ServerConfig,
+    logging: &Logging,
+    log_topics: LogTopics,
+    shutdown: &mut ShutdownLog,
+) -> Result<(), ServerError> {
+    add_local_http(&mut config);
     let live_log = std::cell::RefCell::new(config.log.clone());
     let security = Arc::new(security_handles(&config)?);
     let policies: Arc<Vec<Arc<ListenerPolicy>>> = Arc::new(
@@ -400,6 +428,7 @@ async fn run_broker(
     let log_topics = tokio::spawn(log_topics.serve(broker.clone()));
     let serving = broker.clone();
     let http = HttpApi::new(&config, &server);
+    let http_inventory = http.clone();
     let result = server
         .with_broker_observation(broker.clone())
         .run_with_signals(
@@ -441,17 +470,17 @@ async fn run_broker(
                 }
             },
             || async {
-                // Mosquitto src/signals.c: SIGHUP rereads the credential files even when their
-                // paths are unchanged; a malformed file stops the broker (exit 3).
-                security.reload(&config)?;
-                if membership.as_ref().is_some_and(|membership| membership.is_serving())
-                    && registered.load(Ordering::Acquire)
-                {
-                    security.register(&broker).await?;
-                }
                 if let Some(path) = &cli.file {
-                    match ServerConfig::load(path) {
+                    match reload_config(path, cli, &config) {
                         Ok(mut fresh) => {
+                            // signals.c: reload configuration before opening credential files.
+                            security.reload(&fresh)?;
+                            if membership.as_ref().is_none_or(|membership| membership.is_serving())
+                                && registered.load(Ordering::Acquire)
+                            {
+                                security.register(&broker).await?;
+                            }
+                            http_inventory.reload_access(&config, &fresh);
                             cli.override_log_types(&mut fresh.log);
                             broker.set_connection_messages(fresh.log.connection_messages);
                             logging.reload(&fresh.log);
@@ -610,13 +639,19 @@ struct SecurityHandles {
 
 impl SecurityHandles {
     fn for_listener(&self, index: usize) -> SecurityHandle {
-        self.handles[if self.per_listener { index } else { 0 }].clone()
+        let (group, slot) = if self.per_listener { (index, 0) } else { (0, index) };
+        self.handles[group].clone().for_listener(slot)
     }
 
     fn reload(&self, config: &ServerConfig) -> Result<(), ServerError> {
         let fresh = load_credentials(config)?;
-        for (handle, credentials) in self.handles.iter().zip(fresh) {
-            credentials.install(|password, acl| handle.replace_text(password, acl))?;
+        for (index, (handle, credentials)) in self.handles.iter().zip(fresh).enumerate() {
+            let anonymous = if self.per_listener {
+                Box::from([config.allow_anonymous_for(&config.listeners[index])]) as Box<[bool]>
+            } else {
+                config.listeners.iter().map(|l| config.allow_anonymous_for(l)).collect()
+            };
+            credentials.install(|password, acl| handle.replace_text(password, acl, anonymous))?;
         }
         Ok(())
     }

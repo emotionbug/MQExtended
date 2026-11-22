@@ -141,7 +141,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let dynamic = listener.security.1.zip(dynamic.map(|(_, policy)| policy));
     let security_snapshot = security.borrow_and_update().clone();
     if !identity
-        .authorized(&client_id, security_snapshot, dynamic.as_ref())
+        .authorized(&listener.security, &client_id, security_snapshot, dynamic.as_ref())
         .await
     {
         if options.is_some() {
@@ -464,17 +464,19 @@ struct Identity {
 impl Identity {
     async fn authorized(
         &self,
+        security: &SecurityHandle,
         client_id: &Arc<str>,
         snapshot: Arc<Security>,
         dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
     ) -> bool {
+        let anonymous = security.anonymous(&snapshot, self.allow_anonymous);
         self.certificate
             || snapshot
                 .authenticate(
                     client_id,
                     self.username.as_ref(),
                     self.password.as_ref(),
-                    self.allow_anonymous,
+                    anonymous,
                     dynamic,
                 )
                 .await
@@ -492,7 +494,7 @@ impl Identity {
                 .dynamic_policy_snapshot(security)
                 .map(|(_, policy)| policy),
         );
-        self.authorized(client_id, snapshot, dynamic.as_ref()).await
+        self.authorized(security, client_id, snapshot, dynamic.as_ref()).await
     }
 }
 

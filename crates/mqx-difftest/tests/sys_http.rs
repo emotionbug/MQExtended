@@ -439,6 +439,60 @@ fn http_api_cross_broker() {
     }
 }
 
+// src/signals.c: signal__flag_check loads the new file before reapplying
+// security to connected clients. Changing the path is not an in-place edit.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires MQExtended and Mosquitto 2.1.4 with libmicrohttpd"]
+fn sighup_rotates_credentials_and_revokes_anonymous_sessions() {
+    for kind in [BrokerKind::Mosquitto, BrokerKind::MqExtended] {
+        let [mqtt, http] = ports();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        fs::write(dir.join("old"), "").unwrap();
+        assert!(Command::new(reference().join("apps/mosquitto_passwd/mosquitto_passwd"))
+            .args(["-b", "-c", "new", "user", "password"])
+            .current_dir(dir).status().unwrap().success());
+        let a = format!("listener {mqtt} 127.0.0.1\n");
+        let b = format!("listener {http} 127.0.0.1\nprotocol http_api\n");
+        let mut process = start(kind, dir, format!("allow_anonymous true\npassword_file old\n{a}{b}"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while request(http, "GET", "/api/v1/version", None).is_err() {
+            assert!(Instant::now() < deadline && process.0.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(10));
+        }
+        let connect = || {
+            let mut stream = TcpStream::connect(("127.0.0.1", mqtt)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.write_all(b"\x10\x0f\0\x04MQTT\x04\x02\0\0\0\x03sys").unwrap();
+            let mut ack = [0; 4];
+            stream.read_exact(&mut ack).unwrap();
+            (stream, ack)
+        };
+        let (mut active, ack) = connect();
+        assert_eq!(ack, [0x20, 2, 0, 0]);
+        // Keep the HTTP listener open to anonymous monitoring while revoking
+        // it on MQTT. File order is deliberately different from bound order.
+        let reload = |conf| {
+            fs::write(dir.join("mosquitto.conf"), conf).unwrap();
+            assert!(Command::new("kill").args(["-HUP", &process.0.id().to_string()]).status().unwrap().success());
+        };
+        reload(format!("allow_anonymous false\npassword_file new\n{b}listener_allow_anonymous true\n{a}"));
+        assert_eq!(active.read(&mut [0]).unwrap(), 0, "{kind:?}");
+        assert_eq!(connect().1, [0x20, 2, 0, 5]);
+        let listeners = api_json(request(http, "GET", "/api/v1/listeners", None).unwrap());
+        assert_eq!(listeners["listeners"][0]["allow_anonymous"], false);
+        assert_eq!(listeners["listeners"][1]["allow_anonymous"], true);
+        reload(format!("allow_anonymous false\npassword_file new\n{a}{b}listener_allow_anonymous false\n"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while request(http, "GET", "/api/v1/version", None).unwrap().status != 401 {
+            assert!(Instant::now() < deadline, "{kind:?}: HTTP still permits anonymous reads");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(request(http, "GET", "/api/v1/version", Some("dXNlcjpwYXNzd29yZA==")).unwrap().status, 200);
+    }
+}
+
 #[test]
 #[ignore = "requires MQExtended"]
 fn cluster_http_reports_members_and_raft_progress() {

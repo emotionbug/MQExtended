@@ -384,7 +384,7 @@ async fn replicated_acl_reload_rechecks_original_retained_source_across_nodes() 
     }))
     .await;
     security
-        .replace_text(None, Some(b"topic read history\n".to_vec()))
+        .replace_text(None, Some(b"topic read history\n".to_vec()), Box::default())
         .unwrap();
     c.register_security(&security).await.unwrap();
     sink.subscribe(&[("history", Q1)], &[Q1]).await;
