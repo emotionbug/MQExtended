@@ -81,4 +81,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-CI runs fmt, clippy and the workspace tests in one job, and in a second job builds the Mosquitto references (cached) and runs every differential and failover test. `mqx-bench`'s ignored test needs release builds and runs locally.
+CI checks formatting, lint and tests against `Cargo.lock`. The differential job builds the Mosquitto references (cached); `linux-bundle` stages and validates a release without installing it. On trusted pushes to `main`, `root-process` runs the privilege/daemon smoke separately. `mqx-bench`'s ignored test needs release builds and runs locally.

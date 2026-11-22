@@ -19,8 +19,8 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace
 
   differential:
     # Runs the #[ignore]d differential tests against real Mosquitto builds;
@@ -63,7 +63,7 @@ jobs:
             -DWITH_PLUGINS=ON -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_WEBSOCKETS=OFF -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
             -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
           cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
-      - run: cargo build -p mqx-server
+      - run: cargo build --locked -p mqx-server
       - name: Differential and failover tests
         env:
           MOSQUITTO_BUILD_DIR: /tmp/mosquitto/build
@@ -72,7 +72,29 @@ jobs:
           MOSQUITTO_PLUGIN_BUILD_DIR: /tmp/mosquitto/build-plugins
           MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
         # mqx-bench's ignored test needs release builds; run it locally.
-        run: cargo test --workspace --exclude mqx-bench --all-features -- --ignored
+        run: cargo test --locked --workspace --exclude mqx-bench --all-features -- --ignored
+
+  linux-bundle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify staged release, sample configuration and unit
+        shell: bash
+        run: |
+          bundle="$RUNNER_TEMP/mqx-bundle"
+          ./scripts/stage-linux.sh "$bundle"
+          (cd "$bundle" && sha256sum --check --strict SHA256SUMS)
+          "$bundle/bin/mqextended" --version
+          "$bundle/bin/mqextended" --test-config -c "$bundle/etc/mqextended.conf"
+          sed "s|^ExecStart=.*|ExecStart=\"$bundle/bin/mqextended\" -c \"$bundle/etc/mqextended.conf\"|" \
+            "$bundle/lib/systemd/system/mqextended.service" > "$RUNNER_TEMP/mqx-check.service"
+          systemd-analyze verify "$RUNNER_TEMP/mqx-check.service"
 
   root-process:
     # Only a trusted revision may run a repository-built binary as root.
