@@ -459,6 +459,44 @@ fn list_plugins_includes_dynamic_security_without_configuration_or_options() {
     }
 }
 
+#[test]
+#[ignore = "requires Mosquitto 2.1.4 with the stock plugins and mqextended"]
+fn inventory_includes_file_and_sparkplug_plugins_in_registration_order() {
+    let plugins = reference("MOSQUITTO_PLUGIN_BUILD_DIR").join("plugins");
+    let settings = tempfile::tempdir().unwrap();
+    let acl = settings.path().join("acl");
+    fs::write(&acl, "topic readwrite $CONTROL/#\n").unwrap();
+    let ext = std::env::consts::DLL_EXTENSION;
+    let conf = format!(
+        "{CONFIG}{ENABLED}plugin {}/sparkplug-aware/mosquitto_sparkplug_aware.{ext}\n\
+         plugin {}/acl-file/mosquitto_acl_file.{ext}\nplugin_opt_acl_file {}\n",
+        plugins.display(),
+        plugins.display(),
+        acl.display()
+    );
+    for kind in [BrokerKind::Mosquitto, BrokerKind::MqExtended] {
+        let mut harness = standalone(kind, &conf);
+        let admin = client(&mut harness, 1, "inventory", None);
+        subscribe(&mut harness, admin, RESPONSE);
+        request(
+            &mut harness,
+            admin,
+            TOPIC,
+            br#"{"commands":[{"command":"listPlugins"}]}"#,
+            QoS::AtLeastOnce,
+            R::SUCCESS,
+        );
+        assert_eq!(
+            response(&mut harness, admin, RESPONSE),
+            json!({"responses":[{"command":"listPlugins","data":{"plugins":[
+                {"name":"sparkplug-aware","version":"1.0","control-endpoints":[]},
+                {"name":"acl-file","control-endpoints":[]}
+            ]}}]}),
+            "{kind:?}"
+        );
+    }
+}
+
 fn expect_missing(harness: &mut Harness, writer: Connection, observer: Connection, topic: &str) {
     request(harness, writer, topic, LIST, QoS::AtLeastOnce, R::SUCCESS);
     assert_eq!(

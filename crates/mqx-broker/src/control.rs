@@ -26,20 +26,17 @@ pub struct ControlListener {
 /// Inventory is taken on the node that receives the request, not the Raft leader.
 pub struct ControlInventory {
     listeners: Vec<ControlListener>,
-    dynamic_security: bool,
+    plugins: Vec<Plugin>,
 }
 
 #[derive(Serialize)]
 struct Plugin {
     name: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'static str>,
     #[serde(rename = "control-endpoints")]
     control_endpoints: &'static [&'static str],
 }
-
-static DYNSEC: [Plugin; 1] = [Plugin {
-    name: "dynamic-security",
-    control_endpoints: &[DYNSEC_CONTROL_TOPIC],
-}];
 
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,11 +62,20 @@ struct Envelope<'a> {
 }
 
 impl ControlInventory {
-    pub fn new(listeners: Vec<ControlListener>, dynamic_security: bool) -> Self {
-        Self {
-            listeners,
-            dynamic_security,
-        }
+    pub fn new(listeners: Vec<ControlListener>, registrations: &[&'static str]) -> Self {
+        let plugins = registrations
+            .iter()
+            .map(|&name| Plugin {
+                name,
+                version: (name == "sparkplug-aware").then_some("1.0"),
+                control_endpoints: if name == "dynamic-security" {
+                    &[DYNSEC_CONTROL_TOPIC]
+                } else {
+                    &[]
+                },
+            })
+            .collect();
+        Self { listeners, plugins }
     }
 
     pub(crate) fn respond(&self, payload: &[u8], client_id: &str, username: Option<&str>) -> Bytes {
@@ -125,8 +131,7 @@ impl ControlInventory {
             let (command, data) = if command.eq_ignore_ascii_case("listListeners") {
                 ("listListeners", Data::Listeners(&self.listeners))
             } else if command.eq_ignore_ascii_case("listPlugins") {
-                let plugins: &[Plugin] = if self.dynamic_security { &DYNSEC } else { &[] };
-                ("listPlugins", Data::Plugins(plugins))
+                ("listPlugins", Data::Plugins(&self.plugins))
             } else {
                 responses.push(error(command, "Unknown command", correlation));
                 continue;

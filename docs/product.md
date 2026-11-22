@@ -16,7 +16,7 @@ You run devices or services built on libmosquitto. Their settings are unknown or
 
 - Changing client behaviour to make the cluster easier (redirects, MQTT 5-only features as a requirement, forced reconnect settings).
 - Load balancing. The network in front of the cluster decides which node a connection reaches.
-- Loading Mosquitto's C plugins. The dynamic security plugin is built in; others are refused.
+- Loading arbitrary Mosquitto C plugins. MQExtended implements [selected stock plugins](mosquitto-compatibility.md#plugins) in Rust; it does not execute shared libraries.
 
 ## Direction
 

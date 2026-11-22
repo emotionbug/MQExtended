@@ -300,7 +300,7 @@ impl Server {
                 tls: protocol.is_some() && bound.options.tls.borrow().is_some(),
             });
         }
-        ControlInventory::new(listeners, config.dynamic_security.is_some())
+        ControlInventory::new(listeners, &config.plugin_inventory)
     }
 
     pub async fn run<H, F, R, RF, E>(self, handler: H, reload: R) -> Result<(), ServerError>

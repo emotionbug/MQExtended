@@ -13,7 +13,7 @@ plugin_opt_config_file /var/lib/mosquitto/dynamic-security.json
 
 - `plugin`, `auth_plugin`, `global_plugin`, and `plugin_load` with `plugin_use` work as in 2.1.4, including per-listener scoping under `per_listener_settings true`.
 - `plugin_opt_config_file` is the JSON file with clients, groups, roles and ACLs, in Mosquitto's format. Existing files load as they are.
-- Any other plugin path makes `mqextended` refuse to start, naming the plugin.
+- See [supported plugins and their configuration limits](mosquitto-compatibility.md#plugins) before combining plugins on a listener.
 
 Authentication and ACL checks run in the plugin's order, after or alongside `password_file` and `acl_file` exactly as Mosquitto combines them. Control requests on `$CONTROL/dynamic-security/v1` get Mosquitto's JSON responses, so `mosquitto_ctrl` and other tools need no change.
 

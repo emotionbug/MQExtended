@@ -12,7 +12,7 @@ The [Mosquitto download page](https://mosquitto.org/download/) lists 2.1.4. The 
 | MQTT-SN | [1.2](https://www.oasis-open.org/committees/tc_home.php?wg_abbrev=mqtt-sn) is the input specification. The [2.0 document dated 2026-11-17](https://groups.oasis-open.org/higherlogic/ws/public/document?document_id=73644) is a working draft, not an approved standard. | This is a separate wire protocol. Use an MQTT-SN gateway; there is no native MQTT-SN listener. |
 | MQTT over WebSocket | MQTT §6 uses [RFC 6455](https://www.rfc-editor.org/info/rfc6455/). [RFC 8441](https://www.rfc-editor.org/info/rfc8441/) and [RFC 9220](https://www.rfc-editor.org/info/rfc9220/) specify bootstrapping over HTTP/2 and HTTP/3 respectively. | WS/WSS clients use HTTP/1.1 Upgrade. The broker does not implement HTTP/2 or HTTP/3 Extended CONNECT or a native QUIC listener. |
 | TLS | [RFC 9846](https://www.rfc-editor.org/info/rfc9846/) supersedes RFC 8446; the negotiated version is still TLS 1.3. | Both TLS 1.2 and 1.3 were exercised on MQTT and WSS listeners. Successful negotiation is not an audit of every RFC requirement. |
-| Sparkplug | [Eclipse Sparkplug 3.0](https://sparkplug.eclipse.org/specification/version/3.0/) is [ISO/IEC 20237:2023](https://www.iso.org/standard/86204.html). | This is an application profile over MQTT. Forwarding its topics and payloads is not Sparkplug certification; the Sparkplug TCK was not run. |
+| Sparkplug | [Eclipse Sparkplug 3.0](https://sparkplug.eclipse.org/specification/version/3.0/) is [ISO/IEC 20237:2023](https://www.iso.org/standard/86204.html). | The optional [Sparkplug-aware plugin](#plugins) publishes birth certificates. This is not Sparkplug certification; the TCK was not run. |
 
 MQTT 5 support does not imply support for every authentication mechanism. A CONNECT with a nonempty Authentication Method receives CONNACK `0x8C` (Bad Authentication Method); there is no enhanced-authentication plugin. This does not prevent username/password or certificate authentication.
 
@@ -55,6 +55,21 @@ See [client interoperability](testing.md#client-sdk-interoperability) for the di
 - With any `pattern` line present, a client id or username containing `+` or `#` is denied everything.
 - Lines are split on spaces only; tabs are part of a token, and an indented `#` is not a comment.
 
+### Plugins
+
+`plugin` and `auth_plugin` recognize the stock `.so` and `.dll` filenames; MQExtended runs the corresponding Rust implementation, not code from that path. `plugin_opt_` and `auth_opt_` are aliases. Use `global_plugin` for global scope, or `plugin_load` and `plugin_use` to attach a named plugin to a listener. Restart to change declarations or their options.
+
+| Module | Behavior |
+| --- | --- |
+| `mosquitto_dynamic_security` | See [dynamic security](dynamic-security.md). |
+| `mosquitto_password_file` | Set `plugin_opt_password_file` to the Mosquitto hash file. |
+| `mosquitto_acl_file` | Set `plugin_opt_acl_file` to the Mosquitto ACL file. |
+| `mosquitto_sparkplug_aware` | For an authorized `spBv1.0/+/NBIRTH/+` or `spBv1.0/+/DBIRTH/+/+` PUBLISH, publish a broker-origin copy at `$sparkplug/certificates/<original topic>` with the original QoS. Copies are retained if retention is enabled; an empty payload clears a stored certificate. A global plugin also sees inbound publications from outgoing bridges. |
+
+Password and ACL plugins can be used together. SIGHUP rereads their **startup file paths**; an invalid policy file stops the broker. Validate replacement files before rotating them. MQExtended refuses different password files or different ACL files serving the same listener, and refuses an explicit file plugin and Dynamic Security on the same listener, rather than dropping a callback.
+
+Use at most one Sparkplug-aware instance per listener. A certificate is not emitted if its prefixed topic cannot fit an MQTT topic name. In a cluster, [upgrade all nodes before enabling the plugin](cluster.md#upgrades).
+
 ### Broker (`mqx-broker` ← `src/handle_*.c`, `src/subs.c`, `src/database.c`)
 
 - Taking over a client id sends the old connection's will when the old or the new session is clean; persistent-to-persistent takeover discards it (`connect__on_authorised`).
@@ -72,6 +87,7 @@ See [client interoperability](testing.md#client-sdk-interoperability) for the di
 - Behind `enable_proxy_protocol 2`, the forwarded certificate CN becomes the username only when both `require_certificate` and `use_identity_as_username` are set; a missing CN is refused at CONNECT with bad credentials. A forwarded CN replaces the CONNECT credentials but still goes through password authentication; only a certificate the listener verified itself bypasses it (`proxy_v2.c`, `handle_connect.c`).
 - The built-in WebSocket upgrade accepts any request path, does not require `Host`, and accepts a subprotocol that is a case-sensitive prefix of `mqtt` or `mqttv3.1`. A present `Origin` must be a prefix of a configured `websockets_origin`. Rejections close silently. `http_dir` is accepted but never served on a WebSocket listener.
 - Incoming WebSocket close frames are ignored; the broker sends close 1000 when it ends the connection.
+- On an mTLS listener, `disable_client_cert_date_checks true` tolerates expired and not-yet-valid certificates in the client chain. Trust, signatures, client usage and CRL checks still apply. Leave the option off unless your client deployment requires it; it does not affect bridge or cluster TLS.
 - `listener 0 <path>` opens a Unix socket listener (`net__socket_listen_unix`).
 
 ### Bridges (`mqx-bridge` ← `src/bridge.c`, `src/bridge_topic.c`, `src/handle_connack.c`, `lib/send_publish.c`)
@@ -118,8 +134,7 @@ These directives make `mqextended` refuse to start, naming the directive, rather
 
 | Directive | Why |
 | --- | --- |
-| `psk_file`, `psk_hint` | Incoming TLS-PSK is not implemented; PSK is available only on outgoing bridges |
-| `tls_engine`, `tls_engine_kpass_sha1`, `tls_keyform engine` | OpenSSL engines |
-| `plugin`, `auth_plugin`, `plugin_opt_*` for plugins other than dynamic security | C plugins cannot be loaded |
-| `memory_limit` above 0 | No process-wide allocation limit |
-| `disable_client_cert_date_checks true` | Not implemented |
+| `psk_file`, `psk_hint` | Incoming TLS-PSK needs to transmit the configured identity hint. The safe OpenSSL binding exposes the server callback but not the hint setter. Outgoing bridge PSK is supported. |
+| `tls_engine`, `tls_engine_kpass_sha1`, `tls_keyform engine` | No provider for legacy OpenSSL ENGINE private keys or engine PIN controls. The broker does not substitute a PEM key. |
+| `plugin`, `auth_plugin`, `plugin_load` for libraries outside the [supported set](#plugins) | Arbitrary Mosquitto C plugin ABIs are not loaded. |
+| `memory_limit` above 0 | No fallible, process-wide equivalent of Mosquitto's tracked allocation limit. An address-space cap or systemd `MemoryMax` can kill the process rather than reject one operation. |
