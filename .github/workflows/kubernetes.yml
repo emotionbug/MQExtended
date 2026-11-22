@@ -1,0 +1,65 @@
+name: Kubernetes
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Helm, kind, and MQTT clients
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://get.helm.sh/helm-v3.22.1-linux-amd64.tar.gz
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          sha256sum -c <<'SUMS'
+          896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea  helm-v3.22.1-linux-amd64.tar.gz
+          aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind
+          SUMS
+          tar xf helm-v3.22.1-linux-amd64.tar.gz linux-amd64/helm
+          mkdir -p "$RUNNER_TEMP/tools"
+          install -m755 linux-amd64/helm kind "$RUNNER_TEMP/tools/"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y mosquitto-clients mosquitto
+      - name: Build non-root broker image
+        run: |
+          docker build -t mqextended:chart-test .
+          docker run --rm --read-only mqextended:chart-test --version
+      - name: Start disposable Kubernetes cluster
+        run: |
+          kind create cluster --name mqx-chart --image kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0 --config=- <<'YAML'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+            - role: worker
+            - role: worker
+          YAML
+          kubectl taint nodes mqx-chart-control-plane node-role.kubernetes.io/control-plane:NoSchedule-
+          kind load docker-image mqextended:chart-test --name mqx-chart
+          manifest="$RUNNER_TEMP/cert-manager.yaml"
+          curl -fsSL https://github.com/cert-manager/cert-manager/releases/download/v1.21.3/cert-manager.yaml -o "$manifest"
+          echo "c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74  $manifest" | sha256sum -c
+          kubectl apply --server-side -f "$manifest"
+          kubectl -n cert-manager wait --for=condition=Available deployments --all --timeout=4m
+          # Deployment availability can precede CA injection for the admission webhook.
+          for attempt in {1..30}; do
+            if kubectl create --dry-run=server -f - <<< '{"apiVersion":"cert-manager.io/v1","kind":"Issuer","metadata":{"name":"admission-check"},"spec":{"selfSigned":{}}}'; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Check singleton recovery, pair quorum and broker failover
+        run: bash scripts/test-kubernetes.sh
+      - name: Diagnose a failed deployment
+        if: failure()
+        run: |
+          kubectl --context kind-mqx-chart get pods,pvc,certificates -A -o wide || true
+          kubectl --context kind-mqx-chart -n mqx-chart-smoke get events --sort-by=.lastTimestamp | tail -60 || true
+          kubectl --context kind-mqx-chart -n mqx-chart-smoke logs -l app.kubernetes.io/name=mqextended --all-containers --prefix --tail=80 || true
