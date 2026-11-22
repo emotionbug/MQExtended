@@ -50,13 +50,23 @@ impl HttpApi {
             .iter()
             .map(|listener| config.allow_anonymous_for(listener))
             .collect();
-        let listeners = tokio::sync::watch::Sender::new(Self::inventory(config, &copies, &anonymous));
-        Self { listeners, anonymous, copies }
+        let listeners =
+            tokio::sync::watch::Sender::new(Self::inventory(config, &copies, &anonymous));
+        Self {
+            listeners,
+            anonymous,
+            copies,
+        }
     }
 
     pub fn reload_access(&self, bound: &ServerConfig, fresh: &ServerConfig) {
-        let anonymous: Vec<_> = fresh.listeners.iter().map(|l| fresh.allow_anonymous_for(l)).collect();
-        self.listeners.send_replace(Self::inventory(bound, &self.copies, &anonymous));
+        let anonymous: Vec<_> = fresh
+            .listeners
+            .iter()
+            .map(|l| fresh.allow_anonymous_for(l))
+            .collect();
+        self.listeners
+            .send_replace(Self::inventory(bound, &self.copies, &anonymous));
     }
 
     fn inventory(config: &ServerConfig, copies: &[usize], anonymous: &[bool]) -> Bytes {
@@ -171,7 +181,10 @@ impl HttpApi {
                 } else {
                     respond(StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
                 };
-                response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("no-store"),
+                );
                 response
             }
             "/api/v1/mqx/cluster" => {
@@ -282,13 +295,20 @@ async fn prometheus(broker: &Broker) -> String {
 
 fn write_wal_metrics(body: &mut String, metrics: mqx_cluster::WalMetrics) {
     for (name, value) in [
-        ("mqx_raft_wal_appended_entries_total", metrics.appended_entries),
+        (
+            "mqx_raft_wal_appended_entries_total",
+            metrics.appended_entries,
+        ),
         ("mqx_raft_wal_sync_batches_total", metrics.sync_batches),
     ] {
         writeln!(body, "# TYPE {name} counter\n{name} {value}").unwrap();
     }
     for (name, kind, duration) in [
-        ("mqx_raft_wal_sync_seconds_total", "counter", metrics.sync_time),
+        (
+            "mqx_raft_wal_sync_seconds_total",
+            "counter",
+            metrics.sync_time,
+        ),
         ("mqx_raft_wal_sync_max_seconds", "gauge", metrics.sync_max),
         ("mqx_raft_wal_write_max_seconds", "gauge", metrics.write_max),
         (

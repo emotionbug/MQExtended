@@ -59,7 +59,12 @@ impl Psk {
         }
         // Mosquitto lib/util_mosq.c: mosquitto__hex2bin preserves leading zero
         // octets, then decodes the remaining digits as a big-endian integer.
-        let leading = digits.chunks_exact(2).take_while(|pair| *pair == b"00").count();
+        let leading = digits
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take_while(|pair| *pair == b"00")
+            .count();
         let digits = &digits[2 * leading..];
         let odd = digits.len() % 2;
         let high = odd != 0 && digits[0] != b'0';
@@ -76,8 +81,8 @@ impl Psk {
         if high {
             key.push(nibble(digits[0]));
         }
-        for pair in digits[odd..].chunks_exact(2) {
-            key.push(nibble(pair[0]) << 4 | nibble(pair[1]));
+        for &[hi, lo] in digits[odd..].as_chunks::<2>().0 {
+            key.push(nibble(hi) << 4 | nibble(lo));
         }
         Ok(Self(Arc::new(key)))
     }
@@ -117,7 +122,9 @@ impl TlsConfig {
 
     pub fn validate(&self) -> Result<(), &'static str> {
         match (&self.psk, &self.identity) {
-            (Some(_), None) => return Err("Invalid bridge configuration: missing bridge_identity."),
+            (Some(_), None) => {
+                return Err("Invalid bridge configuration: missing bridge_identity.");
+            }
             (None, Some(_)) => return Err("Invalid bridge configuration: missing bridge_psk."),
             (Some(_), Some(identity)) => {
                 if identity.is_empty() || identity.len() >= 256 || identity.contains('\0') {

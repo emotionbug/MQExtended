@@ -141,7 +141,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let dynamic = listener.security.1.zip(dynamic.map(|(_, policy)| policy));
     let security_snapshot = security.borrow_and_update().clone();
     if !identity
-        .authorized(&listener.security, &client_id, security_snapshot, dynamic.as_ref())
+        .authorized(
+            &listener.security,
+            &client_id,
+            security_snapshot,
+            dynamic.as_ref(),
+        )
         .await
     {
         if options.is_some() {
@@ -494,7 +499,8 @@ impl Identity {
                 .dynamic_policy_snapshot(security)
                 .map(|(_, policy)| policy),
         );
-        self.authorized(security, client_id, snapshot, dynamic.as_ref()).await
+        self.authorized(security, client_id, snapshot, dynamic.as_ref())
+            .await
     }
 }
 

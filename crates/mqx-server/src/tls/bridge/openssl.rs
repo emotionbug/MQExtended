@@ -30,7 +30,9 @@ pub(super) async fn connect(
         None | Some("tlsv1.2") => SslVersion::TLS1_2,
         Some("tlsv1.3") => SslVersion::TLS1_3,
         Some(version) => {
-            return Err(io::Error::other(format!("Protocol {version} not supported")));
+            return Err(io::Error::other(format!(
+                "Protocol {version} not supported"
+            )));
         }
     };
     context
@@ -116,7 +118,8 @@ pub(super) async fn connect(
         _ => {}
     }
     if tls.require_ocsp {
-        ssl.set_status_type(StatusType::OCSP).map_err(io::Error::other)?;
+        ssl.set_status_type(StatusType::OCSP)
+            .map_err(io::Error::other)?;
     }
     let mut stream = SslStream::new(ssl, stream).map_err(io::Error::other)?;
     Pin::new(&mut stream)
@@ -185,13 +188,27 @@ fn checked_path<'a>(path: Option<&'a Path>, directive: &str) -> io::Result<Optio
     Ok(path)
 }
 
+type CertIdHash = (&'static [u8], fn() -> MessageDigest);
+
 // DER contents of the standard SHA-family hash OIDs used in OCSP CertIDs.
-const CERT_ID_HASHES: [(&[u8], fn() -> MessageDigest); 5] = [
+const CERT_ID_HASHES: [CertIdHash; 5] = [
     (b"\x2b\x0e\x03\x02\x1a", MessageDigest::sha1),
-    (b"\x60\x86\x48\x01\x65\x03\x04\x02\x04", MessageDigest::sha224),
-    (b"\x60\x86\x48\x01\x65\x03\x04\x02\x01", MessageDigest::sha256),
-    (b"\x60\x86\x48\x01\x65\x03\x04\x02\x02", MessageDigest::sha384),
-    (b"\x60\x86\x48\x01\x65\x03\x04\x02\x03", MessageDigest::sha512),
+    (
+        b"\x60\x86\x48\x01\x65\x03\x04\x02\x04",
+        MessageDigest::sha224,
+    ),
+    (
+        b"\x60\x86\x48\x01\x65\x03\x04\x02\x01",
+        MessageDigest::sha256,
+    ),
+    (
+        b"\x60\x86\x48\x01\x65\x03\x04\x02\x02",
+        MessageDigest::sha384,
+    ),
+    (
+        b"\x60\x86\x48\x01\x65\x03\x04\x02\x03",
+        MessageDigest::sha512,
+    ),
 ];
 
 fn verify_staple(ssl: &SslRef) -> io::Result<()> {
@@ -241,7 +258,9 @@ fn verify_staple(ssl: &SslRef) -> io::Result<()> {
         }
     }
     if !matched {
-        return Err(error("Stapled OCSP response does not cover the verified leaf"));
+        return Err(error(
+            "Stapled OCSP response does not cover the verified leaf",
+        ));
     }
     Ok(())
 }

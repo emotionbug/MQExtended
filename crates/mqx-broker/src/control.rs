@@ -6,7 +6,8 @@ use serde_json::Value;
 pub(crate) const PREFIX: &str = "$CONTROL/";
 pub(crate) const TOPIC: &str = "$CONTROL/broker/v1";
 pub(crate) const RESPONSE_TOPIC: &str = "$CONTROL/broker/v1/response";
-pub(crate) const UNAVAILABLE: Bytes = Bytes::from_static(b"{\"error\": \"endpoint not available\"}");
+pub(crate) const UNAVAILABLE: Bytes =
+    Bytes::from_static(b"{\"error\": \"endpoint not available\"}");
 
 /// Public metadata from a bound listener. Never include certificate paths,
 /// security configuration or plugin options in control replies.
@@ -84,7 +85,8 @@ impl ControlInventory {
                 None => vec![error("Unknown command", "Invalid/missing commands", None)],
             },
         };
-        let response = serde_json::to_vec(&Envelope { responses }).expect("control response serializes");
+        let response =
+            serde_json::to_vec(&Envelope { responses }).expect("control response serializes");
         Bytes::from(response)
     }
 
@@ -101,7 +103,11 @@ impl ControlInventory {
         let mut correlation = None;
         for value in commands {
             if !value.is_object() {
-                responses.push(error("Unknown command", "Command not an object", correlation));
+                responses.push(error(
+                    "Unknown command",
+                    "Command not an object",
+                    correlation,
+                ));
                 break;
             }
             let Some(command) = item(value, "command").and_then(Value::as_str).map(c_str) else {

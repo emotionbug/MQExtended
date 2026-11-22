@@ -23,7 +23,13 @@ impl Broker {
         // control.c: a dynamic-security handler is a separate registration.
         // The replicated policy alone cannot register it on this node.
         if topic == mqx_auth::DYNSEC_CONTROL_TOPIC
-            && self.0.runtime.lock().unwrap().dynamic_security_path.is_some()
+            && self
+                .0
+                .runtime
+                .lock()
+                .unwrap()
+                .dynamic_security_path
+                .is_some()
         {
             return self.receive_dynamic_control(live, publication).await;
         }

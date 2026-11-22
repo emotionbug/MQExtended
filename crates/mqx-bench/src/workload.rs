@@ -373,10 +373,7 @@ impl Receiver {
         Ok(())
     }
 
-    async fn receive(
-        mut self,
-        deadline: Instant,
-    ) -> Result<(Coverage, Deliveries), Error> {
+    async fn receive(mut self, deadline: Instant) -> Result<(Coverage, Deliveries), Error> {
         let mut incoming = HashMap::<PacketId, Bytes>::new();
         let end = sleep_until(deadline);
         tokio::pin!(end);

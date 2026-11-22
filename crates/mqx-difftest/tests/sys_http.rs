@@ -450,12 +450,21 @@ fn sighup_rotates_credentials_and_revokes_anonymous_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         fs::write(dir.join("old"), "").unwrap();
-        assert!(Command::new(reference().join("apps/mosquitto_passwd/mosquitto_passwd"))
-            .args(["-b", "-c", "new", "user", "password"])
-            .current_dir(dir).status().unwrap().success());
+        assert!(
+            Command::new(reference().join("apps/mosquitto_passwd/mosquitto_passwd"))
+                .args(["-b", "-c", "new", "user", "password"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
         let a = format!("listener {mqtt} 127.0.0.1\n");
         let b = format!("listener {http} 127.0.0.1\nprotocol http_api\n");
-        let mut process = start(kind, dir, format!("allow_anonymous true\npassword_file old\n{a}{b}"));
+        let mut process = start(
+            kind,
+            dir,
+            format!("allow_anonymous true\npassword_file old\n{a}{b}"),
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while request(http, "GET", "/api/v1/version", None).is_err() {
             assert!(Instant::now() < deadline && process.0.try_wait().unwrap().is_none());
@@ -463,8 +472,12 @@ fn sighup_rotates_credentials_and_revokes_anonymous_sessions() {
         }
         let connect = || {
             let mut stream = TcpStream::connect(("127.0.0.1", mqtt)).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            stream.write_all(b"\x10\x0f\0\x04MQTT\x04\x02\0\0\0\x03sys").unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(b"\x10\x0f\0\x04MQTT\x04\x02\0\0\0\x03sys")
+                .unwrap();
             let mut ack = [0; 4];
             stream.read_exact(&mut ack).unwrap();
             (stream, ack)
@@ -475,21 +488,43 @@ fn sighup_rotates_credentials_and_revokes_anonymous_sessions() {
         // it on MQTT. File order is deliberately different from bound order.
         let reload = |conf| {
             fs::write(dir.join("mosquitto.conf"), conf).unwrap();
-            assert!(Command::new("kill").args(["-HUP", &process.0.id().to_string()]).status().unwrap().success());
+            assert!(
+                Command::new("kill")
+                    .args(["-HUP", &process.0.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         };
-        reload(format!("allow_anonymous false\npassword_file new\n{b}listener_allow_anonymous true\n{a}"));
+        reload(format!(
+            "allow_anonymous false\npassword_file new\n{b}listener_allow_anonymous true\n{a}"
+        ));
         assert_eq!(active.read(&mut [0]).unwrap(), 0, "{kind:?}");
         assert_eq!(connect().1, [0x20, 2, 0, 5]);
         let listeners = api_json(request(http, "GET", "/api/v1/listeners", None).unwrap());
         assert_eq!(listeners["listeners"][0]["allow_anonymous"], false);
         assert_eq!(listeners["listeners"][1]["allow_anonymous"], true);
-        reload(format!("allow_anonymous false\npassword_file new\n{a}{b}listener_allow_anonymous false\n"));
+        reload(format!(
+            "allow_anonymous false\npassword_file new\n{a}{b}listener_allow_anonymous false\n"
+        ));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while request(http, "GET", "/api/v1/version", None).unwrap().status != 401 {
-            assert!(Instant::now() < deadline, "{kind:?}: HTTP still permits anonymous reads");
+        while request(http, "GET", "/api/v1/version", None)
+            .unwrap()
+            .status
+            != 401
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{kind:?}: HTTP still permits anonymous reads"
+            );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(request(http, "GET", "/api/v1/version", Some("dXNlcjpwYXNzd29yZA==")).unwrap().status, 200);
+        assert_eq!(
+            request(http, "GET", "/api/v1/version", Some("dXNlcjpwYXNzd29yZA=="))
+                .unwrap()
+                .status,
+            200
+        );
     }
 }
 
@@ -602,5 +637,10 @@ fn cluster_http_reports_members_and_raft_progress() {
         assert!(Instant::now() < deadline, "isolated voter remained ready");
         thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(request(http[leader], "GET", "/api/v1/mqx/cluster", None).unwrap().status, 200);
+    assert_eq!(
+        request(http[leader], "GET", "/api/v1/mqx/cluster", None)
+            .unwrap()
+            .status,
+        200
+    );
 }

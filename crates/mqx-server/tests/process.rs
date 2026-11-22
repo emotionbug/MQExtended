@@ -394,7 +394,9 @@ async fn root_only_identity_mapping_and_privilege_drop_order() {
 
     const ABSENT: &str = "mqx-process-test-absent";
     assert!(User::from_name(ABSENT).unwrap().is_none());
-    let nobody = User::from_name("nobody").unwrap().expect("no nobody account");
+    let nobody = User::from_name("nobody")
+        .unwrap()
+        .expect("no nobody account");
     assert!(!nobody.uid.is_root());
     assert_ne!(nobody.gid.as_raw(), 0);
     let uid = (60000..=65000)
@@ -466,11 +468,9 @@ async fn root_only_identity_mapping_and_privilege_drop_order() {
     }
     let output = timeout(WAIT, broker().output()).await.unwrap().unwrap();
     assert_eq!(output.status.code(), Some(3));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains(&format!(
-            "Unable to drop privileges to '{ABSENT}' because this user does not exist."
-        ))
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+        "Unable to drop privileges to '{ABSENT}' because this user does not exist."
+    )));
     no_startup_artifacts();
 
     let (root_uid, root_gid) = (Uid::from_raw(0), Gid::from_raw(0));
@@ -528,11 +528,18 @@ async fn root_only_identity_mapping_and_privilege_drop_order() {
     let passwords = dir.path().join("passwords");
     fs::write(&passwords, "").unwrap();
     mode(&passwords, 0o600);
-    fs::write(&path, format!("user nobody\npassword_file passwords\n{config}")).unwrap();
+    fs::write(
+        &path,
+        format!("user nobody\npassword_file passwords\n{config}"),
+    )
+    .unwrap();
     let output = timeout(WAIT, broker().output()).await.unwrap().unwrap();
     assert_eq!(output.status.code(), Some(3));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Unable to load password_file 'passwords'"), "{stderr}");
+    assert!(
+        stderr.contains("Unable to load password_file 'passwords'"),
+        "{stderr}"
+    );
     assert!(stderr.contains("Permission denied"), "{stderr}");
     assert!(!stderr.contains("Opening unix listen socket"), "{stderr}");
     no_startup_artifacts();

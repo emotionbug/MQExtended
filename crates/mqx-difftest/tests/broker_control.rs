@@ -1,20 +1,14 @@
 //! Live parity for Mosquitto's test/broker/17-control-*.py scenarios.
 
-use std::{
-    env, fs,
-    net::TcpListener,
-    path::PathBuf,
-    process::Command,
-    time::Duration,
-};
 #[cfg(unix)]
 use std::time::Instant;
+use std::{env, fs, net::TcpListener, path::PathBuf, process::Command, time::Duration};
 
 use bytes::Bytes;
 use mqx_codec::{PacketId, QoS, v5};
-use mqx_difftest::{BrokerConfig, BrokerKind, Connection, Harness, Reading};
 #[cfg(unix)]
 use mqx_difftest::ClusterConfig;
+use mqx_difftest::{BrokerConfig, BrokerKind, Connection, Harness, Reading};
 use serde_json::{Value, json};
 use v5::{Packet, ReasonCode as R};
 
@@ -28,28 +22,50 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(100);
 
 fn reference(var: &str) -> PathBuf {
-    PathBuf::from(env::var_os(var).unwrap_or_else(|| panic!("set {var} to a Mosquitto 2.1.4 build")))
-        .canonicalize()
-        .unwrap()
+    PathBuf::from(
+        env::var_os(var).unwrap_or_else(|| panic!("set {var} to a Mosquitto 2.1.4 build")),
+    )
+    .canonicalize()
+    .unwrap()
 }
 
 fn standalone(kind: BrokerKind, conf: &str) -> Harness {
-    Harness::start(kind, BrokerConfig { conf, ..BrokerConfig::default() }).unwrap()
+    Harness::start(
+        kind,
+        BrokerConfig {
+            conf,
+            ..BrokerConfig::default()
+        },
+    )
+    .unwrap()
 }
 
-fn client(harness: &mut Harness, node: usize, id: &str, credentials: Option<(&str, &str)>) -> Connection {
+fn client(
+    harness: &mut Harness,
+    node: usize,
+    id: &str,
+    credentials: Option<(&str, &str)>,
+) -> Connection {
     let connection = harness.open_v5_on(node).unwrap();
-    harness.send_v5(connection, &Packet::Connect(v5::Connect {
-        private_protocol_bit: false,
-        clean_start: true,
-        keep_alive: 20,
-        properties: Vec::new(),
-        client_id: id.into(),
-        will: None,
-        username: credentials.map(|(user, _)| user.into()),
-        password: credentials.map(|(_, password)| Bytes::copy_from_slice(password.as_bytes())),
-    })).unwrap();
-    assert!(matches!(packet(harness, connection), Packet::ConnAck(ack) if ack.reason == R::SUCCESS));
+    harness
+        .send_v5(
+            connection,
+            &Packet::Connect(v5::Connect {
+                private_protocol_bit: false,
+                clean_start: true,
+                keep_alive: 20,
+                properties: Vec::new(),
+                client_id: id.into(),
+                will: None,
+                username: credentials.map(|(user, _)| user.into()),
+                password: credentials
+                    .map(|(_, password)| Bytes::copy_from_slice(password.as_bytes())),
+            }),
+        )
+        .unwrap();
+    assert!(
+        matches!(packet(harness, connection), Packet::ConnAck(ack) if ack.reason == R::SUCCESS)
+    );
     connection
 }
 
@@ -62,22 +78,30 @@ fn packet(harness: &mut Harness, connection: Connection) -> &Packet {
 
 fn subscribe(harness: &mut Harness, connection: Connection, filter: &str) {
     let packet_id = PacketId::new(1).unwrap();
-    harness.send_v5(connection, &Packet::Subscribe(v5::Subscribe {
-        packet_id,
-        properties: Vec::new(),
-        subscriptions: vec![v5::Subscription {
-            filter: filter.into(),
-            qos: QoS::ExactlyOnce,
-            no_local: false,
-            retain_as_published: false,
-            retain_handling: v5::RetainHandling::SendAlways,
-        }],
-    })).unwrap();
-    assert_eq!(packet(harness, connection), &Packet::SubAck(v5::SubscriptionAck {
-        packet_id,
-        properties: Vec::new(),
-        reasons: vec![R::GRANTED_QOS_2],
-    }));
+    harness
+        .send_v5(
+            connection,
+            &Packet::Subscribe(v5::Subscribe {
+                packet_id,
+                properties: Vec::new(),
+                subscriptions: vec![v5::Subscription {
+                    filter: filter.into(),
+                    qos: QoS::ExactlyOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: v5::RetainHandling::SendAlways,
+                }],
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        packet(harness, connection),
+        &Packet::SubAck(v5::SubscriptionAck {
+            packet_id,
+            properties: Vec::new(),
+            reasons: vec![R::GRANTED_QOS_2],
+        })
+    );
 }
 
 fn request(
@@ -89,22 +113,31 @@ fn request(
     reason: R,
 ) -> PacketId {
     let id = PacketId::new(2).unwrap();
-    harness.send_v5(connection, &Packet::Publish(v5::Publish {
-        dup: false,
-        qos,
-        retain: true,
-        topic: topic.into(),
-        packet_id: (qos != QoS::AtMostOnce).then_some(id),
-        // JSON correlationData, not MQTT 5 request/response properties, is used.
-        properties: vec![
-            v5::Property::ResponseTopic("wrong-response-topic".into()),
-            v5::Property::CorrelationData(Bytes::from_static(b"unrelated")),
-        ],
-        payload: Bytes::copy_from_slice(payload),
-    })).unwrap();
-    let ack = v5::PublishAck { packet_id: id, reason, properties: Vec::new() };
+    harness
+        .send_v5(
+            connection,
+            &Packet::Publish(v5::Publish {
+                dup: false,
+                qos,
+                retain: true,
+                topic: topic.into(),
+                packet_id: (qos != QoS::AtMostOnce).then_some(id),
+                // JSON correlationData, not MQTT 5 request/response properties, is used.
+                properties: vec![
+                    v5::Property::ResponseTopic("wrong-response-topic".into()),
+                    v5::Property::CorrelationData(Bytes::from_static(b"unrelated")),
+                ],
+                payload: Bytes::copy_from_slice(payload),
+            }),
+        )
+        .unwrap();
+    let ack = v5::PublishAck {
+        packet_id: id,
+        reason,
+        properties: Vec::new(),
+    };
     match qos {
-        QoS::AtMostOnce => {},
+        QoS::AtMostOnce => {}
         QoS::AtLeastOnce => assert_eq!(packet(harness, connection), &Packet::PubAck(ack)),
         QoS::ExactlyOnce => assert_eq!(packet(harness, connection), &Packet::PubRec(ack)),
     }
@@ -112,11 +145,17 @@ fn request(
 }
 
 fn payload<'a>(packet: &'a Packet, topic: &str) -> &'a [u8] {
-    let Packet::Publish(packet) = packet else { panic!("expected PUBLISH, received {packet:?}") };
+    let Packet::Publish(packet) = packet else {
+        panic!("expected PUBLISH, received {packet:?}")
+    };
     assert_eq!(packet.topic, topic);
     assert_eq!(packet.qos, QoS::AtMostOnce);
     assert!(!packet.dup && !packet.retain && packet.packet_id.is_none());
-    assert!(packet.properties.is_empty(), "unexpected properties: {:?}", packet.properties);
+    assert!(
+        packet.properties.is_empty(),
+        "unexpected properties: {:?}",
+        packet.properties
+    );
     &packet.payload
 }
 
@@ -125,7 +164,10 @@ fn response(harness: &mut Harness, connection: Connection, topic: &str) -> Value
 }
 
 fn silent(harness: &mut Harness, connection: Connection) {
-    assert_eq!(harness.receive(connection, QUIET).unwrap(), &Reading::TimedOut);
+    assert_eq!(
+        harness.receive(connection, QUIET).unwrap(),
+        &Reading::TimedOut
+    );
 }
 
 fn listeners(expected: Value) -> Value {
@@ -148,20 +190,35 @@ fn listener_inventory_reports_native_transport_fields_in_configuration_order() {
     fs::write(&certfile, cert.pem()).unwrap();
     fs::write(&keyfile, signing_key.serialize_pem()).unwrap();
     let sockets = std::array::from_fn::<_, 3, _>(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    let [ws, tls, http] = sockets.each_ref().map(|socket| socket.local_addr().unwrap().port());
+    let [ws, tls, http] = sockets
+        .each_ref()
+        .map(|socket| socket.local_addr().unwrap().port());
     drop(sockets);
-    let unix = if cfg!(unix) { "listener 0 control-test.sock\n" } else { "" };
+    let unix = if cfg!(unix) {
+        "listener 0 control-test.sock\n"
+    } else {
+        ""
+    };
     let conf = format!(
         "{CONFIG}{ENABLED}listener {ws} 127.0.0.1\nprotocol websockets\n\
          listener {tls} 127.0.0.1\ncertfile {}\nkeyfile {}\n\
          listener {http} 127.0.0.1\nprotocol http_api\ncertfile {}\nkeyfile {}\n{unix}",
-        certfile.display(), keyfile.display(), certfile.display(), keyfile.display(),
+        certfile.display(),
+        keyfile.display(),
+        certfile.display(),
+        keyfile.display(),
     );
     for kind in [BrokerKind::Mosquitto, BrokerKind::MqExtended] {
         let mut harness = match kind {
             BrokerKind::Mosquitto => Harness::start_with_binary(
-                kind, &reference, BrokerConfig { conf: &conf, ..BrokerConfig::default() },
-            ).unwrap(),
+                kind,
+                &reference,
+                BrokerConfig {
+                    conf: &conf,
+                    ..BrokerConfig::default()
+                },
+            )
+            .unwrap(),
             BrokerKind::MqExtended => standalone(kind, &conf),
         };
         let mut expected = json!([
@@ -177,8 +234,19 @@ fn listener_inventory_reports_native_transport_fields_in_configuration_order() {
         }
         let writer = client(&mut harness, 1, "inventory", None);
         subscribe(&mut harness, writer, RESPONSE);
-        request(&mut harness, writer, TOPIC, LIST, QoS::AtMostOnce, R::SUCCESS);
-        assert_eq!(response(&mut harness, writer, RESPONSE), listeners(expected), "{kind:?}");
+        request(
+            &mut harness,
+            writer,
+            TOPIC,
+            LIST,
+            QoS::AtMostOnce,
+            R::SUCCESS,
+        );
+        assert_eq!(
+            response(&mut harness, writer, RESPONSE),
+            listeners(expected),
+            "{kind:?}"
+        );
         let newcomer = client(&mut harness, 1, "no-retain", None);
         subscribe(&mut harness, newcomer, "$CONTROL/broker/#");
         silent(&mut harness, newcomer);
@@ -214,10 +282,26 @@ fn envelope_errors_correlations_and_qos_match_native_control() {
             request(&mut harness, writer, TOPIC, request_json, QoS::AtLeastOnce, R::SUCCESS);
             assert_eq!(response(&mut harness, writer, RESPONSE), json!({"responses":expected}), "{kind:?}");
         }
-        let mid = request(&mut harness, writer, TOPIC, LIST, QoS::ExactlyOnce, R::SUCCESS);
-        assert_eq!(response(&mut harness, writer, RESPONSE)["responses"][0]["correlationData"], "listeners");
-        let ack = v5::PublishAck { packet_id: mid, reason: R::SUCCESS, properties: Vec::new() };
-        harness.send_v5(writer, &Packet::PubRel(ack.clone())).unwrap();
+        let mid = request(
+            &mut harness,
+            writer,
+            TOPIC,
+            LIST,
+            QoS::ExactlyOnce,
+            R::SUCCESS,
+        );
+        assert_eq!(
+            response(&mut harness, writer, RESPONSE)["responses"][0]["correlationData"],
+            "listeners"
+        );
+        let ack = v5::PublishAck {
+            packet_id: mid,
+            reason: R::SUCCESS,
+            properties: Vec::new(),
+        };
+        harness
+            .send_v5(writer, &Packet::PubRel(ack.clone()))
+            .unwrap();
         assert_eq!(packet(&mut harness, writer), &Packet::PubComp(ack));
         silent(&mut harness, writer);
     }
@@ -229,20 +313,51 @@ fn request_write_and_broadcast_read_are_checked_independently() {
     let acl = "user writer\ntopic write $CONTROL/broker/v1\nuser observer\ntopic read $CONTROL/broker/v1/response\n";
     for kind in [BrokerKind::Mosquitto, BrokerKind::MqExtended] {
         for startup in [ENABLED, DISABLED] {
-            let mut harness = Harness::start(kind, BrokerConfig {
-                conf: &format!("{CONFIG}{startup}"),
-                passwords: &[("writer", "write-only"), ("observer", "read-only")],
-                acl: Some(acl),
-            }).unwrap();
-            let writer = client(&mut harness, 1, "control-writer", Some(("writer", "write-only")));
-            let observer = client(&mut harness, 1, "control-observer", Some(("observer", "read-only")));
+            let mut harness = Harness::start(
+                kind,
+                BrokerConfig {
+                    conf: &format!("{CONFIG}{startup}"),
+                    passwords: &[("writer", "write-only"), ("observer", "read-only")],
+                    acl: Some(acl),
+                },
+            )
+            .unwrap();
+            let writer = client(
+                &mut harness,
+                1,
+                "control-writer",
+                Some(("writer", "write-only")),
+            );
+            let observer = client(
+                &mut harness,
+                1,
+                "control-observer",
+                Some(("observer", "read-only")),
+            );
             subscribe(&mut harness, observer, "$CONTROL/broker/#");
-            request(&mut harness, observer, TOPIC, LIST, QoS::AtLeastOnce, R::NOT_AUTHORIZED);
+            request(
+                &mut harness,
+                observer,
+                TOPIC,
+                LIST,
+                QoS::AtLeastOnce,
+                R::NOT_AUTHORIZED,
+            );
             silent(&mut harness, observer);
             if startup == ENABLED {
                 subscribe(&mut harness, writer, RESPONSE);
-                request(&mut harness, writer, TOPIC, LIST, QoS::AtLeastOnce, R::SUCCESS);
-                assert_eq!(response(&mut harness, observer, RESPONSE)["responses"][0]["correlationData"], "listeners");
+                request(
+                    &mut harness,
+                    writer,
+                    TOPIC,
+                    LIST,
+                    QoS::AtLeastOnce,
+                    R::SUCCESS,
+                );
+                assert_eq!(
+                    response(&mut harness, observer, RESPONSE)["responses"][0]["correlationData"],
+                    "listeners"
+                );
                 silent(&mut harness, writer);
             } else {
                 // A direct error has neither a subscription nor a read ACL.
@@ -264,8 +379,15 @@ fn list_plugins_includes_dynamic_security_without_configuration_or_options() {
     let dir = tempfile::tempdir().unwrap();
     let settings = dir.path().join("private-plugin-settings.json");
     let output = Command::new(build.join("apps/mosquitto_ctrl/mosquitto_ctrl"))
-        .args(["dynsec", "init", settings.to_str().unwrap(), "admin", "control-test-secret"])
-        .output().unwrap();
+        .args([
+            "dynsec",
+            "init",
+            settings.to_str().unwrap(),
+            "admin",
+            "control-test-secret",
+        ])
+        .output()
+        .unwrap();
     assert!(output.status.success(), "dynsec init failed: {output:?}");
     // apps/mosquitto_ctrl/dynsec.c: init_create grants only Dynamic Security
     // administration. Control topics never inherit the default ACL grants.
@@ -281,39 +403,68 @@ fn list_plugins_includes_dynamic_security_without_configuration_or_options() {
         ("subscribeLiteral", RESPONSE),
         ("publishClientReceive", RESPONSE),
     ];
-    admin["acls"].as_array_mut().unwrap().extend(
-        rights.map(|(kind, topic)| json!({
-            "acltype": kind,
-            "topic": topic,
-            "allow": true,
-            "priority": 0,
-        })),
-    );
+    admin["acls"]
+        .as_array_mut()
+        .unwrap()
+        .extend(rights.map(|(kind, topic)| {
+            json!({
+                "acltype": kind,
+                "topic": topic,
+                "allow": true,
+                "priority": 0,
+            })
+        }));
     fs::write(&settings, serde_json::to_vec(&policy).unwrap()).unwrap();
     let conf = format!(
         "{CONFIG}{ENABLED}plugin {}\nplugin_opt_config_file {}\n",
-        plugin.display(), settings.display(),
+        plugin.display(),
+        settings.display(),
     );
     for kind in [BrokerKind::Mosquitto, BrokerKind::MqExtended] {
         let mut harness = match kind {
             BrokerKind::Mosquitto => Harness::start_with_binary(
-                kind, &build.join("src/mosquitto"), BrokerConfig { conf: &conf, ..BrokerConfig::default() },
-            ).unwrap(),
+                kind,
+                &build.join("src/mosquitto"),
+                BrokerConfig {
+                    conf: &conf,
+                    ..BrokerConfig::default()
+                },
+            )
+            .unwrap(),
             BrokerKind::MqExtended => standalone(kind, &conf),
         };
-        let admin = client(&mut harness, 1, "plugin-inventory", Some(("admin", "control-test-secret")));
+        let admin = client(
+            &mut harness,
+            1,
+            "plugin-inventory",
+            Some(("admin", "control-test-secret")),
+        );
         subscribe(&mut harness, admin, RESPONSE);
-        request(&mut harness, admin, TOPIC, br#"{"commands":[{"command":"listPlugins"}]}"#, QoS::AtLeastOnce, R::SUCCESS);
-        assert_eq!(response(&mut harness, admin, RESPONSE), json!({"responses":[{
-            "command":"listPlugins",
-            "data":{"plugins":[{"name":"dynamic-security","control-endpoints":["$CONTROL/dynamic-security/v1"]}]},
-        }]}), "{kind:?}");
+        request(
+            &mut harness,
+            admin,
+            TOPIC,
+            br#"{"commands":[{"command":"listPlugins"}]}"#,
+            QoS::AtLeastOnce,
+            R::SUCCESS,
+        );
+        assert_eq!(
+            response(&mut harness, admin, RESPONSE),
+            json!({"responses":[{
+                "command":"listPlugins",
+                "data":{"plugins":[{"name":"dynamic-security","control-endpoints":["$CONTROL/dynamic-security/v1"]}]},
+            }]}),
+            "{kind:?}"
+        );
     }
 }
 
 fn expect_missing(harness: &mut Harness, writer: Connection, observer: Connection, topic: &str) {
     request(harness, writer, topic, LIST, QoS::AtLeastOnce, R::SUCCESS);
-    assert_eq!(response(harness, writer, &format!("{topic}/response")), json!({"error":"endpoint not available"}));
+    assert_eq!(
+        response(harness, writer, &format!("{topic}/response")),
+        json!({"error":"endpoint not available"})
+    );
     silent(harness, observer);
 }
 
@@ -322,8 +473,13 @@ fn expect_list(harness: &mut Harness, writer: Connection, observer: Connection, 
     let port = harness.node_addr(node).unwrap().port();
     request(harness, writer, TOPIC, LIST, QoS::AtLeastOnce, R::SUCCESS);
     let data = response(harness, observer, RESPONSE);
-    let entries = data["responses"][0]["data"]["listeners"].as_array().unwrap();
-    assert_eq!(entries[0], json!({"port":port,"protocol":"mqtt","bind-address":"127.0.0.1","tls":false}));
+    let entries = data["responses"][0]["data"]["listeners"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        entries[0],
+        json!({"port":port,"protocol":"mqtt","bind-address":"127.0.0.1","tls":false})
+    );
     assert_eq!(data["responses"][0]["correlationData"], "listeners");
     silent(harness, writer);
 }
@@ -336,26 +492,42 @@ fn wait_for_reload(harness: &mut Harness, watcher: Connection) {
     // An unsubscribe log proves logging was reconfigured, rather than only
     // proving that the SIGHUP handler started or that the socket stayed open.
     loop {
-        harness.send_v5(watcher, &Packet::Unsubscribe(v5::Unsubscribe {
-            packet_id: PacketId::new(3).unwrap(),
-            properties: Vec::new(),
-            filters: vec![marker.into()],
-        })).unwrap();
+        harness
+            .send_v5(
+                watcher,
+                &Packet::Unsubscribe(v5::Unsubscribe {
+                    packet_id: PacketId::new(3).unwrap(),
+                    properties: Vec::new(),
+                    filters: vec![marker.into()],
+                }),
+            )
+            .unwrap();
         let mut ack = false;
         let mut log = false;
         loop {
             match harness.receive(watcher, QUIET).unwrap() {
-                Reading::ReceivedV5 { packet: Packet::UnsubAck(_), .. } => ack = true,
-                Reading::ReceivedV5 { packet: Packet::Publish(p), .. } if p.topic == topic => {
+                Reading::ReceivedV5 {
+                    packet: Packet::UnsubAck(_),
+                    ..
+                } => ack = true,
+                Reading::ReceivedV5 {
+                    packet: Packet::Publish(p),
+                    ..
+                } if p.topic == topic => {
                     assert!(p.payload.ends_with(marker.as_bytes()));
                     log = true;
-                },
+                }
                 Reading::TimedOut => break,
                 other => panic!("unexpected packet during reload: {other:?}"),
             }
-            if ack && log { return; }
+            if ack && log {
+                return;
+            }
         }
-        assert!(Instant::now() < deadline, "node did not reload its logging configuration");
+        assert!(
+            Instant::now() < deadline,
+            "node did not reload its logging configuration"
+        );
     }
 }
 
@@ -369,14 +541,22 @@ fn reload_contract(mut harness: Harness, enabled: bool, clustered: bool) {
     subscribe(&mut harness, watcher, "$SYS/broker/log/M/unsubscribe");
     expect_missing(&mut harness, writer, observer, "$CONTROL/broker/v2");
     let check = |harness: &mut Harness| {
-        if enabled { expect_list(harness, writer, observer, node); }
-        else { expect_missing(harness, writer, observer, TOPIC); }
+        if enabled {
+            expect_list(harness, writer, observer, node);
+        } else {
+            expect_missing(harness, writer, observer, TOPIC);
+        }
     };
     check(&mut harness);
     let changed = if enabled { DISABLED } else { ENABLED };
-    harness.reload_node(node, &format!(
-        "{CONFIG}{changed}log_dest topic\nlog_type unsubscribe\nlog_timestamp false\n",
-    )).unwrap();
+    harness
+        .reload_node(
+            node,
+            &format!(
+                "{CONFIG}{changed}log_dest topic\nlog_type unsubscribe\nlog_timestamp false\n",
+            ),
+        )
+        .unwrap();
     wait_for_reload(&mut harness, watcher);
     harness.close_socket(watcher);
     check(&mut harness);
@@ -388,7 +568,11 @@ fn reload_contract(mut harness: Harness, enabled: bool, clustered: bool) {
 fn sighup_keeps_the_startup_registration_on_standalone() {
     for kind in [BrokerKind::Mosquitto, BrokerKind::MqExtended] {
         for (startup, enabled) in [("", false), (ENABLED, true)] {
-            reload_contract(standalone(kind, &format!("{CONFIG}{startup}")), enabled, false);
+            reload_contract(
+                standalone(kind, &format!("{CONFIG}{startup}")),
+                enabled,
+                false,
+            );
         }
     }
 }
@@ -398,10 +582,14 @@ fn sighup_keeps_the_startup_registration_on_standalone() {
 #[ignore = "requires MQExtended"]
 fn sighup_keeps_node_local_registration_and_inventory_in_a_cluster() {
     for (startup, enabled) in [(DISABLED, false), (ENABLED, true)] {
-        let harness = Harness::start_cluster(BrokerConfig {
-            conf: &format!("{CONFIG}{startup}"),
-            ..BrokerConfig::default()
-        }, ClusterConfig::default()).unwrap();
+        let harness = Harness::start_cluster(
+            BrokerConfig {
+                conf: &format!("{CONFIG}{startup}"),
+                ..BrokerConfig::default()
+            },
+            ClusterConfig::default(),
+        )
+        .unwrap();
         reload_contract(harness, enabled, true);
     }
 }

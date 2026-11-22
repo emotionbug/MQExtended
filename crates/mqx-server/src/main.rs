@@ -28,8 +28,7 @@ use mqx_server::{
 use persistence::Persistence;
 use process::{PidFile, StartupError, TERMINATING};
 
-const USAGE: &str =
-    "Usage: mqextended [-c <mosquitto.conf>] [-d] [-p <port>]... [-q] [-v] [--test-config] [--version] [-h]";
+const USAGE: &str = "Usage: mqextended [-c <mosquitto.conf>] [-d] [-p <port>]... [-q] [-v] [--test-config] [--version] [-h]";
 
 #[derive(Default)]
 struct Cli {
@@ -42,14 +41,21 @@ struct Cli {
 }
 
 impl Cli {
-    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ControlFlow<&'static str, Self>, ServerError> {
+    fn parse(
+        args: impl IntoIterator<Item = OsString>,
+    ) -> Result<ControlFlow<&'static str, Self>, ServerError> {
         let mut args = args.into_iter();
         let mut cli = Self::default();
         let error = |message: &str| ServerError::Arguments(format!("Error: {message}"));
         while let Some(arg) = args.next() {
             match arg.to_str() {
                 Some("-h" | "--help") => return Ok(ControlFlow::Break(USAGE)),
-                Some("--version") => return Ok(ControlFlow::Break(concat!("mqextended ", env!("CARGO_PKG_VERSION")))),
+                Some("--version") => {
+                    return Ok(ControlFlow::Break(concat!(
+                        "mqextended ",
+                        env!("CARGO_PKG_VERSION")
+                    )));
+                }
                 Some("-c" | "--config-file") => {
                     let file = args
                         .next()
@@ -115,7 +121,8 @@ fn main() -> ExitCode {
 
 fn start() -> Result<ExitCode, StartupError> {
     let cli = match Cli::parse(std::env::args_os().skip(1))
-        .map_err(|error| StartupError::invalid(error.to_string()))? {
+        .map_err(|error| StartupError::invalid(error.to_string()))?
+    {
         ControlFlow::Continue(cli) => cli,
         ControlFlow::Break(text) => {
             println!("{text}");
@@ -252,25 +259,36 @@ fn add_local_http(config: &mut ServerConfig) {
     }
 }
 
-fn reload_config(path: &Path, cli: &Cli, bound: &ServerConfig) -> Result<ServerConfig, ServerError> {
+fn reload_config(
+    path: &Path,
+    cli: &Cli,
+    bound: &ServerConfig,
+) -> Result<ServerConfig, ServerError> {
     let mut fresh = ServerConfig::load(path)?.with_command_line_ports(&cli.ports);
     add_local_http(&mut fresh);
     if let Some(location) = std::env::var_os("MOSQUITTO_PERSISTENCE_LOCATION") {
         fresh.persistence.location = Some(location.into());
     }
-    let changed_layout = || ServerError::Arguments(
-        "Changing listeners or per_listener_settings requires a restart.".into()
-    );
-    if bound.per_listener_settings != fresh.per_listener_settings || bound.listeners.len() != fresh.listeners.len() {
+    let changed_layout = || {
+        ServerError::Arguments(
+            "Changing listeners or per_listener_settings requires a restart.".into(),
+        )
+    };
+    if bound.per_listener_settings != fresh.per_listener_settings
+        || bound.listeners.len() != fresh.listeners.len()
+    {
         return Err(changed_layout());
     }
     // conf.c: config__read_file_core matches a reloaded listener by endpoint,
     // not file order. Keep listener indices (including replicated ACL ids) stable.
     for (i, old) in bound.listeners.iter().enumerate() {
-        let offset = fresh.listeners[i..].iter().position(|l|
-            (l.port, &l.host, &l.unix_socket_path, l.protocol)
-                == (old.port, &old.host, &old.unix_socket_path, old.protocol)
-        ).ok_or_else(changed_layout)?;
+        let offset = fresh.listeners[i..]
+            .iter()
+            .position(|l| {
+                (l.port, &l.host, &l.unix_socket_path, l.protocol)
+                    == (old.port, &old.host, &old.unix_socket_path, old.protocol)
+            })
+            .ok_or_else(changed_layout)?;
         fresh.listeners.swap(i, i + offset);
     }
     Ok(fresh)
@@ -410,7 +428,9 @@ async fn run_broker(
     let serving_registered = registered.clone();
     let ready = Arc::new(move || {
         serving_registered.load(Ordering::Acquire)
-            && serving_membership.as_ref().is_none_or(|m| m.lease_valid_until().is_some())
+            && serving_membership
+                .as_ref()
+                .is_none_or(|m| m.lease_valid_until().is_some())
     });
     // retain.c: retain__queue rechecks the source with an ordinary context
     // and no listener, even if the live publication came from a bridge.
@@ -644,7 +664,11 @@ struct SecurityHandles {
 
 impl SecurityHandles {
     fn for_listener(&self, index: usize) -> SecurityHandle {
-        let (group, slot) = if self.per_listener { (index, 0) } else { (0, index) };
+        let (group, slot) = if self.per_listener {
+            (index, 0)
+        } else {
+            (0, index)
+        };
         self.handles[group].clone().for_listener(slot)
     }
 
@@ -654,7 +678,11 @@ impl SecurityHandles {
             let anonymous = if self.per_listener {
                 Box::from([config.allow_anonymous_for(&config.listeners[index])]) as Box<[bool]>
             } else {
-                config.listeners.iter().map(|l| config.allow_anonymous_for(l)).collect()
+                config
+                    .listeners
+                    .iter()
+                    .map(|l| config.allow_anonymous_for(l))
+                    .collect()
             };
             credentials.install(|password, acl| handle.replace_text(password, acl, anonymous))?;
         }

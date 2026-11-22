@@ -27,14 +27,18 @@ fn root(name: &str) -> CertifiedIssuer<'static, KeyPair> {
     let mut params = CertificateParams::default();
     params.distinguished_name.push(DnType::CommonName, name);
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
     CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
 }
 
 impl Pki {
     fn new() -> Self {
         let root = root("OCSP test root");
-        let mut params = CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+        let mut params =
+            CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
         params.serial_number = Some(1u64.into());
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let key = KeyPair::generate().unwrap();
@@ -101,7 +105,11 @@ impl Pki {
 
 fn der(tag: u8, pieces: &[&[u8]]) -> Vec<u8> {
     let mut output = Vec::new();
-    der_header(&mut output, tag, pieces.iter().map(|piece| piece.len()).sum());
+    der_header(
+        &mut output,
+        tag,
+        pieces.iter().map(|piece| piece.len()).sum(),
+    );
     for piece in pieces {
         output.extend_from_slice(piece);
     }
@@ -154,12 +162,17 @@ async fn dial(
     Result<SslStream<TcpStream>, ::openssl::ssl::Error>,
 ) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
     let (server, _) = listener.accept().await.unwrap();
     let ssl = Ssl::new(&context.build()).unwrap();
     let mut socket = SslStream::new(ssl, server).unwrap();
     let (client, server) = timeout(Duration::from_secs(5), async {
-        tokio::join!(connect_bridge_tls(client, host, tls), Pin::new(&mut socket).accept())
+        tokio::join!(
+            connect_bridge_tls(client, host, tls),
+            Pin::new(&mut socket).accept()
+        )
     })
     .await
     .unwrap();
@@ -225,7 +238,11 @@ async fn bridge_ocsp_checks_signed_status_for_the_verified_leaf() {
         ("unknown", Some(pki.staple(&[&unknown])), Some("GOOD")),
         ("stale", Some(pki.staple(&[&stale])), Some("not current")),
         ("future", Some(pki.staple(&[&future])), Some("not current")),
-        ("no expiry", Some(pki.staple(&[&undated])), Some("not current")),
+        (
+            "no expiry",
+            Some(pki.staple(&[&undated])),
+            Some("not current"),
+        ),
         (
             "duplicate ID",
             Some(pki.staple(&[&good, &revoked])),
@@ -271,12 +288,16 @@ async fn bridge_ocsp_preserves_tls_identity_and_bridge_settings() {
     .unwrap();
     let client_pem = dir.path().join("client.pem");
     let key_pem = dir.path().join("client.key");
-    let params = CertificateParams {
-        extended_key_usages: vec![ExtendedKeyUsagePurpose::ClientAuth],
-        ..CertificateParams::default()
-    };
+    let mut params = CertificateParams::default();
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
     let key = KeyPair::generate().unwrap();
-    fs::write(&client_pem, params.signed_by(&key, &pki.root).unwrap().pem()).unwrap();
+    fs::write(
+        &client_pem,
+        params.signed_by(&key, &pki.root).unwrap().pem(),
+    )
+    .unwrap();
     fs::write(&key_pem, key.serialize_pem()).unwrap();
     let mut tls = TlsConfig {
         capath: Some(dir.path().to_owned()),

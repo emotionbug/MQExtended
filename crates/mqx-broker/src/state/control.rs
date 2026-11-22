@@ -52,7 +52,11 @@ impl State {
         Ok(session)
     }
 
-    pub(super) fn broker_control(&mut self, control: BrokerControl, effects: &mut Vec<Effect>) -> Reply {
+    pub(super) fn broker_control(
+        &mut self,
+        control: BrokerControl,
+        effects: &mut Vec<Effect>,
+    ) -> Reply {
         let BrokerControl {
             origin,
             lease,
@@ -62,7 +66,9 @@ impl State {
             now,
             response,
         } = control;
-        let checked = self.check_control(origin, &lease, &topic, payload_len).map(|_| ());
+        let checked = self
+            .check_control(origin, &lease, &topic, payload_len)
+            .map(|_| ());
         if checked == Err(Reply::Stale) {
             return Reply::Stale;
         }
