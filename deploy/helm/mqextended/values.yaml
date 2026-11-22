@@ -1,0 +1,28 @@
+# Number of client-facing Raft voters. Use 3 to tolerate one voter failure.
+replicaCount: 1
+additionalVoter:
+  # Valid with replicaCount: 2. Adds a full voter without a client endpoint.
+  enabled: false
+
+image:
+  repository: ""
+  tag: ""
+
+storage:
+  # Null uses the default StorageClass; "" requests a volume with no class.
+  storageClassName: null
+  size: 10Gi
+
+auth:
+  # Secret keys: password_file, acl_file (Mosquitto format).
+  existingSecret: ""
+mqttTLS:
+  # kubernetes.io/tls Secret with tls.crt and tls.key for the clients' hostname.
+  existingSecret: ""
+
+service:
+  type: ClusterIP
+  loadBalancerClass: ""
+  annotations: {}
+
+resources: {}

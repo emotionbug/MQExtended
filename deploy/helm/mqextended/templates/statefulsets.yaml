@@ -1,0 +1,168 @@
+{{- $voters := include "mqextended.voterCount" . | int }}
+{{- range $id := untilStep 1 (int (add1 $voters)) 1 }}
+{{- $name := include "mqextended.voterName" (list $.Release.Name $id) }}
+{{- $clientFacing := le $id (int $.Values.replicaCount) }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mqextended.selectorLabels" $ | nindent 4 }}
+    mqextended.io/node-id: {{ $id | quote }}
+spec:
+  serviceName: {{ $.Release.Name }}-headless
+  replicas: 1
+  # Independent controllers must not all restart their voters on Helm upgrade.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      {{- include "mqextended.selectorLabels" $ | nindent 6 }}
+      mqextended.io/node-id: {{ $id | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "mqextended.selectorLabels" $ | nindent 8 }}
+        mqextended.io/node-id: {{ $id | quote }}
+        mqextended.io/client-facing: {{ $clientFacing | quote }}
+      annotations:
+        checksum/bootstrap: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "mqextended.selectorLabels" $ | nindent 18 }}
+      containers:
+        - name: broker
+          image: {{ printf "%s:%s" $.Values.image.repository $.Values.image.tag | quote }}
+          command: ["/bin/sh", "/etc/mqextended/bootstrap/start.sh"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MQX_NODE_ID
+              value: {{ $id | quote }}
+            - name: MQX_MQTT_BIND
+              value: {{ ternary "0.0.0.0" "127.0.0.1" $clientFacing | quote }}
+          ports:
+            {{- if $clientFacing }}
+            - name: mqtts
+              containerPort: 8883
+            {{- end }}
+            - name: peer
+              containerPort: 7000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            exec:
+              command:
+                - curl
+                - --noproxy
+                - '*'
+                - --fail
+                - --silent
+                - --show-error
+                - --max-time
+                - '2'
+                - http://127.0.0.1:9883/api/v1/mqx/ready
+            timeoutSeconds: 3
+            periodSeconds: 2
+          {{- with $.Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mqextended
+            - name: config
+              mountPath: /run/mqextended
+            # subPath gives the broker regular files where its policy reader
+            # rejects symlinks. Recreate each Pod to pick up new credentials.
+            - name: bootstrap
+              mountPath: /etc/mqextended/bootstrap/start.sh
+              subPath: start.sh
+              readOnly: true
+            - name: bootstrap
+              mountPath: /etc/mqextended/bootstrap/readiness.acl
+              subPath: readiness.acl
+              readOnly: true
+            - name: auth
+              mountPath: /etc/mqextended/auth/password_file
+              subPath: password_file
+              readOnly: true
+            - name: auth
+              mountPath: /etc/mqextended/auth/acl_file
+              subPath: acl_file
+              readOnly: true
+            - name: mqtt-tls
+              mountPath: /etc/mqextended/mqtt
+              readOnly: true
+            - name: peer-tls
+              mountPath: /etc/mqextended/peer
+              readOnly: true
+      volumes:
+        - name: config
+          emptyDir: {}
+        - name: bootstrap
+          configMap:
+            name: {{ $.Release.Name }}-bootstrap
+        - name: auth
+          secret:
+            secretName: {{ $.Values.auth.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: password_file
+                path: password_file
+              - key: acl_file
+                path: acl_file
+        - name: mqtt-tls
+          secret:
+            secretName: {{ $.Values.mqttTLS.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        - name: peer-tls
+          secret:
+            secretName: {{ $name }}-tls
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+  # StatefulSet claims are retained by default, including after uninstall.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if kindIs "string" $.Values.storage.storageClassName }}
+        storageClassName: {{ $.Values.storage.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $.Values.storage.size | quote }}
+{{- end }}

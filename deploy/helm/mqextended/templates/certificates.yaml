@@ -1,0 +1,79 @@
+{{- $ca := printf "%s-ca" .Release.Name -}}
+{{- $mqttSecret := .Values.mqttTLS.existingSecret -}}
+{{- if eq $mqttSecret $ca -}}
+{{- fail "mqttTLS.existingSecret may not refer to the generated peer CA secret" -}}
+{{- end -}}
+{{- range $id := untilStep 1 4 1 -}}
+{{- if eq $mqttSecret (printf "%s-tls" (include "mqextended.voterName" (list $.Release.Name $id))) -}}
+{{- fail "mqttTLS.existingSecret may not refer to a generated peer leaf secret" -}}
+{{- end -}}
+{{- end -}}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Release.Name }}-selfsigned
+  labels:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $ca }}
+  labels:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+spec:
+  secretName: {{ $ca }}
+  isCA: true
+  commonName: {{ .Release.Name }}-peer-ca
+  duration: 87600h
+  renewBefore: 2160h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  usages:
+    - cert sign
+    - crl sign
+  issuerRef:
+    name: {{ .Release.Name }}-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $ca }}
+  labels:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ $ca }}
+{{- $voters := include "mqextended.voterCount" . | int }}
+{{- range $id := untilStep 1 (int (add1 $voters)) 1 }}
+{{- $name := include "mqextended.voterName" (list $.Release.Name $id) }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mqextended.selectorLabels" $ | nindent 4 }}
+    mqextended.io/node-id: {{ $id | quote }}
+spec:
+  secretName: {{ $name }}-tls
+  commonName: mqx-node-{{ $id }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+    - client auth
+  issuerRef:
+    name: {{ $ca }}
+    kind: Issuer
+    group: cert-manager.io
+{{- end }}

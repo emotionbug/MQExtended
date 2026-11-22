@@ -53,7 +53,76 @@ Issue node certificates from a CA used only for the cluster, one per node, with 
 - Keep `cluster_bind` on a private network even with TLS. With `cluster_insecure_plaintext true` peer traffic is neither authenticated nor encrypted, and anyone who can reach the port can rewrite broker state; use it only on an isolated network or for tests.
 - The MQTT listeners sit behind your load balancer. Any node can serve any client, so the balancer needs no stickiness; least-connections spreads reconnect storms best.
 - Probe `GET /api/v1/mqx/ready` on an HTTP API listener, with credentials and a read ACL for just that path. It checks the same gate as MQTT admission: security registration and an unexpired quorum-backed voter lease. A partition may remain ready until that lease expires. A TCP connect or a successful cluster-status query only proves the process is up.
-- Run an odd number of nodes. Three nodes tolerate one failure; writes stop while a majority is unreachable.
+- One voter can serve and persist data on its own, but has no failover. Two voters require both for a majority. Use three voters to keep serving through one failure. Never turn an isolated member of a larger cluster into a new single-voter cluster.
+
+## Quick start on EKS
+
+The [Helm chart](../deploy/helm/mqextended) starts a new cluster without asking for node IDs, peer IPs or peer keys. Pick the topology **at first install**:
+
+| Helm values | MQTT-serving Pods | Total voters | If one voter stops |
+| --- | ---: | ---: | --- |
+| Defaults (`replicaCount=1`) | 1 | 1 | No service until that Pod restarts with its PVC. |
+| `replicaCount=2` | 2 | 2 | No quorum for writes; admission closes after the lease expires. Restart the missing voter with its PVC. |
+| `replicaCount=2,additionalVoter.enabled=true` | 2 | 3 | The remaining majority serves MQTT. If one serving Pod fails, **one MQTT Pod plus the additional voter** can still commit writes. |
+| `replicaCount=3` | 3 | 3 | The two survivors keep serving; any voter can receive MQTT traffic. |
+
+The additional voter is a full replica, not a lightweight witness. Give each voter its own schedulable worker and volume. Spread workers and voters across availability zones if you need to survive loss of a zone. An EBS volume can reattach only in its own zone; a singleton cannot fail over across zones.
+
+### Install
+
+Use an IPv4 EKS cluster with Helm 3, [cert-manager](https://cert-manager.io/docs/installation/helm/), and an [EBS CSI StorageClass](https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html) with `WaitForFirstConsumer`. [EKS Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/create-storage-class.html) uses provisioner `ebs.csi.eks.amazonaws.com`; clusters with the standard EBS CSI driver use `ebs.csi.aws.com`. Use the actual StorageClass name, not the provisioner name. Allow worker access to the image registry. These steps assume your `kubectl` context points at the target cluster.
+
+1. Build the image from this checkout and push it to an existing ECR repository. Choose the architecture of the worker nodes (`linux/arm64` for Graviton). Use a new tag for each build.
+
+   ```sh
+   region=us-east-1
+   repo=$(aws ecr describe-repositories --region "$region" --repository-names mqextended \
+     --query 'repositories[0].repositoryUri' --output text)
+   tag=$(git rev-parse HEAD)
+   aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "${repo%%/*}"
+   docker buildx build --platform linux/amd64 -t "$repo:$tag" --push .
+   ```
+
+2. Create the client-facing secrets. Use a server certificate whose DNS SAN covers the name your MQTT clients use. For an existing installation, import its password and ACL files. For a first private test, `mosquitto_passwd -c password_file device` prompts for a password **and creates a new file**; an ACL containing `user device` and `topic readwrite devices/device/#` on separate lines restricts that account to its test topic tree.
+
+   ```sh
+   kubectl create namespace mqtt
+   kubectl -n mqtt create secret generic mqtt-policy --from-file=password_file --from-file=acl_file
+   kubectl -n mqtt create secret tls mqtt-listener --cert=server-chain.pem --key=server.key
+   ```
+
+3. Install from the repository root. This starts a **single durable voter**. For two client-facing brokers that must survive one broker failure, append `--set replicaCount=2,additionalVoter.enabled=true` on this first install.
+
+   ```sh
+   helm upgrade --install mqtt ./deploy/helm/mqextended -n mqtt \
+     --set-string image.repository="$repo" --set-string image.tag="$tag" \
+     --set-string auth.existingSecret=mqtt-policy --set-string mqttTLS.existingSecret=mqtt-listener \
+     --set-string storage.storageClassName=gp3 --wait --timeout 10m
+   kubectl -n mqtt get pods,pvc,certificates
+   ```
+
+The default MQTT endpoint is the private Service `mqtt.mqtt.svc:8883`. Connect with TLS, the server CA and your MQTT credentials. To expose it through an **internal** NLB managed by EKS Auto Mode, include this values file with `-f` on install. Use `service.k8s.aws/nlb` instead of `eks.amazonaws.com/nlb` for the AWS Load Balancer Controller. Use private subnets tagged for internal load balancers and point your certificate's DNS name at the NLB. The NLB forwards TLS to the broker; port 7000 and the HTTP API are not exposed.
+
+```yaml
+service:
+  type: LoadBalancer
+  loadBalancerClass: eks.amazonaws.com/nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+```
+
+### Restart and upgrade
+
+Each voter gets a numbered StatefulSet, a stable peer Service IP, a PVC and its own `mqx-node-<id>` certificate. cert-manager issues peer certificates from a release-specific CA; no Pod receives the CA signing key or another voter's private key. The peer Services publish addresses before readiness so the voters can form a quorum. Only Ready serving Pods enter the MQTT Service.
+
+Keep the namespace, release name, peer Services, CA and PVCs. Restart a Pod, **not** its Service: a numeric peer IP is part of committed membership. `helm uninstall` removes Services; retained PVCs alone do not make a new install a safe restore. Use the [cold restore procedure](#cold-backup-and-restore) for a lost installation.
+
+Do not use an HPA, `kubectl scale`, or a change to Helm replica counts to resize an existing cluster. The chart manages fixed topologies and rejects ordinary topology-changing upgrades. To move an existing installation, plan a [membership change](#changing-membership) separately.
+
+StatefulSets use `OnDelete` so a chart upgrade cannot restart all voters together. Apply new chart values, then replace **one Pod at a time**, waiting for each new Pod to be Ready before touching another. Recreate Pods this way after peer certificate renewal or a password/ACL Secret change: Kubernetes does not update `subPath` mounts in place, so SIGHUP alone will not load a new policy. A one-voter or two-voter cluster necessarily has a maintenance interruption. For incompatible broker versions follow [Upgrades](#upgrades), not a rolling restart.
+
+The disruption budget protects a majority from voluntary evictions. A worker drain can therefore block for a one- or two-voter topology; schedule downtime rather than lowering the broker's quorum. A disruption budget does not prevent physical node failures.
 
 ## Bootstrap and restart
 

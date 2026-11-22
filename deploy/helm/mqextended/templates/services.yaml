@@ -1,0 +1,102 @@
+{{- $release := .Release.Name -}}
+{{- $namespace := .Release.Namespace -}}
+{{- $voters := include "mqextended.voterCount" . | int -}}
+{{- $clients := int .Values.replicaCount -}}
+{{- if not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" $release) -}}
+{{- fail "the Helm release name must be a DNS-1035 Service name (lowercase letters, digits and dashes, starting with a letter)" -}}
+{{- end -}}
+{{- $voterCountKey := "mqextended.io/voter-count" -}}
+{{- $clientCountKey := "mqextended.io/client-count" -}}
+{{- $annotations := .Values.service.annotations -}}
+{{- if or (hasKey $annotations $voterCountKey) (hasKey $annotations $clientCountKey) -}}
+{{- fail "service.annotations may not override the topology marker annotations" -}}
+{{- end -}}
+{{- if .Release.IsUpgrade -}}
+  {{- $marker := lookup "v1" "Service" $namespace $release -}}
+  {{- if not $marker -}}
+    {{- fail "cannot verify the cluster topology: client Service not found (upgrades require a live Helm connection; use --dry-run=server for a preview)" -}}
+  {{- end -}}
+  {{- $current := $marker.metadata.annotations | default dict -}}
+  {{- if or (ne (get $current $voterCountKey) (toString $voters)) (ne (get $current $clientCountKey) (toString $clients)) -}}
+    {{- fail "cannot change cluster topology with Helm: both replicaCount and additionalVoter.enabled must match the installed release" -}}
+  {{- end -}}
+  {{- range $id := untilStep 1 (int (add1 $voters)) 1 -}}
+    {{- $name := include "mqextended.voterName" (list $release $id) -}}
+    {{- if not (lookup "v1" "Service" $namespace $name) -}}
+      {{- fail (printf "cannot upgrade: peer Service %s is missing, and re-creating it could change a persisted Raft address" $name) -}}
+    {{- end -}}
+  {{- end -}}
+{{- else if .Release.IsInstall -}}
+  {{- range $id := untilStep 1 4 1 -}}
+    {{- $claim := printf "data-%s-0" (include "mqextended.voterName" (list $release $id)) -}}
+    {{- if lookup "v1" "PersistentVolumeClaim" $namespace $claim -}}
+      {{- fail (printf "cannot install with retained PVC %s: its persisted Raft addresses may no longer match. Back up the PVC and use a fresh release name or remove the old data to start an empty cluster." $claim) -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $release }}
+  labels:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+  annotations:
+    {{ $voterCountKey }}: {{ $voters | quote }}
+    {{ $clientCountKey }}: {{ $clients | quote }}
+    {{- with $annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if and (eq .Values.service.type "LoadBalancer") .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ .Values.service.loadBalancerClass | quote }}
+  {{- end }}
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [IPv4]
+  selector:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+    mqextended.io/client-facing: "true"
+  ports:
+    - name: mqtts
+      port: 8883
+      targetPort: mqtts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $release }}-headless
+  labels:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [IPv4]
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: peer
+      port: 7000
+      targetPort: peer
+{{- range $id := untilStep 1 (int (add1 $voters)) 1 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mqextended.voterName" (list $release $id) }}
+  labels:
+    {{- include "mqextended.selectorLabels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [IPv4]
+  # Raft must see peers before quorum-dependent MQTT readiness is possible.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mqextended.selectorLabels" $ | nindent 4 }}
+    mqextended.io/node-id: {{ $id | quote }}
+  ports:
+    - name: peer
+      port: 7000
+      targetPort: peer
+{{- end }}

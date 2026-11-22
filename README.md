@@ -9,6 +9,8 @@ A clustered MQTT broker in Rust that replaces Mosquitto without changing clients
 
 ## Quick start
 
+**EKS:** [Install with Helm](docs/cluster.md#quick-start-on-eks). Start with one durable broker on one worker, or choose a multi-voter topology. The chart supplies node IDs, stable peer addresses, per-voter mTLS and PVCs.
+
 Build a [Linux bundle](docs/development.md#linux-broker-build) into a fresh directory. This does not install or start a service.
 
 ```sh

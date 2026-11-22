@@ -1,0 +1,12 @@
+{{- $voters := include "mqextended.voterCount" . | int -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+spec:
+  minAvailable: {{ add1 (div $voters 2) }}
+  selector:
+    matchLabels:
+      {{- include "mqextended.selectorLabels" . | nindent 6 }}

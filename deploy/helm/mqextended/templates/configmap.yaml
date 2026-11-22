@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-bootstrap
+  labels:
+    {{- include "mqextended.selectorLabels" . | nindent 4 }}
+data:
+  readiness.acl: |
+    topic read /api/v1/mqx/ready
+  start.sh: |
+    set -eu
+    umask 077
+    trap 'exit 0' INT TERM
+
+    peer() {
+      id=$1
+      host="$2.$POD_NAMESPACE.svc"
+      # Use the pod's DNS search list for the cluster domain. Resolve regular
+      # IPv4 Services, never Pod IPs or headless endpoints: Raft persists them.
+      echo "Resolving Raft voter $id at $host" >&2
+      while :; do
+        addr=$(getent ahostsv4 "$host" | awk '$2 == "STREAM" { print $1; exit }')
+        if [ -n "$addr" ]; then
+          printf 'cluster_peer %s %s:7000\n' "$id" "$addr"
+          return
+        fi
+        sleep 2
+      done
+    }
+
+    config=/run/mqextended/mosquitto.conf
+    {
+      cat <<EOF
+    per_listener_settings true
+    log_dest stdout
+
+    listener 8883 $MQX_MQTT_BIND
+    protocol mqtt
+    allow_anonymous false
+    password_file /etc/mqextended/auth/password_file
+    acl_file /etc/mqextended/auth/acl_file
+    certfile /etc/mqextended/mqtt/tls.crt
+    keyfile /etc/mqextended/mqtt/tls.key
+
+    listener 9883 127.0.0.1
+    protocol http_api
+    allow_anonymous true
+    acl_file /etc/mqextended/bootstrap/readiness.acl
+
+    cluster_node_id $MQX_NODE_ID
+    cluster_bind 0.0.0.0:7000
+    cluster_data_dir /var/lib/mqextended/raft
+    cluster_cafile /etc/mqextended/peer/ca.crt
+    cluster_certfile /etc/mqextended/peer/tls.crt
+    cluster_keyfile /etc/mqextended/peer/tls.key
+    EOF
+      {{- $voters := include "mqextended.voterCount" . | int }}
+      {{- range $id := untilStep 1 (int (add1 $voters)) 1 }}
+      peer {{ $id }} {{ include "mqextended.voterName" (list $.Release.Name $id) | quote }}
+      {{- end }}
+    } > "$config"
+    exec mqextended -c "$config"
