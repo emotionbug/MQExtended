@@ -4,6 +4,7 @@ mod process;
 
 use std::{
     ffi::OsString,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
@@ -28,7 +29,7 @@ use persistence::Persistence;
 use process::{PidFile, StartupError, TERMINATING};
 
 const USAGE: &str =
-    "Usage: mqextended [-c <mosquitto.conf>] [-d] [-p <port>]... [-q] [-v] [--test-config] [-h]";
+    "Usage: mqextended [-c <mosquitto.conf>] [-d] [-p <port>]... [-q] [-v] [--test-config] [--version] [-h]";
 
 #[derive(Default)]
 struct Cli {
@@ -41,13 +42,14 @@ struct Cli {
 }
 
 impl Cli {
-    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Self>, ServerError> {
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ControlFlow<&'static str, Self>, ServerError> {
         let mut args = args.into_iter();
         let mut cli = Self::default();
         let error = |message: &str| ServerError::Arguments(format!("Error: {message}"));
         while let Some(arg) = args.next() {
             match arg.to_str() {
-                Some("-h" | "--help") => return Ok(None),
+                Some("-h" | "--help") => return Ok(ControlFlow::Break(USAGE)),
+                Some("--version") => return Ok(ControlFlow::Break(concat!("mqextended ", env!("CARGO_PKG_VERSION")))),
                 Some("-c" | "--config-file") => {
                     let file = args
                         .next()
@@ -71,7 +73,7 @@ impl Cli {
                 Some("-q" | "--quiet") => cli.quiet = true,
                 Some("-d" | "--daemon") => cli.daemon = true,
                 Some("--test-config") => cli.test_config = true,
-                Some("--tls-keylog" | "--version") => {
+                Some("--tls-keylog") => {
                     return Err(error(&format!(
                         "Unsupported Mosquitto option '{}'.",
                         arg.to_string_lossy()
@@ -85,7 +87,7 @@ impl Cli {
                 }
             }
         }
-        Ok(Some(cli))
+        Ok(ControlFlow::Continue(cli))
     }
 
     fn override_log_types(&self, log: &mut LogConfig) {
@@ -112,11 +114,13 @@ fn main() -> ExitCode {
 }
 
 fn start() -> Result<ExitCode, StartupError> {
-    let cli = Cli::parse(std::env::args_os().skip(1))
-        .map_err(|error| StartupError::invalid(error.to_string()))?;
-    let Some(cli) = cli else {
-        println!("{USAGE}");
-        return Ok(ExitCode::SUCCESS);
+    let cli = match Cli::parse(std::env::args_os().skip(1))
+        .map_err(|error| StartupError::invalid(error.to_string()))? {
+        ControlFlow::Continue(cli) => cli,
+        ControlFlow::Break(text) => {
+            println!("{text}");
+            return Ok(ExitCode::SUCCESS);
+        }
     };
     let mut config = match cli.file.as_deref() {
         Some(file) => {
