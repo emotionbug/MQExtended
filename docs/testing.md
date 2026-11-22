@@ -55,15 +55,15 @@ Failover tests have no Mosquitto counterpart; they assert MQTT's guarantees dire
 
 | Client | Transport | Scenarios |
 | --- | --- | --- |
-| Eclipse Paho Python 2.1.0 | TCP | MQTT 3.1 retained QoS 2; MQTT 3.1.1 offline delivery after session resume; MQTT 5 request/reply with binary Correlation Data |
+| [Eclipse Paho Python 2.2.0](https://pypi.org/project/paho-mqtt/2.2.0/) | TCP | MQTT 3.1 retained QoS 2; MQTT 3.1.1 offline delivery after session resume; MQTT 5 request/reply with binary Correlation Data |
 | MQTT.js 5.16.1 | TCP and WebSocket | MQTT 3.1.1 QoS 2; MQTT 5 batched subscriptions, No Local, Retain As Published, repeated User Properties and request/reply |
 
-With Python 3 and Node.js 24 on `PATH`, run from the repository root:
+With Python 3.9 or newer and Node.js 24 on `PATH`, run from the repository root:
 
 ```sh
 python3 -m venv /tmp/mqx-client-venv
 . /tmp/mqx-client-venv/bin/activate
-python3 -m pip install --no-deps paho-mqtt==2.1.0
+python3 -m pip install --require-hashes --only-binary=:all: -r crates/mqx-difftest/tests/clients/requirements.txt
 npm ci --prefix crates/mqx-difftest/tests/clients --ignore-scripts --no-audit --no-fund
 cargo build --locked -p mqx-server
 MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build MOSQUITTO_WS_BUILD_DIR=/tmp/mosquitto/build-ws \

@@ -5,7 +5,7 @@ use std::process::Command;
 use mqx_difftest::{BrokerConfig, BrokerKind, ClusterConfig, Harness};
 
 #[test]
-#[ignore = "requires Mosquitto 2.1.4, mqextended and paho-mqtt 2.1.0"]
+#[ignore = "requires Mosquitto 2.1.4, mqextended and Eclipse Paho Python"]
 fn paho_tcp() {
     run("python3", "paho_interop.py", None);
 }

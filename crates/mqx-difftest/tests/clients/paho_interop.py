@@ -1,4 +1,4 @@
-"""Run real paho-mqtt 2.1.0 clients: python paho_interop.py HOST PUB_PORT SUB_PORT."""
+"""Run Eclipse Paho Python clients: python paho_interop.py HOST PUB_PORT SUB_PORT."""
 
 import argparse
 from contextlib import contextmanager

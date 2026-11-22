@@ -71,7 +71,7 @@ jobs:
           node-version: '24'
       - name: Install client SDKs for interoperability tests
         run: |
-          python3 -m pip install --no-deps paho-mqtt==2.1.0
+          python3 -m pip install --require-hashes --only-binary=:all: -r crates/mqx-difftest/tests/clients/requirements.txt
           npm ci --prefix crates/mqx-difftest/tests/clients --ignore-scripts --no-audit --no-fund
       - run: cargo build --locked -p mqx-server
       - name: Differential and failover tests
