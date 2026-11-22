@@ -1,0 +1,7 @@
+{
+  "name": "mqextended-client-interop",
+  "private": true,
+  "dependencies": {
+    "mqtt": "5.16.1"
+  }
+}

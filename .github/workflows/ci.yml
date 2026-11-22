@@ -63,6 +63,16 @@ jobs:
             -DWITH_PLUGINS=ON -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_WEBSOCKETS=OFF -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
             -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
           cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install client SDKs for interoperability tests
+        run: |
+          python3 -m pip install --no-deps paho-mqtt==2.1.0
+          npm ci --prefix crates/mqx-difftest/tests/clients --ignore-scripts --no-audit --no-fund
       - run: cargo build --locked -p mqx-server
       - name: Differential and failover tests
         env:

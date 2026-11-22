@@ -2,3 +2,4 @@
 **/*.rs.bk
 /proptest-regressions
 **/proptest-regressions
+/crates/mqx-difftest/tests/clients/node_modules/

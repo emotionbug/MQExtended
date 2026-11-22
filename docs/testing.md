@@ -49,6 +49,29 @@ Only generated client ids and clock-dependent expiry values are normalized, afte
 
 Failover tests have no Mosquitto counterpart; they assert MQTT's guarantees directly while killing (SIGKILL) and restarting nodes: persistent queues and DUP resends survive, a lost node's wills are published once, retained messages and subscriptions survive, takeover works across nodes, publishing resumes after leader loss.
 
+### Client SDK interoperability
+
+`client_sdks` runs unmodified client libraries against Mosquitto 2.1.4, standalone MQExtended and a three-node MQExtended cluster. In cluster runs the publisher and subscriber connect to different nodes.
+
+| Client | Transport | Scenarios |
+| --- | --- | --- |
+| Eclipse Paho Python 2.1.0 | TCP | MQTT 3.1 retained QoS 2; MQTT 3.1.1 offline delivery after session resume; MQTT 5 request/reply with binary Correlation Data |
+| MQTT.js 5.16.1 | TCP and WebSocket | MQTT 3.1.1 QoS 2; MQTT 5 batched subscriptions, No Local, Retain As Published, repeated User Properties and request/reply |
+
+With Python 3 and Node.js 24 on `PATH`, run from the repository root:
+
+```sh
+python3 -m venv /tmp/mqx-client-venv
+. /tmp/mqx-client-venv/bin/activate
+python3 -m pip install --no-deps paho-mqtt==2.1.0
+npm ci --prefix crates/mqx-difftest/tests/clients --ignore-scripts --no-audit --no-fund
+cargo build --locked -p mqx-server
+MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build MOSQUITTO_WS_BUILD_DIR=/tmp/mosquitto/build-ws \
+  cargo test --locked -p mqx-difftest --test client_sdks -- --ignored
+```
+
+These tests cover the listed client paths, not full [MQTT 3.1.1](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html) or [MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) conformance.
+
 ## Root process smoke
 
 The Linux `root-process` job runs on a dedicated GitHub-hosted VM after a push to `main`, not on pull requests. It builds as the runner user, then runs only the selected process test and the repository-built `mqextended` as root. It does not run a Mosquitto reference binary as root.
