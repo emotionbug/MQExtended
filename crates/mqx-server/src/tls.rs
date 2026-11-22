@@ -2,9 +2,25 @@ mod bridge;
 
 pub use bridge::connect_bridge_tls;
 
-use std::{borrow::Cow, fmt::Write as _, fs, path::Path, sync::Arc};
+use std::{
+    borrow::Cow,
+    fmt::{Display, Write as _},
+    fs,
+    path::Path,
+    sync::Arc,
+};
 
 use ::ring::digest::{Context as DigestContext, SHA1_FOR_LEGACY_USE_ONLY};
+use openssl::{
+    error::ErrorStack,
+    pkey::PKey,
+    ssl::{
+        SslContext, SslContextBuilder, SslFiletype, SslMethod, SslMode, SslOptions,
+        SslSessionCacheMode, SslVerifyMode, SslVersion,
+    },
+    stack::Stack,
+    x509::{X509, store::X509Lookup, verify::X509VerifyFlags},
+};
 
 use rustls::{
     RootCertStore, ServerConfig, SupportedCipherSuite,
@@ -22,7 +38,13 @@ use x509_parser::{
 
 use crate::{CertIdentity, ListenerConfig, ListenerProtocol, ServerError, TlsConfig, TlsVersion};
 
-pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<TlsAcceptor>, ServerError> {
+#[derive(Clone)]
+pub(crate) enum ListenerAcceptor {
+    Rustls(TlsAcceptor),
+    OpenSsl(SslContext),
+}
+
+pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<ListenerAcceptor>, ServerError> {
     let http_tls;
     let tls = if listener.protocol == ListenerProtocol::HttpApi {
         // http_api.c: http_api__start passes only cert/key into libmicrohttpd.
@@ -48,17 +70,17 @@ pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<TlsAcceptor>,
         (None, None) => return Ok(None),
         _ => return Err(error("both certfile and keyfile are required".into())),
     };
+    if tls.require_certificate && tls.disable_client_cert_date_checks {
+        return openssl_acceptor(tls, certfile, keyfile)
+            .map(|acceptor| Some(ListenerAcceptor::OpenSsl(acceptor)))
+            .map_err(error);
+    }
 
     let chain = pem_contents::<CertificateDer<'static>>(certfile, "certfile").map_err(error)?;
     let key = PrivateKeyDer::from_pem_file(keyfile)
         .map_err(|e| error(format!("keyfile '{}': {e}", keyfile.display())))?;
     let mut roots = RootCertStore::empty();
-    if let Some(cafile) = &tls.cafile {
-        add_roots(&mut roots, cafile, "cafile").map_err(error)?;
-    }
-    if let Some(capath) = &tls.capath {
-        add_capath(&mut roots, capath).map_err(error)?;
-    }
+    client_roots(tls, |cert| roots.add(cert)).map_err(error)?;
     let crls = if let Some(path) = &tls.crlfile {
         let lists = pem_contents::<CertificateRevocationListDer<'static>>(path, "crlfile")
             .map_err(error)?;
@@ -102,7 +124,125 @@ pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<TlsAcceptor>,
         .with_single_cert(chain, key)
         .map_err(|e| error(format!("certfile/keyfile: {e}")))?;
     config.ignore_client_order = true;
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    Ok(Some(ListenerAcceptor::Rustls(acceptor)))
+}
+
+fn openssl_acceptor(
+    tls: &TlsConfig,
+    certfile: &Path,
+    keyfile: &Path,
+) -> Result<SslContext, String> {
+    let ssl_error = |e: ErrorStack| e.to_string();
+    let mut context = SslContextBuilder::new(SslMethod::tls_server()).map_err(ssl_error)?;
+    context.set_options(
+        SslOptions::NO_COMPRESSION
+            | SslOptions::NO_RENEGOTIATION
+            | SslOptions::CIPHER_SERVER_PREFERENCE
+            | SslOptions::NO_TICKET,
+    );
+    // Recheck trust and CRL freshness on every connection.
+    context.set_session_cache_mode(SslSessionCacheMode::OFF);
+    context.set_mode(SslMode::ENABLE_PARTIAL_WRITE | SslMode::ACCEPT_MOVING_WRITE_BUFFER);
+    let minimum = match tls.version {
+        TlsVersion::Tls12OrNewer => SslVersion::TLS1_2,
+        TlsVersion::Tls13 => SslVersion::TLS1_3,
+    };
+    context
+        .set_min_proto_version(Some(minimum))
+        .map_err(|e| format!("tls_version: {e}"))?;
+
+    // Keep the normal listener's cipher selection for certificate-based TLS.
+    let provider = cipher_provider(tls.ciphers.as_deref(), tls.ciphers_tls13.as_deref())?;
+    let (mut tls12, mut tls13) = (String::new(), String::new());
+    for suite in provider.cipher_suites {
+        let (name, _) = cipher_names(suite).expect("known ring cipher suite");
+        let list = if suite.version() == &TLS13 {
+            &mut tls13
+        } else {
+            &mut tls12
+        };
+        if !list.is_empty() {
+            list.push(':');
+        }
+        list.push_str(name);
+    }
+    if minimum == SslVersion::TLS1_2 {
+        context
+            .set_cipher_list(&tls12)
+            .map_err(|e| format!("ciphers: {e}"))?;
+    }
+    context
+        .set_ciphersuites(&tls13)
+        .map_err(|e| format!("ciphers_tls1.3: {e}"))?;
+
+    let mut names = Stack::new().map_err(ssl_error)?;
+    client_roots(tls, |der| {
+        let cert = X509::from_der(der.as_ref())?;
+        names.push(cert.subject_name().to_owned()?)?;
+        context.cert_store_mut().add_cert(cert)
+    })?;
+    if names.is_empty() {
+        return Err("require_certificate (check cafile and capath): no trust roots".into());
+    }
+    context.set_client_ca_list(names);
+
+    if let Some(path) = &tls.crlfile {
+        // The safe OpenSSL file lookup requires a UTF-8 C string.
+        if path.to_str().is_none_or(|path| path.contains('\0')) {
+            return Err("crlfile: expected a UTF-8 path without NUL".into());
+        }
+        let crl_error = |e| format!("crlfile '{}': {e}", path.display());
+        let store = context.cert_store_mut();
+        store
+            .add_lookup(X509Lookup::file())
+            .and_then(|lookup| lookup.load_crl_file(path, SslFiletype::PEM))
+            .map_err(crl_error)?;
+        // Mosquitto src/net.c: net__load_crl_file checks the leaf.
+        store
+            .set_flags(X509VerifyFlags::CRL_CHECK)
+            .map_err(crl_error)?;
+    }
+
+    // Mosquitto src/net.c: client_certificate_verify. In particular, do not
+    // set NO_CHECK_TIME: that would also disable checks on CRL validity.
+    // The safe openssl crate exposes these x509_vfy.h codes only as raw values.
+    const X509_V_ERR_CERT_NOT_YET_VALID: i32 = 9;
+    const X509_V_ERR_CERT_HAS_EXPIRED: i32 = 10;
+    context.set_verify_callback(
+        SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+        |ok, cert| {
+            ok || matches!(
+                cert.error().as_raw(),
+                X509_V_ERR_CERT_NOT_YET_VALID | X509_V_ERR_CERT_HAS_EXPIRED
+            )
+        },
+    );
+
+    let cert_error = |e: ErrorStack| format!("certfile '{}': {e}", certfile.display());
+    for (index, der) in pem_contents::<CertificateDer<'static>>(certfile, "certfile")?
+        .into_iter()
+        .enumerate()
+    {
+        let cert = X509::from_der(der.as_ref()).map_err(cert_error)?;
+        if index == 0 {
+            context.set_certificate(&cert).map_err(cert_error)?;
+        } else {
+            context.add_extra_chain_cert(cert).map_err(cert_error)?;
+        }
+    }
+    // Parse the same key forms as rustls without OpenSSL's password prompt.
+    let key = PrivateKeyDer::from_pem_file(keyfile)
+        .map_err(|e| format!("keyfile '{}': {e}", keyfile.display()))?;
+    let key = PKey::private_key_from_der(key.secret_der())
+        .map_err(|e| format!("keyfile '{}': {e}", keyfile.display()))?;
+    context
+        .set_private_key(&key)
+        .map_err(|e| format!("keyfile '{}': {e}", keyfile.display()))?;
+    context
+        .check_private_key()
+        .map_err(|e| format!("certfile/keyfile: {e}"))?;
+    Ok(context.build())
 }
 
 fn cipher_provider(
@@ -139,16 +279,34 @@ fn pem_contents<T: PemObject>(path: &Path, directive: &str) -> Result<Vec<T>, St
     Ok(entries)
 }
 
-fn add_roots(roots: &mut RootCertStore, path: &Path, directive: &str) -> Result<(), String> {
-    for cert in pem_contents::<CertificateDer<'static>>(path, directive)? {
-        roots
-            .add(cert)
-            .map_err(|e| format!("{directive} '{}': {e}", path.display()))?;
+fn client_roots<E: Display>(
+    tls: &TlsConfig,
+    mut add: impl FnMut(CertificateDer<'static>) -> Result<(), E>,
+) -> Result<(), String> {
+    if let Some(path) = &tls.cafile {
+        add_ca_file(path, "cafile", &mut add)?;
+    }
+    if let Some(directory) = &tls.capath {
+        add_capath(directory, add)?;
     }
     Ok(())
 }
 
-fn add_capath(roots: &mut RootCertStore, directory: &Path) -> Result<(), String> {
+fn add_ca_file<E: Display>(
+    path: &Path,
+    directive: &str,
+    mut add: impl FnMut(CertificateDer<'static>) -> Result<(), E>,
+) -> Result<(), String> {
+    for cert in pem_contents::<CertificateDer<'static>>(path, directive)? {
+        add(cert).map_err(|e| format!("{directive} '{}': {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn add_capath<E: Display>(
+    directory: &Path,
+    mut add: impl FnMut(CertificateDer<'static>) -> Result<(), E>,
+) -> Result<(), String> {
     // Mosquitto src/net.c: net__tls_load_verify delegates to OpenSSL's hashed
     // CA directory lookup. Don't trust unindexed or mismatched PEMs there.
     let err = |error: std::io::Error| format!("capath '{}': {error}", directory.display());
@@ -186,9 +344,7 @@ fn add_capath(roots: &mut RootCertStore, directory: &Path) -> Result<(), String>
             let actual = subject_name_hash(cert.subject())
                 .ok_or_else(|| format!("capath '{}': invalid subject name", file.display()))?;
             if hash == actual {
-                roots
-                    .add(der)
-                    .map_err(|error| format!("capath '{}': {error}", file.display()))?;
+                add(der).map_err(|error| format!("capath '{}': {error}", file.display()))?;
             }
         }
     }
@@ -341,9 +497,9 @@ fn cipher_strength(suite: SupportedCipherSuite) -> u16 {
     }
 }
 
-fn cipher_matches(suite: SupportedCipherSuite, selector: &str, ssl12: bool) -> Option<bool> {
+fn cipher_names(suite: SupportedCipherSuite) -> Option<(&'static str, &'static str)> {
     use rustls::CipherSuite::*;
-    let (openssl, iana) = match suite.suite() {
+    Some(match suite.suite() {
         TLS13_AES_128_GCM_SHA256 => ("TLS_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"),
         TLS13_AES_256_GCM_SHA384 => ("TLS_AES_256_GCM_SHA384", "TLS_AES_256_GCM_SHA384"),
         TLS13_CHACHA20_POLY1305_SHA256 => (
@@ -375,7 +531,11 @@ fn cipher_matches(suite: SupportedCipherSuite, selector: &str, ssl12: bool) -> O
             "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         ),
         _ => return None,
-    };
+    })
+}
+
+fn cipher_matches(suite: SupportedCipherSuite, selector: &str, ssl12: bool) -> Option<bool> {
+    let (openssl, iana) = cipher_names(suite)?;
     // Recognize known suite names even when looking at a different suite.
     const TLS12_NAMES: &[&str] = &[
         "ECDHE-ECDSA-AES128-GCM-SHA256",
@@ -416,12 +576,12 @@ fn cipher_matches(suite: SupportedCipherSuite, selector: &str, ssl12: bool) -> O
     })
 }
 
-pub(crate) fn identity(tls: &TlsConfig, peer: Option<&CertificateDer<'_>>) -> CertIdentity {
+pub(crate) fn identity(tls: &TlsConfig, peer: Option<&[u8]>) -> CertIdentity {
     if !tls.use_identity_as_username && !tls.use_subject_as_username {
         return CertIdentity::None;
     }
     let identity = || {
-        let (_, cert) = parse_x509_certificate(peer?.as_ref()).ok()?;
+        let (_, cert) = parse_x509_certificate(peer?).ok()?;
         let name = cert.subject();
         // Mosquitto src/handle_connect.c: handle_username_from_cert_options,
         // set_username_from_cert_identity, set_username_from_cert_subject_name.

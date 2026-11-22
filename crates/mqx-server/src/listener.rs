@@ -28,11 +28,10 @@ use tokio::{
     task::JoinSet,
     time::{Instant, timeout_at},
 };
-use tokio_rustls::TlsAcceptor;
 
 use crate::{
     ConnectionStream, ListenerConfig, ListenerProtocol, ServerConfig, ServerError, SocketDomain,
-    tls,
+    tls::{self, ListenerAcceptor},
     transport::{self, PeerAddress, SocketStream},
 };
 
@@ -121,7 +120,7 @@ struct ListenerOptions {
     config: Arc<ListenerConfig>,
     index: usize,
     limit: Option<Arc<Semaphore>>,
-    tls: watch::Sender<Option<TlsAcceptor>>,
+    tls: watch::Sender<Option<ListenerAcceptor>>,
     proxy: Option<ProxyOptions>,
     websockets: Option<WsOptions>,
 }

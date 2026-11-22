@@ -15,7 +15,7 @@ use rustls::{
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use super::{add_capath, add_roots, cipher_provider, pem_contents};
+use super::{add_ca_file, add_capath, cipher_provider, pem_contents};
 
 mod openssl;
 
@@ -56,10 +56,10 @@ fn client_config(tls: &TlsConfig) -> Result<ClientConfig, String> {
         }
     }
     if let Some(path) = &tls.cafile {
-        add_roots(&mut roots, path, "bridge_cafile")?;
+        add_ca_file(path, "bridge_cafile", |cert| roots.add(cert))?;
     }
     if let Some(path) = &tls.capath {
-        add_capath(&mut roots, path)?;
+        add_capath(path, |cert| roots.add(cert))?;
     }
     let provider = cipher_provider(tls.ciphers.as_deref(), tls.ciphers_tls13.as_deref())?;
     let signatures = provider.signature_verification_algorithms;
@@ -174,6 +174,9 @@ mod tests {
         })
         .unwrap()
         .unwrap();
+        let crate::tls::ListenerAcceptor::Rustls(acceptor) = acceptor else {
+            panic!("the default listener must not opt in to the date exception");
+        };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();

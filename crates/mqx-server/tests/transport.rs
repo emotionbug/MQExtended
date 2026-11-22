@@ -376,10 +376,20 @@ async fn forwarded_common_name_cannot_bypass_password_file_but_local_mtls_can() 
 #[tokio::test]
 async fn tls_websocket_dispatches_mqtt_with_and_without_a_proxy_v1_prefix() {
     let pki = TestPki::new();
-    for proxy in ["", "enable_proxy_protocol 1\n"] {
+    let expired = pki.dated_client(1990, 2000, ExtendedKeyUsagePurpose::ClientAuth);
+    for (proxy, mtls) in [
+        ("", false),
+        ("enable_proxy_protocol 1\n", false),
+        ("enable_proxy_protocol 1\n", true),
+    ] {
+        let client_auth = if mtls {
+            "require_certificate true\ndisable_client_cert_date_checks true\n"
+        } else {
+            ""
+        };
         let config = pki.server_config(&format!(
             "allow_anonymous true\n\
-            protocol websockets\nwebsockets_origin https://device.example\n{proxy}"
+            protocol websockets\nwebsockets_origin https://device.example\n{proxy}{client_auth}"
         ));
         let mut broker = RunningBroker::start(&config).await;
         let mut tcp = TcpStream::connect(broker.addr).await.unwrap();
@@ -389,7 +399,8 @@ async fn tls_websocket_dispatches_mqtt_with_and_without_a_proxy_v1_prefix() {
             tcp.write_all(V1).await.unwrap();
             "192.0.2.7:47568".parse().unwrap()
         };
-        let tls = TlsConnector::from(Arc::new(pki.client_config(false)));
+        let client = pki.client_config_with(mtls.then_some((&expired.0, &expired.1)));
+        let tls = TlsConnector::from(Arc::new(client));
         let mut stream = timeout(
             DEADLINE,
             tls.connect(ServerName::try_from("localhost").unwrap(), tcp),
@@ -499,27 +510,54 @@ impl TestPki {
     }
 
     fn server_config(&self, extra: &str) -> ServerConfig {
+        local_config(&self.listener_tls(extra))
+    }
+
+    fn listener_tls(&self, extra: &str) -> String {
         let dir = self.dir.path();
-        local_config(&format!(
+        format!(
             "certfile {}\nkeyfile {}\ncafile {}\n{extra}",
             dir.join("server.pem").display(),
             dir.join("server.key").display(),
             dir.join("ca.pem").display()
-        ))
+        )
+    }
+
+    fn dated_client(
+        &self,
+        not_before_year: i32,
+        not_after_year: i32,
+        usage: ExtendedKeyUsagePurpose,
+    ) -> (Certificate, KeyPair) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "dated client");
+        params.not_before = date_time_ymd(not_before_year, 1, 1);
+        params.not_after = date_time_ymd(not_after_year, 1, 1);
+        params.serial_number = Some(25.into());
+        params.extended_key_usages = vec![usage];
+        let cert = params.signed_by(&key, &self.ca).unwrap();
+        (cert, key)
     }
 
     fn client_config(&self, client_cert: bool) -> ClientConfig {
+        self.client_config_with(client_cert.then_some((&self.client, &self.client_key)))
+    }
+
+    fn client_config_with(&self, client: Option<(&Certificate, &KeyPair)>) -> ClientConfig {
         let mut roots = RootCertStore::empty();
         roots.add(self.ca.der().clone()).unwrap();
         let builder = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_root_certificates(roots);
-        if client_cert {
+        if let Some((cert, key)) = client {
             builder
                 .with_client_auth_cert(
-                    vec![self.client.der().clone()],
-                    self.client_key.serialize_der().try_into().unwrap(),
+                    vec![cert.der().clone()],
+                    key.serialize_der().try_into().unwrap(),
                 )
                 .unwrap()
         } else {
@@ -613,7 +651,10 @@ async fn authenticated_tls_dispatches_common_name_or_openssl_rfc2253_subject() {
 #[tokio::test]
 async fn tls_without_client_auth_does_not_request_a_certificate() {
     let pki = TestPki::new();
-    let config = pki.server_config("require_certificate false\nuse_identity_as_username true");
+    let config = pki.server_config(
+        "require_certificate false\nuse_identity_as_username true\n\
+         disable_client_cert_date_checks true",
+    );
     let (addr, mut identities, stop, serving) = serve_tls(&config).await;
     assert_eq!(
         timeout(DEADLINE, dial(addr, pki.client_config(true)))
@@ -686,6 +727,208 @@ async fn certificate_revocation_file_refuses_a_revoked_client() {
     assert!(identities.try_recv().is_err());
     stop.send(()).unwrap();
     serving.await.unwrap();
+}
+
+#[test]
+fn client_certificate_date_policy_requires_an_explicit_listener() {
+    let option = "disable_client_cert_date_checks true";
+    assert!(ServerConfig::parse(option).is_err());
+    let config = ServerConfig::parse(&format!(
+        "listener 1883 127.0.0.1\n{option}\nlistener 8883 127.0.0.1\n"
+    ))
+    .unwrap();
+    assert!(config.listeners[0].tls.disable_client_cert_date_checks);
+    assert!(!config.listeners[1].tls.disable_client_cert_date_checks);
+}
+
+#[tokio::test]
+async fn client_certificate_date_opt_in_accepts_only_date_errors() {
+    use ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+    // Mosquitto test/broker/08-ssl-connect-cert-auth-expired-allowed.py.
+    let pki = TestPki::new();
+    let expired = pki.dated_client(1990, 2000, ClientAuth);
+    let future = pki.dated_client(2099, 2199, ClientAuth);
+    let wrong_usage = pki.dated_client(1990, 2000, ServerAuth);
+    // The issuing DN is identical to the trusted CA's but the signing key is not.
+    let foreign_issuer = TestPki::new();
+    let untrusted = foreign_issuer.dated_client(1990, 2000, ClientAuth);
+    for allow_dates in [false, true] {
+        let config = pki.server_config(&format!(
+            "require_certificate true\nuse_identity_as_username true\n\
+             disable_client_cert_date_checks {allow_dates}"
+        ));
+        let (addr, mut identities, stop, serving) = serve_tls(&config).await;
+        for (label, client, expected) in [
+            (
+                "valid",
+                Some((&pki.client, &pki.client_key)),
+                Some(" Néw+device "),
+            ),
+            (
+                "expired",
+                Some((&expired.0, &expired.1)),
+                allow_dates.then_some("dated client"),
+            ),
+            (
+                "future",
+                Some((&future.0, &future.1)),
+                allow_dates.then_some("dated client"),
+            ),
+            ("wrong EKU", Some((&wrong_usage.0, &wrong_usage.1)), None),
+            ("untrusted issuer", Some((&untrusted.0, &untrusted.1)), None),
+            ("no certificate", None, None),
+        ] {
+            let result = timeout(DEADLINE, dial(addr, pki.client_config_with(client)))
+                .await
+                .unwrap();
+            if let Some(username) = expected {
+                assert_eq!(result.unwrap_or_else(|e| panic!("{label}: {e}")), 42);
+                assert_eq!(
+                    identities.try_recv().unwrap(),
+                    CertIdentity::Username(username.into())
+                );
+            } else {
+                assert!(result.is_err(), "{label}: TLS reached application data");
+                assert!(identities.try_recv().is_err());
+            }
+        }
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn client_certificate_date_opt_in_still_checks_crl_dates_and_revocation() {
+    let pki = TestPki::new();
+    let (expired, key) = pki.dated_client(1990, 2000, ExtendedKeyUsagePurpose::ClientAuth);
+    let path = pki.dir.path().join("client.crl");
+    let config = pki.server_config(&format!(
+        "require_certificate true\ndisable_client_cert_date_checks true\ncrlfile {}",
+        path.display()
+    ));
+
+    for (label, from, until, revoked, accepted) in [
+        ("current", 2020, 2099, false, true),
+        ("expired", 1990, 2000, false, false),
+        ("future", 2099, 2199, false, false),
+        ("revoked", 2020, 2099, true, false),
+    ] {
+        let params = CertificateRevocationListParams {
+            this_update: date_time_ymd(from, 1, 1),
+            next_update: date_time_ymd(until, 1, 1),
+            crl_number: 1.into(),
+            issuing_distribution_point: None,
+            revoked_certs: if revoked {
+                vec![RevokedCertParams {
+                    serial_number: 25.into(),
+                    revocation_time: date_time_ymd(2020, 1, 1),
+                    reason_code: None,
+                    invalidity_date: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            key_identifier_method: KeyIdMethod::Sha256,
+        };
+        fs::write(&path, params.signed_by(&pki.ca).unwrap().pem().unwrap()).unwrap();
+        let (addr, mut identities, stop, serving) = serve_tls(&config).await;
+        let client = pki.client_config_with(Some((&expired, &key)));
+        let result = timeout(DEADLINE, dial(addr, client)).await.unwrap();
+        if accepted {
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(identities.try_recv().unwrap(), CertIdentity::None);
+        } else {
+            assert!(result.is_err(), "{label} CRL did not stop the handshake");
+            assert!(identities.try_recv().is_err());
+        }
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn client_certificate_date_opt_in_keeps_working_after_failed_ca_reload() {
+    use std::process::Stdio;
+
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, BufReader},
+        net::UnixStream,
+        process::Command,
+    };
+
+    let pki = TestPki::new();
+    let dir = pki.dir.path();
+    let socket = dir.join("mqtt.sock");
+    let conf = dir.join("mosquitto.conf");
+    let tls = pki.listener_tls("require_certificate true\ndisable_client_cert_date_checks true");
+    fs::write(
+        &conf,
+        format!(
+            "user root\nallow_anonymous true\nlog_dest stdout\nlistener 0 {}\n{tls}",
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mqextended"))
+        .arg("-c")
+        .arg(conf)
+        .env_remove("NOTIFY_SOCKET")
+        .env("TOKIO_WORKER_THREADS", "2")
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = Pid::from_raw(child.id().unwrap().try_into().unwrap());
+    let mut logs = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut wait_for_log = async |needle: &str| {
+        timeout(DEADLINE, async {
+            loop {
+                let line = logs.next_line().await.unwrap().expect("broker exited");
+                if line.contains(needle) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("missing log line: {needle}"));
+    };
+    wait_for_log("mosquitto version 2.1.4 running").await;
+
+    let (expired, key) = pki.dated_client(1990, 2000, ExtendedKeyUsagePurpose::ClientAuth);
+    let connector = TlsConnector::from(Arc::new(pki.client_config_with(Some((&expired, &key)))));
+    for reload in [false, true] {
+        if reload {
+            fs::write(dir.join("ca.pem"), "broken CA certificate").unwrap();
+            kill(pid, Signal::SIGHUP).unwrap();
+            wait_for_log("Certificate reload failed").await;
+        }
+        timeout(DEADLINE, async {
+            let unix = UnixStream::connect(&socket).await.unwrap();
+            let mut stream = connector
+                .connect(ServerName::try_from("localhost").unwrap(), unix)
+                .await
+                .unwrap();
+            stream.write_all(CONNECT).await.unwrap();
+            assert_eq!(read_ack(&mut stream).await, ACCEPT);
+        })
+        .await
+        .expect("the last usable TLS context did not accept the client");
+    }
+
+    kill(pid, Signal::SIGTERM).unwrap();
+    assert!(
+        timeout(DEADLINE, child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
 }
 
 #[tokio::test]

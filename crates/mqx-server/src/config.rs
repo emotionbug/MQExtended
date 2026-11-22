@@ -207,6 +207,7 @@ pub struct TlsConfig {
     pub certfile: Option<PathBuf>,
     pub keyfile: Option<PathBuf>,
     pub require_certificate: bool,
+    pub disable_client_cert_date_checks: bool,
     pub use_identity_as_username: bool,
     pub use_subject_as_username: bool,
     pub version: TlsVersion,
@@ -1121,10 +1122,8 @@ impl Parser {
             }
             "enable_control_api" => self.config.enable_control_api = v.boolean()?,
             "disable_client_cert_date_checks" => {
-                require_listener(*current, name)?;
-                if v.boolean()? {
-                    return Err(unsupported(name, "enabling this feature"));
-                }
+                let index = require_listener(*current, name)?;
+                self.config.listeners[index].tls.disable_client_cert_date_checks = v.boolean()?;
             }
             "tls_keyform" => {
                 if v.string()? == "engine" {

@@ -10,15 +10,19 @@ use std::{
 use bytes::{Buf, Bytes};
 use mqx_proxy::{ProxyAddresses, ProxyInfo, ProxyOptions, read_proxy_header};
 use mqx_ws::WsOptions;
+use openssl::ssl::Ssl;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
-use tokio_rustls::TlsAcceptor;
+use tokio_openssl::SslStream;
 
-use crate::{CertIdentity, TlsConfig};
+use crate::{
+    CertIdentity, TlsConfig,
+    tls::{self, ListenerAcceptor},
+};
 
 /// MQTT byte stream after any PROXY, TLS, and WebSocket negotiations.
 pub struct ConnectionStream(Stream);
@@ -211,7 +215,7 @@ pub(crate) async fn negotiate(
     stream: SocketStream,
     peer: &mut PeerAddress<'_>,
     proxy: Option<ProxyOptions>,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ListenerAcceptor>,
     tls: &TlsConfig,
     ws: Option<&WsOptions>,
 ) -> Result<Option<(ConnectionStream, CertIdentity)>, NegotiationError> {
@@ -249,7 +253,7 @@ async fn negotiate_stream<S: TransportIo + 'static>(
     plain: impl FnOnce(S) -> ConnectionStream,
     peer: &mut PeerAddress<'_>,
     proxy: Option<ProxyOptions>,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ListenerAcceptor>,
     tls: &TlsConfig,
     ws: Option<&WsOptions>,
 ) -> Result<Option<(ConnectionStream, CertIdentity)>, NegotiationError> {
@@ -299,30 +303,55 @@ async fn negotiate_stream<S: TransportIo + 'static>(
 
 async fn upgrade<S: TransportIo + 'static>(
     stream: S,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ListenerAcceptor>,
     tls: &TlsConfig,
     ws: Option<&WsOptions>,
     identity: &mut CertIdentity,
 ) -> Result<ConnectionStream, NegotiationError> {
-    if let Some(acceptor) = acceptor {
-        let stream = acceptor
-            .accept(stream)
-            .await
-            .map_err(NegotiationError::Tls)?;
-        let certificate = stream
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|chain| chain.first());
-        *identity = crate::tls::identity(tls, certificate);
-        if let Some(options) = ws {
-            Ok(ConnectionStream::layered(
-                mqx_ws::accept(stream, options).await?,
-            ))
-        } else {
-            Ok(ConnectionStream::layered(stream))
+    match acceptor {
+        Some(ListenerAcceptor::Rustls(acceptor)) => {
+            let stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(NegotiationError::Tls)?;
+            let certificate = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first());
+            *identity = tls::identity(tls, certificate.map(AsRef::as_ref));
+            upgrade_websocket(stream, ws).await
         }
-    } else if let Some(options) = ws {
+        Some(ListenerAcceptor::OpenSsl(context)) => {
+            let tls_error = |error| NegotiationError::Tls(io::Error::other(error));
+            let ssl = Ssl::new(&context).map_err(tls_error)?;
+            let mut stream = SslStream::new(ssl, stream).map_err(tls_error)?;
+            Pin::new(&mut stream)
+                .accept()
+                .await
+                .map_err(|error| NegotiationError::Tls(io::Error::other(error)))?;
+            let certificate = if tls.use_identity_as_username || tls.use_subject_as_username {
+                stream
+                    .ssl()
+                    .peer_certificate()
+                    .map(|cert| cert.to_der())
+                    .transpose()
+                    .map_err(tls_error)?
+            } else {
+                None
+            };
+            *identity = tls::identity(tls, certificate.as_deref());
+            upgrade_websocket(stream, ws).await
+        }
+        None => upgrade_websocket(stream, ws).await,
+    }
+}
+
+async fn upgrade_websocket(
+    stream: impl TransportIo + 'static,
+    ws: Option<&WsOptions>,
+) -> Result<ConnectionStream, NegotiationError> {
+    if let Some(options) = ws {
         Ok(ConnectionStream::layered(
             mqx_ws::accept(stream, options).await?,
         ))
