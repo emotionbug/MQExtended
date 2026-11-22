@@ -70,7 +70,25 @@ MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build MOSQUITTO_WS_BUILD_DIR=/tmp/mosquitto/b
   cargo test --locked -p mqx-difftest --test client_sdks -- --ignored
 ```
 
-These tests cover the listed client paths, not full [MQTT 3.1.1](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html) or [MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) conformance.
+These tests cover the listed client paths, not full protocol conformance. The [standards and release scope](mosquitto-compatibility.md#standards-and-release-scope-2026-11-22) distinguishes published MQTT specifications from drafts and application profiles.
+
+#### Additional compatibility checks, 2026-11-22
+
+The following were one-time tests on **both Mosquitto 2.1.4 and standalone MQExtended**. They are not additional cluster CI jobs.
+
+| Released client | Exchange verified |
+| --- | --- |
+| [Mosquitto CLI 2.1.4 and 2.0.23](https://mosquitto.org/blog/2026/11/version-2-1-3-released/) | MQTT 3.1, 3.1.1 and 5.0: retained binary payload replayed with QoS 2 and RETAIN set. |
+| [Eclipse Paho C 1.3.16](https://github.com/eclipse-paho/paho.mqtt.c/releases/tag/v1.3.16) | MQTT 3.1, 3.1.1 and 5.0: Paho's publisher sent a retained binary file to `mosquitto_sub`; Paho's subscriber received the return publication from `mosquitto_pub`. |
+| [Eclipse Paho C++ 1.6.0](https://github.com/eclipse-paho/paho.mqtt.cpp/releases/tag/v1.6.0), linked with Paho C 1.3.16 | MQTT 3.1.1 and 5.0: negotiated the requested version and received the exact binary payload at QoS 2. |
+| Paho Python 2.2.0 | MQTT 5 over TCP/TLS and WSS, forcing TLS 1.2 and 1.3 in turn with certificate and hostname verification. The client applied Server Keep Alive (60 requested, 8 granted) and completed a binary QoS 1 round trip. |
+| [MQTT.js 5.16.1](https://www.npmjs.com/package/mqtt/v/5.16.1) in Chrome 158.0.8127.36 | Native browser WebSocket: MQTT 5 wildcard subscription, QoS 1 grant, publish acknowledgement and binary delivery. |
+| [MQTTnet 5.2.0.1603](https://www.nuget.org/packages/MQTTnet/5.2.0.1603) | .NET 10: MQTT 3.1, 3.1.1 and 5.0 accepted; QoS 2 grant, publish completion and exact binary delivery on each. |
+| [Eclipse Paho Java v3](https://repo.maven.apache.org/maven2/org/eclipse/paho/org.eclipse.paho.client.mqttv3/maven-metadata.xml) and [v5](https://repo.maven.apache.org/maven2/org/eclipse/paho/org.eclipse.paho.mqttv5.client/maven-metadata.xml), both 1.2.5; [HiveMQ MQTT Client 1.4.2](https://repo.maven.apache.org/maven2/com/hivemq/hivemq-mqtt-client/maven-metadata.xml) | OpenJDK 21, separate publisher and subscriber. QoS 1 and 2 grants in order and binary delivery on both topics. Paho: MQTT 3.1, 3.1.1 and 5.0; HiveMQ: 3.1.1 and 5.0. |
+| [Paho Go 1.5.1](https://pkg.go.dev/github.com/eclipse/paho.mqtt.golang@v1.5.1) and [Paho Go 0.23.0](https://pkg.go.dev/github.com/eclipse/paho.golang@v0.23.0) | These are separate modules: MQTT 3.1.1 on the first and 5.0 on the second. Both completed a binary QoS 1 round trip. |
+| [Bytebeam rumqttc 0.25.1](https://github.com/bytebeamio/rumqtt/releases/tag/rumqttc-0.25.1) | MQTT 3.1.1 and 5.0: QoS 1 SUBACK, publisher PUBACK and exact binary delivery to a second client. The `rumqttc-*-next` crates are a separate fork. |
+
+Embedded releases checked upstream, **not run on hardware**: [FreeRTOS coreMQTT 5.0.2](https://github.com/FreeRTOS/coreMQTT/releases/tag/v5.0.2), [ESP-MQTT 1.1.0](https://github.com/espressif/esp-mqtt/releases/tag/v1.1.0), [Arduino PubSubClient 2.8](https://github.com/knolleary/pubsubclient/releases/tag/v2.8) and [Paho Embedded C 1.1.0](https://github.com/eclipse-paho/paho.mqtt.embedded-c/releases/tag/v1.1.0). Library version numbers do not identify the MQTT wire protocol.
 
 ## Root process smoke
 

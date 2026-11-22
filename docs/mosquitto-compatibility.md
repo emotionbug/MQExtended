@@ -2,6 +2,22 @@
 
 The reference is **Mosquitto 2.1.4** (tag `v2.1.4`). When Mosquitto and the MQTT specification disagree, MQExtended matches Mosquitto, because the clients it serves were tested against Mosquitto.
 
+## Standards and release scope (2026-11-22)
+
+The [Mosquitto download page](https://mosquitto.org/download/) lists 2.1.4. The [2.0.23 maintenance release](https://mosquitto.org/blog/2026/11/version-2-1-3-released/) is for the older line, not a newer broker baseline.
+
+| Specification | Published status | What that means for MQExtended |
+| --- | --- | --- |
+| MQTT | The [OASIS publication index](https://docs.oasis-open.org/mqtt/mqtt/) lists [5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) as the newest standard, not 5.1 or 6.0. | The broker accepts wire levels 3, 4 and 5. For 3.1.1 use [the text including Errata 01](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html); [ISO/IEC 20922:2016](https://www.iso.org/standard/69466.html) covers 3.1.1, not 5.0. [3.1](https://mqtt.org/mqtt-specification/) is the historical protocol. |
+| MQTT-SN | [1.2](https://www.oasis-open.org/committees/tc_home.php?wg_abbrev=mqtt-sn) is the input specification. The [2.0 document dated 2026-11-17](https://groups.oasis-open.org/higherlogic/ws/public/document?document_id=73644) is a working draft, not an approved standard. | This is a separate wire protocol. Use an MQTT-SN gateway; there is no native MQTT-SN listener. |
+| MQTT over WebSocket | MQTT §6 uses [RFC 6455](https://www.rfc-editor.org/info/rfc6455/). [RFC 8441](https://www.rfc-editor.org/info/rfc8441/) and [RFC 9220](https://www.rfc-editor.org/info/rfc9220/) specify bootstrapping over HTTP/2 and HTTP/3 respectively. | WS/WSS clients use HTTP/1.1 Upgrade. The broker does not implement HTTP/2 or HTTP/3 Extended CONNECT or a native QUIC listener. |
+| TLS | [RFC 9846](https://www.rfc-editor.org/info/rfc9846/) supersedes RFC 8446; the negotiated version is still TLS 1.3. | Both TLS 1.2 and 1.3 were exercised on MQTT and WSS listeners. Successful negotiation is not an audit of every RFC requirement. |
+| Sparkplug | [Eclipse Sparkplug 3.0](https://sparkplug.eclipse.org/specification/version/3.0/) is [ISO/IEC 20237:2023](https://www.iso.org/standard/86204.html). | This is an application profile over MQTT. Forwarding its topics and payloads is not Sparkplug certification; the Sparkplug TCK was not run. |
+
+MQTT 5 support does not imply support for every authentication mechanism. A CONNECT with a nonempty Authentication Method receives CONNACK `0x8C` (Bad Authentication Method); there is no enhanced-authentication plugin. This does not prevent username/password or certificate authentication.
+
+See [client interoperability](testing.md#client-sdk-interoperability) for the distinction between continuous tests, one-time probes and release lookups.
+
 ## How to add or change a rule
 
 1. Find the Mosquitto code that decides the behaviour and read it, not the man page.
