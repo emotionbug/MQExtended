@@ -81,6 +81,12 @@ pub(super) struct Live {
     pub(super) ready: Notify,
 }
 
+pub(super) enum ClaimResult {
+    Accepted(Arc<Live>, bool),
+    Full,
+    Stale,
+}
+
 impl Live {
     fn new(lease: Lease, transient: bool) -> Self {
         Self {
@@ -276,8 +282,9 @@ impl Broker {
         &self,
         security: &SecurityHandle,
         mut claim: Claim,
-    ) -> Result<Option<(Arc<Live>, bool)>, BrokerError> {
-        let transient = claim.transient;
+    ) -> Result<ClaimResult, BrokerError> {
+        let transient = claim.local_inbox();
+        claim.now = self.now();
         match &self.0.log {
             Log::Local { started, .. } => {
                 let mut runtime = self.0.runtime.lock().unwrap();
@@ -302,12 +309,16 @@ impl Broker {
                     &self.0.config,
                     Some(security),
                 );
-                let Reply::Claimed { lease, present } = reply else {
-                    return Ok(None);
+                let (lease, present) = match reply {
+                    Reply::Claimed { lease, present } => (lease, present),
+                    Reply::Full => return Ok(ClaimResult::Full),
+                    Reply::Stale => return Ok(ClaimResult::Stale),
+                    _ => unreachable!(),
                 };
                 let live = Arc::new(Live::new(lease, transient));
                 runtime.live.insert(live.lease.epoch, live.clone());
-                Ok(Some((live, present)))
+                self.schedule_local_expiry(&mut runtime);
+                Ok(ClaimResult::Accepted(live, present))
             }
             Log::Replicated(log) => {
                 log.ensure_boot().await?;
@@ -335,9 +346,17 @@ impl Broker {
                         request: claim,
                     })
                     .await?;
-                let Reply::Claimed { lease, present } = reply else {
-                    pending.take();
-                    return Ok(None);
+                let (lease, present) = match reply {
+                    Reply::Claimed { lease, present } => (lease, present),
+                    Reply::Full => {
+                        pending.take();
+                        return Ok(ClaimResult::Full);
+                    }
+                    Reply::Stale => {
+                        pending.take();
+                        return Ok(ClaimResult::Stale);
+                    }
+                    _ => unreachable!(),
                 };
                 // In the normal case local apply attached the transport before
                 // dispatching any later traffic. Snapshot installation does not
@@ -355,8 +374,17 @@ impl Broker {
                     })
                 });
                 pending.finished = true;
-                Ok(live.map(|live| (live, present)))
+                Ok(live.map_or(ClaimResult::Stale, |live| {
+                    ClaimResult::Accepted(live, present)
+                }))
             }
+        }
+    }
+
+    pub(super) fn now(&self) -> Duration {
+        match &self.0.log {
+            Log::Local { started, .. } => started.elapsed(),
+            Log::Replicated(_) => wall_now(),
         }
     }
 
@@ -371,7 +399,10 @@ impl Broker {
 
     pub(super) async fn next_outbound(&self, live: &Live) -> Result<Option<Outbound>, BrokerError> {
         if let Some(inbox) = &live.inbox {
-            return Ok(inbox.lock().unwrap().next_outbound(&self.0.config));
+            return Ok(inbox
+                .lock()
+                .unwrap()
+                .next_outbound(&self.0.config, self.now()));
         }
         if let Log::Replicated(log) = &self.0.log
             && !log
@@ -382,7 +413,7 @@ impl Broker {
             // through its apply effect. An empty inbox needs no Raft write.
             return Ok(None);
         }
-        match self.act(live, Operation::NextOutbound).await? {
+        match self.act(live, Operation::NextOutbound(self.now())).await? {
             Reply::Outbound(outbound) => Ok(outbound),
             Reply::Stale => Ok(None),
             _ => unreachable!(),
@@ -392,21 +423,27 @@ impl Broker {
     async fn submit(&self, command: Command) -> Result<Reply, BrokerError> {
         match &self.0.log {
             Log::Local { .. } => {
-                Ok(self
-                    .0
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .apply_local(command, &self.0.config, None))
+                let mut runtime = self.0.runtime.lock().unwrap();
+                let old = runtime.local.as_ref().unwrap().state.next_expiry();
+                let reply = runtime.apply_local(command, &self.0.config, None);
+                if old != runtime.local.as_ref().unwrap().state.next_expiry() {
+                    self.schedule_local_expiry(&mut runtime);
+                }
+                Ok(reply)
             }
             Log::Replicated(log) => log.submit(command).await,
         }
     }
 
-    pub(super) async fn detach(&self, lease: Lease, graceful: bool) -> Result<(), BrokerError> {
+    pub(super) async fn detach(
+        &self,
+        lease: Lease,
+        graceful: bool,
+        expiry: Option<u32>,
+    ) -> Result<(), BrokerError> {
         match &self.0.log {
             Log::Local { .. } => {
-                self.detach_local(lease, graceful);
+                self.detach_local(lease, graceful, expiry);
                 Ok(())
             }
             Log::Replicated(log) => {
@@ -419,49 +456,48 @@ impl Broker {
                     .remove(&lease.epoch)
                     .is_some();
                 if removed && log.cluster.metrics().running {
-                    self.disconnect(lease, graceful).await?;
+                    self.disconnect(lease, graceful, expiry).await?;
                 }
                 Ok(())
             }
         }
     }
 
-    pub(super) fn detach_cancelled(&self, lease: Lease, graceful: bool) {
+    pub(super) fn detach_cancelled(&self, lease: Lease, graceful: bool, expiry: Option<u32>) {
         if let Log::Local { .. } = self.0.log {
-            self.detach_local(lease, graceful);
+            self.detach_local(lease, graceful, expiry);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             self.0.runtime.lock().unwrap().live.remove(&lease.epoch);
             let broker = self.clone();
             handle.spawn(async move {
                 // DISCONNECT is fenced by epoch, so cancellation cannot
                 // disconnect a successor or publish the old will twice.
-                if let Err(error) = broker.disconnect(lease, graceful).await {
+                if let Err(error) = broker.disconnect(lease, graceful, expiry).await {
                     tracing::debug!(%error, "could not clean up cancelled connection");
                 }
             });
         }
     }
 
-    async fn disconnect(&self, lease: Lease, graceful: bool) -> Result<(), BrokerError> {
+    async fn disconnect(
+        &self,
+        lease: Lease,
+        graceful: bool,
+        expiry: Option<u32>,
+    ) -> Result<(), BrokerError> {
         self.submit(Command::Act(
             lease,
             Operation::Disconnect {
                 graceful,
                 now: wall_now(),
+                expiry,
             },
         ))
         .await?;
         Ok(())
     }
 
-    fn detach_local(&self, lease: Lease, graceful: bool) {
-        let Log::Local {
-            started,
-            expiry_changed,
-        } = &self.0.log
-        else {
-            unreachable!()
-        };
+    fn detach_local(&self, lease: Lease, graceful: bool, expiry: Option<u32>) {
         let mut runtime = self.0.runtime.lock().unwrap();
         if runtime.live.remove(&lease.epoch).is_none() {
             return;
@@ -471,12 +507,20 @@ impl Broker {
                 lease,
                 Operation::Disconnect {
                     graceful,
-                    now: started.elapsed(),
+                    now: self.now(),
+                    expiry,
                 },
             ),
             &self.0.config,
             None,
         );
+        self.schedule_local_expiry(&mut runtime);
+    }
+
+    fn schedule_local_expiry(&self, runtime: &mut Runtime) {
+        let Log::Local { expiry_changed, .. } = &self.0.log else {
+            unreachable!()
+        };
         let local = runtime.local.as_mut().unwrap();
         if local.state.next_expiry().is_some() {
             if local.expiry_running {
@@ -792,7 +836,8 @@ impl Drop for PendingClaim<'_> {
         if !self.finished
             && let Some(live) = self.take().and_then(|pending| pending.live)
         {
-            self.broker.detach_cancelled(live.lease.clone(), false);
+            self.broker
+                .detach_cancelled(live.lease.clone(), false, None);
         }
     }
 }
@@ -870,7 +915,7 @@ async fn cluster_maintenance(
             _ = shutdown.changed() => return,
             abandoned = cleanup.recv() => {
                 let (Some(lease), Some(inner)) = (abandoned, inner.upgrade()) else { return; };
-                if let Err(error) = Broker(inner).disconnect(lease, false).await {
+                if let Err(error) = Broker(inner).disconnect(lease, false, None).await {
                     tracing::debug!(%error, "could not clean up abandoned claim");
                 }
             }

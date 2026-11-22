@@ -1,9 +1,11 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
+use mqx_codec::v5::Property;
 use mqx_codec::{PacketId, QoS};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +25,57 @@ pub(crate) struct Message {
     pub(crate) payload: Bytes,
     pub(crate) qos: QoS,
     pub(crate) retain: bool,
+    #[serde(default)]
+    pub(crate) properties: Vec<PublishProperty>,
+    #[serde(default)]
+    pub(crate) expires: Option<Duration>,
+}
+
+impl Message {
+    // database.c: db__message_store reserves zero and UINT32_MAX for no expiry.
+    pub(crate) fn expiry(now: Duration, interval: u32) -> Option<Duration> {
+        (interval != 0 && interval != u32::MAX)
+            .then(|| now.saturating_add(Duration::from_secs(u64::from(interval))))
+    }
+
+    fn expired(&self, now: Duration) -> bool {
+        self.expires
+            .is_some_and(|expiry| now.as_secs() > expiry.as_secs())
+    }
+}
+
+// The subset of v5 properties persisted by property_broker.c:
+// property__process_publish and property__process_will. Order is significant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PublishProperty {
+    PayloadFormat(u8),
+    ContentType(String),
+    ResponseTopic(String),
+    CorrelationData(Bytes),
+    User(String, String),
+}
+
+impl PublishProperty {
+    pub(crate) fn take(property: Property) -> Option<Self> {
+        Some(match property {
+            Property::PayloadFormatIndicator(value) => Self::PayloadFormat(value),
+            Property::ContentType(value) => Self::ContentType(value),
+            Property::ResponseTopic(value) => Self::ResponseTopic(value),
+            Property::CorrelationData(value) => Self::CorrelationData(value),
+            Property::UserProperty(name, value) => Self::User(name, value),
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn wire(&self) -> Property {
+        match self {
+            Self::PayloadFormat(value) => Property::PayloadFormatIndicator(*value),
+            Self::ContentType(value) => Property::ContentType(value.clone()),
+            Self::ResponseTopic(value) => Property::ResponseTopic(value.clone()),
+            Self::CorrelationData(value) => Property::CorrelationData(value.clone()),
+            Self::User(name, value) => Property::UserProperty(name.clone(), value.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +84,8 @@ pub(crate) struct Delivery {
     pub(crate) qos: QoS,
     pub(crate) retain: bool,
     pub(crate) dedup_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) subscription_identifier: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +103,8 @@ pub(crate) enum Ack {
     Received,
     Acknowledged,
     Completed,
+    Rejected,
+    Dropped,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +166,10 @@ pub(crate) struct Inbox {
     incoming: BTreeMap<PacketId, Incoming>,
     incoming_bytes: usize,
     incoming_slots: usize,
+    #[serde(default)]
+    pub(crate) receive_maximum: Option<u16>,
+    #[serde(default)]
+    send_used: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +185,12 @@ pub(crate) enum Offer {
     Dropped,
     FirstDrop,
     Suppressed,
+}
+
+pub(crate) enum Receive {
+    Accepted,
+    Quota,
+    Duplicate,
 }
 
 impl Inbox {
@@ -174,8 +241,7 @@ impl Inbox {
             phase: Phase::Publish,
         };
         if ready {
-            self.flight_stats.change(&entry.delivery, true);
-            self.in_flight.push_back(entry);
+            self.push_flight(entry);
             Offer::Ready
         } else {
             self.queue_stats.change(&entry.delivery, true);
@@ -184,11 +250,16 @@ impl Inbox {
         }
     }
 
+    fn send_maximum(&self, config: &BrokerConfig) -> usize {
+        self.receive_maximum
+            .map_or(config.max_inflight_messages, usize::from)
+    }
+
     // database.c: db__ready_for_flight checks existing payload bytes, so the
     // last admitted packet can cross the configured byte limit.
     fn flight_available(&self, qos: QoS, config: &BrokerConfig) -> bool {
         if qos == QoS::AtMostOnce {
-            if config.max_inflight_messages == 0 && config.max_inflight_bytes == 0 {
+            if self.send_maximum(config) == 0 && config.max_inflight_bytes == 0 {
                 return true;
             }
             if config.max_queued_messages == 0 && config.max_inflight_bytes == 0 {
@@ -204,18 +275,29 @@ impl Inbox {
                 config.max_queued_bytes,
             );
         }
-        below(self.flight_stats.qos_count, config.max_inflight_messages)
+        let used = if self.receive_maximum.is_some() {
+            self.send_used
+        } else {
+            self.flight_stats.qos_count
+        };
+        below(used, self.send_maximum(config))
             && below(self.flight_stats.qos_bytes, config.max_inflight_bytes)
+    }
+
+    fn push_flight(&mut self, entry: Outgoing) {
+        if entry.delivery.qos != QoS::AtMostOnce
+            && let Some(max) = self.receive_maximum
+        {
+            self.send_used = (self.send_used + 1).min(usize::from(max));
+        }
+        self.flight_stats.change(&entry.delivery, true);
+        self.in_flight.push_back(entry);
     }
 
     // database.c: db__ready_for_queue's online allowance includes an extra
     // flight window. Offline QoS 0 does not contribute to either counter.
     fn queue_available(&self, online: bool, config: &BrokerConfig) -> bool {
-        let extra_count = if online {
-            config.max_inflight_messages
-        } else {
-            0
-        };
+        let extra_count = if online { self.send_maximum(config) } else { 0 };
         let extra_bytes = if online { config.max_inflight_bytes } else { 0 };
         below(
             self.queue_stats.qos_count.saturating_sub(extra_count),
@@ -234,8 +316,7 @@ impl Inbox {
         {
             let entry = self.queued.pop_front().unwrap();
             self.queue_stats.change(&entry.delivery, false);
-            self.flight_stats.change(&entry.delivery, true);
-            self.in_flight.push_back(entry);
+            self.push_flight(entry);
         }
     }
 
@@ -250,10 +331,24 @@ impl Inbox {
                 .is_some_and(|entry| self.flight_available(entry.delivery.qos, config))
     }
 
-    pub(crate) fn next_outbound(&mut self, config: &BrokerConfig) -> Option<Outbound> {
+    pub(crate) fn next_outbound(
+        &mut self,
+        config: &BrokerConfig,
+        now: Duration,
+    ) -> Option<Outbound> {
         self.promote(config);
         loop {
+            // database.c: db__message_write_inflight_out uses a strict comparison.
+            // Equality still permits delivery without a Message Expiry property.
             let entry = self.in_flight.get_mut(self.next_unsent)?;
+            if entry.delivery.message.expired(now) {
+                if entry.delivery.qos != QoS::AtMostOnce {
+                    self.send_used = self.send_used.saturating_sub(1);
+                }
+                self.remove_flight(self.next_unsent);
+                self.promote(config);
+                continue;
+            }
             match entry.phase {
                 Phase::Publish if entry.delivery.qos == QoS::AtMostOnce => {
                     let entry = self.remove_flight(self.next_unsent);
@@ -291,6 +386,12 @@ impl Inbox {
     // database.c: db__message_delete_outgoing, db__message_update_outgoing;
     // lib/handle_pubrec.c: even an unknown PUBREC gets a PUBREL on v3.x.
     pub(crate) fn ack(&mut self, id: PacketId, kind: Ack, config: &BrokerConfig) -> bool {
+        // lib/handle_pubackcomp.c: even unknown ACK/COMP returns send quota.
+        // database.c: oversize drops and negative PUBREC remove the message
+        // without returning this quota for the current connection.
+        if matches!(kind, Ack::Acknowledged | Ack::Completed) {
+            self.send_used = self.send_used.saturating_sub(1);
+        }
         if let Some(index) = self.in_flight.iter().position(|entry| entry.id == Some(id)) {
             if !ack_entry(&mut self.in_flight[index], kind) {
                 return false;
@@ -335,22 +436,28 @@ impl Inbox {
     }
 
     // database.c: db__message_reconnect_reset and db__check_acl_of_all_messages.
+    // db__expire_all_messages prunes both directions on reconnection.
     pub(crate) fn resume(
         &mut self,
         mut allowed: impl FnMut(&str, bool) -> bool,
         config: &BrokerConfig,
+        now: Duration,
     ) {
         self.reset_outbound();
-        self.promote(config);
+        if self.receive_maximum.is_none() {
+            self.promote(config);
+        }
         self.in_flight.retain(|entry| {
-            let allowed = allowed(&entry.delivery.message.topic, false);
+            let allowed = !entry.delivery.message.expired(now)
+                && allowed(&entry.delivery.message.topic, false);
             if !allowed {
                 self.flight_stats.change(&entry.delivery, false);
             }
             allowed
         });
         self.queued.retain(|entry| {
-            let allowed = allowed(&entry.delivery.message.topic, false);
+            let allowed = !entry.delivery.message.expired(now)
+                && allowed(&entry.delivery.message.topic, false);
             if !allowed {
                 self.queue_stats.change(&entry.delivery, false);
             }
@@ -358,7 +465,7 @@ impl Inbox {
         });
         self.incoming_slots = self.incoming.len().min(config.max_inflight_messages);
         self.incoming.retain(|_, entry| {
-            let allowed = allowed(&entry.message.topic, true);
+            let allowed = !entry.message.expired(now) && allowed(&entry.message.topic, true);
             if !allowed {
                 self.incoming_bytes -= entry.message.payload.len();
             }
@@ -366,6 +473,11 @@ impl Inbox {
         });
         for entry in self.incoming.values_mut() {
             entry.repeated = false;
+        }
+        if let Some(maximum) = self.receive_maximum {
+            self.send_used = self.flight_stats.qos_count.min(usize::from(maximum));
+            self.incoming_slots = self.incoming.len().min(config.max_inflight_messages);
+            self.promote(config);
         }
     }
 
@@ -377,13 +489,17 @@ impl Inbox {
         id: PacketId,
         message: Arc<Message>,
         config: &BrokerConfig,
-    ) -> bool {
+    ) -> Receive {
         if let Some(previous) = self.incoming.get_mut(&id) {
             if previous.message.qos == message.qos
                 && previous.message.topic == message.topic
                 && previous.message.payload == message.payload
             {
-                return !std::mem::replace(&mut previous.repeated, true);
+                return if std::mem::replace(&mut previous.repeated, true) {
+                    Receive::Duplicate
+                } else {
+                    Receive::Accepted
+                };
             }
             self.remove_incoming(id);
         }
@@ -399,8 +515,10 @@ impl Inbox {
                     repeated: false,
                 },
             );
+            Receive::Accepted
+        } else {
+            Receive::Quota
         }
-        true
     }
 
     pub(crate) fn can_publish_qos1(&mut self, id: PacketId, config: &BrokerConfig) -> bool {
@@ -448,6 +566,8 @@ fn ack_entry(entry: &mut Outgoing, kind: Ack) -> bool {
         }
         Ack::Acknowledged => entry.delivery.qos == QoS::AtLeastOnce,
         Ack::Completed => entry.delivery.qos == QoS::ExactlyOnce && entry.phase == Phase::AwaitComp,
+        Ack::Rejected => entry.delivery.qos == QoS::ExactlyOnce && entry.phase == Phase::AwaitRec,
+        Ack::Dropped => true,
         Ack::Received => false,
     }
 }
@@ -468,16 +588,19 @@ mod tests {
                 payload: Bytes::from_static(bytes),
                 qos,
                 retain: false,
+                properties: Vec::new(),
+                expires: None,
             }),
             qos,
             retain: false,
             dedup_id: None,
+            subscription_identifier: 0,
         }
     }
 
     fn assert_publish_id(inbox: &mut Inbox, config: &BrokerConfig, expected: u16) {
         assert!(
-            matches!(inbox.next_outbound(config), Some(Outbound::Publish { id: Some(id), dup: false, .. }) if id.get() == expected)
+            matches!(inbox.next_outbound(config, Duration::ZERO), Some(Outbound::Publish { id: Some(id), dup: false, .. }) if id.get() == expected)
         );
     }
 
@@ -499,7 +622,7 @@ mod tests {
             Offer::Ready
         );
         assert!(matches!(
-            inbox.next_outbound(&config),
+            inbox.next_outbound(&config, Duration::ZERO),
             Some(Outbound::Publish { id: None, .. })
         ));
         for id in [u16::MAX, 1] {
@@ -551,9 +674,9 @@ mod tests {
         );
         for id in 1..=3 {
             assert_publish_id(&mut inbox, &config, id);
-            assert!(inbox.next_outbound(&config).is_none());
+            assert!(inbox.next_outbound(&config, Duration::ZERO).is_none());
             assert!(inbox.ack(PacketId::new(id).unwrap(), Ack::Acknowledged, &config));
         }
-        assert!(inbox.next_outbound(&config).is_none());
+        assert!(inbox.next_outbound(&config, Duration::ZERO).is_none());
     }
 }

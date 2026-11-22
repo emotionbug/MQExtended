@@ -13,13 +13,15 @@ use mqx_server::{
     parse_command_line_port,
 };
 
-const USAGE: &str = "Usage: mqextended [-c <mosquitto.conf>] [-p <port>]... [-v] [-h]";
+const USAGE: &str =
+    "Usage: mqextended [-c <mosquitto.conf>] [-p <port>]... [-v] [--test-config] [-h]";
 
 #[derive(Default)]
 struct Cli {
     file: Option<PathBuf>,
     ports: Vec<u16>,
     verbose: bool,
+    test_config: bool,
 }
 
 impl Cli {
@@ -50,10 +52,8 @@ impl Cli {
                     )?);
                 }
                 Some("-v" | "--verbose") => cli.verbose = true,
-                Some(
-                    "-d" | "--daemon" | "-q" | "--quiet" | "--test-config" | "--tls-keylog"
-                    | "--version",
-                ) => {
+                Some("--test-config") => cli.test_config = true,
+                Some("-d" | "--daemon" | "-q" | "--quiet" | "--tls-keylog" | "--version") => {
                     return Err(error(&format!(
                         "Unsupported Mosquitto option '{}'.",
                         arg.to_string_lossy()
@@ -87,6 +87,7 @@ async fn run() -> Result<(), ServerError> {
         println!("{USAGE}");
         return Ok(());
     };
+    let has_file = cli.file.is_some();
     let mut config = match cli.file {
         Some(file) => ServerConfig::load(file)?,
         None => ServerConfig::default(),
@@ -96,6 +97,17 @@ async fn run() -> Result<(), ServerError> {
         config.log.verbose();
     }
     mqx_server::init_logging(&config.log)?;
+    // Mosquitto src/mosquitto.c: main checks only the configuration file itself;
+    // credential files are not loaded.
+    if cli.test_config {
+        if !has_file {
+            return Err(ServerError::Arguments(
+                "Please provide a configuration file to test.".into(),
+            ));
+        }
+        tracing::info!("Configuration file is OK.");
+        return Ok(());
+    }
     for message in &config.notices {
         tracing::info!(target: "mqx::notice", "{message}");
     }
@@ -204,6 +216,7 @@ fn broker_config(config: &ServerConfig) -> BrokerConfig {
         queue_qos0_messages: limits.queue_qos0_messages,
         message_size_limit: limits.message_size_limit,
         max_packet_size: limits.max_packet_size,
+        retain_expiry_interval: limits.retain_expiry_interval,
         persistent_client_expiration: limits.persistent_client_expiration,
         retain_available: limits.retain_available,
         upgrade_outgoing_qos: limits.upgrade_outgoing_qos,
@@ -236,6 +249,9 @@ fn listener_policy(
         use_username_as_clientid: listener.use_username_as_clientid,
         disable_protocol_v3: listener.disable_protocol_v3,
         disable_protocol_v4: listener.disable_protocol_v4,
+        disable_protocol_v5: listener.disable_protocol_v5,
+        max_topic_alias: listener.max_topic_alias,
+        max_topic_alias_broker: listener.max_topic_alias_broker,
         mount_point: listener.mount_point.clone(),
         security,
     }

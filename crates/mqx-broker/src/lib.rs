@@ -1,4 +1,4 @@
-//! MQTT 3.1 / 3.1.1 broker with Mosquitto 2.1.4 session semantics.
+//! MQTT 3.1, 3.1.1 and 5 broker with Mosquitto 2.1.4 session semantics.
 
 mod connection;
 mod inbox;
@@ -41,6 +41,7 @@ pub struct BrokerConfig {
     pub queue_qos0_messages: bool,
     pub message_size_limit: usize,
     pub max_packet_size: usize,
+    pub retain_expiry_interval: Option<Duration>,
     pub persistent_client_expiration: Option<Duration>,
     pub retain_available: bool,
     pub upgrade_outgoing_qos: bool,
@@ -68,6 +69,7 @@ impl Default for BrokerConfig {
             queue_qos0_messages: false,
             message_size_limit: 0,
             max_packet_size: 2_000_000,
+            retain_expiry_interval: None,
             persistent_client_expiration: None,
             retain_available: true,
             upgrade_outgoing_qos: false,
@@ -92,6 +94,9 @@ pub struct ListenerPolicy {
     pub use_username_as_clientid: bool,
     pub disable_protocol_v3: bool,
     pub disable_protocol_v4: bool,
+    pub disable_protocol_v5: bool,
+    pub max_topic_alias: u16,
+    pub max_topic_alias_broker: u16,
     pub mount_point: Option<String>,
     pub security: SecurityHandle,
 }
@@ -108,6 +113,9 @@ impl Default for ListenerPolicy {
             use_username_as_clientid: false,
             disable_protocol_v3: false,
             disable_protocol_v4: false,
+            disable_protocol_v5: false,
+            max_topic_alias: 10,
+            max_topic_alias_broker: 10,
             mount_point: None,
             security: SecurityHandle::default(),
         }
@@ -246,6 +254,12 @@ pub enum BrokerError {
     Decode(#[from] DecodeError),
     #[error(transparent)]
     Encode(#[from] EncodeError),
+    #[error(transparent)]
+    DecodeV5(#[from] mqx_codec::v5::DecodeError),
+    #[error(transparent)]
+    EncodeV5(#[from] mqx_codec::v5::EncodeError),
+    #[error("peer violated the MQTT 5 protocol (reason {0:?})")]
+    ProtocolV5(mqx_codec::v5::ReasonCode),
     #[error("peer violated the MQTT protocol")]
     Protocol,
     #[error("operating system could not generate a random identity: {0}")]

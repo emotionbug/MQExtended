@@ -20,34 +20,37 @@ const ANONYMOUS: &str = "allow_anonymous true";
 
 macro_rules! scenario {
     ($name:ident, $conf:expr) => {
+        scenario!($name, $conf, crate::compare);
+    };
+    ($name:ident, $conf:expr, $compare:path) => {
         mod $name {
             use super::*;
 
             #[test]
             #[ignore = "requires real Mosquitto 2.1.4 binaries"]
             fn mosquitto_self() {
-                let first = run(BrokerKind::Mosquitto, $conf, super::$name);
-                let second = run(BrokerKind::Mosquitto, $conf, super::$name);
-                compare(&first, &second);
+                let first = crate::run(crate::BrokerKind::Mosquitto, $conf, super::$name);
+                let second = crate::run(crate::BrokerKind::Mosquitto, $conf, super::$name);
+                $compare(&first, &second);
             }
 
             #[test]
             #[ignore = "requires real Mosquitto 2.1.4 and mqextended binaries"]
             fn cross_broker() {
                 // Resolve and run mqextended first so a missing MQEXTENDED_BIN fails immediately.
-                let actual = run(BrokerKind::MqExtended, $conf, super::$name);
-                let expected = run(BrokerKind::Mosquitto, $conf, super::$name);
-                compare(&expected, &actual);
+                let actual = crate::run(crate::BrokerKind::MqExtended, $conf, super::$name);
+                let expected = crate::run(crate::BrokerKind::Mosquitto, $conf, super::$name);
+                $compare(&expected, &actual);
             }
 
             #[test]
             #[ignore = "requires real Mosquitto 2.1.4 and cluster-enabled mqextended binaries"]
             fn cross_cluster() {
-                let mut cluster = start_cluster($conf);
+                let mut cluster = crate::start_cluster($conf);
                 super::$name(&mut cluster);
                 let actual = cluster.into_transcript();
-                let expected = run(BrokerKind::Mosquitto, $conf, super::$name);
-                compare(&expected, &actual);
+                let expected = crate::run(crate::BrokerKind::Mosquitto, $conf, super::$name);
+                $compare(&expected, &actual);
             }
         }
     };
@@ -57,6 +60,7 @@ mod connect;
 mod failover;
 mod publish;
 mod sessions;
+mod v5;
 
 fn config(conf: &'static str) -> BrokerConfig<'static> {
     BrokerConfig {

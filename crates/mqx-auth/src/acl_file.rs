@@ -182,8 +182,10 @@ impl AclFile {
     }
 
     /// Port of `acl_file__check`: may `client_id`/`username` perform `access`
-    /// on `topic`? `username` is the CONNECT username as decoded from the
-    /// wire; Mosquitto reads a zero-length username as absent.
+    /// on `topic`? `None` is the anonymous principal. The caller maps a
+    /// zero-length CONNECT username to `None` (Mosquitto reads it as absent); a
+    /// present empty username (certificate CN) is a named user, as in
+    /// `acl_check.c`, and never gets the anonymous entries.
     pub fn check(
         &self,
         client_id: &str,
@@ -196,7 +198,6 @@ impl AclFile {
             Access::Read => ACL_READ,
             Access::Write => ACL_WRITE,
         };
-        let username = username.filter(|u| !u.is_empty());
 
         let user_entries = match username {
             Some(name) => self.users.get(name.as_bytes()),
@@ -310,8 +311,9 @@ mod tests {
         assert!(!a.check("c1", None, "alice/x", Read));
         // Unknown users with no patterns are denied outright.
         assert!(!a.check("c1", Some("mallory"), "alice/x", Read));
-        // Zero-length username is anonymous.
-        assert!(a.check("c1", Some(""), "public/x", Read));
+        // A present empty username (e.g. a certificate CN) is a named user
+        // without a section: no anonymous entries (acl_check.c: username != NULL).
+        assert!(!a.check("c1", Some(""), "public/x", Read));
     }
 
     #[test]

@@ -4,13 +4,13 @@ How to move a running Mosquitto deployment to MQExtended without touching client
 
 ## 1. Check the configuration
 
-Run MQExtended against your existing file:
+Check your existing file without starting anything:
 
 ```sh
-mqextended -c /etc/mosquitto/mosquitto.conf
+mqextended --test-config -c /etc/mosquitto/mosquitto.conf
 ```
 
-It parses `mosquitto.conf` with Mosquitto's rules and refuses to start on any directive it does not implement (bridges, plugins, PSK, persistence), naming the directive. A clean start is the first compatibility check. Your `password_file` and `acl_file` load unchanged.
+It parses `mosquitto.conf` with Mosquitto's rules and fails on any directive it does not implement (bridges, plugins, PSK, persistence), naming the directive. Like Mosquitto's `--test-config`, it does not open `password_file` or `acl_file`; start the broker once to load those. Both files load unchanged.
 
 ## 2. Find out what your Mosquitto version is
 

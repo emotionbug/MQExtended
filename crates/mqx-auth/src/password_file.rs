@@ -257,17 +257,18 @@ impl PasswordFile {
         self.users.is_empty()
     }
 
-    /// Port of `password_file__check` for the CONNECT credentials as decoded
-    /// from the wire. Mosquitto reads zero-length username/password fields as
-    /// absent (`packet__read_binary`), so empty values are treated as `None`.
+    /// Port of `password_file__check`. `None` means the field is absent. Mosquitto
+    /// reads zero-length CONNECT username/password fields as absent
+    /// (`packet__read_binary`), so the caller maps those to `None`; a present empty
+    /// username (e.g. from a certificate CN) is a real, unknown user.
     pub fn check(&self, username: Option<&str>, password: Option<&[u8]>) -> BasicAuth {
-        let Some(username) = username.filter(|u| !u.is_empty()) else {
+        let Some(username) = username else {
             return BasicAuth::Ignore;
         };
         let Some(hash) = self.users.get(username.as_bytes()) else {
             return BasicAuth::Deny;
         };
-        match password.filter(|p| !p.is_empty()) {
+        match password {
             Some(password) if hash.verify(password) => BasicAuth::Allow,
             _ => BasicAuth::Deny,
         }
@@ -382,9 +383,13 @@ mod tests {
             lines.extend([test_line.as_str(), empty_line.as_str()]);
             lines.extend(last);
             let pw = file(&lines).unwrap();
+            // The Python test sends these over the wire, where zero-length fields
+            // arrive as absent; apply the same mapping the broker does.
+            let wire_user = |u: Option<&'static str>| u.filter(|u| !u.is_empty());
+            let wire_pass = |p: Option<&'static [u8]>| p.filter(|p| !p.is_empty());
             for user in [Some("test"), Some("empty"), Some("bad"), Some(""), None] {
                 for pass in [Some(&b"test"[..]), Some(b"bad"), Some(b""), None] {
-                    let allowed = pw.check(user, pass) == BasicAuth::Allow;
+                    let allowed = pw.check(wire_user(user), wire_pass(pass)) == BasicAuth::Allow;
                     assert_eq!(
                         allowed,
                         user == Some("test") && pass == Some(b"test"),
@@ -393,7 +398,9 @@ mod tests {
                 }
             }
             assert_eq!(pw.check(None, Some(b"test")), BasicAuth::Ignore);
-            assert_eq!(pw.check(Some(""), None), BasicAuth::Ignore);
+            // A present empty username (certificate CN) is looked up like any other
+            // name, as Mosquitto's HASH_FIND does, and is unknown here.
+            assert_eq!(pw.check(Some(""), None), BasicAuth::Deny);
         }
     }
 

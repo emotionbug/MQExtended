@@ -29,6 +29,47 @@ async fn connect_and_read_ack(addr: std::net::SocketAddr) -> [u8; 4] {
     .unwrap()
 }
 
+// Mosquitto src/mosquitto.c: main with --test-config validates only the configuration
+// file and exits 0, or 3 when no file was given.
+#[test]
+fn test_config_checks_the_file_without_starting() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.conf");
+    // The credential file does not exist: --test-config must not load it.
+    std::fs::write(
+        &good,
+        "listener 18990 127.0.0.1\npassword_file /nonexistent/passwd\nlog_dest stderr\n",
+    )
+    .unwrap();
+    let output = Command::new(BIN)
+        .args(["--test-config", "-c"])
+        .arg(&good)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Configuration file is OK."));
+
+    let bad = dir.path().join("bad.conf");
+    std::fs::write(&bad, "listener 1883\nbridge_bogus 1\n").unwrap();
+    let output = Command::new(BIN)
+        .args(["--test-config", "-c"])
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+
+    let output = Command::new(BIN).arg("--test-config").output().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Please provide a configuration file to test.")
+    );
+}
+
 #[test]
 fn help_and_rejected_mosquitto_flags_are_actionable() {
     let output = Command::new(BIN).arg("-h").output().unwrap();

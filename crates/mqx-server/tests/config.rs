@@ -144,6 +144,37 @@ fn invalid_values_produce_reference_startup_diagnostics() {
 }
 
 #[test]
+fn protocol_versions_and_alias_limits_apply_only_to_their_listener() {
+    // src/conf.c: config__read_file_core resets the allowed protocol versions
+    // on each directive and ignores unrecognized tokens.
+    let config = ServerConfig::parse(concat!(
+        "listener 1888\naccept_protocol_versions 3,4\naccept_protocol_versions 5, \tunused\n",
+        "max_topic_alias 0\nmax_topic_alias_broker 65535\n",
+        "listener 1889\naccept_protocol_versions 3, 4\nretain_expiry_interval 2\n",
+    ))
+    .unwrap();
+    let [v5, legacy] = config.listeners.as_slice() else {
+        panic!("expected two listeners")
+    };
+    assert!(v5.disable_protocol_v3 && v5.disable_protocol_v4 && !v5.disable_protocol_v5);
+    assert!(
+        !legacy.disable_protocol_v3 && !legacy.disable_protocol_v4 && legacy.disable_protocol_v5
+    );
+    assert_eq!(
+        (v5.max_topic_alias, v5.max_topic_alias_broker),
+        (0, u16::MAX)
+    );
+    assert_eq!(
+        (legacy.max_topic_alias, legacy.max_topic_alias_broker),
+        (10, 10)
+    );
+    assert_eq!(
+        config.limits.retain_expiry_interval,
+        Some(Duration::from_secs(120))
+    );
+}
+
+#[test]
 fn commented_sample_binds_loopback_but_configured_listener_does_not_allow_anonymous() {
     // Commented settings excerpted from Mosquitto v2.1.4 mosquitto.conf.
     let sample = "#max_packet_size 0\n#listener\n#listener_allow_anonymous\n#listener_auto_id_prefix auto-\n#persistence false\n#persistence_file mosquitto.db\n#persistence_location\n#log_type error\n#log_type warning\n#log_type notice\n#log_type information\n#allow_anonymous false\n#include_dir\n";

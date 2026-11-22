@@ -41,6 +41,7 @@ pub struct BrokerLimits {
     pub max_packet_size: usize,
     pub message_size_limit: usize,
     pub persistent_client_expiration: Option<Duration>,
+    pub retain_expiry_interval: Option<Duration>,
     pub queue_qos0_messages: bool,
     pub retain_available: bool,
     pub upgrade_outgoing_qos: bool,
@@ -61,6 +62,9 @@ pub struct ListenerConfig {
     pub max_qos: u8,
     pub disable_protocol_v3: bool,
     pub disable_protocol_v4: bool,
+    pub disable_protocol_v5: bool,
+    pub max_topic_alias: u16,
+    pub max_topic_alias_broker: u16,
     pub use_username_as_clientid: bool,
     pub mount_point: Option<String>,
     pub security: SecurityConfig,
@@ -203,6 +207,7 @@ impl Default for BrokerLimits {
             max_packet_size: 2_000_000,
             message_size_limit: 0,
             persistent_client_expiration: None,
+            retain_expiry_interval: None,
             queue_qos0_messages: false,
             retain_available: true,
             upgrade_outgoing_qos: false,
@@ -238,6 +243,9 @@ impl Default for ListenerConfig {
             max_qos: 2,
             disable_protocol_v3: false,
             disable_protocol_v4: false,
+            disable_protocol_v5: false,
+            max_topic_alias: 10,
+            max_topic_alias_broker: 10,
             use_username_as_clientid: false,
             mount_point: None,
             security: SecurityConfig::default(),
@@ -627,6 +635,8 @@ impl Parser {
             | "listener_auto_id_prefix"
             | "mount_point"
             | "accept_protocol_versions"
+            | "max_topic_alias"
+            | "max_topic_alias_broker"
             | "cafile"
             | "tls_version"
             | "http_dir"
@@ -666,13 +676,26 @@ impl Parser {
                         }
                         listener.disable_protocol_v3 = true;
                         listener.disable_protocol_v4 = true;
+                        listener.disable_protocol_v5 = true;
                         for version in versions {
                             match version {
                                 "3" => listener.disable_protocol_v3 = false,
                                 "4" => listener.disable_protocol_v4 = false,
-                                "5" => return Err(unsupported(name, "MQTT 5")),
+                                "5" => listener.disable_protocol_v5 = false,
                                 _ => (),
                             }
+                        }
+                    }
+                    "max_topic_alias" | "max_topic_alias_broker" => {
+                        let maximum = v.range(
+                            0,
+                            i32::from(u16::MAX),
+                            &format!("Invalid '{name}' value in configuration."),
+                        )? as u16;
+                        if name == "max_topic_alias" {
+                            listener.max_topic_alias = maximum;
+                        } else {
+                            listener.max_topic_alias_broker = maximum;
                         }
                     }
                     "cafile" => listener.tls.cafile = Some(v.path()?),
@@ -870,10 +893,19 @@ impl Parser {
                     return Err(invalid(name, value));
                 }
             }
+            // conf.c: config__read_file_core caps the interval in minutes.
             "retain_expiry_interval" => {
-                if v.integer()? < 1 {
+                let minutes = v.integer()?;
+                if minutes < 1 {
                     return Err("retain_expiry_interval must be >= 1.".into());
                 }
+                if minutes > 10_000_000 {
+                    self.config
+                        .notices
+                        .push("Warning: retain_expiry_interval being capped at 19 years.".into());
+                }
+                self.config.limits.retain_expiry_interval =
+                    Some(Duration::from_secs(minutes.min(10_000_000) as u64 * 60));
             }
             "autosave_interval" | "websockets_log_level" => {
                 v.integer()?;
@@ -927,15 +959,6 @@ impl Parser {
                     return Err(unsupported(name, "OpenSSL engine keys"));
                 }
                 self.implicit_listener(current, name);
-            }
-            "max_topic_alias" | "max_topic_alias_broker" => {
-                require_listener(*current, name)?;
-                v.range(
-                    0,
-                    65535,
-                    &format!("Invalid '{name}' value in configuration."),
-                )?;
-                return Err(unsupported(name, "MQTT 5 topic aliases"));
             }
             "psk_file" | "psk_hint" => return Err(unsupported(name, "TLS PSK")),
             "tls_engine" | "tls_engine_kpass_sha1" => {

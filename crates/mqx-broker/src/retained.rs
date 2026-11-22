@@ -1,4 +1,4 @@
-use std::{str::Split, sync::Arc};
+use std::{str::Split, sync::Arc, time::Duration};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -29,15 +29,24 @@ impl Retained {
         root.store(topic.split('/'), message);
     }
 
-    pub(crate) fn visit(&self, filter: &str, mut visit: impl FnMut(&Arc<Message>)) {
+    pub(crate) fn visit(
+        &mut self,
+        filter: &str,
+        now: Duration,
+        mut visit: impl FnMut(&Arc<Message>),
+    ) {
         let root = if filter.starts_with('$') {
-            &self.dollar
+            &mut self.dollar
         } else {
-            &self.ordinary
+            &mut self.ordinary
         };
         // The ordinary hierarchy has an extra empty level in src/retain.c.
         // Start below it, but allow `foo/#` to include the parent `foo`.
-        root.search(filter.split('/'), &mut visit);
+        root.search(filter.split('/'), now, &mut visit);
+    }
+
+    pub(crate) fn expire(&mut self, now: Duration) -> bool {
+        self.ordinary.expire(now) | self.dollar.expire(now)
     }
 }
 
@@ -64,38 +73,66 @@ impl Branch {
 
     // retain.c: retain__search visits children in insertion order, and `#`
     // visits descendants before the parent that matched without a suffix.
-    fn search(&self, mut levels: Split<'_, char>, visit: &mut impl FnMut(&Arc<Message>)) {
+    fn search(
+        &mut self,
+        mut levels: Split<'_, char>,
+        now: Duration,
+        visit: &mut impl FnMut(&Arc<Message>),
+    ) {
         match levels.next() {
-            None => self.visit_message(visit),
+            None => self.visit_message(now, visit),
             Some("#") => {
-                for child in self.children.values() {
-                    child.visit_tree(visit);
+                for child in self.children.values_mut() {
+                    child.visit_tree(now, visit);
                 }
-                self.visit_message(visit);
+                self.visit_message(now, visit);
             }
             Some("+") => {
-                for child in self.children.values() {
-                    child.search(levels.clone(), visit);
+                for child in self.children.values_mut() {
+                    child.search(levels.clone(), now, visit);
                 }
             }
             Some(level) => {
-                if let Some(child) = self.children.get(level) {
-                    child.search(levels, visit);
+                if let Some(child) = self.children.get_mut(level) {
+                    child.search(levels, now, visit);
                 }
             }
         }
     }
 
-    fn visit_tree(&self, visit: &mut impl FnMut(&Arc<Message>)) {
-        self.visit_message(visit);
-        for child in self.children.values() {
-            child.visit_tree(visit);
+    fn visit_tree(&mut self, now: Duration, visit: &mut impl FnMut(&Arc<Message>)) {
+        self.visit_message(now, visit);
+        for child in self.children.values_mut() {
+            child.visit_tree(now, visit);
         }
     }
 
-    fn visit_message(&self, visit: &mut impl FnMut(&Arc<Message>)) {
+    fn visit_message(&mut self, now: Duration, visit: &mut impl FnMut(&Arc<Message>)) {
+        // retain.c: retain__delete_expired_msg uses >=, unlike the inbox.
+        self.delete_expired(now);
         if let Some(message) = &self.message {
             visit(message);
         }
+    }
+
+    fn delete_expired(&mut self, now: Duration) -> bool {
+        let expired = self
+            .message
+            .as_ref()
+            .and_then(|m| m.expires)
+            .is_some_and(|at| at <= now);
+        if expired {
+            self.message = None;
+        }
+        expired
+    }
+
+    fn expire(&mut self, now: Duration) -> bool {
+        let mut pending = false;
+        for child in self.children.values_mut() {
+            pending |= child.expire(now);
+        }
+        self.delete_expired(now);
+        pending || self.message.as_ref().is_some_and(|m| m.expires.is_some())
     }
 }

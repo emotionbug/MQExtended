@@ -1,4 +1,4 @@
-//! Script MQTT 3.1/3.1.1 clients against isolated broker processes.
+//! Script MQTT 3.1/3.1.1 and MQTT 5 clients against isolated broker processes.
 
 mod process;
 
@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
-use mqx_codec::{DecodeContext, DecodeError, EncodeError, Packet, ProtocolVersion, decode, encode};
+use bytes::{Buf, Bytes, BytesMut};
+use mqx_codec::{
+    DecodeContext, DecodeError, EncodeError, Packet, ProtocolVersion, decode, encode, v5,
+};
 pub use process::{ClusterConfig, Placement};
 use thiserror::Error;
 
@@ -49,6 +51,12 @@ pub enum Error {
     Encode(#[from] EncodeError),
     #[error(transparent)]
     Decode(#[from] DecodeError),
+    #[error(transparent)]
+    EncodeV5(#[from] v5::EncodeError),
+    #[error(transparent)]
+    DecodeV5(#[from] v5::DecodeError),
+    #[error("raw MQTT frame has an invalid Remaining Length encoding")]
+    RawRemainingLength,
     #[error(
         "connection {connection:?} ended a read with {pending} bytes of an incomplete MQTT packet ({reason})"
     )]
@@ -87,6 +95,13 @@ pub enum Reading {
         /// The original frame, including flags the decoder may ignore.
         wire: Bytes,
     },
+    ReceivedV5 {
+        packet: v5::Packet,
+        /// The original frame, including properties in their original wire order.
+        wire: Bytes,
+    },
+    /// A complete frame read without interpreting its packet body.
+    Raw(Bytes),
     Closed,
     TimedOut,
 }
@@ -99,34 +114,49 @@ pub struct Observation {
 
 pub type Transcript = Vec<Observation>;
 
+#[derive(Clone, Copy)]
+enum Decoder {
+    V3(DecodeContext),
+    V5,
+}
+
+impl From<ProtocolVersion> for Decoder {
+    fn from(protocol: ProtocolVersion) -> Self {
+        Self::V3(DecodeContext::for_client(0, Some(protocol)))
+    }
+}
+
 struct Client {
     socket: TcpStream,
-    context: DecodeContext,
+    decoder: Decoder,
     decode_buffer: BytesMut,
     wire_buffer: BytesMut,
 }
 
 impl Client {
-    fn connect(addr: SocketAddr, protocol: ProtocolVersion, timeout: Duration) -> io::Result<Self> {
+    fn connect(addr: SocketAddr, decoder: Decoder, timeout: Duration) -> io::Result<Self> {
         let socket = TcpStream::connect_timeout(&addr, timeout)?;
         socket.set_write_timeout(Some(timeout))?;
         socket.set_nodelay(true)?;
         Ok(Self {
             socket,
-            context: DecodeContext::for_client(0, Some(protocol)),
+            decoder,
             decode_buffer: BytesMut::new(),
             wire_buffer: BytesMut::new(),
         })
     }
 
-    fn receive(&mut self, connection: Connection, timeout: Duration) -> Result<Reading, Error> {
+    fn receive(
+        &mut self,
+        connection: Connection,
+        timeout: Duration,
+        raw: bool,
+    ) -> Result<Reading, Error> {
         let deadline = Instant::now() + timeout;
         let mut chunk = [0; 4096];
         loop {
-            if let Some(packet) = decode(&mut self.decode_buffer, self.context)? {
-                let consumed = self.wire_buffer.len() - self.decode_buffer.len();
-                let wire = self.wire_buffer.split_to(consumed).freeze();
-                return Ok(Reading::Received { packet, wire });
+            if let Some(reading) = self.read_frame(raw)? {
+                return Ok(reading);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -153,6 +183,34 @@ impl Client {
         }
     }
 
+    fn read_frame(&mut self, raw: bool) -> Result<Option<Reading>, Error> {
+        if raw {
+            let Some(len) = raw_frame_length(&self.decode_buffer)? else {
+                return Ok(None);
+            };
+            self.decode_buffer.advance(len);
+            return Ok(Some(Reading::Raw(self.take_wire())));
+        }
+        Ok(match self.decoder {
+            Decoder::V3(context) => {
+                decode(&mut self.decode_buffer, context)?.map(|packet| Reading::Received {
+                    packet,
+                    wire: self.take_wire(),
+                })
+            }
+            Decoder::V5 => v5::decode(&mut self.decode_buffer, v5::DecodeContext::for_client(0))?
+                .map(|packet| Reading::ReceivedV5 {
+                    packet,
+                    wire: self.take_wire(),
+                }),
+        })
+    }
+
+    fn take_wire(&mut self) -> Bytes {
+        let consumed = self.wire_buffer.len() - self.decode_buffer.len();
+        self.wire_buffer.split_to(consumed).freeze()
+    }
+
     fn finished_read(
         &self,
         connection: Connection,
@@ -168,6 +226,21 @@ impl Client {
             reason,
         })
     }
+}
+
+fn raw_frame_length(buffer: &[u8]) -> Result<Option<usize>, Error> {
+    let mut body_len = 0;
+    for (index, &byte) in buffer.iter().skip(1).take(4).enumerate() {
+        body_len |= usize::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            let frame_len = 2 + index + body_len;
+            return Ok((buffer.len() >= frame_len).then_some(frame_len));
+        }
+    }
+    if buffer.len() >= 5 {
+        return Err(Error::RawRemainingLength);
+    }
+    Ok(None)
 }
 
 /// Owns isolated broker processes, scripted sockets, and observations in script order.
@@ -210,7 +283,21 @@ impl Harness {
         index: usize,
         protocol: ProtocolVersion,
     ) -> Result<Connection, Error> {
-        let client = Client::connect(self.brokers.addr(index)?, protocol, WRITE_TIMEOUT)?;
+        self.open_with(index, protocol.into())
+    }
+
+    /// Opens an MQTT 5 socket without sending CONNECT.
+    pub fn open_v5(&mut self) -> Result<Connection, Error> {
+        self.open_v5_on(self.brokers.choose(self.clients.len()))
+    }
+
+    /// Opens an MQTT 5 socket on the specified one-based node.
+    pub fn open_v5_on(&mut self, index: usize) -> Result<Connection, Error> {
+        self.open_with(index, Decoder::V5)
+    }
+
+    fn open_with(&mut self, index: usize, decoder: Decoder) -> Result<Connection, Error> {
+        let client = Client::connect(self.brokers.addr(index)?, decoder, WRITE_TIMEOUT)?;
         let connection = Connection(self.clients.len());
         self.clients.push(Some(client));
         Ok(connection)
@@ -237,6 +324,12 @@ impl Harness {
         self.send_raw(connection, &wire)
     }
 
+    pub fn send_v5(&mut self, connection: Connection, packet: &v5::Packet) -> Result<(), Error> {
+        let mut wire = BytesMut::new();
+        v5::encode(packet, &mut wire)?;
+        self.send_raw(connection, &wire)
+    }
+
     pub fn send_raw(&mut self, connection: Connection, wire: &[u8]) -> Result<(), Error> {
         self.client(connection).socket.write_all(wire)?;
         Ok(())
@@ -247,7 +340,25 @@ impl Harness {
         connection: Connection,
         timeout: Duration,
     ) -> Result<&Reading, Error> {
-        let reading = self.client(connection).receive(connection, timeout)?;
+        self.observe(connection, timeout, false)
+    }
+
+    /// Records the next complete frame without applying the negotiated version's decoder.
+    pub fn receive_raw(
+        &mut self,
+        connection: Connection,
+        timeout: Duration,
+    ) -> Result<&Reading, Error> {
+        self.observe(connection, timeout, true)
+    }
+
+    fn observe(
+        &mut self,
+        connection: Connection,
+        timeout: Duration,
+        raw: bool,
+    ) -> Result<&Reading, Error> {
+        let reading = self.client(connection).receive(connection, timeout, raw)?;
         self.transcript.push(Observation {
             connection,
             reading,
@@ -275,5 +386,25 @@ impl Harness {
         self.clients[connection.0]
             .as_mut()
             .expect("socket already closed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_read_waits_for_a_complete_frame_and_preserves_its_encoded_length() {
+        assert_eq!(raw_frame_length(&[0xd0]).unwrap(), None);
+        assert_eq!(raw_frame_length(&[0xd0, 0x80]).unwrap(), None);
+        assert_eq!(raw_frame_length(&[0x30, 0x81, 0]).unwrap(), None);
+        assert_eq!(
+            raw_frame_length(&[0x30, 0x81, 0, 0xff, 0xd0, 0]).unwrap(),
+            Some(4),
+        );
+        assert!(matches!(
+            raw_frame_length(&[0x30, 0x80, 0x80, 0x80, 0x80]),
+            Err(Error::RawRemainingLength),
+        ));
     }
 }

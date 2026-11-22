@@ -10,6 +10,7 @@ members = [
     "crates/mqx-cluster",
     "crates/mqx-proxy",
     "crates/mqx-ws",
+    "crates/mqx-bench",
 ]
 
 [workspace.package]

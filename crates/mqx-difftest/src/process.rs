@@ -254,18 +254,18 @@ fn probe(addr: SocketAddr, index: usize, connect: &[u8], deadline: Instant) -> R
             .min(time_left(deadline))
             .max(Duration::from_millis(1))
     };
-    let mut client = Client::connect(addr, ProtocolVersion::V311, limit(deadline))?;
+    let mut client = Client::connect(addr, ProtocolVersion::V311.into(), limit(deadline))?;
     client.socket.write_all(connect)?;
     let probe_id = Connection(index);
     if !matches!(
-        client.receive(probe_id, limit(deadline))?,
+        client.receive(probe_id, limit(deadline), false)?,
         Reading::Received { packet: Packet::ConnAck(ack), .. } if ack.code == ConnectReturnCode::Accepted
     ) {
         return Ok(false);
     }
     client.socket.write_all(&[0xe0, 0])?;
     Ok(matches!(
-        client.receive(probe_id, limit(deadline))?,
+        client.receive(probe_id, limit(deadline), false)?,
         Reading::Closed
     ))
 }

@@ -2,20 +2,20 @@
 //! are outside the log; command inputs carry the observed time and ACL data.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
 use mqx_auth::{Access, AclFile};
-use mqx_codec::{LastWill, PacketId, Publish, QoS, SubscribeReturnCode};
+use mqx_codec::{LastWill, PacketId, Publish, QoS, SubscribeReturnCode, v5::ReasonCode as R};
 use mqx_topic::{SubscriptionIndex, validate_topic_filter};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     BrokerConfig,
-    inbox::{Ack, Delivery, Inbox, Message, Offer, Outbound, Publisher},
+    inbox::{Ack, Delivery, Inbox, Message, Offer, Outbound, PublishProperty, Publisher, Receive},
     retained::Retained,
 };
 
@@ -65,22 +65,88 @@ pub(crate) enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Claim {
     pub(crate) publisher: Publisher,
-    pub(crate) transient: bool,
+    pub(crate) clean_start: bool,
     pub(crate) bridge: bool,
     pub(crate) max_qos: QoS,
     pub(crate) will: Option<LastWill>,
+    #[serde(default)]
+    pub(crate) v5: Option<SessionSettings>,
+    #[serde(default)]
+    pub(crate) now: Duration,
+}
+
+impl Claim {
+    pub(crate) fn local_inbox(&self) -> bool {
+        self.v5.is_none() && self.clean_start
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionSettings {
+    pub(crate) session_expiry: u32,
+    pub(crate) receive_maximum: Option<u16>,
+    pub(crate) will_delay: u32,
+    pub(crate) will_expiry: u32,
+    pub(crate) will_properties: Vec<PublishProperty>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SubscriptionRequest {
+    pub(crate) filter: String,
+    pub(crate) qos: QoS,
+    pub(crate) no_local: bool,
+    pub(crate) retain_as_published: bool,
+    pub(crate) retain_handling: u8,
+    pub(crate) identifier: u32,
+}
+
+impl SubscriptionRequest {
+    pub(crate) fn legacy((filter, qos): (String, QoS)) -> Self {
+        Self {
+            filter,
+            qos,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            identifier: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Publication {
+    pub(crate) packet: Publish,
+    pub(crate) properties: Vec<PublishProperty>,
+    pub(crate) expires: Option<Duration>,
+    pub(crate) now: Duration,
+}
+
+impl Publication {
+    pub(crate) fn legacy(packet: Publish, now: Duration) -> Self {
+        Self {
+            packet,
+            properties: Vec::new(),
+            expires: None,
+            now,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Operation {
-    Disconnect { graceful: bool, now: Duration },
-    Subscribe(Vec<(String, QoS)>),
+    Disconnect {
+        graceful: bool,
+        now: Duration,
+        #[serde(default)]
+        expiry: Option<u32>,
+    },
+    Subscribe(Vec<SubscriptionRequest>, Duration),
     Unsubscribe(Vec<String>),
-    Receive(Publish),
-    Release(PacketId),
-    Forward(Arc<Message>),
+    Receive(Publication),
+    Release(PacketId, Duration),
+    Forward(Arc<Message>, Duration),
     Ack(PacketId, Ack),
-    NextOutbound,
+    NextOutbound(Duration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +161,8 @@ pub(crate) enum Reply {
     ReceiveLocal(Option<Arc<Message>>),
     LocalInbox,
     Outbound(Option<Outbound>),
+    PublishReason(u8),
+    Unsubscribed(Vec<u8>),
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +208,12 @@ pub(crate) struct State {
     groups: BTreeMap<SharedKey, SharedGroup>,
     retained: Retained,
     expirations: BTreeMap<(Duration, Epoch), Arc<str>>,
+    #[serde(default)]
+    wills: BTreeMap<(Duration, Epoch), Arc<str>>,
+    #[serde(default)]
+    dollar_roots: BTreeSet<Arc<str>>,
+    #[serde(default)]
+    retain_sweep: Option<Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,12 +227,22 @@ struct Session {
     filters: BTreeMap<Arc<str>, IndexedSubscription>,
     will: Option<LastWill>,
     expires: Option<Duration>,
+    #[serde(default)]
+    v5: Option<SessionSettings>,
+    #[serde(default)]
+    will_at: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Subscription {
     qos: QoS,
     bridge: bool,
+    #[serde(default)]
+    no_local: bool,
+    #[serde(default)]
+    retain_as_published: bool,
+    #[serde(default)]
+    identifier: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -194,9 +278,16 @@ impl State {
     }
 
     pub(crate) fn next_expiry(&self) -> Option<Duration> {
-        self.expirations
-            .first_key_value()
-            .map(|(&(time, _), _)| time)
+        [
+            self.expirations
+                .first_key_value()
+                .map(|(&(time, _), _)| time),
+            self.wills.first_key_value().map(|(&(time, _), _)| time),
+            self.retain_sweep,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub(crate) fn acl_text(&self, id: u64) -> Option<&Option<Bytes>> {
@@ -327,15 +418,7 @@ impl State {
                 request,
             } => self.claim(owner, token, request, &mut effects),
             Command::Expire(now) => {
-                while self
-                    .expirations
-                    .first_key_value()
-                    .is_some_and(|(&(time, _), _)| time <= now)
-                {
-                    let (_, id) = self.expirations.pop_first().unwrap();
-                    self.remove_session(&id);
-                    effects.push(Effect::Expired(id));
-                }
+                self.expire(now, &mut effects);
                 Reply::NoChange
             }
             Command::Act(lease, action) => self.act(lease, action, &mut effects),
@@ -359,47 +442,116 @@ impl State {
         // Persistent subscribers on it get offline queue limits, not an
         // in-flight allowance merely because their disconnect sorts later.
         let mut lost = Vec::new();
-        let mut wills = Vec::new();
         for (id, session) in &mut self.sessions {
             if session.owner.is_some_and(|owner| owner.node == node) {
                 session.owner = None;
                 effects.push(Effect::Takeover(session.epoch));
-                if let Some(will) = session.will.take() {
-                    wills.push((session.publisher.clone(), will));
-                }
                 lost.push(id.clone());
             }
         }
         for id in lost {
-            self.offline(id, now);
-        }
-        for (publisher, will) in wills {
-            self.publish_will(publisher, will, effects);
+            self.offline(id, now, false, effects);
         }
     }
 
-    fn offline(&mut self, id: Arc<str>, now: Duration) {
-        let session = self.sessions.get_mut(&id).unwrap();
-        if let Some(inbox) = session.inbox.as_mut() {
-            session.owner = None;
-            inbox.reset_outbound();
-            // session_expiry.c: session_expiry__add.
-            if let Some(ttl) = self
-                .config
-                .persistent_client_expiration
-                .filter(|ttl| !ttl.is_zero())
-            {
-                let expiry = now.saturating_add(ttl.min(Duration::from_secs(u64::from(u32::MAX))));
-                session.expires = Some(expiry);
-                self.expirations.insert((expiry, session.epoch), id);
+    fn expire(&mut self, now: Duration, effects: &mut Vec<Effect>) {
+        // will_delay.c: will_delay__check publishes even when the session
+        // itself does not expire. Session expiry cancels a later Will timer.
+        while let Some((&(at, _), id)) = self.expirations.first_key_value() {
+            if at > now {
+                break;
             }
-        } else {
+            let id = id.clone();
+            let will = self.take_will(&id);
             self.remove_session(&id);
+            if let Some(will) = will {
+                self.publish_will(will, now, effects);
+            }
+            effects.push(Effect::Expired(id));
+        }
+        while let Some((&(at, _), id)) = self.wills.first_key_value() {
+            if at > now {
+                break;
+            }
+            let id = id.clone();
+            if let Some(will) = self.take_will(&id) {
+                self.publish_will(will, now, effects);
+            }
+        }
+        if self.retain_sweep.is_some_and(|at| at <= now) {
+            let pending = self.retained.expire(now);
+            self.retain_sweep = self
+                .config
+                .retain_expiry_interval
+                .filter(|_| pending)
+                .map(|interval| now.saturating_add(interval));
         }
     }
 
-    // handle_connect.c: connect__on_authorised transfers persistent state and
-    // sends the old will only when either end of a v3.x takeover is clean.
+    fn take_will(&mut self, id: &Arc<str>) -> Option<PendingWill> {
+        let session = self.sessions.get_mut(id).unwrap();
+        if let Some(at) = session.will_at.take() {
+            self.wills.remove(&(at, session.epoch));
+        }
+        session.will.take().map(|packet| {
+            let (properties, expiry) = session.v5.as_mut().map_or((Vec::new(), 0), |v5| {
+                (std::mem::take(&mut v5.will_properties), v5.will_expiry)
+            });
+            PendingWill {
+                source: session.publisher.clone(),
+                packet,
+                properties,
+                expiry,
+            }
+        })
+    }
+
+    fn offline(&mut self, id: Arc<str>, now: Duration, graceful: bool, effects: &mut Vec<Effect>) {
+        let session = self.sessions.get_mut(&id).unwrap();
+        let expiry = session.v5.as_ref().map(|v5| v5.session_expiry);
+        let persistent = expiry.map_or(session.inbox.is_some(), |interval| interval != 0);
+        let delay = session.v5.as_ref().map_or(0, |v5| v5.will_delay);
+        // context.c: context__send_will delays only if both intervals are nonzero.
+        if !graceful && persistent && delay != 0 && session.will.is_some() {
+            let at = Duration::from_secs(now.as_secs())
+                .saturating_add(Duration::from_secs(u64::from(delay)));
+            session.will_at = Some(at);
+            self.wills.insert((at, session.epoch), id.clone());
+        } else if let Some(will) = self.take_will(&id).filter(|_| !graceful) {
+            self.publish_will(will, now, effects);
+        }
+        if !persistent {
+            self.remove_session(&id);
+            return;
+        }
+        let session = self.sessions.get_mut(&id).unwrap();
+        session.owner = None;
+        session.inbox.as_mut().unwrap().reset_outbound();
+        // session_expiry.c: session_expiry__add applies the nonzero server cap;
+        // session_expiry__check expires at the first second strictly past it.
+        let cap = self
+            .config
+            .persistent_client_expiration
+            .filter(|ttl| !ttl.is_zero())
+            .map(|ttl| ttl.min(Duration::from_secs(u64::from(u32::MAX))));
+        let requested = expiry
+            .filter(|&ttl| ttl != u32::MAX)
+            .map(|ttl| Duration::from_secs(u64::from(ttl)));
+        if let Some(ttl) = [requested, cap].into_iter().flatten().min() {
+            let at = if expiry.is_some() {
+                Duration::from_secs(now.as_secs())
+                    .saturating_add(ttl)
+                    .saturating_add(Duration::from_secs(1))
+            } else {
+                now.saturating_add(ttl)
+            };
+            session.expires = Some(at);
+            self.expirations.insert((at, session.epoch), id);
+        }
+    }
+
+    // handle_connect.c: connect__on_authorised transfers the old session only
+    // on Clean Start=false and when its expiry interval allows persistence.
     fn claim(
         &mut self,
         owner: Owner,
@@ -423,23 +575,31 @@ impl State {
             return Reply::Full;
         }
         let mut present = false;
-        if let Some(previous) = self.sessions.get_mut(&id) {
-            if let Some(expiry) = previous.expires.take() {
-                self.expirations.remove(&(expiry, previous.epoch));
-            }
-            if previous.owner.is_some() {
+        if let Some(previous) = self.sessions.get(&id) {
+            let expired = previous.expires.is_some_and(|at| at <= claim.now);
+            let due_will = previous.will_at.is_some_and(|at| at <= claim.now);
+            let persistent = previous
+                .v5
+                .as_ref()
+                .map_or(previous.inbox.is_some(), |v5| v5.session_expiry != 0);
+            let active = previous.owner.is_some();
+            if active {
                 effects.push(Effect::Takeover(previous.epoch));
             }
-            present = !claim.transient && previous.inbox.is_some();
+            present = !claim.clean_start && persistent && !expired;
+            let will = self.take_will(&id);
             if !present {
-                let will = previous
-                    .will
-                    .take()
-                    .map(|will| (previous.publisher.clone(), will));
                 self.remove_session(&id);
-                if let Some((publisher, will)) = will {
-                    self.publish_will(publisher, will, effects);
-                }
+            } else if let Some(previous) = self.sessions.get_mut(&id)
+                && let Some(at) = previous.expires.take()
+            {
+                self.expirations.remove(&(at, previous.epoch));
+            }
+            if let Some(will) = will.filter(|_| !present || due_will) {
+                self.publish_will(will, claim.now, effects);
+            }
+            if expired {
+                effects.push(Effect::Expired(id.clone()));
             }
         }
         self.last_epoch += 1;
@@ -450,17 +610,30 @@ impl State {
             owner: Some(owner),
             bridge: claim.bridge,
             max_qos: claim.max_qos,
-            inbox: (!claim.transient).then(Inbox::default),
+            inbox: (!claim.local_inbox()).then(Inbox::default),
             filters: BTreeMap::new(),
             will: None,
             expires: None,
+            v5: None,
+            will_at: None,
         });
         session.publisher = claim.publisher;
         session.epoch = epoch;
         session.owner = Some(owner);
         session.will = claim.will;
+        session.v5 = claim.v5;
         session.bridge = claim.bridge;
         session.max_qos = claim.max_qos;
+        if let Some(inbox) = &mut session.inbox {
+            inbox.receive_maximum = session.v5.as_ref().map(|v5| {
+                v5.receive_maximum.unwrap_or_else(|| {
+                    self.config
+                        .max_inflight_messages
+                        .try_into()
+                        .unwrap_or(u16::MAX)
+                })
+            });
+        }
         if present {
             let publisher = &session.publisher;
             session.inbox.as_mut().unwrap().resume(
@@ -473,6 +646,7 @@ impl State {
                     )
                 },
                 &self.config,
+                claim.now,
             );
         }
         let lease = Lease { id, epoch };
@@ -495,22 +669,44 @@ impl State {
             return Reply::Stale;
         };
         match operation {
-            Operation::Disconnect { graceful, now } => {
-                let will = session.will.take();
-                if !graceful && let Some(will) = will {
-                    let publisher = session.publisher.clone();
-                    self.publish_will(publisher, will, effects);
+            Operation::Disconnect {
+                graceful,
+                now,
+                expiry,
+            } => {
+                if let Some((v5, expiry)) = session.v5.as_mut().zip(expiry) {
+                    v5.session_expiry = expiry;
                 }
-                self.offline(lease.id, now);
+                self.offline(lease.id, now, graceful, effects);
                 Reply::NoChange
             }
-            Operation::Subscribe(filters) => self.subscribe(&lease.id, filters, effects),
+            Operation::Subscribe(filters, now) => self.subscribe(&lease.id, filters, now, effects),
             Operation::Unsubscribe(filters) => {
+                let mut reason = R::SUCCESS;
+                let mut reasons = if session.v5.is_some() {
+                    Vec::with_capacity(filters.len())
+                } else {
+                    Vec::new()
+                };
                 for filter in filters {
-                    if split_filter(&filter).is_none() {
+                    let acl_allowed =
+                        allowed(&self.acls, &session.publisher, &filter, Access::Unsubscribe);
+                    let Some((group, path)) = split_filter(&filter) else {
                         return Reply::ProtocolError;
+                    };
+                    // subs.c: sub__remove leaves the previous reason alone if
+                    // the top-level hierarchy itself was never created.
+                    if !acl_allowed {
+                        reason = R::NOT_AUTHORIZED;
+                    } else if group.is_some()
+                        || !path.starts_with('$')
+                        || dollar_root(path) == "$SYS"
+                        || self.dollar_roots.contains(dollar_root(path))
+                    {
+                        reason = R::NO_SUBSCRIPTION_EXISTED;
                     }
-                    if session.filters.remove(filter.as_str()).is_some() {
+                    if acl_allowed && session.filters.remove(filter.as_str()).is_some() {
+                        reason = R::SUCCESS;
                         remove_filter(
                             &mut self.normal,
                             &mut self.shared,
@@ -519,29 +715,48 @@ impl State {
                             &filter,
                         );
                     }
+                    if session.v5.is_some() {
+                        reasons.push(reason.0);
+                    }
                 }
-                Reply::NoChange
+                Reply::Unsubscribed(reasons)
             }
-            Operation::Receive(publish) => {
-                // handle_publish.c: process_bad_message. Rejected messages are
-                // acknowledged on v3.x, but never enter the inbox or retention.
-                if !allowed(
+            Operation::Receive(publication) => {
+                let Publication {
+                    packet: publish,
+                    properties,
+                    expires,
+                    now,
+                } = publication;
+                // handle_publish.c: handle__publish checks size before write
+                // ACL, and process_bad_message acknowledges without storing.
+                let rejection = if self.config.message_size_limit != 0
+                    && publish.payload.len() > self.config.message_size_limit
+                {
+                    Some(R::PACKET_TOO_LARGE)
+                } else if !allowed(
                     &self.acls,
                     &session.publisher,
                     &publish.topic,
                     Access::Write,
-                ) || (self.config.message_size_limit != 0
-                    && publish.payload.len() > self.config.message_size_limit)
-                    || publish.topic.starts_with("$CONTROL/")
-                {
-                    if publish.qos == QoS::AtLeastOnce {
+                ) {
+                    Some(R::NOT_AUTHORIZED)
+                } else if publish.topic.starts_with("$CONTROL/") {
+                    Some(R::IMPLEMENTATION_SPECIFIC_ERROR)
+                } else {
+                    None
+                };
+                if let Some(reason) = rejection {
+                    if publish.qos == QoS::AtLeastOnce
+                        || (publish.qos == QoS::ExactlyOnce && session.v5.is_some())
+                    {
                         if let Some(inbox) = &mut session.inbox {
                             inbox.credit_incoming();
                         } else {
                             return Reply::ReceiveLocal(None);
                         }
                     }
-                    return Reply::NoChange;
+                    return Reply::PublishReason(reason.0);
                 }
                 let topic = publish.topic.into_boxed_str();
                 let message = Arc::new(Message {
@@ -550,36 +765,47 @@ impl State {
                     payload: publish.payload,
                     qos: publish.qos,
                     retain: publish.retain,
+                    properties,
+                    expires,
                 });
                 if let Some(id) = publish.packet_id {
                     let Some(inbox) = &mut session.inbox else {
                         return Reply::ReceiveLocal(Some(message));
                     };
                     if publish.qos == QoS::ExactlyOnce {
-                        return if inbox.receive(id, message, &self.config) {
-                            Reply::NoChange
-                        } else {
-                            Reply::ProtocolError
+                        return match inbox.receive(id, message, &self.config) {
+                            Receive::Accepted => Reply::NoChange,
+                            Receive::Quota => {
+                                if session.v5.is_some() {
+                                    inbox.credit_incoming();
+                                }
+                                Reply::PublishReason(R::QUOTA_EXCEEDED.0)
+                            }
+                            Receive::Duplicate => Reply::ProtocolError,
                         };
                     }
                     if !inbox.can_publish_qos1(id, &self.config) {
-                        return Reply::NoChange;
+                        return Reply::PublishReason(R::QUOTA_EXCEEDED.0);
                     }
                 }
-                self.publish(message, effects);
-                Reply::NoChange
+                let matched = self.publish(message, now, effects);
+                Reply::PublishReason(if matched {
+                    R::SUCCESS.0
+                } else {
+                    R::NO_MATCHING_SUBSCRIBERS.0
+                })
             }
-            Operation::Release(id) => {
+            Operation::Release(id, now) => {
                 let Some(inbox) = &mut session.inbox else {
                     return Reply::LocalInbox;
                 };
                 if let Some(message) = inbox.release(id) {
-                    self.publish(message, effects);
+                    self.publish(message, now, effects);
                 }
                 Reply::NoChange
             }
-            Operation::Forward(message) => {
-                self.publish(message, effects);
+            Operation::Forward(message, now) => {
+                self.publish(message, now, effects);
                 Reply::NoChange
             }
             Operation::Ack(id, ack) => {
@@ -595,17 +821,23 @@ impl State {
                     Reply::ProtocolError
                 }
             }
-            Operation::NextOutbound => {
+            Operation::NextOutbound(now) => {
                 let Some(inbox) = &mut session.inbox else {
                     return Reply::LocalInbox;
                 };
-                Reply::Outbound(inbox.next_outbound(&self.config))
+                Reply::Outbound(inbox.next_outbound(&self.config, now))
             }
         }
     }
 
     fn remove_session(&mut self, id: &Arc<str>) {
         let session = self.sessions.remove(id).unwrap();
+        if let Some(at) = session.expires {
+            self.expirations.remove(&(at, session.epoch));
+        }
+        if let Some(at) = session.will_at {
+            self.wills.remove(&(at, session.epoch));
+        }
         for filter in session.filters.keys() {
             remove_filter(
                 &mut self.normal,
@@ -620,12 +852,21 @@ impl State {
     fn subscribe(
         &mut self,
         id: &Arc<str>,
-        filters: Vec<(String, QoS)>,
+        filters: Vec<SubscriptionRequest>,
+        now: Duration,
         effects: &mut Vec<Effect>,
     ) -> Reply {
         let session = self.sessions.get_mut(id).unwrap();
         let mut codes = Vec::with_capacity(filters.len());
-        for (filter, qos) in filters {
+        for request in filters {
+            let SubscriptionRequest {
+                filter,
+                qos,
+                no_local,
+                retain_as_published,
+                retain_handling,
+                identifier,
+            } = request;
             let Some((group, path)) = split_filter(&filter) else {
                 return Reply::ProtocolError;
             };
@@ -639,6 +880,9 @@ impl State {
             let subscription = Subscription {
                 qos,
                 bridge: session.bridge,
+                no_local,
+                retain_as_published,
+                identifier,
             };
             if let Some(group) = group {
                 // src/topic_tok.c: sub__topic_tokenise always puts shared
@@ -665,28 +909,44 @@ impl State {
                     members.push_back((id.clone(), subscription));
                 }
             } else {
-                self.normal.insert(path, id.clone(), subscription).unwrap();
-                // retain.c: retain__queue skips shared filters but replays
-                // retained messages on every normal (re)subscribe.
-                self.retained.visit(path, |message| {
-                    if allowed(&self.acls, &session.publisher, &message.topic, Access::Read)
-                        && (!self.config.check_retain_source
-                            || allowed(&self.acls, &message.source, &message.topic, Access::Write))
-                    {
-                        let qos = outgoing_qos(message.qos, qos, &self.config);
-                        deliver(
-                            session,
-                            Delivery {
-                                message: message.clone(),
-                                qos,
-                                retain: true,
-                                dedup_id: None,
-                            },
-                            &self.config,
-                            effects,
-                        );
+                if path.starts_with('$') {
+                    let root = dollar_root(path);
+                    if root != "$SYS" && !self.dollar_roots.contains(root) {
+                        self.dollar_roots.insert(Arc::from(root));
                     }
-                });
+                }
+                self.normal.insert(path, id.clone(), subscription).unwrap();
+                // retain.c: retain__queue skips shared filters; retained replay
+                // does not use the No Local / Retain As Published delivery path.
+                if retain_handling == 0
+                    || retain_handling == 1 && !session.filters.contains_key(filter.as_str())
+                {
+                    self.retained.visit(path, now, |message| {
+                        if allowed(&self.acls, &session.publisher, &message.topic, Access::Read)
+                            && (!self.config.check_retain_source
+                                || allowed(
+                                    &self.acls,
+                                    &message.source,
+                                    &message.topic,
+                                    Access::Write,
+                                ))
+                        {
+                            let qos = outgoing_qos(message.qos, qos, &self.config);
+                            deliver(
+                                session,
+                                Delivery {
+                                    message: message.clone(),
+                                    qos,
+                                    retain: true,
+                                    dedup_id: None,
+                                    subscription_identifier: identifier,
+                                },
+                                &self.config,
+                                effects,
+                            );
+                        }
+                    });
+                }
             }
             if let Some(entry) = session.filters.get_mut(filter.as_str()) {
                 entry.subscription = subscription;
@@ -706,7 +966,13 @@ impl State {
     }
 
     // context.c: context__send_will checks ACL write at publication time.
-    fn publish_will(&mut self, source: Publisher, will: LastWill, effects: &mut Vec<Effect>) {
+    fn publish_will(&mut self, will: PendingWill, now: Duration, effects: &mut Vec<Effect>) {
+        let PendingWill {
+            source,
+            packet: will,
+            properties,
+            expiry,
+        } = will;
         if allowed(&self.acls, &source, &will.topic, Access::Write) {
             self.publish(
                 Arc::new(Message {
@@ -715,13 +981,16 @@ impl State {
                     payload: will.payload,
                     qos: will.qos,
                     retain: will.retain,
+                    properties,
+                    expires: Message::expiry(Duration::from_secs(now.as_secs()), expiry),
                 }),
+                now,
                 effects,
             );
         }
     }
 
-    fn publish(&mut self, message: Arc<Message>, effects: &mut Vec<Effect>) {
+    fn publish(&mut self, message: Arc<Message>, now: Duration, effects: &mut Vec<Effect>) -> bool {
         let topic = &message.topic;
         self.last_message += 1;
         let mut router = Router {
@@ -730,6 +999,7 @@ impl State {
             acls: &self.acls,
             message: &message,
             id: self.last_message,
+            matched: false,
             effects,
         };
         // subs.c: sub__messages_queue searches the normal tree before shared.
@@ -746,10 +1016,30 @@ impl State {
                 members.rotate_left(1);
             });
         }
+        let matched = router.matched;
         if message.retain {
+            if message.expires.is_some()
+                && !message.payload.is_empty()
+                && self.retain_sweep.is_none()
+                && let Some(interval) = self.config.retain_expiry_interval
+            {
+                self.retain_sweep = Some(now.saturating_add(interval));
+            }
             self.retained.store(topic, message.clone());
         }
+        matched
     }
+}
+
+struct PendingWill {
+    source: Publisher,
+    packet: LastWill,
+    properties: Vec<PublishProperty>,
+    expiry: u32,
+}
+
+fn dollar_root(filter: &str) -> &str {
+    filter.split('/').next().unwrap()
 }
 
 struct Router<'a> {
@@ -758,25 +1048,28 @@ struct Router<'a> {
     acls: &'a BTreeMap<u64, Arc<AclFile>>,
     message: &'a Arc<Message>,
     id: u64,
+    matched: bool,
     effects: &'a mut Vec<Effect>,
 }
 
 impl Router<'_> {
     fn route(&mut self, id: &Arc<str>, sub: Subscription, shared: bool) {
+        self.matched = true;
         let session = self.sessions.get_mut(id).unwrap();
         let message = self.message;
-        if (!shared && sub.bridge && *id == message.source.id)
+        if (!shared && (sub.bridge || sub.no_local) && *id == message.source.id)
             || !allowed(self.acls, &session.publisher, &message.topic, Access::Read)
         {
             return;
         }
-        let retain = sub.bridge && message.retain;
+        let retain = (sub.bridge || sub.retain_as_published) && message.retain;
         let qos = outgoing_qos(message.qos, sub.qos, self.config);
         let delivery = Delivery {
             message: message.clone(),
             qos,
             retain,
             dedup_id: (!retain && !self.config.allow_duplicate_messages).then_some(self.id),
+            subscription_identifier: sub.identifier,
         };
         deliver(session, delivery, self.config, self.effects);
     }
@@ -893,10 +1186,12 @@ mod tests {
                     username: None,
                     security: 1,
                 },
-                transient,
+                clean_start: transient,
                 bridge: false,
                 max_qos: QoS::ExactlyOnce,
                 will,
+                v5: None,
+                now: Duration::ZERO,
             },
         }
     }
@@ -934,13 +1229,20 @@ mod tests {
             claim(subscriber.id.clone(), false),
             Command::Act(
                 subscriber.clone(),
-                Operation::Subscribe(vec![("topic/#".into(), QoS::AtLeastOnce)]),
+                Operation::Subscribe(
+                    vec![SubscriptionRequest::legacy((
+                        "topic/#".into(),
+                        QoS::AtLeastOnce,
+                    ))],
+                    Duration::ZERO,
+                ),
             ),
             Command::Act(
                 subscriber.clone(),
                 Operation::Disconnect {
                     graceful: true,
                     now: Duration::from_secs(1),
+                    expiry: None,
                 },
             ),
             claim(publisher.id.clone(), false),
@@ -949,12 +1251,18 @@ mod tests {
                 text: Some(acl),
                 initial: true,
             },
-            Command::Act(publisher.clone(), Operation::Receive(qos2)),
-            Command::Act(publisher, Operation::Release(PacketId::new(26).unwrap())),
+            Command::Act(
+                publisher.clone(),
+                Operation::Receive(Publication::legacy(qos2, Duration::ZERO)),
+            ),
+            Command::Act(
+                publisher,
+                Operation::Release(PacketId::new(26).unwrap(), Duration::ZERO),
+            ),
             Command::Expire(Duration::from_secs(5)),
             claim(subscriber.id.clone(), false),
             Command::Act(subscriber, Operation::Unsubscribe(vec!["topic/#".into()])),
-            Command::Act(new_owner.clone(), Operation::NextOutbound),
+            Command::Act(new_owner.clone(), Operation::NextOutbound(Duration::ZERO)),
             Command::Act(
                 new_owner.clone(),
                 Operation::Ack(PacketId::new(1).unwrap(), Ack::Acknowledged),
@@ -964,6 +1272,7 @@ mod tests {
                 Operation::Disconnect {
                     graceful: true,
                     now: Duration::from_secs(10),
+                    expiry: None,
                 },
             ),
             Command::Expire(Duration::from_secs(40)),
@@ -1048,6 +1357,7 @@ mod tests {
                 max_inflight_messages: 2,
                 max_queued_messages: 4,
                 persistent_client_expiration: Some(Duration::from_secs(10)),
+                retain_expiry_interval: Some(Duration::from_secs(8)),
                 ..BrokerConfig::default()
             });
             let mut a = State::new(config.clone());
@@ -1073,19 +1383,44 @@ mod tests {
                 let topic = ["a", "a/b", "c"][usize::from(value) % 3];
                 let mid = PacketId::new(u16::from(value % 4) + 1).unwrap();
                 let command = match op % 11 {
-                    0 | 1 => make_claim(owner, [index as u8;16], id.clone(), value % 3 == 0, Some(LastWill {
-                        topic: "a/will".into(), payload: Bytes::from_static(b"gone"), qos, retain: value % 2 == 0,
-                    })),
-                    2 => Command::Act(lease, Operation::Subscribe(vec![(filter.into(), qos)])),
+                    0 | 1 => {
+                        let mut claim = make_claim(owner, [index as u8;16], id.clone(), value % 3 == 0, Some(LastWill {
+                            topic: "a/will".into(), payload: Bytes::from_static(b"gone"), qos, retain: value % 2 == 0,
+                        }));
+                        let Command::Claim { request, .. } = &mut claim else { unreachable!() };
+                        request.now = now;
+                        if op % 11 == 1 {
+                            request.v5 = Some(SessionSettings {
+                                session_expiry: u32::from(value % 6),
+                                receive_maximum: Some(u16::from(value % 5) + 1),
+                                will_delay: u32::from(value % 10),
+                                will_expiry: u32::from(value % 5),
+                                will_properties: vec![PublishProperty::ContentType("a/type".into())],
+                            });
+                        }
+                        claim
+                    }
+                    2 => Command::Act(lease, Operation::Subscribe(vec![SubscriptionRequest {
+                        no_local: !filter.starts_with("$share/") && value % 3 == 0,
+                        retain_as_published: value % 3 == 1,
+                        retain_handling: value % 3,
+                        identifier: u32::from(value % 8),
+                        ..SubscriptionRequest::legacy((filter.into(), qos))
+                    }], now)),
                     3 => Command::Act(lease, Operation::Unsubscribe(vec![filter.into()])),
-                    4 => Command::Act(lease, Operation::Receive(Publish {
-                        dup: value % 2 == 0, qos, retain: value % 5 == 0, topic: topic.into(),
-                        packet_id: (qos != QoS::AtMostOnce).then_some(mid), payload: Bytes::from(vec![value]),
+                    4 => Command::Act(lease, Operation::Receive(Publication {
+                        packet: Publish {
+                            dup: value % 2 == 0, qos, retain: value % 5 == 0, topic: topic.into(),
+                            packet_id: (qos != QoS::AtMostOnce).then_some(mid), payload: Bytes::from(vec![value]),
+                        },
+                        properties: vec![PublishProperty::User("key".into(), "value".into())],
+                        expires: Message::expiry(now, u32::from(value % 4)),
+                        now,
                     })),
-                    5 => Command::Act(lease, Operation::Release(mid)),
-                    6 => Command::Act(lease, Operation::NextOutbound),
+                    5 => Command::Act(lease, Operation::Release(mid, now)),
+                    6 => Command::Act(lease, Operation::NextOutbound(now)),
                     7 => Command::Act(lease, Operation::Ack(mid, Ack::Acknowledged)),
-                    8 => Command::Act(lease, Operation::Disconnect { graceful: value % 2 == 0, now }),
+                    8 => Command::Act(lease, Operation::Disconnect { graceful: value % 2 == 0, now, expiry: None }),
                     9 => Command::Expire(now),
                     _ => Command::SetAcl {
                         security: 1, initial: false,
