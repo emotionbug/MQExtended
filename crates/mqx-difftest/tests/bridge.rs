@@ -560,6 +560,63 @@ fn outbound_qos_retries_same_packet_id_after_disconnect() {
     }
 }
 
+// Mosquitto 2.1.4 test/broker/08-tls-psk-bridge.py and its .psk fixture.
+#[test]
+#[ignore = "requires the Mosquitto 2.1.4 reference built with TLS-PSK and mqextended"]
+fn outgoing_psk_bridge_delivers_through_mosquitto() {
+    differential(|kind| {
+        let dir = tempfile::tempdir().unwrap();
+        let psk_file = dir.path().join("bridge.psk");
+        std::fs::write(&psk_file, "psk-test:deadbeef\n").unwrap();
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let remote = reservation.local_addr().unwrap();
+        let config = format!(
+            "{ANONYMOUS}psk_file {}\nlistener {} 127.0.0.1\npsk_hint hint\n",
+            psk_file.display(),
+            remote.port(),
+        );
+        drop(reservation);
+        let mut upstream = start(BrokerKind::Mosquitto, &config);
+        let version = Version::V311;
+        let subscriber = client(
+            &mut upstream,
+            1,
+            version,
+            "no-psk-test-client",
+            false,
+            false,
+            false,
+        );
+        let state = "psk/bridge-state";
+        for (mid, topic) in [(1, "psk/test"), (2, state)] {
+            send(
+                &mut upstream,
+                subscriber,
+                &subscribe_packet(version, mid, topic, 0),
+            );
+            local_expect(&mut upstream, subscriber, &suback(version, mid, 0));
+        }
+        let bridge = bridge_config(
+            version,
+            remote,
+            "bridge_identity psk-test\nbridge_psk deadbeef\nnotification_topic psk/bridge-state\n",
+            "topic psk/test out 0\n",
+        );
+        let mut local = start(kind, &format!("{ANONYMOUS}{bridge}"));
+        // Wait for the bridge's remote notification before publishing at QoS 0.
+        local_expect(
+            &mut upstream,
+            subscriber,
+            &publish(version, state, b"1", 0, 0, 0),
+        );
+        let publisher = client(&mut local, 1, version, "publisher", false, false, false);
+        let packet = publish(version, "psk/test", b"message", 0, 0, 0);
+        send(&mut local, publisher, &packet);
+        local_expect(&mut upstream, subscriber, &packet);
+        (local.into_transcript(), upstream.into_transcript())
+    });
+}
+
 // 06-bridge-b2br-late-connection{,-retain}.py
 #[test]
 #[ignore = "requires Mosquitto 2.1.4 and mqextended"]

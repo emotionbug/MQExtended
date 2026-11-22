@@ -58,11 +58,13 @@ The reference is **Mosquitto 2.1.4** (tag `v2.1.4`). When Mosquitto and the MQTT
 
 ### Bridges (`mqx-bridge` ← `src/bridge.c`, `src/bridge_topic.c`, `src/handle_connack.c`, `lib/send_publish.c`)
 
-- Every bridge directive of 2.1.4 is parsed with `config__read_file_core`'s rules, except the TLS ones listed under [unsupported directives](#unsupported-directives).
+- Bridge configuration follows `config__read_file_core`; outgoing PSK and OCSP settings have the checks below.
 - `topic` patterns, directions and prefixes are remapped as `bridge__add_topic` and `remap_topic_in` do; inbound remapping stops at the first matching topic line.
 - The default remote client id is `<hostname>.<connection>` and the local one `local.<hostname>.<connection>`, as in `bridge__new`. In a cluster the ids are fixed when the bridge is first claimed, so a takeover by a node with another hostname keeps them.
 - `try_private`, notifications, start types, `restart_timeout` backoff and `round_robin` behave as in `bridge__connect`, `bridge__on_connect` and `bridge_check`.
 - In a cluster each bridge runs on exactly one node; see [data model](data-model.md#rules).
+- Use `bridge_identity` and `bridge_psk` together for outgoing TLS 1.2 PSK. Supply the key in hexadecimal without `0x`. Do not combine PSK with certificate settings or OCSP on the same bridge.
+- `bridge_require_ocsp true` requires certificate trust via `bridge_cafile`, `bridge_capath`, or `bridge_tls_use_os_certs`. The bridge accepts only an unambiguous `GOOD` status for the verified server leaf, signed by its issuer or a delegated responder, with a validity interval covering the current time. It never fetches OCSP responses. `bridge_insecure true` skips hostname verification only.
 
 ## Defaults
 
@@ -95,8 +97,7 @@ These directives make `mqextended` refuse to start, naming the directive, rather
 
 | Directive | Why |
 | --- | --- |
-| `psk_file`, `psk_hint`, `bridge_psk`, `bridge_identity` | TLS-PSK; MQExtended uses rustls, which has no TLS 1.2 PSK |
-| `bridge_require_ocsp true` | rustls cannot verify stapled OCSP responses |
+| `psk_file`, `psk_hint` | Incoming TLS-PSK is not implemented; PSK is available only on outgoing bridges |
 | `tls_engine`, `tls_engine_kpass_sha1`, `tls_keyform engine` | OpenSSL engines |
 | `plugin`, `auth_plugin`, `plugin_opt_*` for plugins other than dynamic security | C plugins cannot be loaded |
 | `memory_limit` above 0 | No process-wide allocation limit |

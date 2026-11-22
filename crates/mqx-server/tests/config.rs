@@ -353,21 +353,71 @@ fn security_scope_preserves_per_listener_anonymous_override_and_prefix() {
 fn unsupported_features_are_not_silently_ignored() {
     for (input, directive) in [
         ("psk_file secret.txt", "psk_file"),
-        ("connection upstream\nbridge_psk secret", "bridge_psk"),
-        (
-            "connection upstream\nbridge_identity peer",
-            "bridge_identity",
-        ),
-        (
-            "connection upstream\nbridge_require_ocsp true",
-            "bridge_require_ocsp",
-        ),
+        ("listener 1888\npsk_hint hint", "psk_hint"),
     ] {
         let error = ServerConfig::parse(input).unwrap_err().to_string();
         assert!(
             error.contains(directive) && error.contains("Unsupported"),
             "{error}"
         );
+    }
+}
+
+#[test]
+fn bridge_psk_and_required_ocsp_validate_at_config_load() {
+    const BASE: &str = "connection upstream\naddress localhost\ntopic psk/test out\n";
+    const KEY: &str = "000aB";
+    let parsed =
+        ServerConfig::parse(&format!("{BASE}bridge_psk {KEY}\nbridge_identity peer")).unwrap();
+    let tls = &parsed.bridges[0].tls;
+    assert_eq!(tls.identity.as_deref(), Some("peer"));
+    assert_eq!(tls.psk.as_ref().unwrap().as_bytes(), &[0, 0xab]);
+    assert_eq!(format!("{:?}", tls.psk), "Some(Psk([redacted]))");
+    assert!(!format!("{parsed:?}").contains(KEY));
+
+    let parsed = ServerConfig::parse(&format!(
+        "{BASE}bridge_require_ocsp true\nbridge_cafile root.pem\nbridge_certfile cert.pem\nbridge_keyfile key.pem"
+    ))
+    .unwrap();
+    assert!(parsed.bridges[0].tls.require_ocsp);
+    let parsed = ServerConfig::parse(&format!("{BASE}bridge_require_ocsp false")).unwrap();
+    assert!(!parsed.bridges[0].tls.require_ocsp);
+
+    for (extra, directive) in [
+        ("bridge_identity peer", "bridge_psk"),
+        ("bridge_psk deadbeef", "bridge_identity"),
+        ("bridge_psk 0xPRIVATE\nbridge_identity peer", "bridge_psk"),
+        (
+            "bridge_identity peer\nbridge_psk deadbeef\nbridge_psk 0xPRIVATE",
+            "bridge_psk",
+        ),
+        (
+            "bridge_cafile root.pem\nbridge_psk deadbeef\nbridge_identity peer",
+            "bridge_psk",
+        ),
+        (
+            "bridge_psk deadbeef\nbridge_identity peer\nbridge_tls_use_os_certs true",
+            "bridge_psk",
+        ),
+        (
+            "bridge_psk deadbeef\nbridge_identity peer\nbridge_tls_version tlsv1.3",
+            "bridge_psk",
+        ),
+        (
+            "bridge_psk deadbeef\nbridge_identity peer\nbridge_require_ocsp true",
+            "bridge_require_ocsp",
+        ),
+        ("bridge_require_ocsp true", "bridge_require_ocsp"),
+        (
+            "bridge_require_ocsp true\nbridge_cafile ca.pem\nbridge_certfile client.pem",
+            "bridge_keyfile",
+        ),
+    ] {
+        let error = ServerConfig::parse(&format!("{BASE}{extra}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(directive), "{error}");
+        assert!(!error.contains("PRIVATE") && !error.contains("deadbeef"));
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use mqx_codec::QoS;
 
@@ -46,6 +46,53 @@ impl Topic {
     }
 }
 
+/// A decoded TLS pre-shared key, shared with the outgoing handshake callback.
+#[derive(Clone, Eq, PartialEq)]
+pub struct Psk(Arc<Vec<u8>>);
+
+impl Psk {
+    pub fn from_hex(hex: &str) -> Result<Self, &'static str> {
+        let digits = hex.as_bytes();
+        let invalid = "bridge_psk must be a hexadecimal key of 1 to 512 bytes without 0x.";
+        if digits.len() > 1025 || !digits.iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid);
+        }
+        // Mosquitto lib/util_mosq.c: mosquitto__hex2bin preserves leading zero
+        // octets, then decodes the remaining digits as a big-endian integer.
+        let leading = digits.chunks_exact(2).take_while(|pair| *pair == b"00").count();
+        let digits = &digits[2 * leading..];
+        let odd = digits.len() % 2;
+        let high = odd != 0 && digits[0] != b'0';
+        let len = leading + digits.len() / 2 + usize::from(high);
+        if !(1..=512).contains(&len) {
+            return Err(invalid);
+        }
+        let nibble = |digit: u8| match digit {
+            b'0'..=b'9' => digit - b'0',
+            _ => digit.to_ascii_lowercase() - b'a' + 10,
+        };
+        let mut key = Vec::with_capacity(len);
+        key.resize(leading, 0);
+        if high {
+            key.push(nibble(digits[0]));
+        }
+        for pair in digits[odd..].chunks_exact(2) {
+            key.push(nibble(pair[0]) << 4 | nibble(pair[1]));
+        }
+        Ok(Self(Arc::new(key)))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Psk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Psk([redacted])")
+    }
+}
+
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct TlsConfig {
     pub cafile: Option<PathBuf>,
@@ -58,11 +105,49 @@ pub struct TlsConfig {
     pub version: Option<String>,
     pub insecure: bool,
     pub use_os_certs: bool,
+    pub identity: Option<Arc<str>>,
+    pub psk: Option<Psk>,
+    pub require_ocsp: bool,
 }
 
 impl TlsConfig {
-    pub(crate) fn enabled(&self) -> bool {
+    fn has_roots(&self) -> bool {
         self.cafile.is_some() || self.capath.is_some() || self.use_os_certs
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (&self.psk, &self.identity) {
+            (Some(_), None) => return Err("Invalid bridge configuration: missing bridge_identity."),
+            (None, Some(_)) => return Err("Invalid bridge configuration: missing bridge_psk."),
+            (Some(_), Some(identity)) => {
+                if identity.is_empty() || identity.len() >= 256 || identity.contains('\0') {
+                    return Err("bridge_identity must be 1 to 255 bytes and contain no NUL.");
+                }
+                if self.has_roots() || self.certfile.is_some() || self.keyfile.is_some() {
+                    return Err("Cannot use bridge_psk with certificate-based bridge TLS.");
+                }
+                if self.require_ocsp {
+                    return Err("Cannot use bridge_require_ocsp with bridge_psk.");
+                }
+                if self.version.as_deref() == Some("tlsv1.3") {
+                    return Err("bridge_psk requires TLS 1.2, not bridge_tls_version tlsv1.3.");
+                }
+            }
+            (None, None) => {}
+        }
+        if self.require_ocsp {
+            if !self.has_roots() {
+                return Err("bridge_require_ocsp needs a bridge CA file, directory, or OS roots.");
+            }
+            if self.certfile.is_some() != self.keyfile.is_some() {
+                return Err("Both bridge_certfile and bridge_keyfile must be provided.");
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.has_roots() || self.psk.is_some() || self.identity.is_some() || self.require_ocsp
     }
 }
 

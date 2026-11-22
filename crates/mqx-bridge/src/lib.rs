@@ -4,7 +4,7 @@
 mod config;
 mod wire;
 
-pub use config::{BridgeConfig, Direction, Protocol, Restart, Start, TlsConfig, Topic};
+pub use config::{BridgeConfig, Direction, Protocol, Psk, Restart, Start, TlsConfig, Topic};
 pub use wire::Transport;
 
 use std::{collections::HashMap, future::Future, io, pin::Pin, sync::Arc, time::Duration};

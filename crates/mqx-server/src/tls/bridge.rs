@@ -17,13 +17,19 @@ use tokio_rustls::TlsConnector;
 
 use super::{add_capath, add_roots, cipher_provider, pem_contents};
 
-/// Upgrade a connected outgoing MQTT bridge using the server's rustls stack.
+mod openssl;
+
+/// Upgrade a connected outgoing MQTT bridge, using OpenSSL only for PSK or OCSP.
 pub fn connect_bridge_tls<'a>(
     stream: TcpStream,
     host: &'a str,
     tls: &'a TlsConfig,
 ) -> TlsFuture<'a> {
     Box::pin(async move {
+        tls.validate().map_err(io::Error::other)?;
+        if tls.psk.is_some() || tls.require_ocsp {
+            return Ok(Box::new(openssl::connect(stream, host, tls).await?) as Box<dyn Transport>);
+        }
         let config = Arc::new(client_config(tls).map_err(io::Error::other)?);
         let host = ServerName::try_from(host.to_owned()).map_err(io::Error::other)?;
         let stream = TlsConnector::from(config).connect(host, stream).await?;

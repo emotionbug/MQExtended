@@ -1,7 +1,7 @@
-use mqx_bridge::{BridgeConfig, Direction, Protocol, Restart, Start, Topic};
+use mqx_bridge::{BridgeConfig, Direction, Protocol, Psk, Restart, Start, Topic};
 use mqx_codec::QoS;
 
-use super::{ParseResult, Value, atoi, empty, invalid, unsupported};
+use super::{ParseResult, Value, atoi, c_space, empty, invalid};
 
 pub(super) fn is_directive(name: &str) -> bool {
     matches!(
@@ -67,6 +67,7 @@ pub(super) fn finish(bridges: &mut [BridgeConfig]) -> ParseResult<()> {
         if bridge.topics.is_empty() {
             return Err("Invalid bridge configuration: no topics defined.".into());
         }
+        bridge.tls.validate()?;
         if bridge.remote_clientid.is_empty() {
             bridge.default_remote_clientid = true;
             bridge.remote_clientid = format!(
@@ -273,7 +274,17 @@ pub(super) fn directive(
             };
             *field = Some(string(name, field.is_some())?.into());
         }
-        "bridge_psk" | "bridge_identity" => return Err(unsupported(name, "TLS PSK")),
+        "bridge_psk" => {
+            if tls.psk.is_some() && !value.value.is_empty() {
+                return Err("Duplicate 'bridge_psk' value in configuration.".into());
+            }
+            let key = value.value.trim_matches(c_space);
+            if key.is_empty() {
+                return Err(empty(name));
+            }
+            tls.psk = Some(Psk::from_hex(key)?);
+        }
+        "bridge_identity" => tls.identity = Some(string(name, tls.identity.is_some())?.into()),
         "bridge_alpn" => tls.alpn = Some(string(name, tls.alpn.is_some())?),
         "bridge_ciphers" => tls.ciphers = Some(string(name, tls.ciphers.is_some())?),
         "bridge_ciphers_tls1.3" => {
@@ -281,11 +292,7 @@ pub(super) fn directive(
         }
         "bridge_tls_version" => tls.version = Some(string(name, tls.version.is_some())?),
         "bridge_tls_use_os_certs" => tls.use_os_certs = value.boolean()?,
-        "bridge_require_ocsp" => {
-            if value.boolean()? {
-                return Err(unsupported(name, "TLS OCSP stapling verification"));
-            }
-        }
+        "bridge_require_ocsp" => tls.require_ocsp = value.boolean()?,
         "bridge_insecure" => {
             tls.insecure = value.boolean()?;
             if tls.insecure {
