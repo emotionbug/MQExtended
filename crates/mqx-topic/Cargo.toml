@@ -1,0 +1,16 @@
+[package]
+name = "mqx-topic"
+description = "MQTT topic validation and matching with Mosquitto-compatible semantics"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
