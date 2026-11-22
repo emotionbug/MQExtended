@@ -5,6 +5,181 @@ const BIN: &str = env!("CARGO_BIN_EXE_mqextended");
 const PERSISTENT_CONNECT: &[u8] = b"\x10\x0f\x00\x04MQTT\x04\x00\x00\x3c\x00\x03dev";
 
 #[cfg(unix)]
+mod raft_clients {
+    use bytes::{Bytes, BytesMut};
+    use mqx_codec::{
+        ConnAck, Connect, ConnectReturnCode, Packet, PacketId, ProtocolVersion, Publish, QoS,
+        SubAck, Subscribe, SubscribeReturnCode, encode,
+    };
+    use std::{io, net::SocketAddr, path::Path, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        time::timeout,
+    };
+
+    pub(super) const WAIT: Duration = Duration::from_secs(15);
+    const STATE_TOPIC: &str = "a/state";
+
+    pub(super) fn tls_configs<const N: usize>(directory: &Path) -> [String; N] {
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
+            IsCa, KeyPair,
+        };
+        use std::fs;
+
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+        let ca_path = directory.join("cluster-ca.pem");
+        fs::write(&ca_path, ca.pem()).unwrap();
+        std::array::from_fn(|index| {
+            let id = index + 1;
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::default();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, format!("mqx-node-{id}"));
+            params.extended_key_usages = vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ];
+            let cert = params.signed_by(&key, &ca).unwrap();
+            let cert_path = directory.join(format!("cluster-{id}.pem"));
+            let key_path = directory.join(format!("cluster-{id}.key"));
+            fs::write(&cert_path, cert.pem()).unwrap();
+            fs::write(&key_path, key.serialize_pem()).unwrap();
+            format!(
+                "cluster_cafile {}\ncluster_certfile {}\ncluster_keyfile {}\n",
+                ca_path.display(),
+                cert_path.display(),
+                key_path.display(),
+            )
+        })
+    }
+
+    async fn send(socket: &mut TcpStream, packet: &Packet) -> io::Result<()> {
+        let mut encoded = BytesMut::new();
+        encode(packet, &mut encoded).unwrap();
+        socket.write_all(&encoded).await
+    }
+
+    async fn expect(socket: &mut TcpStream, packet: &Packet) {
+        let mut expected = BytesMut::new();
+        encode(packet, &mut expected).unwrap();
+        let mut received = vec![0; expected.len()];
+        socket.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, &expected[..], "expected {packet:?}");
+    }
+
+    pub(super) async fn writer(addr: SocketAddr, session_present: bool) -> TcpStream {
+        timeout(WAIT, async {
+            let mut socket = TcpStream::connect(addr).await.unwrap();
+            socket.write_all(super::PERSISTENT_CONNECT).await.unwrap();
+            expect(
+                &mut socket,
+                &Packet::ConnAck(ConnAck {
+                    session_present,
+                    code: ConnectReturnCode::Accepted,
+                }),
+            )
+            .await;
+            socket
+        })
+        .await
+        .expect("MQTT writer did not connect")
+    }
+
+    pub(super) async fn retained_write(
+        socket: &mut TcpStream,
+        topic: &str,
+        payload: &'static [u8],
+    ) -> io::Result<()> {
+        send(
+            socket,
+            &Packet::Publish(Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: true,
+                topic: topic.into(),
+                packet_id: Some(PacketId::MIN),
+                payload: Bytes::from_static(payload),
+            }),
+        )
+        .await
+    }
+
+    pub(super) async fn commit(socket: &mut TcpStream, payload: &'static [u8]) {
+        timeout(WAIT, async {
+            retained_write(socket, STATE_TOPIC, payload).await.unwrap();
+            expect(socket, &Packet::PubAck(PacketId::MIN)).await;
+        })
+        .await
+        .expect("retained write was not acknowledged");
+    }
+
+    pub(super) async fn assert_retained(addr: SocketAddr, payload: &'static [u8]) {
+        timeout(WAIT, async {
+            let mut socket = TcpStream::connect(addr).await.unwrap();
+            send(
+                &mut socket,
+                &Packet::Connect(Connect {
+                    protocol: ProtocolVersion::V311,
+                    is_bridge: false,
+                    clean_session: true,
+                    keep_alive: 60,
+                    client_id: "retained-reader".into(),
+                    will: None,
+                    username: None,
+                    password: None,
+                }),
+            )
+            .await
+            .unwrap();
+            expect(
+                &mut socket,
+                &Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    code: ConnectReturnCode::Accepted,
+                }),
+            )
+            .await;
+            send(
+                &mut socket,
+                &Packet::Subscribe(Subscribe {
+                    packet_id: PacketId::MIN,
+                    filters: vec![(STATE_TOPIC.into(), QoS::AtMostOnce)],
+                }),
+            )
+            .await
+            .unwrap();
+            expect(
+                &mut socket,
+                &Packet::SubAck(SubAck {
+                    packet_id: PacketId::MIN,
+                    return_codes: vec![SubscribeReturnCode::Success(QoS::AtMostOnce)],
+                }),
+            )
+            .await;
+            expect(
+                &mut socket,
+                &Packet::Publish(Publish {
+                    dup: false,
+                    qos: QoS::AtMostOnce,
+                    retain: true,
+                    topic: STATE_TOPIC.into(),
+                    packet_id: None,
+                    payload: Bytes::from_static(payload),
+                }),
+            )
+            .await;
+        })
+        .await
+        .expect("committed retained message was not replayed");
+    }
+}
+
+#[cfg(unix)]
 async fn wait_ready(socket: &tokio::net::UnixDatagram) {
     let mut packet = [0; 32];
     let len = tokio::time::timeout(std::time::Duration::from_secs(10), socket.recv(&mut packet))
@@ -156,10 +331,7 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
         sys::signal::{Signal, kill},
         unistd::Pid,
     };
-    use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
-        IsCa, KeyPair,
-    };
+    use raft_clients::{assert_retained, commit, tls_configs, writer};
     use std::{fs, net::TcpListener, process::Stdio, time::Duration};
 
     let mqtt = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -173,44 +345,22 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
     let storage = directory.path().join("raft state");
     let acl = directory.path().join("acl");
     fs::write(&acl, "topic readwrite a/#\n").unwrap();
-    let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
-    let key = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::default();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "mqx-node-1");
-    params.extended_key_usages = vec![
-        ExtendedKeyUsagePurpose::ServerAuth,
-        ExtendedKeyUsagePurpose::ClientAuth,
-    ];
-    let cert = params.signed_by(&key, &ca).unwrap();
-    let ca_path = directory.path().join("cluster-ca.pem");
-    let cert_path = directory.path().join("cluster-cert.pem");
-    let key_path = directory.path().join("cluster-key.pem");
-    fs::write(&ca_path, ca.pem()).unwrap();
-    fs::write(&cert_path, cert.pem()).unwrap();
-    fs::write(&key_path, key.serialize_pem()).unwrap();
+    let [tls] = tls_configs::<1>(directory.path());
     fs::write(
         &path,
         format!(
             "user root\nlistener {} 127.0.0.1\nallow_anonymous true\nacl_file {}\ncluster_node_id 1\n\
-        cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\ncluster_data_dir {}\n\
-        cluster_cafile {}\ncluster_certfile {}\ncluster_keyfile {}\n",
+        cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\ncluster_data_dir {}\n{tls}",
             mqtt_addr.port(),
             acl.display(),
             storage.display(),
-            ca_path.display(),
-            cert_path.display(),
-            key_path.display(),
         ),
     )
     .unwrap();
     assert!(!storage.exists());
     drop((mqtt, raft));
 
-    for session_present in [0, 1] {
+    for resumed in [false, true] {
         let child = tokio::process::Command::new(BIN)
             .arg("-c")
             .arg(&path)
@@ -221,10 +371,13 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
             .unwrap();
         let pid = Pid::from_raw(child.id().unwrap() as i32);
         wait_ready(&notify).await;
-        assert_eq!(
-            connect_and_read_ack(mqtt_addr).await,
-            [0x20, 2, session_present, 0]
-        );
+        let mut publisher = writer(mqtt_addr, resumed).await;
+        if resumed {
+            assert_retained(mqtt_addr, b"singleton state").await;
+        } else {
+            commit(&mut publisher, b"singleton state").await;
+        }
+        drop(publisher);
         assert!(storage.is_dir());
         kill(pid, Signal::SIGTERM).unwrap();
         let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
@@ -236,6 +389,188 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
+    use raft_clients::{WAIT, assert_retained, commit, retained_write, tls_configs, writer};
+    use std::{
+        fs,
+        io::{self, ErrorKind},
+        net::{SocketAddr, TcpListener},
+        time::Duration,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpStream, UnixDatagram},
+        time::{sleep, timeout},
+    };
+
+    async fn http(addr: SocketAddr, path: &str) -> (u16, String) {
+        let response = timeout(WAIT, async {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{addr}{path} did not respond"));
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let status = head
+            .split_ascii_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (status, body.into())
+    }
+
+    async fn wait_for_readiness(addr: SocketAddr, expected: u16) {
+        timeout(WAIT, async {
+            loop {
+                let (status, _) = http(addr, "/api/v1/mqx/ready").await;
+                if status == expected {
+                    break;
+                }
+                assert!(
+                    matches!(status, 200 | 503),
+                    "unexpected readiness: {status}"
+                );
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("readiness at {addr} did not become {expected}"));
+    }
+
+    async fn raft_status(addr: SocketAddr) -> serde_json::Value {
+        let (status, body) = http(addr, "/api/v1/mqx/cluster").await;
+        assert_eq!(status, 200);
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["raft"].take()
+    }
+
+    async fn assert_mqtt_refused(socket: &mut TcpStream, sent: io::Result<()>, request: &str) {
+        let result = match sent {
+            Err(error) => Err(error),
+            Ok(()) => timeout(WAIT, socket.read_u8())
+                .await
+                .unwrap_or_else(|_| panic!("{request} did not finish without quorum")),
+        };
+        let error = result.expect_err(request);
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+            ),
+            "{request}: {error}"
+        );
+    }
+
+    let sockets: [[_; 2]; 3] =
+        std::array::from_fn(|_| std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap()));
+    let [mqtt, raft, http_addr] = sockets
+        .each_ref()
+        .map(|pair| pair.each_ref().map(|s| s.local_addr().unwrap()));
+    let directory = tempfile::tempdir().unwrap();
+    let tls = tls_configs::<2>(directory.path());
+    let configs = [0, 1].map(|index| {
+        let id = index + 1;
+        let path = directory.path().join(format!("node-{id}.conf"));
+        fs::write(
+            &path,
+            format!(
+                "user root\nallow_anonymous true\nlistener {} 127.0.0.1\n\
+                 listener {} 127.0.0.1\nprotocol http_api\n\
+                 cluster_node_id {id}\ncluster_bind {}\ncluster_peer 1 {}\ncluster_peer 2 {}\n\
+                 cluster_data_dir {}\ncluster_lease_interval 100\ncluster_lease_timeout 1000\n{}",
+                mqtt[index].port(),
+                http_addr[index].port(),
+                raft[index],
+                raft[0],
+                raft[1],
+                directory.path().join(format!("raft-{id}")).display(),
+                tls[index],
+            ),
+        )
+        .unwrap();
+        path
+    });
+    let notify_paths = configs.each_ref().map(|path| path.with_extension("notify"));
+    let notify = notify_paths
+        .each_ref()
+        .map(|path| UnixDatagram::bind(path).unwrap());
+    drop(sockets);
+    let start = |index: usize| {
+        tokio::process::Command::new(BIN)
+            .arg("-c")
+            .arg(&configs[index])
+            .env("NOTIFY_SOCKET", &notify_paths[index])
+            .env("TOKIO_WORKER_THREADS", "2")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+
+    let mut brokers = [start(0), start(1)];
+    for index in [0, 1] {
+        wait_ready(&notify[index]).await;
+        wait_for_readiness(http_addr[index], 200).await;
+    }
+    let survivor = match raft_status(http_addr[0]).await["leader"].as_u64() {
+        Some(1) => 0,
+        Some(2) => 1,
+        leader => panic!("two ready voters reported an invalid leader: {leader:?}"),
+    };
+    let lost = 1 - survivor;
+    let mut publisher = writer(mqtt[survivor], false).await;
+    commit(&mut publisher, b"before loss").await;
+    assert_retained(mqtt[lost], b"before loss").await;
+
+    brokers[lost].kill().await.unwrap();
+    let survivor_http = http_addr[survivor];
+    wait_for_readiness(survivor_http, 503).await;
+
+    let committed = raft_status(survivor_http).await["committed_index"]
+        .as_u64()
+        .unwrap();
+    let mut newcomer = TcpStream::connect(mqtt[survivor]).await.unwrap();
+    let sent = newcomer.write_all(PERSISTENT_CONNECT).await;
+    assert_mqtt_refused(&mut newcomer, sent, "survivor admitted a new MQTT client").await;
+    // A timed-out proposal can still commit after quorum returns. Use a separate
+    // topic so that replaying the pre-loss state does not depend on that outcome.
+    let sent = retained_write(&mut publisher, "a/minority", b"without quorum").await;
+    assert_mqtt_refused(
+        &mut publisher,
+        sent,
+        "survivor acknowledged a durable write",
+    )
+    .await;
+    assert_eq!(
+        raft_status(survivor_http).await["committed_index"].as_u64(),
+        Some(committed),
+        "the Raft commit index advanced without a majority"
+    );
+
+    brokers[lost] = start(lost);
+    wait_ready(&notify[lost]).await;
+    wait_for_readiness(http_addr[lost], 200).await;
+    wait_for_readiness(survivor_http, 200).await;
+    assert_retained(mqtt[lost], b"before loss").await;
+    let mut publisher = writer(mqtt[lost], true).await;
+    commit(&mut publisher, b"after restore").await;
+    assert_retained(mqtt[survivor], b"after restore").await;
+
+    for broker in &mut brokers {
+        broker.kill().await.unwrap();
     }
 }
 
