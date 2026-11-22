@@ -59,6 +59,8 @@ With `persistence true`, MQExtended reads Mosquitto's own `mosquitto.db` on its 
 
 For standalone brokers, a failed by-changes autosave leaves the changes pending and retries after a one-second delay without waiting for more client traffic. A failed final save is logged and makes the process exit nonzero; do not treat that shutdown as a successful backup.
 
+For a standalone cold backup, stop the broker successfully, then back up its native `.mqx` file, config and referenced credentials together. Restore them with their original permissions on an isolated broker using the same release before reconnecting clients. Leaving out the `.mqx` file may reimport an older `mosquitto.db`. For replicated state, follow the [cluster restore procedure](cluster.md#cold-backup-and-restore) instead.
+
 Without a persistence file, copy retained messages instead, right before switching: subscribe to `#` on Mosquitto with a user that may read everything, collect every message delivered with the retain flag, and publish each one with retain to MQExtended. Copying after the switch would overwrite values that clients already updated. Persistent sessions then start empty.
 
 ## 6. Cut over

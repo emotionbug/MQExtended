@@ -4,7 +4,7 @@ How to run MQExtended as an active-active cluster and what a client observes whe
 
 ## Configuration
 
-Cluster settings live in the same `mosquitto.conf` as everything else. The `cluster_*` directives are MQExtended extensions; Mosquitto refuses to start with them. Without any `cluster_*` directive the broker runs standalone and in memory, like Mosquitto with `persistence false`.
+Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExtended extensions; Mosquitto refuses to start with them. Without them the broker runs standalone; state survives a restart only when standalone persistence is enabled.
 
 | Directive | Meaning | Default |
 | --- | --- | --- |
@@ -16,7 +16,7 @@ Cluster settings live in the same `mosquitto.conf` as everything else. The `clus
 | `cluster_certfile <path>` | This node's certificate; its Common Name must be `mqx-node-<id>` | required unless plaintext |
 | `cluster_keyfile <path>` | Key for `cluster_certfile` | required unless plaintext |
 | `cluster_insecure_plaintext true` | Run peer traffic without TLS; refused together with a wildcard `cluster_bind` | false |
-| `cluster_max_snapshot_size <bytes>` | Largest snapshot a node accepts from a peer (at most 256 MiB) | 64 MiB |
+| `cluster_max_snapshot_size <bytes>` | Largest snapshot this node can send or receive (at most 256 MiB) | 64 MiB |
 | `cluster_heartbeat_interval <ms>` | Raft leader heartbeat | 100 |
 | `cluster_election_timeout <min> <max>` | Raft election timeout range | 400 800 |
 | `cluster_lease_interval <ms>` | How often a node renews its liveness lease | 1000 |
@@ -44,7 +44,7 @@ cluster_certfile /etc/mqextended/node2.pem
 cluster_keyfile /etc/mqextended/node2.key
 ```
 
-Give every node the same `password_file`, `acl_file` and broker limits. Send SIGHUP to every node after changing them.
+Give every node the same `password_file`, `acl_file` and broker limits. Send SIGHUP to every node after updating file credentials or ACLs. Roll the nodes to apply changed broker limits.
 
 Issue node certificates from a CA used only for the cluster, one per node, with Common Name `mqx-node-<id>` matching `cluster_node_id`. Every peer connection is mutually authenticated: a node only accepts a peer whose certificate chains to `cluster_cafile` and whose Common Name matches the node id it claims, and it checks the same when it dials out. Addresses play no part in authentication.
 
@@ -58,6 +58,15 @@ Issue node certificates from a CA used only for the cluster, one per node, with 
 ## Bootstrap and restart
 
 Start all nodes with identical `cluster_peer` lines and no `cluster_membership_generation`, in any order. The first start bootstraps the cluster exactly once; later starts rejoin from `cluster_data_dir`, and from then on the replicated membership, not the config file, decides who the members are. Never reuse a data directory under a different `cluster_node_id`, and never copy one node's data directory to another.
+
+### Cold backup and restore
+
+1. Drain client traffic and stop **all** nodes. Confirm each process has exited successfully before taking the first copy. Independent copies of live WALs are not a cluster backup.
+2. Back up every node's entire `cluster_data_dir`, indexed by its node ID. Keep its config, referenced credential files and matching peer certificate/key in protected storage as well. Preserve ownership and permissions. Record the binary version, membership generation and state format with the backup.
+3. Restore the set to an isolated network, with the original cluster stopped or unreachable. Use the same binary version, IDs and configured peer addresses. Restore each directory only to its original ID; do not bootstrap an empty cluster or run a restored voter concurrently with its original.
+4. With client traffic still drained, start the restored nodes. Check that `/api/v1/mqx/cluster` reports the expected voters and leader, and `/api/v1/mqx/ready` returns `200` on each serving node. Check a known retained payload and reconnect a test persistent client with clean start disabled: verify session-present and the expected queued messages before routing production traffic. Changes made after the backup are not recovered.
+
+Keep each node's `snapshot.mpk` below the configured transfer limit with headroom. A larger local snapshot can be written, but a learner or lagging voter that needs it cannot catch up from it. Set an alert on the file size and qualify the expected application state against the limit before deploying.
 
 ## Changing membership
 

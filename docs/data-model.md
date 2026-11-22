@@ -31,7 +31,7 @@ A message to a persistent session is reserved for sending in the same commit tha
 
 ## On-disk layout
 
-Single-node mode uses the same layout with a one-member cluster.
+A Raft cluster, including one configured with a single voter, uses the layout below. A standalone broker has no Raft directory; with `persistence true` it stores a native `<persistence_file>.mqx` instead.
 
 ```text
 <data_dir>/
