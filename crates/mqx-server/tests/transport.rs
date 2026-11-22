@@ -25,6 +25,38 @@ fn local_config(extra: &str) -> ServerConfig {
     config
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_listener_preserves_occupied_paths_and_a_replacement_on_shutdown() {
+    use std::os::unix::{fs::symlink, net::UnixStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mqtt.sock");
+    let config = ServerConfig::parse(&format!("listener 0 {}", path.display())).unwrap();
+
+    fs::write(&path, b"not a socket").unwrap();
+    assert!(Server::bind(&config).await.is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"not a socket");
+
+    let backup = dir.path().join("backup");
+    fs::rename(&path, &backup).unwrap();
+    symlink(&backup, &path).unwrap();
+    assert!(Server::bind(&config).await.is_err());
+    assert_eq!(fs::read_link(&path).unwrap(), backup);
+    fs::remove_file(&path).unwrap();
+
+    let original = Server::bind(&config).await.unwrap();
+    assert!(Server::bind(&config).await.is_err());
+    UnixStream::connect(&path).unwrap();
+
+    fs::rename(&path, dir.path().join("retired.sock")).unwrap();
+    let replacement = Server::bind(&config).await.unwrap();
+    drop(original);
+    UnixStream::connect(&path).unwrap();
+    drop(replacement);
+    assert!(!path.exists());
+}
+
 #[tokio::test]
 async fn listener_limit_refuses_extra_tcp_connections_before_dispatch() {
     let config = local_config("max_connections 1\nset_tcp_nodelay true");

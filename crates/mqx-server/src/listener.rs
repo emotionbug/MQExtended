@@ -9,7 +9,12 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{
+    fs,
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::PathBuf,
+    sync::Mutex,
+};
 
 use mqx_broker::{ControlInventory, ControlListener};
 use mqx_proxy::{PROXY_HEADER_TIMEOUT, ProxyOptions};
@@ -795,8 +800,8 @@ fn bind_unix_socket(path: &Path) -> io::Result<ListeningSocket> {
     use nix::sys::stat::{Mode, umask};
     use socket2::SockAddr;
 
-    // Mosquitto src/net.c: net__socket_listen_unix checks sun_path length
-    // before unlinking, ignores unlink failures, and listens with backlog 10.
+    // Mosquitto src/net.c: net__socket_listen_unix replaces stale sockets
+    // and listens with backlog 10. Never unlink a file or a serving listener.
     if path.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -809,7 +814,28 @@ fn bind_unix_socket(path: &Path) -> io::Result<ListeningSocket> {
             format!("Path to unix socket is too long \"{}\".", path.display()),
         )
     })?;
-    let _ = fs::remove_file(path);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "Unix listener path exists and is not a socket",
+                ));
+            }
+            let probe = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+            probe.set_nonblocking(true)?;
+            match probe.connect(&address) {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    unlink_same_socket(path, metadata.dev(), metadata.ino())?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(()) => return Err(io::ErrorKind::AddrInUse.into()),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     tracing::info!("Opening unix listen socket on path {}.", path.display());
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     {
@@ -822,7 +848,12 @@ fn bind_unix_socket(path: &Path) -> io::Result<ListeningSocket> {
         umask(old_mask);
         result?;
     }
-    let path = UnixSocketPath(path.to_owned());
+    let metadata = fs::symlink_metadata(path)?;
+    let path = UnixSocketPath {
+        path: path.to_owned(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
     socket.listen(10)?;
     socket.set_nonblocking(true)?;
     let socket = UnixListener::from_std(socket.into())?;
@@ -841,12 +872,25 @@ fn bind_unix_socket(_: &Path) -> io::Result<ListeningSocket> {
 }
 
 #[cfg(unix)]
-struct UnixSocketPath(PathBuf);
+struct UnixSocketPath {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn unlink_same_socket(path: &Path, dev: u64, ino: u64) -> io::Result<()> {
+    let current = fs::symlink_metadata(path)?;
+    if current.file_type().is_socket() && (current.dev(), current.ino()) == (dev, ino) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 impl Drop for UnixSocketPath {
     fn drop(&mut self) {
-        // Mosquitto src/listeners.c: listeners__stop removes the pathname on shutdown.
-        let _ = fs::remove_file(&self.0);
+        // A replacement listener may already be serving at our former pathname.
+        let _ = unlink_same_socket(&self.path, self.dev, self.ino);
     }
 }

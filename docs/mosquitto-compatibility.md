@@ -104,6 +104,7 @@ See [client interoperability](testing.md#client-sdk-interoperability) for the di
 | Base64 in hashes is decoded strictly | Every value Mosquitto writes is standard base64; malformed values fail Mosquitto's length checks as well |
 | `$SYS/broker/heap/*` is not published | Mosquitto only publishes it in builds with memory tracking, so clients cannot rely on it |
 | Persistence is written to `<persistence_file>.mqx`, not `mosquitto.db` | Clients see the same state after a restart; the Mosquitto file is read once for [migration](migration.md#5-carry-state-over) and left untouched for rollback |
+| A Unix listener refuses a non-socket path or a socket still accepting connections | A typo cannot replace an existing file or disconnect clients from a running listener. A stale socket is still reclaimed. Use a service-owned directory and serialize starts; pathname checks are not a lock against concurrent directory changes. |
 | `log_timestamp_format` is rendered by Chrono, not libc `strftime` | Identical for the standard conversions; only libc-specific extensions differ |
 | `log_dest dlt` logs nothing and `log_dest syslog` has no console fallback | Matches a stock Mosquitto build without DLT; syslog delivery goes to `/dev/log` as Mosquitto's does |
 | An invalid dynamic-security config file stops the broker | Mosquitto would run with an empty policy; refusing to start is the safe reading of the same file ([dynamic security](dynamic-security.md#differences-from-the-c-plugin)) |
