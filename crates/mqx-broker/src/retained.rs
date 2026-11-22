@@ -18,6 +18,17 @@ struct Branch {
 }
 
 impl Retained {
+    pub(crate) fn for_each(&self, mut visit: impl FnMut(&Arc<Message>)) {
+        self.ordinary.for_each(&mut visit);
+        self.dollar.for_each(&mut visit);
+    }
+
+    pub(crate) fn count(&self) -> i64 {
+        let mut count = 0;
+        self.for_each(|_| count += 1);
+        count
+    }
+
     // retain.c: retain__store creates hierarchy entries before processing a
     // tombstone. Only clearing an existing retained message prunes its path.
     pub(crate) fn store(&mut self, topic: &str, message: Arc<Message>) {
@@ -51,6 +62,15 @@ impl Retained {
 }
 
 impl Branch {
+    fn for_each(&self, visit: &mut impl FnMut(&Arc<Message>)) {
+        if let Some(message) = &self.message {
+            visit(message);
+        }
+        for child in self.children.values() {
+            child.for_each(visit);
+        }
+    }
+
     fn store(&mut self, mut levels: Split<'_, char>, message: Arc<Message>) -> bool {
         let Some(level) = levels.next() else {
             if message.payload.is_empty() {

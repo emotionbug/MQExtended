@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,25 +12,37 @@ use futures_util::{Stream, TryStreamExt};
 use openraft::alias::{EntryPayloadOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::{EntryResponder, RaftStateMachine};
 use openraft::{EntryPayload, RaftSnapshotBuilder};
-use tokio::sync::{Mutex, broadcast};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::lease::{Leases, Stamp};
+use crate::membership::{Desired, MemberRole, MemberStatus, MembershipStatus};
 use crate::node::{Command, LogId, Types};
 use crate::snapshot_file::SnapshotData;
 use crate::transport::{decode, encode, invalid_data};
-use crate::{NodeEvent, StateMachine};
+use crate::{NodeEvent, StateMachine, version};
 
 const SNAPSHOT_FILE: &str = "snapshot.mpk";
+pub(crate) const RETIRED_FILE: &str = "removed";
 
 pub(crate) type Snapshot = SnapshotOf<Types, SnapshotData>;
 pub(crate) type SnapshotMeta = SnapshotMetaOf<Types>;
 type StoredMembership = StoredMembershipOf<Types>;
 
+#[derive(Serialize, Deserialize)]
+struct MembershipState<L = Leases, D = Desired, R = BTreeSet<u64>> {
+    leases: L,
+    desired: D,
+    retired: R,
+}
+
 pub(crate) struct Applied<S> {
     pub(crate) app: S,
     pub(crate) leases: Leases,
+    pub(crate) desired: Desired,
+    retired: BTreeSet<u64>,
     last_applied: Option<LogId>,
-    membership: StoredMembership,
+    pub(crate) membership: StoredMembership,
 }
 
 pub(crate) struct Store<S> {
@@ -38,6 +51,8 @@ pub(crate) struct Store<S> {
     dir: Arc<Path>,
     disk_open: Arc<SyncMutex<bool>>,
     pub(crate) events: broadcast::Sender<NodeEvent>,
+    pub(crate) status: watch::Sender<MembershipStatus>,
+    pub(crate) format: u16,
 }
 
 impl<S> Clone for Store<S> {
@@ -48,15 +63,19 @@ impl<S> Clone for Store<S> {
             dir: self.dir.clone(),
             disk_open: self.disk_open.clone(),
             events: self.events.clone(),
+            status: self.status.clone(),
+            format: self.format,
         }
     }
 }
 
 impl<S: StateMachine> Store<S> {
-    pub(crate) fn open(app: S, dir: PathBuf, leases: Leases) -> io::Result<Self> {
+    pub(crate) fn open(app: S, dir: PathBuf, format: u16) -> io::Result<Self> {
         let mut state = Applied {
             app,
-            leases,
+            leases: Leases::new(std::iter::empty()),
+            desired: Desired::default(),
+            retired: BTreeSet::new(),
             last_applied: None,
             membership: StoredMembership::default(),
         };
@@ -69,16 +88,29 @@ impl<S: StateMachine> Store<S> {
             Err(err) => return Err(err),
         };
         if let Some(snapshot) = &snapshot {
-            let leases = state.decode_leases(&snapshot.snapshot)?;
-            state.restore(&snapshot.meta, leases, &snapshot.snapshot.application()?)?;
+            let control = decode_membership::<S>(&snapshot.snapshot)?;
+            if format == 1 && control.desired.generation != 0 {
+                return Err(invalid_data(
+                    "cannot downgrade dynamic membership to state format 1",
+                ));
+            }
+            state.restore(
+                &snapshot.meta,
+                control,
+                snapshot.snapshot.app_version,
+                &snapshot.snapshot.application()?,
+            )?;
         }
         let (events, _) = broadcast::channel(256);
+        let (status, _) = watch::channel(state.membership_status()?);
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             snapshot: Arc::new(Mutex::new(snapshot)),
             dir: dir.into(),
             disk_open: Arc::new(SyncMutex::new(true)),
             events,
+            status,
+            format,
         })
     }
 
@@ -87,7 +119,11 @@ impl<S: StateMachine> Store<S> {
     }
 
     pub(crate) fn validate_snapshot(&self, data: &SnapshotData) -> io::Result<()> {
-        self.state.read().unwrap().decode_leases(data).map(drop)
+        let control = decode_membership::<S>(data)?;
+        if self.format == 1 && control.desired.generation != 0 {
+            return Err(invalid_data("dynamic membership requires state format 2"));
+        }
+        Ok(())
     }
 
     pub(crate) fn expire(&self, stamp: Stamp, timeout_ms: u64) -> Vec<crate::lease::LeaseCommand> {
@@ -102,18 +138,73 @@ impl<S: StateMachine> Store<S> {
     }
 }
 
+fn decode_membership<S: StateMachine>(snapshot: &SnapshotData) -> io::Result<MembershipState> {
+    version::check_app::<S>("application snapshot", snapshot.app_version).map_err(invalid_data)?;
+    if snapshot.format == 1 {
+        Ok(MembershipState {
+            leases: decode(&snapshot.leases)?,
+            desired: Desired::default(),
+            retired: BTreeSet::new(),
+        })
+    } else {
+        decode(&snapshot.leases)
+    }
+}
+
 impl<S: StateMachine> Applied<S> {
-    fn decode_leases(&self, snapshot: &SnapshotData) -> io::Result<Leases> {
-        let leases: Leases = decode(&snapshot.leases)?;
-        if !leases.ids().eq(self.leases.ids()) {
-            return Err(invalid_data("snapshot belongs to a different membership"));
-        }
-        Ok(leases)
+    fn membership_status(&self) -> io::Result<MembershipStatus> {
+        let membership = self.membership.membership();
+        let voters: BTreeSet<_> = membership.voter_ids().collect();
+        let members = membership
+            .nodes()
+            .map(|(&id, node)| {
+                Ok((
+                    id,
+                    MemberStatus {
+                        address: node.addr.parse().map_err(invalid_data)?,
+                        role: if voters.contains(&id) {
+                            MemberRole::Voter
+                        } else {
+                            MemberRole::Learner
+                        },
+                        liveness: self.leases.status(id),
+                    },
+                ))
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(MembershipStatus {
+            generation: self.desired.generation,
+            desired: self.desired.peers.clone(),
+            joint: membership.get_joint_config().len() > 1,
+            members,
+            retired: self.retired.clone(),
+            ..Default::default()
+        })
     }
 
-    fn restore(&mut self, meta: &SnapshotMeta, leases: Leases, app: &[u8]) -> io::Result<()> {
-        self.app.restore(app).map_err(invalid_data)?;
-        self.leases = leases;
+    fn publish_membership(&self, status: &watch::Sender<MembershipStatus>) -> io::Result<()> {
+        let next = self.membership_status()?;
+        status.send_modify(|state| {
+            let error = state.reconciliation_error.take();
+            *state = next;
+            state.reconciliation_error = error;
+        });
+        Ok(())
+    }
+
+    fn restore(
+        &mut self,
+        meta: &SnapshotMeta,
+        control: MembershipState,
+        version: u16,
+        app: &[u8],
+    ) -> io::Result<()> {
+        self.app
+            .restore_versioned(version, app)
+            .map_err(invalid_data)?;
+        self.leases = control.leases;
+        self.desired = control.desired;
+        self.retired = control.retired;
         self.last_applied = meta.last_log_id;
         self.membership = meta.last_membership.clone();
         Ok(())
@@ -139,10 +230,20 @@ impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
             let reply: Result<Option<Bytes>, String> = match entry.payload {
                 EntryPayloadOf::<Types>::Blank => Ok(None),
                 EntryPayload::Membership(membership) => {
+                    let previous = std::mem::take(&mut state.membership);
+                    state.retired.extend(
+                        previous.nodes().filter_map(|(&id, _)| {
+                            membership.get_node(&id).is_none().then_some(id)
+                        }),
+                    );
+                    for (&id, _) in membership.nodes() {
+                        state.leases.ensure(id);
+                    }
                     state.membership = StoredMembership::new(Some(log_id), membership);
+                    state.publish_membership(&self.status)?;
                     Ok(None)
                 }
-                EntryPayload::Normal(Command::App(body)) => match decode(&body) {
+                EntryPayload::Normal(Command::App(body)) => match version::command::<S>(&body) {
                     Ok(command) => {
                         let response = state.app.apply(log_id.index, command);
                         if responder.is_some() {
@@ -153,18 +254,30 @@ impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
                             Ok(None)
                         }
                     }
-                    Err(_) => {
-                        tracing::error!(
-                            index = log_id.index,
-                            "skipping undecodable committed application command"
-                        );
-                        Err("undecodable committed application command".into())
-                    }
+                    Err(error) => return Err(invalid_data(error)),
                 },
                 EntryPayload::Normal(Command::Lease(command)) => {
                     if let Some(event) = state.leases.apply(log_id, command) {
+                        self.status.send_if_modified(|status| {
+                            if let Some(member) = status.members.get_mut(&event.node_id) {
+                                member.liveness = event.status;
+                                true
+                            } else {
+                                false
+                            }
+                        });
                         state.app.on_node_event(event);
                         let _ = self.events.send(event);
+                    }
+                    Ok(None)
+                }
+                EntryPayload::Normal(Command::Desired(desired)) => {
+                    if self.format == 1 {
+                        return Err(invalid_data("dynamic membership requires state format 2"));
+                    }
+                    if desired.generation > state.desired.generation {
+                        state.desired = desired;
+                        state.publish_membership(&self.status)?;
                     }
                     Ok(None)
                 }
@@ -192,12 +305,17 @@ impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
                 let app = data.application()?;
                 {
                     let mut state = store.state.write().unwrap();
-                    let leases = state.decode_leases(&data)?;
-                    state.restore(&meta, leases, &app)?;
+                    let control = decode_membership::<S>(&data)?;
+                    state.restore(&meta, control, data.app_version, &app)?;
                 }
                 drop(app);
                 let _disk = store.lock_disk()?;
                 let snapshot = data.publish(&store.dir, SNAPSHOT_FILE)?;
+                store
+                    .state
+                    .read()
+                    .unwrap()
+                    .publish_membership(&store.status)?;
                 Ok::<_, io::Error>(Snapshot { meta, snapshot })
             })
             .await
@@ -234,14 +352,29 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
             }
             (
                 meta,
-                Bytes::from(encode(&state.leases)?),
+                Bytes::from(if self.format == 1 {
+                    encode(&state.leases)?
+                } else {
+                    encode(&MembershipState {
+                        leases: &state.leases,
+                        desired: &state.desired,
+                        retired: &state.retired,
+                    })?
+                }),
                 state.app.snapshot(),
             )
         };
         let store = self.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
             let _disk = store.lock_disk()?;
-            let snapshot = SnapshotData::build(&store.dir, SNAPSHOT_FILE, &meta, leases, &app)?;
+            let snapshot = SnapshotData::build(
+                &store.dir,
+                SNAPSHOT_FILE,
+                &meta,
+                leases,
+                &app,
+                (store.format, S::WRITE_VERSION),
+            )?;
             Ok::<_, io::Error>(Snapshot { meta, snapshot })
         })
         .await

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 mqx-auth.workspace = true
+mqx-bridge = { path = "../mqx-bridge" }
 mqx-broker.workspace = true
 mqx-cluster = { path = "../mqx-cluster" }
 mqx-codec.workspace = true
@@ -18,19 +19,30 @@ mqx-proxy = { path = "../mqx-proxy", features = ["tokio"] }
 mqx-topic.workspace = true
 mqx-ws = { path = "../mqx-ws" }
 bytes.workspace = true
+base64 = "0.22.1"
+gethostname = "1.1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+percent-encoding = "2"
+serde_json = "1"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 chrono = "0.4.45"
 ring = "0.17.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
 socket2 = { version = "0.6.5", features = ["all"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 x509-parser = "0.18.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["net"] }
+fork = "0.12.0"
+nix = { version = "0.31.3", features = ["fs", "net", "process", "user"] }
 
 [dev-dependencies]
 rcgen = "0.14.10"

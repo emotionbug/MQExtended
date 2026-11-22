@@ -58,8 +58,10 @@ macro_rules! scenario {
 
 mod connect;
 mod failover;
+mod persistence;
 mod publish;
 mod sessions;
+mod sys;
 mod v5;
 
 fn config(conf: &'static str) -> BrokerConfig<'static> {

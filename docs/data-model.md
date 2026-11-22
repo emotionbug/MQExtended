@@ -1,6 +1,6 @@
 # Data model
 
-State is split by write rate and by what must survive the loss of a node. In a cluster both tiers live in the replicated log; standalone mode keeps the same state in memory.
+State is split by write rate and by what must survive the loss of a node. In a cluster both tiers live in the replicated log; standalone mode keeps the same state in memory and, with `persistence true`, saves it to disk as Mosquitto does (on `autosave_interval`, SIGUSR1 and clean shutdown).
 
 ## Tiers
 
@@ -9,13 +9,17 @@ State is split by write rate and by what must survive the loss of a node. In a c
 | 1. Metadata | client-id ownership and connection epoch; persistent-session subscriptions and settings; will messages; retained messages; node membership and leases | connect, disconnect, (un)subscribe, retained publish, node events | every node: subscription index, takeover, CONNACK `session_present`, retained delivery |
 | 2. Inbox | queued messages and in-flight state of persistent sessions | every message to a persistent subscriber, every acknowledgement | the node currently serving that session |
 
-Transient (clean-session) sessions keep their outgoing queue in the memory of the node serving them. Their claim and subscriptions are replicated so every node can route to them, and are removed when the connection ends or the node is declared down.
+Transient (clean-session) sessions keep their outgoing queue in the memory of the node serving them. Their claim and subscriptions are replicated so every node can route to them, and are removed when the connection ends or the node is declared down. Messages reach them over the mesh, not the log ([architecture](architecture.md#request-flows)).
+
+A message to a persistent session is reserved for sending in the same commit that queues it (or that acknowledges the previous message, when the in-flight window was full). The serving node then sends it without another round. Because the reservation is committed before the packet can be written, a session that resumes on another node resends exactly the reserved messages with DUP set, as Mosquitto's `database.c` marks a message sent before writing it. A crash between commit and socket write can set DUP on a packet the client never received; the spec allows that, and clients treat DUP as a hint only.
 
 ## Rules
 
 - **Ownership is an epoch, not a node name.** Every claim increments the epoch. A node acts on a session only while its connection carries the current epoch; anything older is closed.
 - **Retained messages are global.** A retained publish is a tier-1 write so every node serves the same retained set to new subscriptions.
 - **Wills are replicated at CONNECT.** A node that dies cannot publish its clients' wills; the node that removes it does.
+- **Bridge ownership is a claim.** A bridge runs on the node holding the claim on its local client id. A node stops its bridges as soon as it can no longer prove a fresh lease renewal, so it always steps down before a peer can take the bridge over.
+- **Security and `$SYS` state are replicated.** Dynamic-security changes and each `$SYS` sample are log commands, so every node enforces the same rules and serves the same retained `$SYS` tree.
 - **Limits follow Mosquitto defaults.** Queue length 1000 (`max_queued_messages`), in-flight window 20 (`max_inflight_messages`), no session expiry, QoS 0 not queued for offline sessions (`queue_qos0_messages false`). See [Mosquitto compatibility](mosquitto-compatibility.md#defaults).
 
 ## Replication semantics

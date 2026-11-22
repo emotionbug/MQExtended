@@ -5,8 +5,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::future::try_join_all;
 use mqx_cluster::{
-    Cluster, ClusterConfig, ClusterError, ClusterSecurity, NodeEvent, NodeStatus, SnapshotPolicy,
-    StateMachine,
+    Cluster, ClusterConfig, ClusterError, ClusterSecurity, MemberRole, NodeEvent, NodeStatus,
+    SnapshotPolicy, StateMachine,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -175,13 +175,14 @@ async fn event(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn snapshot_and_log_tail_rebuild_standalone_before_election() {
+async fn versioned_reader_restores_legacy_snapshot_and_versioned_wal_tail() {
     let root = tempfile::tempdir().unwrap();
     let mut cfg = configs(&root, 1, SnapshotPolicy::LogsSinceLast(8))
         .remove(&1)
         .unwrap();
     cfg.lease_interval = Duration::from_secs(30);
     cfg.lease_timeout = Duration::from_secs(60);
+    cfg.state_format = 1;
     let node = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
     let mut last = 0;
     for i in 0..8 {
@@ -214,10 +215,23 @@ async fn snapshot_and_log_tail_rebuild_standalone_before_election() {
             );
         }
     }
+    // The first lease heartbeat can race the writes. Include its Alive
+    // transition before comparing all application state across restarts.
+    until(|| {
+        node.read(|kv| {
+            kv.durable
+                .events
+                .iter()
+                .any(|(_, id, status, _)| *id == 1 && *status == NodeStatus::Alive)
+        })
+        .then_some(())
+    })
+    .await;
     let initial = node.read(|kv| kv.durable.clone());
     node.shutdown().await.unwrap();
 
     cfg.snapshot_policy = SnapshotPolicy::Never;
+    cfg.state_format = 2;
     let node = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
     assert_eq!(node.read(|kv| kv.durable.clone()), initial);
     let tail = put(&node, "0", "after snapshot").await;
@@ -630,13 +644,21 @@ async fn configured_packet_limit_carries_large_forwarded_commands_and_mesh_paylo
     stop(nodes).await;
 }
 
-/// `cargo test --release -p mqx-cluster --test cluster -- --ignored --nocapture`
+/// `MQX_BENCH_DATA_DIR="$PWD/target" cargo test --release -p mqx-cluster --test cluster three_node_mtls_commit_throughput -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual local filesystem and mTLS throughput benchmark"]
 async fn three_node_mtls_commit_throughput() {
-    const CLIENTS: usize = 64;
-    const OPERATIONS: usize = 32;
-    let root = tempfile::tempdir().unwrap();
+    const CLIENTS_PER_NODE: usize = 64;
+    const CLIENTS: usize = CLIENTS_PER_NODE * 3;
+    const OPERATIONS: usize = 64;
+    let root = match std::env::var_os("MQX_BENCH_DATA_DIR") {
+        Some(parent) => tempfile::Builder::new()
+            .prefix("mqx-wal-bench-")
+            .tempdir_in(parent),
+        None => tempfile::tempdir(),
+    }
+    .unwrap();
+    println!("WAL benchmark data: {}", root.path().display());
     let mut configs = configs(&root, 3, SnapshotPolicy::Never);
     with_tls(&root, &mut configs);
     for cfg in configs.values_mut() {
@@ -651,6 +673,11 @@ async fn three_node_mtls_commit_throughput() {
     elected(&nodes).await;
     for node in nodes.values() {
         put(node, "warm-up", "ready").await;
+    }
+    let mut before = BTreeMap::new();
+    for (&id, node) in &nodes {
+        node.linearizable_read(|_| ()).await.unwrap();
+        before.insert(id, node.wal_metrics().await.unwrap());
     }
     let start = Instant::now();
     let jobs = (0..CLIENTS)
@@ -686,5 +713,336 @@ async fn three_node_mtls_commit_throughput() {
         p(95),
         p(99),
     );
+    for (id, node) in &nodes {
+        node.linearizable_read(|kv| {
+            let writes = &kv.durable.writes;
+            assert_eq!(writes.len(), CLIENTS * OPERATIONS + nodes.len());
+            assert!(writes.windows(2).all(|pair| pair[0] < pair[1]));
+        })
+        .await
+        .unwrap();
+        let after = node.wal_metrics().await.unwrap();
+        let entries = after.appended_entries - before[id].appended_entries;
+        let syncs = after.sync_batches - before[id].sync_batches;
+        println!(
+            "node {id}: {entries} WAL entries / {syncs} sync batches = {:.2} entries/sync batch",
+            entries as f64 / syncs as f64
+        );
+    }
+    stop(nodes).await;
+}
+
+fn expanding_configs(
+    root: &tempfile::TempDir,
+    policy: SnapshotPolicy,
+) -> BTreeMap<u64, ClusterConfig> {
+    let mut configs = configs(root, 5, policy);
+    for (&id, config) in &mut configs {
+        config.join = id > 3;
+        if !config.join {
+            config.peers.retain(|id, _| *id <= 3);
+        }
+    }
+    configs
+}
+
+fn request_membership(
+    nodes: &BTreeMap<u64, Node>,
+    generation: u64,
+    peers: &BTreeMap<u64, SocketAddr>,
+) {
+    for node in nodes.values() {
+        node.membership_control()
+            .configure(generation, peers.clone())
+            .unwrap();
+    }
+}
+
+// Separate process so the replacement leaves a real crash WAL, without a final flush.
+#[tokio::test]
+#[ignore = "subprocess for the replacement test"]
+async fn replacement_follower_process() {
+    let Some(data_dir) = std::env::var_os("MQX_TEST_CRASH_DATA_DIR") else {
+        return;
+    };
+    let peers = std::env::var("MQX_TEST_CRASH_PEERS")
+        .unwrap()
+        .split(',')
+        .map(|pair| {
+            let (id, address) = pair.split_once('=').unwrap();
+            (id.parse().unwrap(), address.parse().unwrap())
+        })
+        .collect::<BTreeMap<u64, SocketAddr>>();
+    let mut config = ClusterConfig::new(
+        2,
+        peers[&2],
+        peers,
+        data_dir.into(),
+        ClusterSecurity::InsecurePlaintext,
+    );
+    config.lease_interval = Duration::from_millis(70);
+    let _node = Node::start(config, Kv::default()).await.unwrap();
+    std::future::pending::<()>().await;
+}
+
+struct FollowerProcess(std::process::Child);
+
+impl Drop for FollowerProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replaces_a_killed_voter_without_stopping_writes_and_refuses_its_wal() {
+    let root = tempfile::tempdir().unwrap();
+    let configs = expanding_configs(&root, SnapshotPolicy::LogsSinceLast(8));
+    let mut nodes = start(&BTreeMap::from([
+        (1, configs[&1].clone()),
+        (3, configs[&3].clone()),
+    ]))
+    .await;
+    let leader = nodes[&elected(&nodes).await].clone();
+    let peers = configs[&2]
+        .peers
+        .iter()
+        .map(|(id, addr)| format!("{id}={addr}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let crashed = FollowerProcess(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "replacement_follower_process"])
+            .env("MQX_TEST_CRASH_DATA_DIR", &configs[&2].data_dir)
+            .env("MQX_TEST_CRASH_PEERS", peers)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    until(|| (leader.node_statuses().get(&2) == Some(&NodeStatus::Alive)).then_some(())).await;
+    let old_value = put(&leader, "retained", "before loss").await;
+    drop(crashed);
+    for i in 0..20 {
+        put(&leader, &format!("before-replacement-{i}"), "committed").await;
+    }
+    until(|| {
+        leader
+            .metrics()
+            .purged_index
+            .filter(|index| *index >= old_value.index)
+    })
+    .await;
+    let desired = BTreeMap::from([
+        (1, configs[&1].raft_addr),
+        (3, configs[&3].raft_addr),
+        (4, configs[&4].raft_addr),
+    ]);
+    request_membership(&nodes, 1, &desired);
+    until(|| {
+        leader
+            .membership_control()
+            .status()
+            .members
+            .get(&4)
+            .filter(|member| member.role == MemberRole::Learner)
+            .cloned()
+    })
+    .await;
+    put(&leader, "still-writes", "before learner started").await;
+    let mut join = configs[&4].clone();
+    join.snapshot_policy = SnapshotPolicy::Never;
+    let replacement = Node::start(join, Kv::default()).await.unwrap();
+    timeout(WAIT, async {
+        for i in 0.. {
+            put(&leader, &format!("during-replacement-{i}"), "committed").await;
+            if replacement.members() == desired {
+                break;
+            }
+            sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap();
+    timeout(WAIT, replacement.membership_control().wait_serving())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replacement.metrics().snapshot_index.unwrap() >= old_value.index);
+    replacement
+        .linearizable_read(|kv| {
+            assert_eq!(kv.durable.values["retained"], "before loss");
+            assert_eq!(kv.durable.values["still-writes"], "before learner started");
+            assert!(kv.restored > 0);
+        })
+        .await
+        .unwrap();
+    put(&replacement, "still-writes", "after promotion").await;
+    assert!(matches!(
+        Node::start(configs[&2].clone(), Kv::default()).await,
+        Err(ClusterError::Removed(2))
+    ));
+    assert!(matches!(
+        leader
+            .membership_control()
+            .configure(2, configs[&2].peers.clone()),
+        Err(ClusterError::Removed(2))
+    ));
+    nodes.insert(4, replacement);
+    stop(nodes).await;
+    // Old cluster_peer lines on restart must not undo the committed change.
+    let nodes = start(&BTreeMap::from([
+        (1, configs[&1].clone()),
+        (3, configs[&3].clone()),
+        (4, configs[&4].clone()),
+    ]))
+    .await;
+    let leader = &nodes[&elected(&nodes).await];
+    assert_eq!(
+        put(leader, "still-writes", "after restart")
+            .await
+            .previous
+            .as_deref(),
+        Some("after promotion")
+    );
+    assert_eq!(leader.members(), desired);
+    assert!(leader.membership_control().status().retired.contains(&2));
+    stop(nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adds_mtls_voters_then_refuses_a_quorum_losing_removal() {
+    let root = tempfile::tempdir().unwrap();
+    let mut configs = expanding_configs(&root, SnapshotPolicy::Never);
+    with_tls(&root, &mut configs);
+    let initial = configs
+        .iter()
+        .filter(|(id, _)| **id <= 3)
+        .map(|(&id, config)| (id, config.clone()))
+        .collect();
+    let mut nodes = start(&initial).await;
+    let leader_id = elected(&nodes).await;
+    let leader = nodes[&leader_id].clone();
+    let desired = configs[&4].peers.clone();
+    for id in [4, 5] {
+        nodes.insert(
+            id,
+            Node::start(configs[&id].clone(), Kv::default())
+                .await
+                .unwrap(),
+        );
+        assert!(!nodes[&id].membership_control().is_serving());
+    }
+    request_membership(&nodes, 1, &desired);
+    until(|| {
+        nodes
+            .values()
+            .all(|node| node.members() == desired)
+            .then_some(())
+    })
+    .await;
+    put(&nodes[&5], "healthy", "five voters").await;
+    for id in [4, 5] {
+        nodes.remove(&id).unwrap().shutdown().await.unwrap();
+    }
+    // The existing five-voter group has a quorum; this target would not.
+    request_membership(
+        &nodes,
+        2,
+        &BTreeMap::from([
+            (leader_id, desired[&leader_id]),
+            (4, desired[&4]),
+            (5, desired[&5]),
+        ]),
+    );
+    until(|| {
+        leader
+            .membership_control()
+            .status()
+            .reconciliation_error
+            .filter(|error| error.contains("would lose quorum"))
+    })
+    .await;
+    assert_eq!(leader.members(), desired);
+    put(&leader, "healthy", "unsafe request did not commit").await;
+
+    let remove = nodes.keys().copied().find(|id| *id != leader_id).unwrap();
+    let target: BTreeMap<_, _> = desired
+        .into_iter()
+        .filter(|(id, _)| *id != remove && *id != 4 && *id != 5)
+        .collect();
+    let removed = nodes[&remove].membership_control();
+    request_membership(&nodes, 3, &target);
+    timeout(WAIT, removed.wait_removed()).await.unwrap();
+    assert!(!removed.is_serving());
+    assert!(
+        matches!(nodes[&remove].submit(Insert("unsafe".into(), "removed".into())).await, Err(ClusterError::Removed(id)) if id == remove)
+    );
+    assert_eq!(leader.members(), target);
+    put(&leader, "healthy", "after safe removal").await;
+    stop(nodes).await;
+}
+
+struct NextSchema(Kv);
+
+impl StateMachine for NextSchema {
+    type Command = Insert;
+    type Response = Reply;
+
+    const WRITE_VERSION: u16 = 2;
+
+    fn supports_version(version: u16) -> bool {
+        matches!(version, 1 | 2)
+    }
+
+    fn apply(&mut self, index: u64, command: Insert) -> Reply {
+        self.0.apply(index, command)
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.0.snapshot()
+    }
+
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
+        self.0.restore(bytes)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_readers_refuse_new_payloads_without_losing_old_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let configs = configs(&root, 3, SnapshotPolicy::Never);
+    let nodes = start(&BTreeMap::from([
+        (1, configs[&1].clone()),
+        (2, configs[&2].clone()),
+    ]))
+    .await;
+    let leader = &nodes[&elected(&nodes).await];
+    let newer = Cluster::start(configs[&3].clone(), NextSchema(Kv::default()))
+        .await
+        .unwrap();
+    timeout(WAIT, newer.membership_control().wait_serving())
+        .await
+        .unwrap()
+        .unwrap();
+    let error = newer
+        .submit(Insert("future".into(), "must not commit".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ClusterError::UnsupportedVersion {
+            kind: "application command",
+            version: 2
+        }
+    ));
+    put(leader, "old", "committed").await;
+    newer
+        .linearizable_read(|state| {
+            assert!(!state.0.durable.values.contains_key("future"));
+            assert_eq!(state.0.durable.values["old"], "committed");
+        })
+        .await
+        .unwrap();
+    newer.shutdown().await.unwrap();
     stop(nodes).await;
 }

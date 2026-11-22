@@ -1,7 +1,13 @@
+mod bridge;
+mod dynamic_security;
 mod proposals;
+mod telemetry;
+pub use bridge::{BridgeAck, BridgeIdentity, BridgeSession};
+pub use telemetry::SocketObservation;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
+    net::IpAddr,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,10 +30,12 @@ use crate::{
     BrokerConfig, BrokerError, ConnectionInfo, SECURITY_REVISION, Security, SecurityHandle,
     connection, fast,
     inbox::{Delivery, Inbox, Offer, Outbound},
+    persistence::PersistentState,
     state::{
         BatchEntry, Claim, ClaimToken, Command, Effect, Epoch, Lease, Mutations, Operation, Owner,
         Publication, Reply, State,
     },
+    sys::{Metric, ProposalLatency, Traffic},
 };
 
 /// Shared MQTT broker. Each active transport is driven by one `serve` call.
@@ -36,9 +44,13 @@ pub struct Broker(pub(super) Arc<Inner>);
 
 pub(super) struct Inner {
     pub(super) config: Arc<BrokerConfig>,
+    connection_messages: AtomicBool,
     pub(super) shutdown: watch::Sender<bool>,
+    pub(super) traffic: Traffic,
+    sys_interval: watch::Sender<Option<u16>>,
     runtime: Arc<Mutex<Runtime>>,
     log: Log,
+    dynamic_security_registration: tokio::sync::Mutex<()>,
 }
 
 // Both backends apply exactly the same commands. Only Raft writes wait for
@@ -46,6 +58,7 @@ pub(super) struct Inner {
 enum Log {
     Local {
         started: Instant,
+        wall_origin: Duration,
         expiry_changed: watch::Sender<()>,
     },
     Replicated(ReplicatedLog),
@@ -60,9 +73,11 @@ struct ReplicatedLog {
     fence_timeout: Duration,
     // MeshSend only confirms a socket write; waiting for each peer's
     // handler response prevents a later connection overtaking this one.
-    peer_lanes: BTreeMap<u64, tokio::sync::Mutex<()>>,
+    peer_lanes: Mutex<BTreeMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     proposals: mpsc::Sender<proposals::Proposal>,
     batch_limits: proposals::Limits,
+    max_command_size: usize,
+    proposal_latency: Box<ProposalLatency>,
 }
 
 struct LocalLog {
@@ -70,6 +85,7 @@ struct LocalLog {
     security: HashMap<u64, (SecurityHandle, Arc<Security>)>,
     security_revision: u64,
     expiry_running: bool,
+    persistence_changed: Option<watch::Sender<u64>>,
 }
 
 #[derive(Default)]
@@ -79,11 +95,14 @@ struct Runtime {
     pending: HashMap<ClaimToken, Pending>,
     connections: usize,
     listeners: HashMap<usize, usize>,
+    transient_drops: i64,
+    dynamic_security_path: Option<std::path::PathBuf>,
 }
 
 struct Pending {
     transient: bool,
     receive_maximum: Option<u16>,
+    peer_ip: Option<IpAddr>,
     live: Option<Arc<Live>>,
 }
 
@@ -91,18 +110,33 @@ pub(super) struct Live {
     pub(super) lease: Lease,
     pub(super) inbox: Option<Mutex<Inbox>>,
     pub(super) taken: AtomicBool,
+    pub(super) kicked: AtomicBool,
     pub(super) ready: Notify,
+    peer_ip: Option<IpAddr>,
     sequence: AtomicU64,
+    outbox: Mutex<Outbox>,
+}
+
+#[derive(Default)]
+struct Outbox {
+    packets: VecDeque<Outbound>,
+    interrupted: bool,
 }
 
 pub(super) enum ClaimResult {
     Accepted(Arc<Live>, bool),
     Full,
+    Unauthorized,
     Stale,
 }
 
 impl Live {
-    fn new(lease: Lease, transient: bool, receive_maximum: Option<u16>) -> Self {
+    fn new(
+        lease: Lease,
+        transient: bool,
+        receive_maximum: Option<u16>,
+        peer_ip: Option<IpAddr>,
+    ) -> Self {
         Self {
             lease,
             inbox: transient.then(|| {
@@ -111,14 +145,35 @@ impl Live {
                 Mutex::new(inbox)
             }),
             taken: AtomicBool::new(false),
+            kicked: AtomicBool::new(false),
             ready: Notify::new(),
+            peer_ip,
             sequence: AtomicU64::new(0),
+            outbox: Mutex::new(Outbox::default()),
         }
     }
 
     fn close(&self) {
         self.taken.store(true, Ordering::Release);
         self.ready.notify_one();
+    }
+
+    fn interrupt_outbound(&self) {
+        // A snapshot can restore the cursor without the committed send
+        // effects. Reconnecting recovers those packets from the inbox.
+        self.outbox.lock().unwrap().interrupted = true;
+        self.ready.notify_one();
+    }
+
+    fn pop_reserved(&self) -> Result<Option<Outbound>, BrokerError> {
+        let mut outbox = self.outbox.lock().unwrap();
+        if outbox.interrupted {
+            return Err(ClusterError::WriteUncertain(
+                "snapshot skipped outbound send effects".into(),
+            )
+            .into());
+        }
+        Ok(outbox.packets.pop_front())
     }
 }
 
@@ -127,9 +182,14 @@ impl Broker {
         let config = Arc::new(config);
         Self(Arc::new(Inner {
             config: config.clone(),
+            connection_messages: AtomicBool::new(config.connection_messages),
             shutdown: watch::Sender::new(false),
+            traffic: Traffic::default(),
+            sys_interval: watch::Sender::new(None),
+            dynamic_security_registration: tokio::sync::Mutex::new(()),
             log: Log::Local {
                 started: Instant::now(),
+                wall_origin: wall_now(),
                 expiry_changed: watch::Sender::new(()),
             },
             runtime: Arc::new(Mutex::new(Runtime {
@@ -138,6 +198,7 @@ impl Broker {
                     security: HashMap::new(),
                     security_revision: SECURITY_REVISION.load(Ordering::Acquire),
                     expiry_running: false,
+                    persistence_changed: None,
                 }),
                 ..Runtime::default()
             })),
@@ -162,6 +223,7 @@ impl Broker {
         let tick = cluster.heartbeat_interval;
         let timeout = cluster.request_timeout;
         let fence_timeout = timeout.saturating_add(cluster.lease_timeout);
+        let max_command_size = cluster.max_command_size;
         let batch_limits =
             proposals::Limits::new(cluster.max_command_size, cluster.max_append_size);
         let cluster = Cluster::start(
@@ -176,17 +238,14 @@ impl Broker {
             },
         )
         .await?;
-        let peer_lanes = cluster
-            .members()
-            .keys()
-            .copied()
-            .filter(|id| *id != owner.node)
-            .map(|id| (id, tokio::sync::Mutex::new(())))
-            .collect();
         let broker = Self(Arc::new(Inner {
+            connection_messages: AtomicBool::new(config.connection_messages),
             config,
             runtime,
             shutdown: watch::Sender::new(false),
+            traffic: Traffic::default(),
+            sys_interval: watch::Sender::new(None),
+            dynamic_security_registration: tokio::sync::Mutex::new(()),
             log: Log::Replicated(ReplicatedLog {
                 cluster,
                 owner,
@@ -194,9 +253,11 @@ impl Broker {
                 boot: OnceCell::new(),
                 timeout,
                 fence_timeout,
-                peer_lanes,
+                peer_lanes: Mutex::new(BTreeMap::new()),
                 proposals,
                 batch_limits,
+                max_command_size,
+                proposal_latency: Box::default(),
             }),
         }));
         let Log::Replicated(log) = &broker.0.log else {
@@ -246,6 +307,8 @@ impl Broker {
         stream: S,
         info: ConnectionInfo,
     ) -> Result<(), BrokerError> {
+        self.record_socket_accept();
+        let _socket = self.track_socket();
         self.serve_accepted(stream, info, Instant::now()).await
     }
 
@@ -272,6 +335,88 @@ impl Broker {
             .map_err(BrokerError::from)
     }
 
+    /// Connection notices are reloadable independently of broker-wide protocol rules.
+    pub fn set_connection_messages(&self, enabled: bool) {
+        self.0.connection_messages.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn connection_messages(&self) -> bool {
+        self.0.connection_messages.load(Ordering::Relaxed)
+    }
+
+    /// Whether this replica has MQTT state that would fence a migration.
+    pub fn can_import_persistence(&self) -> bool {
+        match &self.0.log {
+            Log::Local { .. } => self
+                .0
+                .runtime
+                .lock()
+                .unwrap()
+                .local
+                .as_ref()
+                .unwrap()
+                .state
+                .can_import_persistence(),
+            Log::Replicated(log) => log
+                .cluster
+                .read(|machine| machine.state.can_import_persistence()),
+        }
+    }
+
+    /// Run once before accepting connections. Cluster imports publish the
+    /// image through the replicated log and apply it atomically.
+    pub async fn restore_persistence(&self, state: PersistentState) -> Result<bool, BrokerError> {
+        match &self.0.log {
+            Log::Local { .. } => {
+                let mut runtime = self.0.runtime.lock().unwrap();
+                let restored = runtime
+                    .local
+                    .as_mut()
+                    .unwrap()
+                    .state
+                    .restore_persistence(state, self.now());
+                self.schedule_local_expiry(&mut runtime);
+                Ok(restored)
+            }
+            Log::Replicated(log) => log.import_persistence(state).await,
+        }
+    }
+
+    /// Subscribe to the standalone broker's autosave-counted mutations.
+    pub fn watch_persistence_changes(&self) -> Option<watch::Receiver<u64>> {
+        let mut runtime = self.0.runtime.lock().unwrap();
+        let local = runtime.local.as_mut()?;
+        Some(
+            local
+                .persistence_changed
+                .get_or_insert_with(|| watch::Sender::new(local.state.persistence_changes))
+                .subscribe(),
+        )
+    }
+
+    pub(super) fn count_transient_ack(&self, ack: crate::inbox::Ack) {
+        if !self.is_clustered() && ack.counts_for_persistence() {
+            let mut runtime = self.0.runtime.lock().unwrap();
+            let local = runtime.local.as_mut().unwrap();
+            local.state.persistence_changes += 1;
+            local.notify_persistence_change();
+        }
+    }
+
+    /// Capture standalone state and its autosave change watermark under one lock.
+    pub fn persistence_snapshot(&self, shutdown: bool) -> Option<(u64, PersistentState)> {
+        let mut runtime = self.0.runtime.lock().unwrap();
+        let now = self.now();
+        let local = runtime.local.as_mut()?;
+        if shutdown {
+            let mut effects = Vec::new();
+            local.state.flush_shutdown_wills(now, &mut effects);
+            runtime.dispatch(effects, &self.0.config, Owner::LOCAL, None);
+        }
+        let state = &runtime.local.as_ref().unwrap().state;
+        Some((state.persistence_changes, state.persistent_snapshot(now)))
+    }
+
     /// Stop accepting clients and ask existing connections to close.
     pub fn shutdown(&self) {
         self.0.shutdown.send_replace(true);
@@ -292,6 +437,14 @@ impl Broker {
         result
     }
 
+    /// Control the local Raft membership; standalone brokers have no cluster.
+    pub fn cluster_membership(&self) -> Option<mqx_cluster::MembershipControl> {
+        match &self.0.log {
+            Log::Local { .. } => None,
+            Log::Replicated(log) => Some(log.cluster.membership_control()),
+        }
+    }
+
     // net.c: net__socket_accept checks accepted sockets, before MQTT CONNECT.
     fn admit(&self, info: &ConnectionInfo) -> Option<Permit<'_>> {
         if *self.0.shutdown.borrow() {
@@ -305,7 +458,7 @@ impl Broker {
             || (listener_limit != 0
                 && runtime.listeners.get(&key).copied().unwrap_or(0) >= listener_limit)
         {
-            if self.0.config.connection_messages {
+            if self.connection_messages() {
                 tracing::info!(
                     "Client connection from {} denied: max_connections exceeded.",
                     connection::Address(info.peer_addr)
@@ -328,6 +481,7 @@ impl Broker {
         &self,
         security: &SecurityHandle,
         mut claim: Claim,
+        peer_ip: Option<IpAddr>,
     ) -> Result<ClaimResult, BrokerError> {
         let transient = claim.local_inbox();
         let receive_maximum = claim
@@ -336,9 +490,9 @@ impl Broker {
             .map(|v5| v5.outgoing_maximum(&self.0.config));
         claim.now = self.now();
         match &self.0.log {
-            Log::Local { started, .. } => {
+            Log::Local { .. } => {
                 let mut runtime = self.0.runtime.lock().unwrap();
-                let now = started.elapsed();
+                let now = self.now();
                 if runtime
                     .local
                     .as_ref()
@@ -363,9 +517,10 @@ impl Broker {
                     Reply::Claimed { lease, present } => (lease, present),
                     Reply::Full => return Ok(ClaimResult::Full),
                     Reply::Stale => return Ok(ClaimResult::Stale),
+                    Reply::DynamicSecurityChanged => return Ok(ClaimResult::Unauthorized),
                     _ => unreachable!(),
                 };
-                let live = Arc::new(Live::new(lease, transient, receive_maximum));
+                let live = Arc::new(Live::new(lease, transient, receive_maximum, peer_ip));
                 runtime.live.insert(live.lease.epoch, live.clone());
                 self.schedule_local_expiry(&mut runtime);
                 Ok(ClaimResult::Accepted(live, present))
@@ -381,6 +536,7 @@ impl Broker {
                         Pending {
                             transient,
                             receive_maximum,
+                            peer_ip,
                             live: None,
                         },
                     );
@@ -403,6 +559,10 @@ impl Broker {
                         pending.take();
                         return Ok(ClaimResult::Full);
                     }
+                    Reply::DynamicSecurityChanged => {
+                        pending.take();
+                        return Ok(ClaimResult::Unauthorized);
+                    }
                     Reply::Stale => {
                         pending.take();
                         return Ok(ClaimResult::Stale);
@@ -419,7 +579,10 @@ impl Broker {
                         if !machine.state.owns(log.owner, &lease) {
                             return None;
                         }
-                        let live = Arc::new(Live::new(lease, transient, receive_maximum));
+                        let live = Arc::new(Live::new(lease, transient, receive_maximum, peer_ip));
+                        if machine.state.has_reserved_outbound(&live.lease) {
+                            live.interrupt_outbound();
+                        }
                         runtime.live.insert(live.lease.epoch, live.clone());
                         Some(live)
                     })
@@ -438,7 +601,11 @@ impl Broker {
 
     pub(super) fn now(&self) -> Duration {
         match &self.0.log {
-            Log::Local { started, .. } => started.elapsed(),
+            Log::Local {
+                started,
+                wall_origin,
+                ..
+            } => wall_origin.saturating_add(started.elapsed()),
             Log::Replicated(_) => wall_now(),
         }
     }
@@ -457,6 +624,13 @@ impl Broker {
         live: &Live,
         publication: Publication,
     ) -> Result<Reply, BrokerError> {
+        self.0.traffic.add(
+            Metric::PayloadReceived,
+            publication.packet.payload.len() as i64,
+        );
+        if publication.packet.topic == mqx_auth::DYNSEC_CONTROL_TOPIC {
+            return self.receive_dynamic_control(live, publication).await;
+        }
         let admitted_local = publication.packet.qos == QoS::AtLeastOnce
             && live
                 .inbox
@@ -488,10 +662,13 @@ impl Broker {
         };
         log.cluster
             .read(|machine| machine.state.publisher_only(&live.lease))
-            && live.inbox.as_ref().is_none_or(|inbox| {
-                let inbox = inbox.lock().unwrap();
-                inbox.simple_qos1() && !inbox.has_outbound(&self.0.config)
-            })
+            && live.inbox.as_ref().map_or_else(
+                || live.outbox.lock().unwrap().packets.is_empty(),
+                |inbox| {
+                    let inbox = inbox.lock().unwrap();
+                    inbox.simple_qos1() && !inbox.has_outbound(&self.0.config)
+                },
+            )
     }
 
     pub(super) async fn receive_many(
@@ -505,6 +682,28 @@ impl Broker {
         let mut responses = Vec::with_capacity(publications.len());
         let mut durable = Vec::new();
         for publication in publications {
+            self.0.traffic.add(
+                Metric::PayloadReceived,
+                publication.packet.payload.len() as i64,
+            );
+            if publication.packet.topic == mqx_auth::DYNSEC_CONTROL_TOPIC {
+                if !durable.is_empty() {
+                    responses.extend(
+                        log.propose(live.lease.clone(), std::mem::take(&mut durable))
+                            .await?,
+                    );
+                    if matches!(responses.last(), Some(Reply::Stale | Reply::ProtocolError)) {
+                        return Ok(responses);
+                    }
+                }
+                let reply = self.receive_dynamic_control(live, publication).await?;
+                let stop = reply == Reply::Stale || live.taken.load(Ordering::Acquire);
+                responses.push(reply);
+                if stop {
+                    return Ok(responses);
+                }
+                continue;
+            }
             let local = publication.packet.qos == QoS::AtLeastOnce && live.inbox.is_some();
             let mut plan = log.plan(live, &publication, local);
             if plan.is_some() && !durable.is_empty() {
@@ -593,7 +792,8 @@ impl Broker {
             if node == log.owner.node {
                 self.deliver_owned_fast(log, node, publication);
             } else {
-                let _ordered = log.peer_lanes[&node].lock().await;
+                let lane = log.peer_lane(node);
+                let _ordered = lane.lock().await;
                 // Do not retry an uncertain send: it may already be in a
                 // recipient's inbox, especially for QoS 0.
                 if let Err(error) = log
@@ -622,6 +822,11 @@ impl Broker {
                 // sender is already enqueued here before this direct delivery.
                 log.wait_applied(publication.index).await?;
                 self.deliver_owned_fast(log, from, publication);
+            }
+            fast::Request::SysSample => {
+                return rmp_serde::to_vec(&self.sample_node(log.owner))
+                    .map(Bytes::from)
+                    .map_err(|error| ClusterError::MeshHandler(error.to_string()));
             }
         }
         Ok(Bytes::new())
@@ -653,14 +858,39 @@ impl Broker {
                 .unwrap()
                 .next_outbound(&self.0.config, self.now()));
         }
-        if let Log::Replicated(log) = &self.0.log
-            && !log
+        if let Log::Replicated(log) = &self.0.log {
+            if let Some(packet) = live.pop_reserved()? {
+                return Ok(Some(packet));
+            }
+            if !log
                 .cluster
                 .read(|machine| machine.state.has_outbound(&live.lease))
-        {
-            // A delivery committed after this read wakes the local transport
-            // through its apply effect. An empty inbox needs no Raft write.
-            return Ok(None);
+            {
+                // A later committed delivery wakes the transport on apply.
+                return Ok(None);
+            }
+            // Advance the replicated cursor before sending. The owning replica
+            // already has the payload, so only a small reply crosses Raft RPC.
+            let reply = self
+                .act(live, Operation::ReserveOutbound(self.now()))
+                .await?;
+            match reply {
+                Reply::OutboundReserved | Reply::NoChange => {
+                    let packet = live.pop_reserved()?;
+                    if packet.is_none()
+                        && reply == Reply::OutboundReserved
+                        && !live.taken.load(Ordering::Acquire)
+                    {
+                        return Err(ClusterError::WriteUncertain(
+                            "outbound reservation applied without a local packet".into(),
+                        )
+                        .into());
+                    }
+                    return Ok(packet);
+                }
+                Reply::Stale => return Ok(None),
+                _ => unreachable!(),
+            }
         }
         match self.act(live, Operation::NextOutbound(self.now())).await? {
             Reply::Outbound(outbound) => Ok(outbound),
@@ -795,6 +1025,15 @@ impl Broker {
 }
 
 impl ReplicatedLog {
+    fn peer_lane(&self, node: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.peer_lanes
+            .lock()
+            .unwrap()
+            .entry(node)
+            .or_default()
+            .clone()
+    }
+
     fn plan(
         &self,
         live: &Live,
@@ -836,18 +1075,66 @@ impl ReplicatedLog {
         replies.await.map_err(|_| ClusterError::Shutdown)?
     }
 
+    async fn import_persistence(&self, image: PersistentState) -> Result<bool, BrokerError> {
+        let size = self.max_command_size.saturating_sub(128);
+        if size == 0 {
+            return Err(ClusterError::InvalidConfig(
+                "command budget is too small for migration".into(),
+            )
+            .into());
+        }
+        let image = tokio::task::spawn_blocking(move || {
+            rmp_serde::to_vec(&image)
+                .map(Bytes::from)
+                .map_err(std::io::Error::other)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        for offset in (0..image.len()).step_by(size) {
+            let end = (offset + size).min(image.len());
+            let finish = (end == image.len()).then(wall_now);
+            match self
+                .submit(Command::ImportPersistence {
+                    offset,
+                    bytes: image.slice(offset..end),
+                    finish,
+                })
+                .await?
+            {
+                Reply::PersistenceStaged => {}
+                Reply::PersistenceImported => return Ok(true),
+                Reply::NoChange => return Ok(false),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid replicated persistence import",
+                    )
+                    .into());
+                }
+            }
+        }
+        unreachable!("an encoded image always includes a MessagePack header")
+    }
+
     async fn submit(&self, command: Command) -> Result<Reply, BrokerError> {
         let fence = match &command {
-            Command::SetAcl { .. } => true,
+            Command::SetAcl { .. }
+            | Command::InitDynamicSecurity(_)
+            | Command::ImportPersistence {
+                finish: Some(_), ..
+            } => true,
             Command::Act(_, operation) => operation.needs_fence(),
             Command::Batch(batch) => batch.iter().any(BatchEntry::needs_fence),
             _ => false,
         };
         // Cluster::submit follows definitive redirects, but never retries an
         // ambiguous write. Propagation closes the MQTT connection on uncertainty.
-        let applied = self.cluster.submit(command).await?;
+        let started = Instant::now();
+        let applied = self.cluster.submit(command).await;
+        self.proposal_latency.record(started.elapsed());
+        let applied = applied?;
         self.wait_applied(applied.index).await?;
-        if fence {
+        if fence || applied.reply.dynamic_security_mutated() {
             self.fence_peers(applied.index).await?;
         }
         Ok(applied.reply)
@@ -883,9 +1170,19 @@ impl ReplicatedLog {
         // visible to any existing publisher's local routing replica. A down
         // node cannot host an active session until its next committed Boot.
         let deadline = Instant::now() + self.fence_timeout;
-        for &node in self.peer_lanes.keys() {
+        for node in self
+            .cluster
+            .voter_ids()
+            .into_iter()
+            .filter(|&node| node != self.owner.node)
+        {
+            let peer_gone = || {
+                self.cluster
+                    .voter_status(node)
+                    .is_none_or(|status| status == NodeStatus::Down)
+            };
             loop {
-                if self.cluster.node_statuses().get(&node) == Some(&NodeStatus::Down) {
+                if peer_gone() {
                     break;
                 }
                 match tokio::time::timeout_at(
@@ -902,7 +1199,7 @@ impl ReplicatedLog {
                         tokio::time::sleep(Duration::from_millis(30)).await;
                     }
                     _ => {
-                        if self.cluster.node_statuses().get(&node) == Some(&NodeStatus::Down) {
+                        if peer_gone() {
                             break;
                         }
                         return Err(ClusterError::WriteUncertain(format!(
@@ -993,14 +1290,13 @@ struct Applied {
 }
 
 impl Machine {
-    fn emit(&self, effects: Vec<Effect>) {
-        if !effects.is_empty() {
-            self.runtime.lock().unwrap().dispatch(
-                effects,
-                &self.config,
-                self.owner,
-                Some(&self.abandoned),
-            );
+    fn emit(&self, effects: Vec<Effect>, save_dynamic_security: bool) {
+        if !effects.is_empty() || save_dynamic_security {
+            let mut runtime = self.runtime.lock().unwrap();
+            if save_dynamic_security {
+                runtime.save_dynamic_security(&self.state);
+            }
+            runtime.dispatch(effects, &self.config, self.owner, Some(&self.abandoned));
         }
         self.applied.send_replace(self.state.applied);
     }
@@ -1013,7 +1309,7 @@ impl StateMachine for Machine {
     fn apply(&mut self, index: u64, command: Command) -> Applied {
         let outcome = self.state.apply(command);
         self.state.applied = index;
-        self.emit(outcome.effects);
+        self.emit(outcome.effects, outcome.reply.dynamic_security_mutated());
         Applied {
             index,
             reply: outcome.reply,
@@ -1022,7 +1318,7 @@ impl StateMachine for Machine {
 
     fn on_node_event(&mut self, event: NodeEvent) {
         let effects = self.state.node_event(event);
-        self.emit(effects);
+        self.emit(effects, false);
     }
 
     fn snapshot(&self) -> Vec<u8> {
@@ -1030,10 +1326,18 @@ impl StateMachine for Machine {
     }
 
     fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
+        let previous = self.state.applied;
+        let previous_dynamic = self.state.dynamic_policy().map(|(revision, _)| revision);
         self.state.restore(bytes)?;
-        self.runtime.lock().unwrap().live.retain(|_, live| {
+        let mut runtime = self.runtime.lock().unwrap();
+        if previous_dynamic != self.state.dynamic_policy().map(|(revision, _)| revision) {
+            runtime.save_dynamic_security(&self.state);
+        }
+        runtime.live.retain(|_, live| {
             if self.state.owns(self.owner, &live.lease) {
-                if self.state.has_outbound(&live.lease) {
+                if self.state.applied > previous && self.state.has_reserved_outbound(&live.lease) {
+                    live.interrupt_outbound();
+                } else if self.state.has_outbound(&live.lease) {
                     live.ready.notify_one();
                 }
                 true
@@ -1056,8 +1360,16 @@ impl Runtime {
     ) -> Reply {
         let local = self.local.as_mut().unwrap();
         local.update_security(security);
+        let changes = local.state.persistence_changes;
         let outcome = local.state.apply(command);
+        if outcome.reply.dynamic_security_mutated() {
+            self.save_dynamic_security(&self.local.as_ref().unwrap().state);
+        }
         self.dispatch(outcome.effects, config, Owner::LOCAL, None);
+        let local = self.local.as_ref().unwrap();
+        if local.state.persistence_changes != changes {
+            local.notify_persistence_change();
+        }
         outcome.reply
     }
 
@@ -1076,8 +1388,12 @@ impl Runtime {
                     lease,
                 } if owner == here => {
                     if let Some(pending) = self.pending.get_mut(&token) {
-                        let live =
-                            Arc::new(Live::new(lease, pending.transient, pending.receive_maximum));
+                        let live = Arc::new(Live::new(
+                            lease,
+                            pending.transient,
+                            pending.receive_maximum,
+                            pending.peer_ip,
+                        ));
                         self.live.insert(live.lease.epoch, live.clone());
                         pending.live = Some(live);
                     } else if let Some(abandoned) = abandoned {
@@ -1088,13 +1404,30 @@ impl Runtime {
                 }
                 Effect::Attach { .. } => {}
                 Effect::Deliver { owner, packet } => self.deliver(owner, packet, config),
-                Effect::Ready(owner) => {
-                    if let Some(live) = self.live.get(&owner) {
+                Effect::Ready(lease) => {
+                    if let Some(live) = self.live.get(&lease.epoch) {
                         live.ready.notify_one();
+                    }
+                }
+                Effect::ReservedOutbound { owner, packet } => {
+                    if let Some(live) = self.live.get(&owner) {
+                        let mut outbox = live.outbox.lock().unwrap();
+                        let first = outbox.packets.is_empty();
+                        outbox.packets.push_back(packet);
+                        drop(outbox);
+                        if first {
+                            live.ready.notify_one();
+                        }
                     }
                 }
                 Effect::Takeover(owner) => {
                     if let Some(live) = self.live.remove(&owner) {
+                        live.close();
+                    }
+                }
+                Effect::Kick(owner) => {
+                    if let Some(live) = self.live.remove(&owner) {
+                        live.kicked.store(true, Ordering::Release);
                         live.close();
                     }
                 }
@@ -1115,8 +1448,16 @@ impl Runtime {
             .lock()
             .unwrap()
             .offer(packet, true, QoS::ExactlyOnce, config);
+        if matches!(result, Offer::Dropped | Offer::FirstDrop) {
+            self.transient_drops += 1;
+        }
         if result == Offer::FirstDrop {
             report_drop(&live.lease.id);
+        }
+        if result == Offer::Queued
+            && let Some(local) = &mut self.local
+        {
+            local.state.persistence_changes += 1;
         }
         if result == Offer::Ready {
             live.ready.notify_one();
@@ -1125,6 +1466,12 @@ impl Runtime {
 }
 
 impl LocalLog {
+    fn notify_persistence_change(&self) {
+        if let Some(changed) = &self.persistence_changed {
+            changed.send_replace(self.state.persistence_changes);
+        }
+    }
+
     fn update_security(&mut self, new: Option<&SecurityHandle>) {
         let revision = SECURITY_REVISION.load(Ordering::Acquire);
         if self.security_revision != revision {
@@ -1229,11 +1576,16 @@ async fn expire_local(inner: Weak<Inner>, mut changed: watch::Receiver<()>) {
             let Some(inner) = inner.upgrade() else {
                 return;
             };
-            let Log::Local { started, .. } = &inner.log else {
+            let Log::Local {
+                started,
+                wall_origin,
+                ..
+            } = &inner.log
+            else {
                 unreachable!()
             };
             let mut runtime = inner.runtime.lock().unwrap();
-            let now = started.elapsed();
+            let now = wall_origin.saturating_add(started.elapsed());
             if runtime
                 .local
                 .as_ref()
@@ -1250,7 +1602,7 @@ async fn expire_local(inner: Weak<Inner>, mut changed: watch::Receiver<()>) {
                 .next_expiry()
                 .filter(|_| !*inner.shutdown.borrow())
             {
-                *started + time
+                *started + time.saturating_sub(*wall_origin)
             } else {
                 local.expiry_running = false;
                 return;

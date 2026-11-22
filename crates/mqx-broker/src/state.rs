@@ -1,6 +1,13 @@
 //! Deterministic metadata and persistent inbox commands. Transport and clocks
 //! are outside the log; command inputs carry the observed time and ACL data.
 
+mod dynamic_security;
+mod persistence;
+mod telemetry;
+pub(crate) use dynamic_security::DynamicControl;
+use dynamic_security::DynamicPolicy;
+pub(crate) use telemetry::Store;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
@@ -8,7 +15,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use mqx_auth::{Access, AclFile};
+use mqx_auth::{Access, AclFile, DynamicSecurity};
 use mqx_codec::{LastWill, PacketId, Publish, QoS, SubscribeReturnCode, v5::ReasonCode as R};
 use mqx_topic::{SubscriptionIndex, validate_topic_filter};
 use serde::{Deserialize, Serialize};
@@ -16,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BrokerConfig,
     inbox::{Ack, Delivery, Inbox, Message, Offer, Outbound, PublishProperty, Publisher, Receive},
+    persistence::PendingImport,
     retained::Retained,
+    sys::{Metric, Sampler, Tick, Values},
 };
 
 pub(crate) type Epoch = u64;
@@ -61,6 +70,21 @@ pub(crate) enum Command {
     Act(Lease, Operation),
     Expire(Duration),
     Batch(Vec<BatchEntry>),
+    // Distinct from Batch so older WAL entries replay their original cursor transitions.
+    EagerBatch(Vec<BatchEntry>),
+    Sys(Tick),
+    SysLog {
+        topic: Box<str>,
+        payload: Bytes,
+        now: Duration,
+    },
+    ImportPersistence {
+        offset: usize,
+        bytes: Bytes,
+        finish: Option<Duration>,
+    },
+    InitDynamicSecurity(Arc<DynamicSecurity>),
+    DynamicSecurityControl(DynamicControl),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +120,12 @@ pub(crate) struct Claim {
     pub(crate) v5: Option<SessionSettings>,
     #[serde(default)]
     pub(crate) now: Duration,
+    // Only local bridge claims carry this identity. Keep it out of the inline
+    // MQTT claim so ordinary entries in a mixed proposal batch stay small.
+    #[serde(default)]
+    pub(crate) internal_bridge: Option<Box<BridgeState>>,
+    #[serde(default)]
+    pub(crate) dynamic_security_revision: Option<u64>,
 }
 
 impl Claim {
@@ -191,11 +221,38 @@ pub(crate) enum Operation {
     NextOutbound(Duration),
     /// Local transient incoming state cannot influence this particular QoS 1.
     ReceiveAdmitted(Publication),
+    ReserveOutbound(Duration),
+    BridgePrepare {
+        filters: Vec<SubscriptionRequest>,
+        will: Option<LastWill>,
+        max_qos: QoS,
+        clean_incoming: bool,
+        receive_maximum: Option<u16>,
+        now: Duration,
+    },
+    BridgeOnline {
+        max_qos: QoS,
+        receive_maximum: Option<u16>,
+        now: Duration,
+    },
+    BridgeOffline {
+        now: Duration,
+        graceful: bool,
+    },
+    BridgeNotify(Publication),
+    BridgeMid,
+    BridgeRemove,
 }
 
 impl Operation {
     pub(crate) fn needs_fence(&self) -> bool {
-        matches!(self, Self::Subscribe(..) | Self::Unsubscribe(_))
+        matches!(
+            self,
+            Self::Subscribe(..)
+                | Self::Unsubscribe(_)
+                | Self::BridgePrepare { .. }
+                | Self::BridgeRemove
+        )
     }
 }
 
@@ -214,6 +271,14 @@ pub(crate) enum Reply {
     PublishReason(u8),
     Unsubscribed(Vec<u8>),
     Batched(Vec<Vec<Reply>>),
+    OutboundReserved,
+    BridgeMid(PacketId),
+    PersistenceImported,
+    PersistenceStaged,
+    InvalidPersistence,
+    DynamicSecurityInitialized,
+    DynamicSecurityChanged,
+    ControlAccepted { changed: bool },
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,10 +292,15 @@ pub(crate) enum Effect {
         owner: Epoch,
         packet: Delivery,
     },
-    Ready(Epoch),
+    Ready(Lease),
     Takeover(Epoch),
     Expired(Arc<str>),
     QueueFull(Arc<str>),
+    ReservedOutbound {
+        owner: Epoch,
+        packet: Outbound,
+    },
+    Kick(Epoch),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -252,6 +322,8 @@ pub(crate) struct State {
     last_message: u64,
     sessions: BTreeMap<Arc<str>, Session>,
     #[serde(skip)]
+    bridges: BTreeMap<Arc<str>, Arc<str>>,
+    #[serde(skip)]
     normal: SubscriptionIndex<Arc<str>, Subscription>,
     #[serde(skip)]
     shared: SubscriptionIndex<Arc<str>, SharedKey>,
@@ -265,6 +337,16 @@ pub(crate) struct State {
     dollar_roots: BTreeSet<Arc<str>>,
     #[serde(default)]
     retain_sweep: Option<Duration>,
+    #[serde(default)]
+    pub(crate) sys: Sampler,
+    #[serde(default)]
+    sys_counters: Values,
+    #[serde(skip)]
+    pub(crate) persistence_changes: u64,
+    #[serde(default)]
+    pending_import: Option<PendingImport>,
+    #[serde(default)]
+    dynamic_security: Option<DynamicPolicy>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +364,21 @@ struct Session {
     v5: Option<SessionSettings>,
     #[serde(default)]
     will_at: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    internal_bridge: Option<BridgeState>,
+    #[serde(skip)]
+    clean_start: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BridgeState {
+    pub(crate) name: Arc<str>,
+    pub(crate) remote_clientid: Arc<str>,
+    pub(crate) reuse_remote_clientid: bool,
+    pub(crate) reuse_local_clientid: bool,
+    pub(crate) local_clean: bool,
+    pub(crate) lazy: bool,
+    pub(crate) online: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,12 +417,99 @@ struct NodeIdentity {
     down: bool,
 }
 
+// Mosquitto src/subs.c: sub__tree_print walks the normal and shared trees
+// separately. Shared branches omit their group members.
+struct DiagnosticBranch<'a> {
+    order: u64,
+    children: BTreeMap<&'a str, Self>,
+    subscribers: Vec<(u64, &'a str, QoS)>,
+}
+
+impl<'a> DiagnosticBranch<'a> {
+    fn new(order: u64) -> Self {
+        Self {
+            order,
+            children: BTreeMap::new(),
+            subscribers: Vec::new(),
+        }
+    }
+
+    fn branch(&mut self, name: &'a str, order: u64) -> &mut Self {
+        let branch = self
+            .children
+            .entry(name)
+            .or_insert_with(|| Self::new(order));
+        branch.order = branch.order.min(order);
+        branch
+    }
+
+    fn path(&mut self, filter: &'a str, order: u64) -> &mut Self {
+        filter
+            .split('/')
+            .fold(self, |branch, level| branch.branch(level, order))
+    }
+
+    fn write(&mut self, indent: usize, output: &mut String) {
+        use std::fmt::Write as _;
+
+        let mut children: Vec<_> = self.children.iter_mut().collect();
+        children.sort_unstable_by_key(|(name, branch)| (branch.order, **name));
+        for (name, branch) in children {
+            let _ = write!(output, "{:indent$}{name}", "");
+            branch
+                .subscribers
+                .sort_unstable_by_key(|&(order, _, _)| order);
+            for &(_, client, qos) in &branch.subscribers {
+                let _ = write!(output, " ({client}, {})", qos as u8);
+            }
+            output.push('\n');
+            branch.write(indent + 2, output);
+        }
+    }
+}
+
 impl State {
     pub(crate) fn new(config: Arc<BrokerConfig>) -> Self {
         Self {
             config,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn subscription_tree(&self) -> String {
+        let mut normal = DiagnosticBranch::new(0);
+        normal.branch("", 0);
+        normal.branch("$SYS", 1);
+        // src/topic_tok.c: sub__topic_tokenise duplicates a leading dollar
+        // component as a root and child; ordinary and shared roots are empty.
+        for (client, session) in &self.sessions {
+            for (filter, entry) in &session.filters {
+                if let Some((None, path)) = split_filter(filter) {
+                    let root = if path.starts_with('$') {
+                        dollar_root(path)
+                    } else {
+                        ""
+                    };
+                    normal
+                        .branch(root, entry.order + 2)
+                        .path(path, entry.order)
+                        .subscribers
+                        .push((entry.order, client, entry.subscription.qos));
+                }
+            }
+        }
+        for root in &self.dollar_roots {
+            normal.branch(root, u64::MAX);
+        }
+        let mut shared = DiagnosticBranch::new(0);
+        let root = shared.branch("", 0);
+        for (key, group) in &self.groups {
+            root.path(&key.filter, group.order);
+        }
+        let mut output = String::new();
+        normal.write(4, &mut output);
+        shared.write(4, &mut output);
+        output
     }
 
     pub(crate) fn next_expiry(&self) -> Option<Duration> {
@@ -362,6 +546,48 @@ impl State {
             .get(&lease.id)
             .is_some_and(|session| session.owner == Some(owner) && session.epoch == lease.epoch)
     }
+
+    pub(crate) fn bridge_claimed(&self, id: &str, name: &str) -> bool {
+        self.sessions
+            .get(id)
+            .is_some_and(|session| session.owner.is_some() && session.internal_bridge.is_some())
+            || self
+                .bridge_by_name(name)
+                .is_some_and(|session| session.owner.is_some())
+    }
+
+    fn bridge_by_name(&self, name: &str) -> Option<&Session> {
+        self.bridges.get(name).and_then(|id| self.sessions.get(id))
+    }
+
+    pub(crate) fn bridge_remote_id(&self, lease: &Lease) -> Option<Arc<str>> {
+        self.sessions
+            .get(&lease.id)
+            .filter(|session| session.epoch == lease.epoch)
+            .and_then(|session| session.internal_bridge.as_ref())
+            .map(|bridge| bridge.remote_clientid.clone())
+    }
+
+    pub(crate) fn rebuild_bridge_index(&mut self) {
+        self.bridges = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                session
+                    .internal_bridge
+                    .as_ref()
+                    .map(|bridge| (bridge.name.clone(), id.clone()))
+            })
+            .collect();
+    }
+
+    pub(crate) fn bridge_pending(&self, lease: &Lease) -> usize {
+        self.sessions
+            .get(&lease.id)
+            .filter(|session| session.epoch == lease.epoch)
+            .and_then(|session| session.inbox.as_ref())
+            .map_or(0, Inbox::outgoing_count)
+    }
     pub(crate) fn publisher_only(&self, lease: &Lease) -> bool {
         self.sessions.get(&lease.id).is_some_and(|session| {
             session.epoch == lease.epoch
@@ -389,6 +615,7 @@ impl State {
         if publish.retain || publish.qos == QoS::ExactlyOnce || !self.owns(owner, lease) {
             return None;
         }
+        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
         let source = &self.sessions[&lease.id];
         if publish.qos == QoS::AtLeastOnce
             && !admitted_local
@@ -399,7 +626,7 @@ impl State {
         {
             return None;
         }
-        if publish_rejection(&self.config, &self.acls, &source.publisher, publish).is_some() {
+        if publish_rejection(&self.config, acl, source, publish).is_some() {
             return None;
         }
         // Rotating the selected leaf is cluster-wide shared subscription state.
@@ -422,7 +649,7 @@ impl State {
                     return;
                 }
                 let session = &self.sessions[id];
-                if !can_deliver(&self.acls, session, *sub, &lease.id, &publish.topic, false) {
+                if !can_deliver(acl, session, *sub, &lease.id, &publish.topic, false) {
                     return;
                 }
                 if session.inbox.is_some() {
@@ -452,6 +679,14 @@ impl State {
             .filter(|s| s.owner.is_some() && s.epoch == lease.epoch)
             .and_then(|s| s.inbox.as_ref())
             .is_some_and(|inbox| inbox.has_outbound(&self.config))
+    }
+
+    pub(crate) fn has_reserved_outbound(&self, lease: &Lease) -> bool {
+        self.sessions
+            .get(&lease.id)
+            .filter(|s| s.epoch == lease.epoch)
+            .and_then(|s| s.inbox.as_ref())
+            .is_some_and(Inbox::has_reserved)
     }
 
     pub(crate) fn snapshot(&self) -> Vec<u8> {
@@ -498,12 +733,14 @@ impl State {
                 .insert(&key.filter, key.name.clone(), key.clone())
                 .map_err(invalid)?;
         }
+        restored.rebuild_bridge_index();
         *self = restored;
         Ok(())
     }
 
     pub(crate) fn apply(&mut self, command: Command) -> Outcome {
         let mut effects = Vec::new();
+        let eager = matches!(&command, Command::EagerBatch(_));
         let reply = match command {
             Command::SetAcl {
                 security,
@@ -525,6 +762,15 @@ impl State {
                 }
                 Reply::NoChange
             }
+            Command::InitDynamicSecurity(data) => {
+                if self.dynamic_security.is_none() {
+                    self.dynamic_security = Some(DynamicPolicy { revision: 1, data });
+                    Reply::DynamicSecurityInitialized
+                } else {
+                    Reply::NoChange
+                }
+            }
+            Command::DynamicSecurityControl(control) => self.dynamic_control(control, &mut effects),
             Command::Boot {
                 owner,
                 previous,
@@ -551,12 +797,35 @@ impl State {
                 token,
                 request,
             } => self.claim(owner, token, request, &mut effects),
+            Command::ImportPersistence {
+                offset,
+                bytes,
+                finish,
+            } => self.apply_import_part(offset, bytes, finish),
+            Command::Sys(tick) => {
+                self.sample_sys(tick, &mut effects, |_| {});
+                Reply::NoChange
+            }
+            Command::SysLog {
+                topic,
+                payload,
+                now,
+            } => {
+                self.publish_system(
+                    &topic,
+                    payload,
+                    now,
+                    Some(now.saturating_add(Duration::from_secs(20))),
+                    &mut effects,
+                );
+                Reply::NoChange
+            }
             Command::Expire(now) => {
                 self.expire(now, &mut effects);
                 Reply::NoChange
             }
             Command::Act(lease, action) => self.act(lease, action, &mut effects),
-            Command::Batch(batch) => Reply::Batched(
+            Command::Batch(batch) | Command::EagerBatch(batch) => Reply::Batched(
                 batch
                     .into_iter()
                     .map(|entry| match entry {
@@ -568,7 +837,11 @@ impl State {
                         BatchEntry::Act(entry) => {
                             let mut replies = Vec::with_capacity(entry.operations.len());
                             for operation in entry.operations {
+                                let first_effect = effects.len();
                                 let reply = self.act(entry.lease.clone(), operation, &mut effects);
+                                if eager {
+                                    self.reserve_ready(&mut effects[first_effect..]);
+                                }
                                 let stop = matches!(reply, Reply::Stale | Reply::ProtocolError);
                                 replies.push(reply);
                                 if stop {
@@ -582,6 +855,27 @@ impl State {
             ),
         };
         Outcome { reply, effects }
+    }
+
+    // database.c: db__message_insert_outgoing calls
+    // db__message_write_inflight_out_latest for newly admitted online messages.
+    // Queue the transport's send and persist its DUP transition in the same
+    // entry; messages outside the in-flight window are still unattempted.
+    fn reserve_ready(&mut self, effects: &mut [Effect]) {
+        for effect in effects {
+            let Effect::Ready(lease) = effect else {
+                continue;
+            };
+            let session = self.sessions.get_mut(&lease.id).unwrap();
+            if session.owner.is_some_and(|owner| owner != Owner::LOCAL)
+                && let Some(packet) = session.inbox.as_mut().unwrap().reserve_ready_qos1()
+            {
+                *effect = Effect::ReservedOutbound {
+                    owner: lease.epoch,
+                    packet,
+                };
+            }
+        }
     }
 
     pub(crate) fn node_event(&mut self, event: mqx_cluster::NodeEvent) -> Vec<Effect> {
@@ -625,6 +919,7 @@ impl State {
             if let Some(will) = will {
                 self.publish_will(will, now, effects);
             }
+            self.sys_counters.add(Metric::Expired, 1);
             effects.push(Effect::Expired(id));
         }
         while let Some((&(at, _), id)) = self.wills.first_key_value() {
@@ -660,6 +955,7 @@ impl State {
                 packet,
                 properties,
                 expiry,
+                internal_bridge: session.internal_bridge.is_some(),
             }
         })
     }
@@ -685,6 +981,10 @@ impl State {
         let session = self.sessions.get_mut(&id).unwrap();
         session.owner = None;
         session.inbox.as_mut().unwrap().reset_outbound();
+        if let Some(bridge) = &mut session.internal_bridge {
+            bridge.online = false;
+            return;
+        }
         // session_expiry.c: session_expiry__add applies the nonzero server cap;
         // session_expiry__check expires at the first second strictly past it.
         let cap = self
@@ -714,9 +1014,20 @@ impl State {
         &mut self,
         owner: Owner,
         token: ClaimToken,
-        claim: Claim,
+        mut claim: Claim,
         effects: &mut Vec<Effect>,
     ) -> Reply {
+        if claim.dynamic_security_revision.is_some_and(|revision| {
+            self.dynamic_security
+                .as_ref()
+                .is_none_or(|policy| policy.revision != revision)
+        }) {
+            return Reply::DynamicSecurityChanged;
+        }
+        if self.pending_import.is_some() {
+            // Do not expose half of a bootstrap import to clients on other peers.
+            return Reply::Stale;
+        }
         if owner != Owner::LOCAL
             && !self
                 .nodes
@@ -725,8 +1036,38 @@ impl State {
         {
             return Reply::Stale;
         }
+        if let Some(bridge) = &mut claim.internal_bridge {
+            if self.bridge_claimed(&claim.publisher.id, &bridge.name) {
+                return Reply::Stale;
+            }
+            if let Some(previous) = self.bridge_by_name(&bridge.name) {
+                // Host-derived IDs must not change when a bridge moves to
+                // another node; otherwise the remote and local sessions fork.
+                if bridge.reuse_remote_clientid {
+                    bridge.remote_clientid = previous
+                        .internal_bridge
+                        .as_ref()
+                        .unwrap()
+                        .remote_clientid
+                        .clone();
+                }
+                if bridge.reuse_local_clientid {
+                    claim.publisher.id = previous.publisher.id.clone();
+                } else if claim.publisher.id != previous.publisher.id {
+                    let old = previous.publisher.id.clone();
+                    self.remove_session(&old);
+                }
+            }
+        } else if self
+            .sessions
+            .get(&claim.publisher.id)
+            .is_some_and(|session| session.internal_bridge.is_some())
+        {
+            return Reply::Stale;
+        }
         let id = claim.publisher.id.clone();
         if !self.sessions.contains_key(&id)
+            && claim.internal_bridge.is_none()
             && self.config.global_max_clients != 0
             && self.sessions.len() >= self.config.global_max_clients
         {
@@ -760,6 +1101,8 @@ impl State {
                 effects.push(Effect::Expired(id.clone()));
             }
         }
+        // handle_connect.c: connect__on_authorised counts non-clean CONNECTs.
+        self.persistence_changes += u64::from(!claim.clean_start);
         self.last_epoch += 1;
         let epoch = self.last_epoch;
         let session = self.sessions.entry(id.clone()).or_insert_with(|| Session {
@@ -774,6 +1117,8 @@ impl State {
             expires: None,
             v5: None,
             will_at: None,
+            internal_bridge: None,
+            clean_start: claim.clean_start,
         });
         session.publisher = claim.publisher;
         session.epoch = epoch;
@@ -782,6 +1127,16 @@ impl State {
         session.v5 = claim.v5;
         session.bridge = claim.bridge;
         session.max_qos = claim.max_qos;
+        if let Some(bridge) = &claim.internal_bridge {
+            if let Some(previous) = &session.internal_bridge
+                && previous.name != bridge.name
+            {
+                self.bridges.remove(&previous.name);
+            }
+            self.bridges.insert(bridge.name.clone(), id.clone());
+        }
+        session.internal_bridge = claim.internal_bridge.map(|bridge| *bridge);
+        session.clean_start = claim.clean_start;
         if let Some(inbox) = &mut session.inbox {
             inbox.receive_maximum = session
                 .v5
@@ -790,14 +1145,16 @@ impl State {
         }
         if present {
             let publisher = &session.publisher;
+            let internal_bridge = session.internal_bridge.is_some();
+            let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
             session.inbox.as_mut().unwrap().resume(
                 |topic, writing| {
-                    allowed(
-                        &self.acls,
-                        publisher,
-                        topic,
-                        if writing { Access::Write } else { Access::Read },
-                    )
+                    internal_bridge
+                        || acl.allowed(
+                            publisher,
+                            topic,
+                            if writing { Access::Write } else { Access::Read },
+                        )
                 },
                 &self.config,
                 claim.now,
@@ -815,6 +1172,7 @@ impl State {
     }
 
     fn act(&mut self, lease: Lease, operation: Operation, effects: &mut Vec<Effect>) -> Reply {
+        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
         let Some(session) = self
             .sessions
             .get_mut(&lease.id)
@@ -835,7 +1193,91 @@ impl State {
                 self.offline(lease.id, now, graceful, effects);
                 Reply::NoChange
             }
-            Operation::Subscribe(filters, now) => self.subscribe(&lease.id, filters, now, effects),
+            Operation::BridgePrepare {
+                filters,
+                will,
+                max_qos,
+                clean_incoming,
+                receive_maximum,
+                now,
+            } => {
+                let bridge = session
+                    .internal_bridge
+                    .as_mut()
+                    .expect("internal bridge session");
+                bridge.online = false;
+                session.max_qos = max_qos;
+                session.will = will.map(|mut will| {
+                    will.retain &= self.config.retain_available;
+                    will
+                });
+                if receive_maximum.is_none() {
+                    session.v5 = None;
+                }
+                let inbox = session.inbox.as_mut().unwrap();
+                inbox.bridge_receive_maximum = receive_maximum;
+                inbox.bridge_reset(bridge.local_clean, clean_incoming);
+                for filter in std::mem::take(&mut session.filters).keys() {
+                    remove_filter(
+                        &mut self.normal,
+                        &mut self.shared,
+                        &mut self.groups,
+                        &lease.id,
+                        filter,
+                    );
+                }
+                self.subscribe(&lease.id, filters, now, effects)
+            }
+            Operation::BridgeOnline {
+                max_qos,
+                receive_maximum,
+                now,
+            } => {
+                session
+                    .internal_bridge
+                    .as_mut()
+                    .expect("internal bridge session")
+                    .online = true;
+                session.max_qos = max_qos;
+                let inbox = session.inbox.as_mut().unwrap();
+                inbox.receive_maximum = receive_maximum;
+                inbox.resume(|_, _| true, &self.config, now);
+                Reply::NoChange
+            }
+            Operation::BridgeOffline { now, graceful } => {
+                session
+                    .internal_bridge
+                    .as_mut()
+                    .expect("internal bridge session")
+                    .online = false;
+                if let Some(will) = self.take_will(&lease.id)
+                    && !graceful
+                {
+                    self.publish_will(will, now, effects);
+                }
+                Reply::NoChange
+            }
+            Operation::BridgeNotify(mut publication) => {
+                // database.c: db__messages_easy_queue does not check the source write ACL.
+                publication.packet.retain &= self.config.retain_available;
+                let now = publication.now;
+                let message = publication.into_message(session.publisher.clone());
+                self.publish(message, now, effects);
+                Reply::NoChange
+            }
+            Operation::BridgeMid => {
+                Reply::BridgeMid(session.inbox.as_mut().unwrap().allocate_mid())
+            }
+            Operation::BridgeRemove => {
+                self.remove_session(&lease.id);
+                Reply::NoChange
+            }
+            Operation::Subscribe(filters, now) => {
+                let reply = self.subscribe(&lease.id, filters, now, effects);
+                // handle_subscribe.c: handle__subscribe counts once per packet.
+                self.persistence_changes += u64::from(matches!(reply, Reply::Subscribed(_)));
+                reply
+            }
             Operation::Unsubscribe(filters) => {
                 let mut reason = R::SUCCESS;
                 let mut reasons = if session.v5.is_some() {
@@ -844,8 +1286,7 @@ impl State {
                     Vec::new()
                 };
                 for filter in filters {
-                    let acl_allowed =
-                        allowed(&self.acls, &session.publisher, &filter, Access::Unsubscribe);
+                    let acl_allowed = acl.allowed(&session.publisher, &filter, Access::Unsubscribe);
                     let Some((group, path)) = split_filter(&filter) else {
                         return Reply::ProtocolError;
                     };
@@ -874,12 +1315,13 @@ impl State {
                         reasons.push(reason.0);
                     }
                 }
+                // handle_unsubscribe.c: handle__unsubscribe counts once per packet.
+                self.persistence_changes += 1;
                 Reply::Unsubscribed(reasons)
             }
             Operation::Receive(publication) | Operation::ReceiveAdmitted(publication) => {
                 let publish = &publication.packet;
-                let rejection =
-                    publish_rejection(&self.config, &self.acls, &session.publisher, publish);
+                let rejection = publish_rejection(&self.config, acl, session, publish);
                 let qos = publish.qos;
                 let id = publish.packet_id;
                 if let Some(reason) = rejection {
@@ -903,6 +1345,7 @@ impl State {
                         return match inbox.receive(id, message, &self.config) {
                             Receive::Accepted => Reply::NoChange,
                             Receive::Quota => {
+                                self.sys_counters.add(Metric::Dropped, 1);
                                 if session.v5.is_some() {
                                     inbox.credit_incoming();
                                 }
@@ -912,6 +1355,7 @@ impl State {
                         };
                     }
                     if !inbox.can_publish_qos1(id, &self.config) {
+                        self.sys_counters.add(Metric::Dropped, 1);
                         return Reply::PublishReason(R::QUOTA_EXCEEDED.0);
                     }
                 }
@@ -943,8 +1387,9 @@ impl State {
                     return Reply::LocalInbox;
                 };
                 if inbox.ack(id, ack, &self.config) {
+                    self.persistence_changes += u64::from(ack.counts_for_persistence());
                     if inbox.has_outbound(&self.config) {
-                        effects.push(Effect::Ready(session.epoch));
+                        effects.push(Effect::Ready(lease));
                     }
                     Reply::NoChange
                 } else {
@@ -957,11 +1402,28 @@ impl State {
                 };
                 Reply::Outbound(inbox.next_outbound(&self.config, now))
             }
+            Operation::ReserveOutbound(now) => {
+                let Some(inbox) = &mut session.inbox else {
+                    return Reply::LocalInbox;
+                };
+                if let Some(packet) = inbox.next_outbound(&self.config, now) {
+                    effects.push(Effect::ReservedOutbound {
+                        owner: session.epoch,
+                        packet,
+                    });
+                    Reply::OutboundReserved
+                } else {
+                    Reply::NoChange
+                }
+            }
         }
     }
 
     fn remove_session(&mut self, id: &Arc<str>) {
         let session = self.sessions.remove(id).unwrap();
+        if let Some(bridge) = &session.internal_bridge {
+            self.bridges.remove(&bridge.name);
+        }
         if let Some(at) = session.expires {
             self.expirations.remove(&(at, session.epoch));
         }
@@ -986,6 +1448,7 @@ impl State {
         now: Duration,
         effects: &mut Vec<Effect>,
     ) -> Reply {
+        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
         let session = self.sessions.get_mut(id).unwrap();
         let mut codes = Vec::with_capacity(filters.len());
         for request in filters {
@@ -1003,7 +1466,7 @@ impl State {
             if validate_topic_filter(path).is_err() {
                 return Reply::ProtocolError;
             }
-            if !allowed(&self.acls, &session.publisher, &filter, Access::Subscribe) {
+            if !acl.session_allowed(session, &filter, Access::Subscribe) {
                 codes.push(SubscribeReturnCode::Failure);
                 continue;
             }
@@ -1052,14 +1515,10 @@ impl State {
                     || retain_handling == 1 && !session.filters.contains_key(filter.as_str())
                 {
                     self.retained.visit(path, now, |message| {
-                        if allowed(&self.acls, &session.publisher, &message.topic, Access::Read)
+                        if acl.session_allowed(session, &message.topic, Access::Read)
                             && (!self.config.check_retain_source
-                                || allowed(
-                                    &self.acls,
-                                    &message.source,
-                                    &message.topic,
-                                    Access::Write,
-                                ))
+                                || message.source.id.is_empty()
+                                || acl.allowed(&message.source, &message.topic, Access::Write))
                         {
                             let qos = outgoing_qos(message.qos, qos, &self.config);
                             deliver(
@@ -1073,6 +1532,8 @@ impl State {
                                 },
                                 &self.config,
                                 effects,
+                                &mut self.sys_counters,
+                                &mut self.persistence_changes,
                             );
                         }
                     });
@@ -1102,8 +1563,10 @@ impl State {
             packet: will,
             properties,
             expiry,
+            internal_bridge,
         } = will;
-        if allowed(&self.acls, &source, &will.topic, Access::Write) {
+        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
+        if internal_bridge || acl.allowed(&source, &will.topic, Access::Write) {
             self.publish(
                 Arc::new(Message {
                     source,
@@ -1126,11 +1589,13 @@ impl State {
         let mut router = Router {
             sessions: &mut self.sessions,
             config: &self.config,
-            acls: &self.acls,
+            acl: Acls::new(&self.acls, self.dynamic_security.as_ref()),
             message: &message,
             id: self.last_message,
             matched: false,
             effects,
+            counters: &mut self.sys_counters,
+            persistence_changes: &mut self.persistence_changes,
         };
         // subs.c: sub__messages_queue searches the normal tree before shared.
         let _ = self
@@ -1148,6 +1613,8 @@ impl State {
         }
         let matched = router.matched;
         if message.retain {
+            // retain.c: retain__store counts writes and clears outside $SYS.
+            self.persistence_changes += u64::from(!topic.starts_with("$SYS"));
             if message.expires.is_some()
                 && !message.payload.is_empty()
                 && self.retain_sweep.is_none()
@@ -1166,6 +1633,7 @@ struct PendingWill {
     packet: LastWill,
     properties: Vec<PublishProperty>,
     expiry: u32,
+    internal_bridge: bool,
 }
 
 fn dollar_root(filter: &str) -> &str {
@@ -1175,11 +1643,13 @@ fn dollar_root(filter: &str) -> &str {
 struct Router<'a> {
     sessions: &'a mut BTreeMap<Arc<str>, Session>,
     config: &'a BrokerConfig,
-    acls: &'a BTreeMap<u64, Arc<AclFile>>,
+    acl: Acls<'a>,
     message: &'a Arc<Message>,
     id: u64,
     matched: bool,
     effects: &'a mut Vec<Effect>,
+    counters: &'a mut Values,
+    persistence_changes: &'a mut u64,
 }
 
 impl Router<'_> {
@@ -1188,7 +1658,7 @@ impl Router<'_> {
         let session = self.sessions.get_mut(id).unwrap();
         let message = self.message;
         if !can_deliver(
-            self.acls,
+            self.acl,
             session,
             sub,
             &message.source.id,
@@ -1207,7 +1677,14 @@ impl Router<'_> {
                 .then_some(crate::inbox::DedupId::Log(self.id)),
             subscription_identifier: sub.identifier,
         };
-        deliver(session, delivery, self.config, self.effects);
+        deliver(
+            session,
+            delivery,
+            self.config,
+            self.effects,
+            self.counters,
+            self.persistence_changes,
+        );
     }
 }
 
@@ -1216,12 +1693,39 @@ fn deliver(
     packet: Delivery,
     config: &BrokerConfig,
     effects: &mut Vec<Effect>,
+    counters: &mut Values,
+    persistence_changes: &mut u64,
 ) {
     if let Some(inbox) = &mut session.inbox {
-        match inbox.offer(packet, session.owner.is_some(), session.max_qos, config) {
-            Offer::Ready => effects.push(Effect::Ready(session.epoch)),
-            Offer::FirstDrop => effects.push(Effect::QueueFull(session.publisher.id.clone())),
-            Offer::Queued | Offer::Dropped | Offer::Suppressed => {}
+        let (online, queue_qos0, clean_offline) = if let Some(bridge) = &session.internal_bridge {
+            (
+                session.owner.is_some() && bridge.online,
+                bridge.lazy,
+                bridge.local_clean,
+            )
+        } else {
+            (session.owner.is_some(), false, false)
+        };
+        match inbox.offer_with_offline(
+            packet,
+            online,
+            session.max_qos,
+            config,
+            queue_qos0,
+            clean_offline,
+        ) {
+            Offer::Ready => effects.push(Effect::Ready(Lease {
+                id: session.publisher.id.clone(),
+                epoch: session.epoch,
+            })),
+            Offer::FirstDrop => {
+                counters.add(Metric::Dropped, 1);
+                effects.push(Effect::QueueFull(session.publisher.id.clone()));
+            }
+            Offer::Dropped => counters.add(Metric::Dropped, 1),
+            // database.c: db__message_insert_outgoing counts only queued inserts.
+            Offer::Queued => *persistence_changes += 1,
+            Offer::Suppressed => {}
         }
     } else {
         effects.push(Effect::Deliver {
@@ -1232,7 +1736,7 @@ fn deliver(
 }
 
 fn can_deliver(
-    acls: &BTreeMap<u64, Arc<AclFile>>,
+    acl: Acls<'_>,
     session: &Session,
     sub: Subscription,
     source: &str,
@@ -1240,19 +1744,19 @@ fn can_deliver(
     shared: bool,
 ) -> bool {
     (shared || !(sub.bridge || sub.no_local) || session.publisher.id.as_ref() != source)
-        && allowed(acls, &session.publisher, topic, Access::Read)
+        && acl.session_allowed(session, topic, Access::Read)
 }
 
 fn publish_rejection(
     config: &BrokerConfig,
-    acls: &BTreeMap<u64, Arc<AclFile>>,
-    source: &Publisher,
+    acl: Acls<'_>,
+    source: &Session,
     publish: &Publish,
 ) -> Option<R> {
     // handle_publish.c: handle__publish checks size before write ACL.
     if config.message_size_limit != 0 && publish.payload.len() > config.message_size_limit {
         Some(R::PACKET_TOO_LARGE)
-    } else if !allowed(acls, source, &publish.topic, Access::Write) {
+    } else if !acl.session_allowed(source, &publish.topic, Access::Write) {
         Some(R::NOT_AUTHORIZED)
     } else if publish.topic.starts_with("$CONTROL/") {
         Some(R::IMPLEMENTATION_SPECIFIC_ERROR)
@@ -1261,23 +1765,50 @@ fn publish_rejection(
     }
 }
 
-fn allowed(
-    acls: &BTreeMap<u64, Arc<AclFile>>,
-    publisher: &Publisher,
-    topic: &str,
-    access: Access,
-) -> bool {
-    // plugin_acl_check.c: acl__check_dollar runs before the file ACL. Only
-    // bridge status writes are potentially permitted under `$SYS`.
-    if (topic.starts_with("$share") && matches!(access, Access::Read | Access::Write))
-        || (topic.starts_with("$SYS")
-            && access == Access::Write
-            && !mqx_topic::matches("$SYS/broker/connection/+/state", topic).unwrap_or(false))
-    {
-        return false;
+#[derive(Clone, Copy)]
+struct Acls<'a> {
+    files: &'a BTreeMap<u64, Arc<AclFile>>,
+    dynamic: Option<&'a DynamicSecurity>,
+}
+
+impl<'a> Acls<'a> {
+    fn new(files: &'a BTreeMap<u64, Arc<AclFile>>, dynamic: Option<&'a DynamicPolicy>) -> Self {
+        Self {
+            files,
+            dynamic: dynamic.map(|policy| policy.data.as_ref()),
+        }
     }
-    acls.get(&publisher.security)
-        .is_none_or(|acl| acl.check(&publisher.id, publisher.username.as_deref(), topic, access))
+
+    // plugin_acl_check.c: mosquitto_acl_check exempts local bridge contexts,
+    // not incoming private-protocol connections or synthetic retained sources.
+    fn session_allowed(self, session: &Session, topic: &str, access: Access) -> bool {
+        session.internal_bridge.is_some() || self.allowed(&session.publisher, topic, access)
+    }
+
+    fn allowed(self, publisher: &Publisher, topic: &str, access: Access) -> bool {
+        // plugin_acl_check.c: acl__check_dollar runs before the ACL callbacks.
+        if (topic.starts_with("$share") && matches!(access, Access::Read | Access::Write))
+            || (topic.starts_with("$SYS")
+                && access == Access::Write
+                && !mqx_topic::matches("$SYS/broker/connection/+/state", topic).unwrap_or(false))
+        {
+            return false;
+        }
+        let id = &publisher.id;
+        let username = publisher.username.as_deref();
+        let file = || {
+            self.files
+                .get(&publisher.security)
+                .map(|acl| acl.check(id, username, topic, access))
+        };
+        let order = publisher.dynamic_security;
+        let dynamic = || {
+            self.dynamic
+                .and_then(|policy| policy.authorize(id, username, topic, access))
+        };
+        // All configured callbacks deferring means denial.
+        crate::security_callbacks(order, file, dynamic).unwrap_or(order.is_none())
+    }
 }
 
 fn outgoing_qos(publish: QoS, subscribe: QoS, config: &BrokerConfig) -> QoS {
@@ -1351,6 +1882,7 @@ mod tests {
                     id,
                     username: None,
                     security: 1,
+                    dynamic_security: None,
                 },
                 clean_start: transient,
                 bridge: false,
@@ -1358,6 +1890,8 @@ mod tests {
                 will,
                 v5: None,
                 now: Duration::ZERO,
+                internal_bridge: None,
+                dynamic_security_revision: None,
             },
         }
     }
@@ -1584,6 +2118,7 @@ mod tests {
                         now,
                     })),
                     5 => Command::Act(lease, Operation::Release(mid, now)),
+                    6 if value % 2 == 0 => Command::Act(lease, Operation::ReserveOutbound(now)),
                     6 => Command::Act(lease, Operation::NextOutbound(now)),
                     7 => Command::Act(lease, Operation::Ack(mid, Ack::Acknowledged)),
                     8 => Command::Act(lease, Operation::Disconnect { graceful: value % 2 == 0, now, expiry: None }),
@@ -1592,6 +2127,12 @@ mod tests {
                         security: 1, initial: false,
                         text: Some(Bytes::from_static(if value % 2 == 0 { b"topic readwrite #\n" } else { b"topic readwrite a/#\n" })),
                     },
+                };
+                let command = match command {
+                    Command::Act(lease, operation) if value % 2 == 0 && matches!(op % 11, 4 | 5 | 7) => {
+                        Command::EagerBatch(vec![BatchEntry::Act(Mutations { lease, operations: vec![operation] })])
+                    }
+                    command => command,
                 };
                 let encoded = rmp_serde::to_vec(&command).unwrap();
                 let load = || rmp_serde::from_slice(&encoded).unwrap();

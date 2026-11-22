@@ -1,19 +1,21 @@
-//! Durable static-membership Raft and a direct application mesh.
+//! Durable Raft with dynamic membership and a direct application mesh.
 //!
-//! Use a dedicated cluster CA. An authenticated configured peer is trusted to
-//! participate in consensus and submit application commands.
+//! Use a CA dedicated to this cluster. A certificate authorizes its holder to
+//! participate in Raft; application RPCs additionally require voter membership.
 
 mod admission;
 mod lease;
+mod membership;
 mod mtls;
 mod mux;
 mod node;
 mod snapshot;
 mod snapshot_file;
 mod transport;
+mod version;
 mod wal;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
@@ -25,9 +27,11 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 pub use lease::{NodeEvent, NodeStatus};
+pub use membership::{MemberRole, MemberStatus, MembershipControl, MembershipStatus};
 pub use node::{Cluster, ClusterMetrics};
 pub use openraft::SnapshotPolicy;
 pub use transport::Mesh;
+pub use wal::WalMetrics;
 
 /// Largest configurable snapshot transfer, including the encoded metadata.
 pub const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
@@ -60,6 +64,20 @@ pub trait StateMachine: Send + Sync + 'static {
     type Command: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static;
     type Response: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static;
 
+    /// Application payload schema to write. Keep this at the previous version
+    /// until every replica's command and snapshot readers support the new one.
+    const WRITE_VERSION: u16 = 1;
+
+    /// Accepted application payload versions. Default readers handle schema 1.
+    fn supports_version(version: u16) -> bool {
+        version == 1
+    }
+
+    /// Override when decoding older schemas requires translating their commands.
+    fn decode_command(_version: u16, bytes: &[u8]) -> Result<Self::Command, ClusterError> {
+        Ok(transport::decode(bytes)?)
+    }
+
     /// Apply a committed command deterministically. On each node this runs in log order,
     /// once per applied entry per process lifetime. Restart replays entries after the
     /// snapshot; installing a snapshot does not re-apply entries it already covers.
@@ -76,6 +94,11 @@ pub trait StateMachine: Send + Sync + 'static {
 
     /// Replace replicated state with this snapshot. Do not replay historical effects.
     fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError>;
+
+    /// Override when older snapshot schemas need a migration on restore.
+    fn restore_versioned(&mut self, _version: u16, bytes: &[u8]) -> Result<(), ClusterError> {
+        self.restore(bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -83,14 +106,23 @@ pub struct ClusterConfig {
     pub node_id: u64,
     /// Local TCP bind address. Advertise its reachable address in `peers[node_id]`.
     pub raft_addr: SocketAddr,
-    /// The identical static configuration on every node, including self.
+    /// Desired voters. On first bootstrap these are the initial voters. On
+    /// an empty joining node they also identify the existing seed peers.
     pub peers: BTreeMap<u64, SocketAddr>,
+    /// Start an empty node without initializing a separate Raft cluster.
+    pub join: bool,
+    /// Monotonically increasing desired membership revision; zero only bootstraps.
+    pub membership_generation: u64,
+    /// Write legacy format 1 for a rolling upgrade from static membership, or
+    /// format 2 for tagged payloads and dynamic membership.
+    pub state_format: u16,
     pub data_dir: PathBuf,
     pub security: ClusterSecurity,
     pub heartbeat_interval: Duration,
     pub election_timeout_min: Duration,
     pub election_timeout_max: Duration,
-    /// Total deadline for forwarding, Raft commit and linearizable reads; also the mesh RPC deadline.
+    /// Total deadline for forwarding, Raft commit and linearizable reads; also
+    /// the mesh RPC and AppendEntries replication stream deadline.
     pub request_timeout: Duration,
     pub lease_interval: Duration,
     pub lease_timeout: Duration,
@@ -119,6 +151,9 @@ impl ClusterConfig {
             node_id,
             raft_addr,
             peers,
+            join: false,
+            membership_generation: 0,
+            state_format: 2,
             data_dir,
             security,
             heartbeat_interval: Duration::from_millis(100),
@@ -170,18 +205,15 @@ impl ClusterConfig {
     fn raft_config(&self) -> Result<openraft::Config, ClusterError> {
         self.check_frame_limits()?;
         let invalid = ClusterError::InvalidConfig;
-        if !self.peers.contains_key(&self.node_id) {
-            return Err(invalid("peers must contain node_id".into()));
+        membership::validate_peers(&self.peers)?;
+        if !matches!(self.state_format, 1 | 2) {
+            return Err(ClusterError::UnsupportedVersion {
+                kind: "state write format",
+                version: self.state_format,
+            });
         }
-        if self
-            .peers
-            .values()
-            .any(|addr| addr.port() == 0 || addr.ip().is_unspecified())
-            || self.peers.values().collect::<BTreeSet<_>>().len() != self.peers.len()
-        {
-            return Err(invalid(
-                "peer addresses must be distinct and routable".into(),
-            ));
+        if self.state_format == 1 && (self.join || self.membership_generation != 0) {
+            return Err(invalid("dynamic membership requires state format 2".into()));
         }
         if !(1..=MAX_SNAPSHOT_SIZE).contains(&self.max_snapshot_size) {
             return Err(invalid(
@@ -213,6 +245,9 @@ impl ClusterConfig {
             max_payload_entries: transport::MAX_APPEND_ENTRIES,
             // OpenRaft's entry-count cap complements the byte cap in Wal::limited_get_log_entries.
             api_batch_linger_ms: Some(1),
+            // Replication and local disk may advance concurrently; Raft still
+            // gates acknowledgments on the logged durable I/O frontier.
+            broadcast_submitted_on_append: Some(true),
             snapshot_policy: self.snapshot_policy.clone(),
             max_in_snapshot_log_to_keep: self.snapshot_log_retention,
             purge_batch_size: 1,
@@ -242,6 +277,12 @@ pub enum ClusterError {
     Shutdown,
     #[error("no cluster member with ID {0}")]
     UnknownNode(u64),
+    #[error("node {0} has been permanently removed from the cluster")]
+    Removed(u64),
+    #[error("membership configuration refused: {0}")]
+    Membership(String),
+    #[error("unsupported {kind} version {version}")]
+    UnsupportedVersion { kind: &'static str, version: u16 },
     #[error("node {node_id} is unreachable: {source}")]
     Unreachable { node_id: u64, source: io::Error },
     #[error("node {0} did not answer before the mesh request deadline")]

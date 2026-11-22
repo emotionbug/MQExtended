@@ -5,6 +5,7 @@ members = [
     "crates/mqx-codec",
     "crates/mqx-auth",
     "crates/mqx-broker",
+    "crates/mqx-bridge",
     "crates/mqx-server",
     "crates/mqx-difftest",
     "crates/mqx-cluster",

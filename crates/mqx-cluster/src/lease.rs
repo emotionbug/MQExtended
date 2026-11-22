@@ -85,8 +85,18 @@ impl Leases {
             .collect()
     }
 
-    pub(crate) fn ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.0.keys().copied()
+    pub(crate) fn ensure(&mut self, id: u64) {
+        self.0.entry(id).or_insert(Lease {
+            status: NodeStatus::Unknown,
+            heartbeat: None,
+            expired_at: None,
+        });
+    }
+
+    pub(crate) fn status(&self, id: u64) -> NodeStatus {
+        self.0
+            .get(&id)
+            .map_or(NodeStatus::Unknown, |lease| lease.status)
     }
 
     pub(crate) fn expired(&self, stamp: Stamp, timeout_ms: u64) -> Vec<LeaseCommand> {

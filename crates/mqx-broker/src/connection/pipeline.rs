@@ -108,6 +108,7 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
     for (id, reply) in ids.into_iter().zip(replies) {
         let reason = match reply {
             Reply::PublishReason(reason) => R(reason),
+            Reply::ControlAccepted { .. } => R::SUCCESS,
             Reply::Stale => return Ok(Step::End(End::Takeover)),
             Reply::ProtocolError => return Err(BrokerError::Protocol),
             _ => unreachable!("QoS 0/1 pipeline got a handshake reply"),

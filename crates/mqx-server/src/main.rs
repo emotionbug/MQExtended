@@ -1,25 +1,42 @@
+mod dynsec_config;
+mod persistence;
+mod process;
+
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use mqx_auth::{AclFileError, PasswordFile};
+use mqx_bridge::Bridges;
 use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, SecurityHandle};
+use mqx_cluster::ClusterError;
 use mqx_codec::QoS;
 use mqx_server::{
-    ListenerConfig, SecurityConfig, Server, ServerConfig, ServerError, parse_command_line_port,
+    BrokerSignal, HttpApi, ListenerConfig, ListenerProtocol, LogConfig, LogTopics, Logging,
+    SecurityConfig, Server, ServerConfig, ServerError, connect_bridge_tls, init_logging,
+    parse_command_line_port, startup_log,
 };
 
+use persistence::Persistence;
+use process::{PidFile, StartupError, TERMINATING};
+
 const USAGE: &str =
-    "Usage: mqextended [-c <mosquitto.conf>] [-p <port>]... [-v] [--test-config] [-h]";
+    "Usage: mqextended [-c <mosquitto.conf>] [-d] [-p <port>]... [-q] [-v] [--test-config] [-h]";
 
 #[derive(Default)]
 struct Cli {
     file: Option<PathBuf>,
     ports: Vec<u16>,
     verbose: bool,
+    quiet: bool,
+    daemon: bool,
     test_config: bool,
 }
 
@@ -51,8 +68,10 @@ impl Cli {
                     )?);
                 }
                 Some("-v" | "--verbose") => cli.verbose = true,
+                Some("-q" | "--quiet") => cli.quiet = true,
+                Some("-d" | "--daemon") => cli.daemon = true,
                 Some("--test-config") => cli.test_config = true,
-                Some("-d" | "--daemon" | "-q" | "--quiet" | "--tls-keylog" | "--version") => {
+                Some("--tls-keylog" | "--version") => {
                     return Err(error(&format!(
                         "Unsupported Mosquitto option '{}'.",
                         arg.to_string_lossy()
@@ -68,49 +87,173 @@ impl Cli {
         }
         Ok(Some(cli))
     }
-}
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::from(3)
+    fn override_log_types(&self, log: &mut LogConfig) {
+        // Mosquitto src/conf.c: config__parse_args and config__read.
+        if self.quiet {
+            log.types.clear();
+        } else if self.verbose {
+            log.verbose();
         }
     }
 }
 
-async fn run() -> Result<(), ServerError> {
-    let Some(cli) = Cli::parse(std::env::args_os().skip(1))? else {
+fn main() -> ExitCode {
+    let result = start();
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            let log = LogConfig::default();
+            startup_log(&log, format_args!("{}", error.message));
+            startup_log(&log, format_args!("{TERMINATING}"));
+            error.code
+        }
+    }
+}
+
+fn start() -> Result<ExitCode, StartupError> {
+    let cli = Cli::parse(std::env::args_os().skip(1))
+        .map_err(|error| StartupError::invalid(error.to_string()))?;
+    let Some(cli) = cli else {
         println!("{USAGE}");
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     };
-    let has_file = cli.file.is_some();
-    let mut config = match cli.file {
-        Some(file) => ServerConfig::load(file)?,
+    let mut config = match cli.file.as_deref() {
+        Some(file) => {
+            ServerConfig::load(file).map_err(|error| StartupError::invalid(error.to_string()))?
+        }
         None => ServerConfig::default(),
     }
     .with_command_line_ports(&cli.ports);
-    if cli.verbose {
-        config.log.verbose();
+    // Mosquitto src/conf.c: config__parse_args overrides the configured location.
+    if let Some(location) = std::env::var_os("MOSQUITTO_PERSISTENCE_LOCATION") {
+        config.persistence.location = Some(location.into());
     }
-    mqx_server::init_logging(&config.log)?;
-    // Mosquitto src/mosquitto.c: main checks only the configuration file itself;
-    // credential files are not loaded.
+    cli.override_log_types(&mut config.log);
+    for notice in &config.notices {
+        startup_log(&config.log, format_args!("{notice}"));
+    }
+    // Mosquitto src/mosquitto.c: main tests configuration before any
+    // privilege, daemon, pid-file or log-destination changes.
     if cli.test_config {
-        if !has_file {
-            return Err(ServerError::Arguments(
-                "Please provide a configuration file to test.".into(),
-            ));
+        let code = if cli.file.is_some() {
+            startup_log(&config.log, format_args!("Configuration file is OK."));
+            ExitCode::SUCCESS
+        } else {
+            startup_log(
+                &config.log,
+                format_args!("Please provide a configuration file to test."),
+            );
+            ExitCode::from(3)
+        };
+        startup_log(&config.log, format_args!("{TERMINATING}"));
+        return Ok(code);
+    }
+
+    let run = || {
+        process::drop_privileges(&config.user, &config.log)?;
+        process::set_umask()?;
+        if cli.daemon {
+            process::daemonise(&config.log)?;
         }
-        tracing::info!("Configuration file is OK.");
-        return Ok(());
+        config.pid_file.as_deref().map(PidFile::write).transpose()
+    };
+    let _pid_file = match run() {
+        Ok(pid_file) => pid_file,
+        Err(error) => {
+            startup_log(&config.log, format_args!("{}", error.message));
+            // mosquitto__daemonise exits directly on error without cleanup.
+            if error.code != ExitCode::FAILURE {
+                startup_log(&config.log, format_args!("{TERMINATING}"));
+            }
+            return Ok(error.code);
+        }
+    };
+
+    let log_error = |error: &dyn std::fmt::Display| StartupError::invalid(error.to_string());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| log_error(&error))?;
+    let (logging, log_topics) = init_logging(&config.log).map_err(|error| log_error(&error))?;
+    report_startup(cli.file.as_deref());
+    let mut shutdown = ShutdownLog::default();
+    let result = runtime.block_on(run_broker(
+        &cli,
+        config,
+        &logging,
+        log_topics,
+        &mut shutdown,
+    ));
+    shutdown.finish(&result);
+    Ok(if result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
+    })
+}
+
+#[derive(Default)]
+struct ShutdownLog(bool);
+
+impl ShutdownLog {
+    // Mosquitto src/mosquitto.c: post_shutdown_cleanup logs before saving
+    // final persistence state. Startup failures take the same path.
+    fn finish(&mut self, result: &Result<(), ServerError>) {
+        if !std::mem::replace(&mut self.0, true) {
+            if let Err(error) = result {
+                tracing::error!("{error}");
+            }
+            tracing::info!("{TERMINATING}");
+        }
     }
-    for message in &config.notices {
-        tracing::info!(target: "mqx::notice", "{message}");
+}
+
+fn report_startup(file: Option<&Path>) {
+    // Mosquitto src/mosquitto.c: main and report_features.
+    tracing::info!("mosquitto version 2.1.4 starting");
+    if let Some(file) = file {
+        tracing::info!("Config loaded from {}.", file.display());
+    } else {
+        tracing::info!("Using default config.");
     }
-    let security = security_handles(&config)?;
+    tracing::info!("Bridge support available.");
+    tracing::info!("Persistence support available.");
+    tracing::info!("TLS support available.");
+    tracing::info!("TLS-PSK support NOT available.");
+    tracing::info!("Websockets support available.");
+    if std::env::var_os("MOSQUITTO_UNSAFE_ALLOW_SYMLINKS").is_some() {
+        tracing::info!(target: "mqx::notice", "MOSQUITTO_UNSAFE_ALLOW_SYMLINKS is set, loading of sensitive files through symbolic links is allowed.");
+    }
+}
+
+async fn run_broker(
+    cli: &Cli,
+    mut config: ServerConfig,
+    logging: &Logging,
+    log_topics: LogTopics,
+    shutdown: &mut ShutdownLog,
+) -> Result<(), ServerError> {
+    if config.local_only {
+        // Mosquitto src/listeners.c: listeners__start_local_only adds
+        // the HTTP endpoint after default MQTT listeners, including with -p.
+        config.listeners.push(ListenerConfig {
+            port: 9883,
+            host: Some("127.0.0.1".into()),
+            protocol: ListenerProtocol::HttpApi,
+            security: SecurityConfig {
+                allow_anonymous: config.security.allow_anonymous,
+                ..SecurityConfig::default()
+            },
+            dynamic_security: config
+                .listeners
+                .first()
+                .and_then(|listener| listener.dynamic_security.clone()),
+            ..ListenerConfig::default()
+        });
+    }
+    let live_log = std::cell::RefCell::new(config.log.clone());
+    let security = Arc::new(security_handles(&config)?);
     let policies: Arc<Vec<Arc<ListenerPolicy>>> = Arc::new(
         config
             .listeners
@@ -125,10 +268,16 @@ async fn run() -> Result<(), ServerError> {
             })
             .collect(),
     );
-    let server = Server::bind(&config).await?;
     let cluster = config.cluster.take();
-    let clustered = cluster.is_some();
-    let broker = if let Some(mut cluster) = cluster {
+    let cluster_identity = cluster
+        .as_ref()
+        .map(|cluster| (cluster.node_id, cluster.state_format));
+    let joining = cluster.as_ref().is_some_and(|cluster| cluster.join);
+    let persistence = cluster
+        .is_none()
+        .then(|| Arc::new(Persistence::new(config.persistence.clone())));
+    let (broker, membership, server) = if let Some(mut cluster) = cluster {
+        let server = Server::bind(&config).await?;
         let limits = &config.limits;
         let packet_limit = if limits.max_packet_size == 0 {
             0
@@ -139,26 +288,137 @@ async fn run() -> Result<(), ServerError> {
             .set_packet_limit(packet_limit)
             .map_err(mqx_broker::BrokerError::from)
             .map_err(ServerError::Cluster)?;
+        let request_timeout = cluster.request_timeout;
+        // One deterministic bootstrap candidate, even if several empty
+        // voters race to initialize the same Raft membership.
+        let bootstrap_node = !joining
+            && cluster
+                .peers
+                .first_key_value()
+                .is_some_and(|(&id, _)| id == cluster.node_id);
+        let migration_node = bootstrap_node && cluster.membership_generation == 0;
         let broker = Broker::clustered(broker_config(&config), cluster)
             .await
             .map_err(ServerError::Cluster)?;
-        if let Err(error) = security.register(&broker).await {
-            if let Err(error) = broker.shutdown_cluster().await {
-                tracing::error!("Cluster shutdown failed: {error}");
+        let membership = broker
+            .cluster_membership()
+            .expect("the clustered broker owns membership control");
+        if !joining {
+            let ready = async {
+                tokio::time::timeout(request_timeout, membership.wait_serving())
+                    .await
+                    .unwrap_or(Err(ClusterError::Deadline))
+                    .map_err(mqx_broker::BrokerError::from)
+                    .map_err(ServerError::Cluster)?;
+                security.register(&broker).await?;
+                dynsec_config::register(&broker, config.dynamic_security.as_ref(), bootstrap_node)
+                    .await?;
+                if migration_node {
+                    persistence::migrate_cluster(&broker, &config).await?;
+                }
+                Ok(())
+            };
+            if let Err(error) = ready.await {
+                if let Err(error) = broker.shutdown_cluster().await {
+                    tracing::error!("Cluster shutdown failed: {error}");
+                }
+                return Err(error);
             }
-            return Err(error);
         }
-        broker
+        (broker, Some(membership), server)
     } else {
-        Broker::new(broker_config(&config))
+        let broker = Broker::new(broker_config(&config));
+        security.register(&broker).await?;
+        dynsec_config::register(&broker, config.dynamic_security.as_ref(), true).await?;
+        // mosquitto.c: plugin initializers run before the listener opens.
+        let server = Server::bind(&config).await?;
+        if let Some(persistence) = &persistence {
+            persistence.restore(&broker, &config).await?;
+        }
+        (broker, None, server)
     };
+    let (stop_autosave, stop) = tokio::sync::watch::channel(false);
+    let autosave = persistence.as_ref().map(|persistence| {
+        let (persistence, broker) = (persistence.clone(), broker.clone());
+        tokio::spawn(async move { persistence.autosave(&broker, stop).await })
+    });
+    let registered = Arc::new(AtomicBool::new(!joining));
+    let membership_watch = membership.as_ref().map(|membership| {
+        let membership = membership.clone();
+        let broker = broker.clone();
+        let security = security.clone();
+        let dynamic_security = config.dynamic_security.clone();
+        let registered = registered.clone();
+        tokio::spawn(async move {
+            if joining {
+                while membership.wait_serving().await.is_ok() {
+                    let result = async {
+                        security.register(&broker).await?;
+                        dynsec_config::register(&broker, dynamic_security.as_ref(), false).await
+                    }
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            registered.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!("Joining node could not register security: {error}")
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            membership.wait_removed().await;
+            // Leave the HTTP diagnostics available, but close existing MQTT clients.
+            broker.shutdown();
+        })
+    });
+    let serving_membership = membership.clone();
+    let serving_registered = registered.clone();
+    // retain.c: retain__queue rechecks the source with an ordinary context
+    // and no listener, even if the live publication came from a bridge.
+    let bridge_security = if config.per_listener_settings {
+        SecurityHandle::with_id(u64::MAX, None, Some(b"topic deny #\n".to_vec()))
+            .expect("valid ACL for a synthetic source without a listener")
+    } else {
+        security.for_listener(0)
+    };
+    let mut bridges = Bridges::new(
+        broker.clone(),
+        bridge_security,
+        config.set_tcp_nodelay,
+        connect_bridge_tls,
+    );
+    bridges.start(std::mem::take(&mut config.bridges));
+    let bridges = std::cell::RefCell::new(bridges);
+    broker.start_sys_tree(config.sys_interval);
+    let log_topics = tokio::spawn(log_topics.serve(broker.clone()));
     let serving = broker.clone();
+    let http = HttpApi::new(&config, &server);
     let result = server
-        .run_with_shutdown(
+        .with_broker_observation(broker.clone())
+        .run_with_signals(
             move |connection| {
                 let broker = serving.clone();
                 let policies = policies.clone();
+                let http = http.clone();
+                let mqtt_ready = serving_membership
+                    .as_ref()
+                    .is_none_or(|membership| membership.is_serving())
+                    && serving_registered.load(Ordering::Acquire);
                 async move {
+                    if connection.listener.protocol == ListenerProtocol::HttpApi {
+                        let policy = &policies[connection.listener_index];
+                        if let Err(error) = http.serve(connection, &broker, &policy.security).await
+                        {
+                            tracing::debug!("HTTP connection ended: {error}");
+                        }
+                        return;
+                    }
+                    if !mqtt_ready {
+                        return;
+                    }
                     let info = ConnectionInfo {
                         peer_addr: connection.peer_addr,
                         listener: policies[connection.listener_index].clone(),
@@ -167,6 +427,7 @@ async fn run() -> Result<(), ServerError> {
                     if let Err(error) = broker
                         .serve_accepted(connection.stream, info, connection.accepted_at)
                         .await
+                        && broker.connection_messages()
                     {
                         tracing::debug!(
                             "Connection from {:?} ended: {error}",
@@ -179,15 +440,87 @@ async fn run() -> Result<(), ServerError> {
                 // Mosquitto src/signals.c: SIGHUP rereads the credential files even when their
                 // paths are unchanged; a malformed file stops the broker (exit 3).
                 security.reload(&config)?;
-                if clustered {
+                if membership.as_ref().is_some_and(|membership| membership.is_serving())
+                    && registered.load(Ordering::Acquire)
+                {
                     security.register(&broker).await?;
                 }
+                if let Some(path) = &cli.file {
+                    match ServerConfig::load(path) {
+                        Ok(mut fresh) => {
+                            cli.override_log_types(&mut fresh.log);
+                            broker.set_connection_messages(fresh.log.connection_messages);
+                            logging.reload(&fresh.log);
+                            live_log.replace(fresh.log);
+                            if let Some(persistence) = &persistence {
+                                persistence.reload(fresh.persistence);
+                            }
+                            broker.start_sys_tree(fresh.sys_interval);
+                            bridges.borrow_mut().reload(fresh.bridges);
+                            if let Some((membership, (node_id, format))) =
+                                membership.as_ref().zip(cluster_identity)
+                            {
+                                match fresh.cluster {
+                                    Some(cluster) if cluster.node_id == node_id && cluster.state_format == format => {
+                                        if cluster.membership_generation != 0
+                                            && let Err(error) = membership.configure(cluster.membership_generation, cluster.peers)
+                                        {
+                                            tracing::warn!("Cluster membership reload refused: {error}");
+                                        }
+                                    }
+                                    _ => tracing::warn!("Changing cluster identity or state format requires a restart"),
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("Unable to reload configuration: {error}");
+                            logging.reload(&live_log.borrow());
+                        }
+                    }
+                } else {
+                    logging.reload(&live_log.borrow());
+                }
                 Ok::<_, ServerError>(())
+            },
+            || {
+                // Mosquitto src/mosquitto.c: main calls signal__setup
+                // before announcing readiness to logs and systemd.
+                tracing::info!("mosquitto version 2.1.4 running");
+                process::notify_ready();
+            },
+            async |signal| match signal {
+                // Mosquitto src/signals.c: persist__backup is a no-op when
+                // standalone persistence is disabled.
+                BrokerSignal::Backup => {
+                    if let Some(persistence) = &persistence {
+                        persistence.backup(&broker, false).await;
+                    }
+                }
+                BrokerSignal::Diagnostics => {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().lock().write_all(broker.subscription_tree().as_bytes());
+                }
+                BrokerSignal::Rotate => logging.reload(&live_log.borrow()),
+                BrokerSignal::Reload => unreachable!("handled by the listener"),
             },
             || broker.shutdown(),
         )
         .await;
-    if clustered {
+    shutdown.finish(&result);
+    stop_autosave.send_replace(true);
+    if let Some(task) = autosave {
+        let _ = task.await;
+    }
+    broker.shutdown();
+    bridges.into_inner().shutdown().await;
+    if let Some(persistence) = &persistence {
+        persistence.backup(&broker, true).await;
+    }
+    log_topics.abort();
+    if let Some(task) = membership_watch {
+        task.abort();
+    }
+    if membership.is_some() {
         return result.and(
             broker
                 .shutdown_cluster()
@@ -237,6 +570,10 @@ fn listener_policy(
     security: SecurityHandle,
 ) -> ListenerPolicy {
     let source = config.security_for(listener);
+    let security = match &listener.dynamic_security {
+        Some(dynamic) => security.with_dynamic_security(dynamic.before_file),
+        None => security,
+    };
     ListenerPolicy {
         allow_anonymous: Some(config.allow_anonymous_for(listener)),
         allow_zero_length_clientid: Some(source.allow_zero_length_clientid),

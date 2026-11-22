@@ -6,9 +6,13 @@
 //! so existing Mosquitto configuration can be reused unchanged.
 
 mod ctext;
+mod dynamic_security;
 
 pub mod acl_file;
 pub mod password_file;
 
 pub use acl_file::{Access, AclFile, AclFileError, AclWarning};
+pub use dynamic_security::{
+    DYNSEC_CONTROL_TOPIC, DYNSEC_RESPONSE_TOPIC, DynamicSecurity, DynsecRequest, DynsecResult,
+};
 pub use password_file::{BasicAuth, HashError, PasswordFile, PasswordFileError, PasswordHash};

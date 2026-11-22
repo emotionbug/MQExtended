@@ -3,9 +3,11 @@
 mod connection;
 mod fast;
 mod inbox;
+mod persistence;
 mod retained;
 mod runtime;
 mod state;
+mod sys;
 
 use std::{
     fmt,
@@ -18,14 +20,16 @@ use std::{
 };
 
 use bytes::Bytes;
-use mqx_auth::{AclFile, AclFileError, PasswordFile};
+use mqx_auth::{AclFile, AclFileError, BasicAuth, DynamicSecurity, PasswordFile};
 use mqx_cluster::ClusterError;
 use mqx_codec::{DecodeError, EncodeError, QoS};
 use thiserror::Error;
 use tokio::sync::watch;
 
-pub use runtime::Broker;
+pub use persistence::{PersistenceCounts, PersistentState};
 use runtime::Live;
+pub use runtime::{BridgeAck, BridgeIdentity, BridgeSession, Broker, SocketObservation};
+pub use sys::{BrokerMetrics, MOSQUITTO_VERSION, ProposalHistogram, SysTree};
 
 /// Broker-wide options. Zero-valued limits are disabled.
 #[derive(Debug, Clone)]
@@ -130,6 +134,78 @@ struct Security {
     reload: bool,
 }
 
+impl Security {
+    async fn authenticate(
+        self: Arc<Self>,
+        client_id: &Arc<str>,
+        username: Option<&Arc<str>>,
+        password: Option<&Bytes>,
+        allow_anonymous: bool,
+        dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
+    ) -> bool {
+        if username.is_some()
+            && password.is_some()
+            && (self.password.is_some() || dynamic.is_some())
+        {
+            let client_id = client_id.clone();
+            let username = username.cloned();
+            let password = password.cloned();
+            let dynamic = dynamic.cloned();
+            tokio::task::spawn_blocking(move || {
+                self.basic_auth(
+                    &client_id,
+                    username.as_deref(),
+                    password.as_deref(),
+                    allow_anonymous,
+                    dynamic.as_ref(),
+                )
+            })
+            .await
+            .unwrap_or(false)
+        } else {
+            self.basic_auth(
+                client_id,
+                username.map(AsRef::as_ref),
+                password.map(AsRef::as_ref),
+                allow_anonymous,
+                dynamic,
+            )
+        }
+    }
+
+    fn basic_auth(
+        &self,
+        client_id: &str,
+        username: Option<&str>,
+        password: Option<&[u8]>,
+        allow_anonymous: bool,
+        dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
+    ) -> bool {
+        let file = || match self.password.as_ref()?.check(username, password) {
+            BasicAuth::Allow => Some(true),
+            BasicAuth::Deny => Some(false),
+            BasicAuth::Ignore => None,
+        };
+        let policy = || dynamic?.1.authenticate(client_id, username, password);
+        // plugin_basic_auth.c: unlike an ignored password-file callback, a
+        // deferred callback can fall back to allow_anonymous only for no user.
+        security_callbacks(dynamic.map(|(order, _)| *order), file, policy)
+            .unwrap_or(allow_anonymous && (dynamic.is_none() || username.is_none()))
+    }
+}
+
+fn security_callbacks(
+    dynamic_before_file: Option<bool>,
+    file: impl FnOnce() -> Option<bool>,
+    dynamic: impl FnOnce() -> Option<bool>,
+) -> Option<bool> {
+    match dynamic_before_file {
+        Some(true) => dynamic().or_else(file),
+        Some(false) => file().or_else(dynamic),
+        None => file(),
+    }
+}
+
 struct SharedSecurity {
     id: u64,
     stable_id: Option<u64>,
@@ -139,16 +215,17 @@ struct SharedSecurity {
 static NEXT_LOCAL_SECURITY_ID: AtomicU64 = AtomicU64::new(1);
 static SECURITY_REVISION: AtomicU64 = AtomicU64::new(0);
 
-/// One reloadable set of Mosquitto password and ACL files. Use a single handle
-/// for listeners sharing security settings and separate handles for separate files.
+/// Reloadable security callbacks. Listeners sharing password/ACL files share a
+/// handle; dynamic security state is owned by the broker, not by the handle.
 #[derive(Clone)]
-pub struct SecurityHandle(Arc<SharedSecurity>);
+pub struct SecurityHandle(Arc<SharedSecurity>, Option<bool>);
 
 impl std::fmt::Debug for SecurityHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SecurityHandle")
             .field("cluster_id", &self.0.stable_id)
+            .field("dynamic_security_before_file", &self.1)
             .finish_non_exhaustive()
     }
 }
@@ -181,16 +258,26 @@ impl SecurityHandle {
         acl: Option<AclFile>,
         text: Option<Bytes>,
     ) -> Self {
-        Self(Arc::new(SharedSecurity {
-            id: NEXT_LOCAL_SECURITY_ID.fetch_add(1, Ordering::Relaxed),
-            stable_id,
-            snapshots: watch::Sender::new(Arc::new(Security {
-                password,
-                acl: acl.map(Arc::new),
-                text,
-                reload: false,
-            })),
-        }))
+        Self(
+            Arc::new(SharedSecurity {
+                id: NEXT_LOCAL_SECURITY_ID.fetch_add(1, Ordering::Relaxed),
+                stable_id,
+                snapshots: watch::Sender::new(Arc::new(Security {
+                    password,
+                    acl: acl.map(Arc::new),
+                    text,
+                    reload: false,
+                })),
+            }),
+            None,
+        )
+    }
+
+    /// Enables this listener's Dynamic Security auth and ACL callbacks.
+    /// `before_file` places them before password/ACL file callbacks.
+    pub fn with_dynamic_security(mut self, before_file: bool) -> Self {
+        self.1 = Some(before_file);
+        self
     }
 
     /// Replaces policy files loaded by the caller. In cluster mode follow
@@ -274,4 +361,14 @@ pub enum BrokerError {
     ClusterSecurity,
     #[error("replicated ACL bytes were rejected by the ACL parser")]
     InvalidClusterAcl,
+    #[error("dynamic security is not initialized")]
+    DynamicSecurityUninitialized,
+    #[error("could not prepare a dynamic security request: {0}")]
+    DynamicSecurityRequest(getrandom::Error),
+    #[error("dynamic security configuration {path}: {source}")]
+    DynamicSecurityFile {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }

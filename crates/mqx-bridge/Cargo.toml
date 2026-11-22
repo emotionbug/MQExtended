@@ -1,0 +1,20 @@
+[package]
+name = "mqx-bridge"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+mqx-broker.workspace = true
+mqx-codec.workspace = true
+mqx-topic.workspace = true
+getrandom = "0.4"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

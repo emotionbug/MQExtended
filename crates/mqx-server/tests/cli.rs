@@ -71,7 +71,7 @@ fn test_config_checks_the_file_without_starting() {
 }
 
 #[test]
-fn help_and_rejected_mosquitto_flags_are_actionable() {
+fn help_and_invalid_mosquitto_flags_are_actionable() {
     let output = Command::new(BIN).arg("-h").output().unwrap();
     assert!(output.status.success());
     assert!(
@@ -84,7 +84,6 @@ fn help_and_rejected_mosquitto_flags_are_actionable() {
         ("-p", "-p argument given, but no port specified."),
         ("-c", "-c argument given, but no config file specified."),
         ("--unknown", "Unknown option '--unknown'."),
-        ("-d", "Unsupported Mosquitto option '-d'."),
     ] {
         let output = Command::new(BIN).arg(arg).output().unwrap();
         assert_eq!(output.status.code(), Some(3));
@@ -105,7 +104,7 @@ async fn invalid_credentials_on_sighup_stop_the_broker() {
         sys::signal::{Signal, kill},
         unistd::Pid,
     };
-    use tokio::time::timeout;
+    use tokio::{net::UnixDatagram, time::timeout};
     for (option, good, bad) in [
         ("acl_file", "topic readwrite a/#", "topic readwrite a#"),
         ("password_file", "", "test:bad\n"),
@@ -116,18 +115,27 @@ async fn invalid_credentials_on_sighup_stop_the_broker() {
         let config = dir.path().join("broker.conf");
         let rules = dir.path().join("rules");
         let log = dir.path().join("broker.log");
+        let notify_path = dir.path().join("notify");
+        let notify = UnixDatagram::bind(&notify_path).unwrap();
         fs::write(&rules, good).unwrap();
-        fs::write(&config, format!("listener {} 127.0.0.1\nallow_anonymous true\n{option} {}\nlog_type information\nlog_dest file {}\nlog_timestamp_format %Y\nconnection_messages false\n", addr.port(), rules.display(), log.display())).unwrap();
+        fs::write(&config, format!("user root\nlistener {} 127.0.0.1\nallow_anonymous true\n{option} {}\nlog_type information\nlog_type error\nlog_dest file {}\nlog_timestamp_format %Y\nconnection_messages false\n", addr.port(), rules.display(), log.display())).unwrap();
         drop(pin);
         let child = tokio::process::Command::new(BIN)
             .arg("-c")
             .arg(&config)
+            .env("NOTIFY_SOCKET", &notify_path)
+            .env("TOKIO_WORKER_THREADS", "2")
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
         let pid = Pid::from_raw(child.id().unwrap() as i32);
-        // Wait for the signal handlers as well as the TCP bind.
+        let mut ready = [0; 7];
+        let length = timeout(Duration::from_secs(5), notify.recv(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ready[..length], b"READY=1");
         assert_eq!(connect_and_read_ack(addr).await, [0x20, 2, 0, 0]);
         fs::write(&rules, bad).unwrap();
         kill(pid, Signal::SIGHUP).unwrap();
@@ -136,13 +144,9 @@ async fn invalid_credentials_on_sighup_stop_the_broker() {
             .unwrap()
             .unwrap();
         assert_eq!(output.status.code(), Some(3));
-        assert!(
-            String::from_utf8(output.stderr)
-                .unwrap()
-                .contains(&format!("Security reload failed: Unable to load {option}"))
-        );
         let log = fs::read_to_string(&log).unwrap();
-        let (timestamp, _) = log.split_once(": Opening ipv4 listen socket").unwrap();
+        assert!(log.contains(&format!("Security reload failed: Unable to load {option}")));
+        let (timestamp, _) = log.lines().next().unwrap().split_once(": ").unwrap();
         assert_eq!(timestamp.len(), 4);
         assert!(timestamp.bytes().all(|digit| digit.is_ascii_digit()));
         assert!(log.contains(": Reloading config."));
@@ -194,7 +198,7 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
     fs::write(
         &path,
         format!(
-            "listener {} 127.0.0.1\nallow_anonymous true\nacl_file {}\ncluster_node_id 1\n\
+            "user root\nlistener {} 127.0.0.1\nallow_anonymous true\nacl_file {}\ncluster_node_id 1\n\
         cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\ncluster_data_dir {}\n\
         cluster_cafile {}\ncluster_certfile {}\ncluster_keyfile {}\n",
             mqtt_addr.port(),
@@ -233,5 +237,271 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+    use std::{
+        fs,
+        io::ErrorKind,
+        net::{SocketAddr, TcpListener},
+        time::Duration,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpStream, UnixDatagram},
+        time::{sleep, timeout},
+    };
+
+    async fn connect(addr: SocketAddr) -> std::io::Result<(TcpStream, [u8; 4])> {
+        let mut socket = TcpStream::connect(addr).await?;
+        socket.write_all(PERSISTENT_CONNECT).await?;
+        let mut ack = [0; 4];
+        socket.read_exact(&mut ack).await?;
+        Ok((socket, ack))
+    }
+
+    fn closed(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+        )
+    }
+
+    // The process can report READY before a joining voter is promoted and
+    // finishes security registration. Only a complete CONNACK proves MQTT is ready.
+    async fn wait_serving(addr: SocketAddr) -> (TcpStream, [u8; 4]) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match connect(addr).await {
+                    Ok(client) => return client,
+                    Err(error) if closed(&error) => sleep(Duration::from_millis(20)).await,
+                    Err(error) => panic!("MQTT connect to {addr}: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("MQTT listener {addr} never served a CONNECT"))
+    }
+
+    async fn wait_ready(socket: UnixDatagram) {
+        let mut packet = [0; 32];
+        let len = timeout(Duration::from_secs(10), socket.recv(&mut packet))
+            .await
+            .expect("broker did not send READY=1")
+            .unwrap();
+        assert_eq!(&packet[..len], b"READY=1");
+    }
+
+    let sockets: [_; 4] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    let [mqtt1, raft1, mqtt2, raft2] = sockets.each_ref().map(|s| s.local_addr().unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let first_config = directory.path().join("one.conf");
+    let second_config = directory.path().join("two.conf");
+    let config = |id: u64, mqtt: std::net::SocketAddr, raft| {
+        format!(
+            "user root\nlistener {} 127.0.0.1\nallow_anonymous true\ncluster_node_id {id}\n\
+             cluster_bind {raft}\ncluster_peer 1 {raft1}\ncluster_insecure_plaintext true\n\
+             cluster_data_dir {}\ncluster_lease_interval 100\ncluster_lease_timeout 1000\n",
+            mqtt.port(),
+            directory.path().join(id.to_string()).display(),
+        )
+    };
+    let initial = config(1, mqtt1, raft1);
+    fs::write(&first_config, &initial).unwrap();
+    fs::write(
+        &second_config,
+        format!(
+            "{}cluster_peer 2 {raft2}\ncluster_join true\n",
+            config(2, mqtt2, raft2)
+        ),
+    )
+    .unwrap();
+    drop(sockets);
+    let start = |path: &std::path::Path| {
+        let notify_path = path.with_extension("notify");
+        let notify = UnixDatagram::bind(&notify_path).unwrap();
+        let child = tokio::process::Command::new(BIN)
+            .arg("-c")
+            .arg(path)
+            .env("NOTIFY_SOCKET", &notify_path)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        (child, notify)
+    };
+    let (mut first, first_ready) = start(&first_config);
+    let pid = Pid::from_raw(first.id().unwrap().try_into().unwrap());
+    let wait = Duration::from_secs(10);
+    wait_ready(first_ready).await;
+    assert_eq!(wait_serving(mqtt1).await.1, [0x20, 2, 0, 0]);
+    let (mut second, second_ready) = start(&second_config);
+    wait_ready(second_ready).await;
+    let unpromoted = timeout(wait, connect(mqtt2))
+        .await
+        .expect("unpromoted learner did not refuse the connection")
+        .expect_err("unpromoted learner served MQTT");
+    assert!(closed(&unpromoted), "{unpromoted}");
+
+    fs::write(
+        &first_config,
+        format!("{initial}cluster_peer 2 {raft2}\ncluster_membership_generation 1\n"),
+    )
+    .unwrap();
+    kill(pid, Signal::SIGHUP).unwrap();
+    let (mut connected, ack) = wait_serving(mqtt2).await;
+    assert_eq!(ack, [0x20, 2, 1, 0]);
+
+    fs::write(
+        &first_config,
+        format!("{initial}cluster_membership_generation 2\n"),
+    )
+    .unwrap();
+    kill(pid, Signal::SIGHUP).unwrap();
+    let rejected = timeout(wait, connected.read_u8())
+        .await
+        .expect("retired node did not close the existing connection")
+        .expect_err("retired node still served the existing connection");
+    assert!(closed(&rejected), "{rejected}");
+    let rejected = timeout(wait, connect(mqtt2))
+        .await
+        .expect("retired node did not refuse a new connection")
+        .expect_err("retired node served a new MQTT connection");
+    assert!(closed(&rejected), "{rejected}");
+    assert_eq!(wait_serving(mqtt1).await.1, [0x20, 2, 1, 0]);
+
+    for child in [&mut first, &mut second] {
+        kill(
+            Pid::from_raw(child.id().unwrap().try_into().unwrap()),
+            Signal::SIGTERM,
+        )
+        .unwrap();
+        assert!(
+            timeout(wait, child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires the Mosquitto 2.1.4 reference with Unix sockets"]
+async fn unix_listener_replaces_stale_socket_and_unlinks_on_shutdown() {
+    use std::{
+        fs,
+        os::unix::fs::{FileTypeExt, PermissionsExt},
+        path::PathBuf,
+        process::Stdio,
+        time::Duration,
+    };
+
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixStream,
+        time::{sleep, timeout},
+    };
+
+    let reference = PathBuf::from(
+        std::env::var_os("MOSQUITTO_BUILD_DIR")
+            .expect("set MOSQUITTO_BUILD_DIR to the Mosquitto 2.1.4 build directory"),
+    )
+    .join("src/mosquitto")
+    .canonicalize()
+    .unwrap();
+    let wait = Duration::from_secs(5);
+    for binary in [reference, PathBuf::from(BIN)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt.sock");
+        let log_path = dir.path().join("broker.log");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        fs::write(
+            dir.path().join("broker.conf"),
+            "user root\nlistener 0 mqtt.sock\nlistener_allow_anonymous true\n\
+             set_tcp_nodelay true\nlog_dest stderr\nlog_type all\n",
+        )
+        .unwrap();
+        let mut child = tokio::process::Command::new(&binary)
+            .args(["-c", "broker.conf"])
+            .current_dir(dir.path())
+            .env_remove("PUID")
+            .env_remove("PGID")
+            .env("TOKIO_WORKER_THREADS", "2")
+            .stderr(Stdio::from(fs::File::create(&log_path).unwrap()))
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let (ack, pong) = timeout(wait, async {
+            let mut stream = loop {
+                if let Ok(stream) = UnixStream::connect(&path).await {
+                    break stream;
+                }
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "{binary:?} exited before accepting a Unix connection:\n{}",
+                    fs::read_to_string(&log_path).unwrap(),
+                );
+                sleep(Duration::from_millis(10)).await;
+            };
+            // Mosquitto test/broker/01-connect-unix-socket.py checks MQTT CONNECT/CONNACK.
+            stream
+                .write_all(b"\x10\x17\x00\x04MQTT\x04\x02\x00\x3c\x00\x0bunix-socket")
+                .await
+                .unwrap();
+            let mut ack = [0; 4];
+            stream.read_exact(&mut ack).await.unwrap();
+            stream.write_all(b"\xc0\x00").await.unwrap();
+            let mut pong = [0; 2];
+            stream.read_exact(&mut pong).await.unwrap();
+            // Drain the disconnect before SIGTERM. In Mosquitto loop.c the
+            // signal handler only clears g_run; racing it with mux__handle
+            // on an active disconnect can leave epoll waiting for the next tick.
+            stream.write_all(b"\xe0\x00").await.unwrap();
+            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+            (ack, pong)
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{binary:?} did not serve MQTT on its Unix socket"));
+        assert_eq!(ack, [0x20, 2, 0, 0], "{binary:?}");
+        assert_eq!(pong, [0xd0, 0], "{binary:?}");
+
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.file_type().is_socket(), "{binary:?}");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o770, "{binary:?}");
+        let pid = Pid::from_raw(child.id().unwrap().try_into().unwrap());
+        kill(pid, Signal::SIGTERM).unwrap();
+        let status = timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{binary:?} did not stop:\n{}",
+                    fs::read_to_string(&log_path).unwrap()
+                )
+            })
+            .unwrap();
+        assert!(status.success(), "{binary:?} exited with {status}");
+        assert!(
+            !path.exists(),
+            "{binary:?} left the listener pathname behind"
+        );
+
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("Opening unix listen socket on path mqtt.sock."));
+        assert!(log.contains("New connection from mqtt.sock:0 on port 0."));
+        assert!(!log.contains("Unable to set TCP_NODELAY"));
     }
 }

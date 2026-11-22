@@ -58,6 +58,7 @@ fn invalid_values_produce_reference_startup_diagnostics() {
             "Invalid 'mount_point' value (test/+/). Does it contain a wildcard character?",
         ),
         ("listener 100000", "Invalid 'port' value (100000)."),
+        #[cfg(unix)]
         (
             "listener 0",
             "A listener with port 0 must provide a Unix socket path.",
@@ -351,18 +352,16 @@ fn security_scope_preserves_per_listener_anonymous_override_and_prefix() {
 #[test]
 fn unsupported_features_are_not_silently_ignored() {
     for (input, directive) in [
-        ("persistence true", "persistence"),
-        ("retained_persistence true", "retained_persistence"),
-        ("listener 1888\nprotocol http_api", "protocol"),
         ("psk_file secret.txt", "psk_file"),
-        ("connection upstream", "connection"),
+        ("connection upstream\nbridge_psk secret", "bridge_psk"),
         (
-            "bridge_protocol_version mqttv311",
-            "bridge_protocol_version",
+            "connection upstream\nbridge_identity peer",
+            "bridge_identity",
         ),
-        ("plugin_opt_verbose true", "plugin_opt_verbose"),
-        ("auth_plugin my_plugin.so", "auth_plugin"),
-        ("listener 0 /tmp/mqtt.sock", "listener"),
+        (
+            "connection upstream\nbridge_require_ocsp true",
+            "bridge_require_ocsp",
+        ),
     ] {
         let error = ServerConfig::parse(input).unwrap_err().to_string();
         assert!(
@@ -370,6 +369,315 @@ fn unsupported_features_are_not_silently_ignored() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn dynsec_direct_plugins_follow_global_and_legacy_listener_scope() {
+    // Mosquitto test/broker/14-dynsec-auth.py uses the distribution plugin name.
+    for (directive, scope) in [
+        ("plugin", ""),
+        ("auth_plugin", ""),
+        ("global_plugin", "per_listener_settings true\n"),
+    ] {
+        let config = ServerConfig::parse(&format!(
+            "{scope}listener 1888\npassword_file users.pass\n\
+             {directive} /usr/lib/mosquitto_dynamic_security.so\n\
+             plugin_opt_config_file first.json\n\
+             auth_opt_CONFIG_FILE \tconfig files/dynsec.json \n\
+             plugin_opt_password_init_file /run/secrets/dynsec\n\
+             auth_plugin_deny_special_chars false\n\
+             plugin_opt_ignored yes\nlistener 1889\n"
+        ))
+        .unwrap();
+        let active = config.dynamic_security.as_ref().unwrap();
+        assert_eq!(
+            active.config_file.as_path(),
+            Path::new("config files/dynsec.json ")
+        );
+        assert_eq!(
+            active.password_init_file.as_deref(),
+            Some(Path::new("/run/secrets/dynsec"))
+        );
+        assert!(active.before_file);
+        for listener in &config.listeners {
+            assert_eq!(listener.dynamic_security.as_ref(), Some(active));
+        }
+    }
+
+    let config = ServerConfig::parse(
+        "per_listener_settings true\nlistener 1888\n\
+         plugin mosquitto_dynamic_security.so\nplugin_opt_config_file dynsec.json\n\
+         listener 1889\n",
+    )
+    .unwrap();
+    let active = config.dynamic_security.as_ref().unwrap();
+    assert_eq!(config.listeners[0].dynamic_security.as_ref(), Some(active));
+    assert!(active.before_file);
+    assert!(config.listeners[1].dynamic_security.is_none());
+}
+
+#[test]
+fn dynsec_named_plugin_attaches_only_to_explicit_listeners() {
+    // Mosquitto test/broker/09-plugin-load-basic-auth.py uses one load and several uses.
+    for (scope, before_file) in [("", false), ("per_listener_settings true\n", true)] {
+        let config = ServerConfig::parse(&format!(
+            "{scope}plugin_load dynsec mosquitto_dynamic_security.so\n\
+             listener 1888\nplugin_use dynsec\nplugin_opt_CONFIG_FILE dynsec.json\n\
+             password_file users.pass\nlistener 1889\nlistener 1890\nplugin_use dynsec\n"
+        ))
+        .unwrap();
+        let active = config.dynamic_security.as_ref().unwrap();
+        assert_eq!(active.config_file.as_path(), Path::new("dynsec.json"));
+        assert_eq!(active.before_file, before_file);
+        assert_eq!(config.listeners[0].dynamic_security.as_ref(), Some(active));
+        assert!(config.listeners[1].dynamic_security.is_none());
+        assert_eq!(config.listeners[2].dynamic_security.as_ref(), Some(active));
+    }
+}
+
+#[test]
+fn dynsec_global_plugin_applies_to_local_only_and_command_line_listeners() {
+    let config = ServerConfig::parse(
+        "plugin mosquitto_dynamic_security.so\nplugin_opt_config_file dynsec.json\n",
+    )
+    .unwrap();
+    assert!(config.dynamic_security.is_some());
+    assert_eq!(
+        config.listeners[0].dynamic_security,
+        config.dynamic_security
+    );
+    let config = config.with_command_line_ports(&[1888, 1889]);
+    for listener in &config.listeners {
+        assert_eq!(listener.dynamic_security, config.dynamic_security);
+    }
+
+    let config = ServerConfig::parse(
+        "plugin mosquitto_dynamic_security.so\nplugin_opt_password_init_file password\n",
+    )
+    .unwrap();
+    assert!(config.dynamic_security.is_none());
+    assert!(config.listeners[0].dynamic_security.is_none());
+    assert!(
+        config
+            .notices
+            .iter()
+            .any(|notice| notice.contains("The plugin will not be activated."))
+    );
+}
+
+#[test]
+fn dynsec_named_loads_survive_includes_but_current_plugin_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("dynsec.conf"),
+        "plugin_load dynsec mosquitto_dynamic_security.so\nplugin_opt_config_file dynsec.json\n",
+    )
+    .unwrap();
+    let root = format!("include_dir {}\n", dir.path().display());
+    let config = ServerConfig::parse(&format!("{root}listener 1888\nplugin_use dynsec")).unwrap();
+    assert!(config.listeners[0].dynamic_security.is_some());
+    let err = ServerConfig::parse(&format!("{root}plugin_opt_config_file incorrect.json"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("requires plugin/global_plugin/plugin_load"));
+}
+
+#[test]
+fn dynsec_rejects_unsupported_plugins_and_invalid_scope() {
+    let path = "mosquitto_dynamic_security.so";
+    for directive in [
+        "plugin",
+        "auth_plugin",
+        "global_plugin",
+        "plugin_load other",
+    ] {
+        let err = ServerConfig::parse(&format!("{directive} /opt/custom/auth.so"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unsupported") && err.contains("/opt/custom/auth.so"));
+    }
+    for (input, expected) in [
+        (
+            "plugin_opt_verbose true".into(),
+            "The 'plugin_opt_verbose' option requires plugin/global_plugin/plugin_load",
+        ),
+        (
+            format!("plugin {path}\nplugin_opt_ unknown"),
+            "Invalid 'plugin_opt_' config option.",
+        ),
+        (
+            format!("plugin {path}\nplugin_opt_config_file"),
+            "Empty 'config_file' value",
+        ),
+        (
+            format!("per_listener_settings true\nplugin {path}"),
+            "requires a listener",
+        ),
+        (
+            format!("plugin {path}\nper_listener_settings true"),
+            "must be set before any other security settings",
+        ),
+        (
+            format!("plugin_load dynsec {path}\nport 1888\nplugin_use dynsec"),
+            "requires a listener",
+        ),
+        (
+            "listener 1888\nplugin_use dynsec".into(),
+            "Plugin 'dynsec' not previously loaded.",
+        ),
+        (
+            format!("plugin_load dynsec {path}\nlistener 1888"),
+            "must be attached to a listener with plugin_use",
+        ),
+        (
+            format!("plugin_load dynsec {path}\nplugin_load dynsec {path}"),
+            "Duplicate plugin name 'dynsec'.",
+        ),
+        (
+            format!(
+                "plugin_load dynsec {path}\nplugin_opt_config_file dynsec.json\n\
+                     listener 1888\nplugin_use dynsec\nplugin_use dynsec"
+            ),
+            "Dynamic security plugin can currently only be loaded once.",
+        ),
+        (
+            format!(
+                "plugin {path}\nplugin_opt_config_file first.json\n\
+                     global_plugin {path}\nplugin_opt_config_file second.json"
+            ),
+            "Dynamic security plugin can currently only be loaded once.",
+        ),
+    ] {
+        let err = ServerConfig::parse(&input).unwrap_err().to_string();
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+#[test]
+fn bridge_blocks_keep_address_order_identity_and_remapped_filters() {
+    let config = ServerConfig::parse(
+        "connection first\naddresses primary:1884 secondary\nclientid remote\n\
+         local_clientid local\nbridge_protocol_version mqttv50\nlocal_cleansession false\n\
+         start_type lazy\nrestart_timeout 2 20 30\n\
+         topic \"with spaces/#\" BoTh 1 local/ remote/\n\
+         topic \"\" in 0 from to\n\
+         connection second\naddress primary\ntopic #",
+    )
+    .unwrap();
+    let [first, second] = &config.bridges[..] else {
+        panic!("expected two bridge blocks")
+    };
+    assert_eq!(
+        first.addresses,
+        [("primary".into(), 1884), ("secondary".into(), 1883)]
+    );
+    assert_eq!(first.remote_clientid, "remote");
+    assert_eq!(first.local_clientid, "local");
+    assert!(!first.default_local_clientid);
+    assert!(!first.default_remote_clientid);
+    assert_eq!(first.protocol, mqx_bridge::Protocol::V5);
+    assert_eq!(first.start, mqx_bridge::Start::Lazy);
+    assert_eq!(first.local_clean_session, Some(false));
+    assert_eq!(
+        first.restart,
+        mqx_bridge::Restart {
+            initial_ms: 2000,
+            base_ms: 2000,
+            cap_ms: 20000,
+            stable_secs: 30
+        }
+    );
+    assert_eq!(first.topics[0].local_filter, "local/with spaces/#");
+    assert_eq!(first.topics[0].remote_filter, "remote/with spaces/#");
+    assert_eq!(first.topics[1].local_filter, "from");
+    assert_eq!(first.topics[1].remote_filter, "to");
+    assert_eq!(
+        second.local_clientid,
+        format!("local.{}", second.remote_clientid)
+    );
+    assert!(second.default_local_clientid && second.default_remote_clientid);
+}
+
+#[test]
+fn malformed_bridge_blocks_fail_with_the_reference_diagnostics() {
+    for (input, message) in [
+        ("topic #", "requires a bridge to be defined first"),
+        ("connection one\n", "no remote addresses defined"),
+        ("connection one\naddress host\n", "no topics defined"),
+        (
+            "connection one\naddress host:0\ntopic #\n",
+            "Invalid bridge port value (0)",
+        ),
+        (
+            "connection one\naddress host\ntopic #\naddresses other",
+            "'address' only allowed once",
+        ),
+        (
+            "connection one\naddress host\ntopic \"\" both",
+            "Invalid bridge remapping",
+        ),
+        (
+            "connection one\naddress host\ntopic #\nconnection one",
+            "Duplicate bridge name 'one'",
+        ),
+    ] {
+        let error = ServerConfig::parse(input).unwrap_err().to_string();
+        assert!(error.contains(message), "{error}");
+    }
+}
+
+#[test]
+fn persistence_alias_and_paths_use_mosquitto_config_rules() {
+    let default = ServerConfig::default().persistence;
+    assert!(!default.enabled);
+    assert_eq!(default.autosave_interval, 1800);
+    assert!(!default.autosave_on_changes);
+    assert_eq!(default.mosquitto_path(), Path::new("mosquitto.db"));
+
+    let config = ServerConfig::parse(
+        "persistence false\nretained_persistence true\npersistence_location /path name\npersistence_file custom.db\nautosave_interval -1\nautosave_on_changes true",
+    ).unwrap().persistence;
+    assert!(config.enabled);
+    assert_eq!(config.mosquitto_path(), Path::new("/path name/custom.db"));
+    assert_eq!(config.autosave_interval, 0);
+    assert!(config.autosave_on_changes);
+    let config = ServerConfig::parse("retained_persistence true\npersistence false").unwrap();
+    assert!(!config.persistence.enabled);
+    assert!(ServerConfig::parse("persistence_file a\npersistence_file b").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn port_zero_uses_the_socket_path_instead_of_a_tcp_hostname() {
+    let input = "listener 0 mqtt.sock # ignored\nlistener 1883 localhost";
+    let config = ServerConfig::parse(input).unwrap();
+    assert!(!config.local_only);
+    let [unix, tcp] = config.listeners.as_slice() else {
+        panic!("expected the configured Unix and TCP listeners");
+    };
+    assert_eq!(unix.port, 0);
+    assert_eq!(
+        unix.unix_socket_path.as_deref(),
+        Some(Path::new("mqtt.sock"))
+    );
+    assert_eq!(unix.host, None);
+    assert_eq!(tcp.host.as_deref(), Some("localhost"));
+    assert_eq!(tcp.unix_socket_path, None);
+    assert!(ServerConfig::parse("listener 0 # no path").is_err());
+}
+
+#[test]
+fn http_api_configuration_uses_mosquitto_directives() {
+    let config = ServerConfig::parse(
+        "sys_interval 0\nlistener 9883\nprotocol http_api\nhttp_dir .\nrequire_certificate true\n",
+    )
+    .unwrap();
+    assert_eq!(config.sys_interval, 0);
+    assert_eq!(config.listeners[0].protocol, ListenerProtocol::HttpApi);
+    assert!(config.listeners[0].http_dir.as_ref().unwrap().is_absolute());
+    assert!(config.listeners[0].tls.require_certificate);
+    assert_eq!(ServerConfig::default().sys_interval, 10);
+    assert!(ServerConfig::parse("sys_interval 65536").is_err());
 }
 
 #[test]
@@ -459,6 +767,29 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
     assert_eq!(config.lease_timeout, Duration::from_millis(4800));
     assert_eq!(config.request_timeout, Duration::from_millis(6900));
     assert_eq!(config.max_snapshot_size, 123456);
+}
+
+#[test]
+fn membership_generation_can_exclude_the_local_node_but_bootstrap_cannot() {
+    let config = ServerConfig::parse(&format!(
+        "cluster_node_id 1\ncluster_bind 127.0.0.1:7001\ncluster_data_dir node1\n\
+         cluster_peer 2 127.0.0.1:7002\ncluster_membership_generation 17\n{CLUSTER_TLS}"
+    ))
+    .unwrap()
+    .cluster
+    .unwrap();
+    assert_eq!(config.membership_generation, 17);
+    assert!(!config.peers.contains_key(&1));
+    let join = ServerConfig::parse(&format!("{CLUSTER}{CLUSTER_TLS}cluster_join true\n"))
+        .unwrap()
+        .cluster
+        .unwrap();
+    assert!(join.join);
+    let error = ServerConfig::parse(&format!(
+        "{CLUSTER}{CLUSTER_TLS}cluster_join true\ncluster_state_format 1\n"
+    ))
+    .unwrap_err();
+    assert!(error.to_string().contains("Dynamic membership requires"));
 }
 
 #[test]

@@ -20,13 +20,26 @@ use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGu
 
 use crate::node::{LogId, Types};
 use crate::snapshot::prepare_dir;
-use crate::transport::{decode, encode, invalid_data};
+use crate::transport::{decode, invalid_data};
+use crate::version;
 
 type Entry = EntryOf<Types>;
 type Vote = VoteOf<Types>;
+
+/// Counters for the open WAL, reset when the node restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalMetrics {
+    /// Entries accepted for append, including Raft control and lease entries.
+    pub appended_entries: u64,
+    /// Filesystem-sync batches completed by the WAL worker. A batch spanning
+    /// multiple WAL files can sync more than one file.
+    pub sync_batches: u64,
+}
+
 struct Inner {
     log: raft_log::RaftLog<WalTypes>,
     pending_commit: Option<LogId>,
+    appended_entries: u64,
 }
 
 impl Inner {
@@ -42,10 +55,11 @@ impl Inner {
 pub(crate) struct Wal {
     inner: Arc<RwLock<Option<Inner>>>,
     append_budget: usize,
+    format: u16,
 }
 
 impl Wal {
-    pub(crate) fn open(path: &Path, max_append_size: usize) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path, max_append_size: usize, format: u16) -> io::Result<Self> {
         prepare_dir(path, true)?;
         let dir = path
             .to_str()
@@ -66,8 +80,18 @@ impl Wal {
             inner: Arc::new(RwLock::new(Some(Inner {
                 log,
                 pending_commit: None,
+                appended_entries: 0,
             }))),
             append_budget: max_append_size - crate::transport::MAX_CONTROL_FRAME,
+            format,
+        })
+    }
+
+    pub(crate) async fn metrics(&self) -> io::Result<WalMetrics> {
+        let inner = self.read().await?;
+        Ok(WalMetrics {
+            appended_entries: inner.appended_entries,
+            sync_batches: inner.log.stat().flush_metrics.sync_batch_count,
         })
     }
 
@@ -118,7 +142,7 @@ impl RaftLogReader<Types> for Wal {
             .await?
             .log
             .read(start, end)
-            .map(|item| decode(&item?.1.0))
+            .map(|item| item?.1.entry())
             .collect()
     }
 
@@ -132,7 +156,7 @@ impl RaftLogReader<Types> for Wal {
             if !entries.is_empty() && len > remaining {
                 break;
             }
-            entries.push(decode(&body.0)?);
+            entries.push(body.entry()?);
             remaining = remaining.saturating_sub(len);
         }
         Ok(entries)
@@ -196,12 +220,17 @@ impl RaftLogStorage<Types> for Wal {
     {
         let encoded = entries
             .into_iter()
-            .map(|entry| Ok((Packed(entry.log_id()), EntryBytes(encode(&entry)?.into()))))
+            .map(|entry| {
+                let body = version::encode(&entry, self.format, self.format != 1)?;
+                Ok((Packed(entry.log_id()), EntryBytes(body)))
+            })
             .collect::<io::Result<Vec<_>>>()?;
         let mut log = self.write().await?;
         log.record_commit()?;
+        let count = encoded.len() as u64;
         log.log.append(encoded)?;
         log.log.flush(true, Some(Flushed::Raft(callback)))?;
+        log.appended_entries += count;
         Ok(())
     }
 
@@ -249,6 +278,23 @@ impl raft_log::Types for WalTypes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EntryBytes(Bytes);
 
+impl EntryBytes {
+    fn payload(&self) -> io::Result<&[u8]> {
+        let (version, payload) = version::split(&self.0, "WAL entry").map_err(invalid_data)?;
+        match version {
+            1 | 2 => Ok(payload),
+            _ => Err(invalid_data(crate::ClusterError::UnsupportedVersion {
+                kind: "WAL entry",
+                version,
+            })),
+        }
+    }
+
+    fn entry(&self) -> io::Result<Entry> {
+        decode(self.payload()?)
+    }
+}
+
 impl Encode for EntryBytes {
     fn encode<W: io::Write>(&self, mut writer: W) -> io::Result<usize> {
         let len = u32::try_from(self.0.len()).map_err(invalid_data)?;
@@ -260,7 +306,9 @@ impl Encode for EntryBytes {
 
 impl Decode for EntryBytes {
     fn decode<R: io::Read>(reader: R) -> io::Result<Self> {
-        Ok(Self(Vec::<u8>::decode(reader)?.into()))
+        let entry = Self(Vec::<u8>::decode(reader)?.into());
+        entry.payload()?;
+        Ok(entry)
     }
 }
 
@@ -322,5 +370,60 @@ impl raft_log::Callback for Flushed {
                 let _ = tx.send(result);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openraft::type_config::TypeConfigExt;
+
+    use super::*;
+    use crate::node::Leadership;
+
+    #[tokio::test]
+    async fn vote_and_append_acknowledge_only_after_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), crate::DEFAULT_MAX_APPEND_SIZE, 1).unwrap();
+        let initial = wal.metrics().await.unwrap();
+        let vote = Vote::new_committed(1, 1);
+        wal.save_vote(&vote).await.unwrap();
+        let voted = wal.metrics().await.unwrap();
+        assert!(voted.sync_batches > initial.sync_batches);
+
+        let log_id = LogId::new(
+            Leadership {
+                term: 1,
+                node_id: 1,
+            },
+            0,
+        );
+        let (tx, rx) = Types::oneshot();
+        wal.append(
+            [Entry {
+                log_id,
+                payload: openraft::alias::EntryPayloadOf::<Types>::Blank,
+            }],
+            IOFlushed::signal(tx),
+        )
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+        let appended = wal.metrics().await.unwrap();
+        assert_eq!(appended.appended_entries, 1);
+        assert!(appended.sync_batches > voted.sync_batches);
+        wal.close().await.unwrap();
+    }
+
+    #[test]
+    fn refuses_future_wal_envelope_before_deserializing_entry() {
+        let bytes = version::encode(&0, 3, true).unwrap();
+        let mut record = Vec::new();
+        EntryBytes(bytes).encode(&mut record).unwrap();
+        let error = EntryBytes::decode(record.as_slice()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported WAL entry version 3")
+        );
     }
 }

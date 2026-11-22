@@ -27,6 +27,8 @@ MQExtended is a clustered MQTT broker in Rust that replaces Mosquitto without ch
 | [docs/data-model.md](docs/data-model.md) | State tiers, replicated commands, on-disk layout |
 | [docs/cluster.md](docs/cluster.md) | Running a cluster: `cluster_*` directives, network, bootstrap, what clients see on node failure |
 | [docs/migration.md](docs/migration.md) | Moving a running Mosquitto deployment over: config check, version differences, client discovery from logs, cutover |
+| [docs/dynamic-security.md](docs/dynamic-security.md) | Built-in dynamic security plugin: enabling it, first start, cluster replication, differences |
+| [docs/monitoring.md](docs/monitoring.md) | `$SYS` topics, Mosquitto HTTP API, cluster status endpoint, Prometheus metrics |
 | [docs/performance.md](docs/performance.md) | Running `mqx-bench`, current latency/throughput numbers, known performance gaps |
 | [docs/mosquitto-compatibility.md](docs/mosquitto-compatibility.md) | The parity contract: reference version, rule catalogue, deliberate deviations |
 | [docs/glossary.md](docs/glossary.md) | Authoritative terminology |

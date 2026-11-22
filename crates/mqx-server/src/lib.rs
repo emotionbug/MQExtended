@@ -1,4 +1,5 @@
 mod config;
+mod http_api;
 mod listener;
 mod logging;
 mod tls;
@@ -7,12 +8,14 @@ mod transport;
 use std::{io, path::PathBuf};
 
 pub use config::{
-    BrokerLimits, ListenerConfig, ListenerProtocol, LogConfig, LogDestination, LogType,
-    ProxyProtocol, SecurityConfig, ServerConfig, SocketDomain, TlsConfig, TlsVersion,
-    parse_command_line_port,
+    BrokerLimits, DynamicSecurityConfig, ListenerConfig, ListenerProtocol, LogConfig,
+    LogDestination, LogType, PersistenceConfig, ProxyProtocol, SecurityConfig, ServerConfig,
+    SocketDomain, TlsConfig, TlsVersion, parse_command_line_port,
 };
-pub use listener::{CertIdentity, Connection, Server};
-pub use logging::init_logging;
+pub use http_api::HttpApi;
+pub use listener::{BrokerSignal, CertIdentity, Connection, Server};
+pub use logging::{LogTopics, Logging, init_logging, startup_log};
+pub use tls::connect_bridge_tls;
 pub use transport::ConnectionStream;
 
 #[derive(Debug, thiserror::Error)]

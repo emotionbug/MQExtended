@@ -240,3 +240,57 @@ fn keepalive_timeout_closes_without_reason(h: &mut Harness) {
     );
     received(h, watcher, will_publication());
 }
+
+#[test]
+#[ignore = "requires cluster-enabled mqextended"]
+fn persistent_qos2_pubrel_and_unsent_qos1_resume_after_kill() {
+    let mut h = crate::start_cluster(config(ANONYMOUS));
+    let h = &mut h;
+    let settings = Connect {
+        clean_start: false,
+        properties: vec![
+            Property::SessionExpiryInterval(60),
+            Property::ReceiveMaximum(1),
+        ],
+        ..options("durable-v5")
+    };
+    let receiver = h.open_v5_on(2).unwrap();
+    send(h, receiver, Packet::Connect(settings.clone()));
+    connack(h, receiver, false, connack_properties());
+    let topic = "failover/qos2";
+    subscribe(h, receiver, 1, topic, Q2);
+
+    let publisher = h.open_on(1, crate::V311).unwrap();
+    crate::send(
+        h,
+        publisher,
+        crate::Packet::Connect(crate::options("source")),
+    );
+    crate::connack(h, publisher, crate::Accepted, false);
+    crate::publish_from(h, publisher, crate::publish(topic, b"qos2", Q2, 10));
+    received(
+        h,
+        receiver,
+        Packet::Publish(publication(topic, b"qos2", Q2, 1)),
+    );
+    send(h, receiver, Packet::PubRec(ack(1, R::SUCCESS)));
+    received(h, receiver, Packet::PubRel(ack(1, R::SUCCESS)));
+    crate::publish_from(h, publisher, crate::publish(topic, b"queued", Q1, 11));
+
+    h.kill_node(2).unwrap();
+    closed(h, receiver);
+    let receiver = h.open_v5_on(3).unwrap();
+    send(h, receiver, Packet::Connect(settings));
+    connack(h, receiver, true, connack_properties());
+    // database.c: db__message_reconnect_reset_outgoing resumes PUBREL
+    // after PUBREC, and an unattempted PUBLISH starts with DUP clear.
+    received(h, receiver, Packet::PubRel(ack(1, R::SUCCESS)));
+    send(h, receiver, Packet::PubComp(ack(1, R::SUCCESS)));
+    received(
+        h,
+        receiver,
+        Packet::Publish(publication(topic, b"queued", Q1, 2)),
+    );
+    send(h, receiver, Packet::PubAck(ack(2, R::SUCCESS)));
+    ping(h, receiver);
+}

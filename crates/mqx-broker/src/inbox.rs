@@ -9,13 +9,18 @@ use mqx_codec::v5::Property;
 use mqx_codec::{PacketId, QoS};
 use serde::{Deserialize, Serialize};
 
-use crate::BrokerConfig;
+use crate::{
+    BrokerConfig,
+    persistence::{PersistentOutgoing, PersistentSession},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Publisher {
     pub(crate) id: Arc<str>,
     pub(crate) username: Option<Arc<str>>,
     pub(crate) security: u64,
+    #[serde(default)]
+    pub(crate) dynamic_security: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,7 +43,7 @@ impl Message {
             .then(|| now.saturating_add(Duration::from_secs(u64::from(interval))))
     }
 
-    fn expired(&self, now: Duration) -> bool {
+    pub(crate) fn expired(&self, now: Duration) -> bool {
         self.expires
             .is_some_and(|expiry| now.as_secs() > expiry.as_secs())
     }
@@ -114,6 +119,14 @@ pub(crate) enum Ack {
     Dropped,
 }
 
+impl Ack {
+    // database.c: db__message_delete_outgoing counts normal acknowledgements
+    // and the negative PUBREC path, but not discards for an oversized packet.
+    pub(crate) fn counts_for_persistence(self) -> bool {
+        matches!(self, Self::Acknowledged | Self::Completed | Self::Rejected)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Phase {
     Publish,
@@ -177,6 +190,8 @@ pub(crate) struct Inbox {
     pub(crate) receive_maximum: Option<u16>,
     #[serde(default)]
     send_used: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bridge_receive_maximum: Option<u16>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,25 +216,145 @@ pub(crate) enum Receive {
 }
 
 impl Inbox {
+    pub(crate) fn persist_into(
+        &self,
+        entry: &mut PersistentSession,
+        mut intern: impl FnMut(&Arc<Message>) -> usize,
+    ) {
+        entry.last_mid = self.last_mid;
+        entry.incoming.extend(
+            self.incoming
+                .iter()
+                .map(|(&id, message)| (id, intern(&message.message))),
+        );
+        entry.outgoing.extend(
+            self.in_flight
+                .iter()
+                .map(|entry| (entry, false))
+                .chain(self.queued.iter().map(|entry| (entry, true)))
+                .map(|(entry, queued)| PersistentOutgoing {
+                    message: intern(&entry.delivery.message),
+                    id: entry.id,
+                    qos: entry.delivery.qos,
+                    retain: entry.delivery.retain,
+                    dup: entry.dup,
+                    release: matches!(entry.phase, Phase::Release | Phase::AwaitComp),
+                    queued,
+                    identifier: entry.delivery.subscription_identifier,
+                }),
+        );
+    }
+
+    pub(crate) fn restore_persisted(
+        entry: &mut PersistentSession,
+        messages: &[Arc<Message>],
+        config: &BrokerConfig,
+        now: Duration,
+    ) -> Self {
+        let mut inbox = Self {
+            last_mid: entry.last_mid,
+            ..Self::default()
+        };
+        for (id, index) in std::mem::take(&mut entry.incoming) {
+            let message = &messages[index];
+            if !message.expired(now)
+                && let std::collections::btree_map::Entry::Vacant(slot) = inbox.incoming.entry(id)
+            {
+                inbox.incoming_bytes += message.payload.len();
+                slot.insert(Incoming {
+                    message: message.clone(),
+                    repeated: false,
+                });
+            }
+        }
+        inbox.incoming_slots = inbox.incoming.len().min(config.max_inflight_messages);
+        for msg in std::mem::take(&mut entry.outgoing) {
+            let message = &messages[msg.message];
+            if message.expired(now) {
+                continue;
+            }
+            let outgoing = Outgoing {
+                delivery: Delivery {
+                    message: message.clone(),
+                    qos: msg.qos,
+                    retain: msg.retain,
+                    dedup_id: None,
+                    subscription_identifier: msg.identifier,
+                },
+                id: msg.id,
+                dup: msg.dup,
+                phase: if msg.release {
+                    Phase::Release
+                } else {
+                    Phase::Publish
+                },
+            };
+            // persist_read.c: persist__client_msg_restore respects the new
+            // server's flight quota even for records that were in flight.
+            if msg.queued
+                || (msg.qos != QoS::AtMostOnce
+                    && !below(inbox.flight_stats.qos_count, config.max_inflight_messages))
+            {
+                inbox.queue_stats.change(&outgoing.delivery, true);
+                inbox.queued.push_back(outgoing);
+            } else {
+                inbox.push_flight(outgoing);
+            }
+        }
+        inbox
+    }
+
+    pub(crate) fn visit_messages(&self, mut visit: impl FnMut(&Arc<Message>)) {
+        for entry in self.in_flight.iter().chain(&self.queued) {
+            visit(&entry.delivery.message);
+        }
+        for entry in self.incoming.values() {
+            visit(&entry.message);
+        }
+    }
+
     // lib/util_mosq.c: mosquitto__mid_generate; subs.c: subs__send allocates
     // before duplicate suppression and queue admission, so even drops use IDs.
     pub(crate) fn offer(
+        &mut self,
+        delivery: Delivery,
+        online: bool,
+        max_qos: QoS,
+        config: &BrokerConfig,
+    ) -> Offer {
+        self.offer_with_offline(delivery, online, max_qos, config, false, false)
+    }
+
+    pub(crate) fn allocate_mid(&mut self) -> PacketId {
+        self.last_mid = self.last_mid.wrapping_add(1).max(1);
+        PacketId::new(self.last_mid).unwrap()
+    }
+
+    pub(crate) fn outgoing_count(&self) -> usize {
+        self.in_flight.len() + self.queued.len()
+    }
+
+    pub(crate) fn offer_with_offline(
         &mut self,
         mut delivery: Delivery,
         online: bool,
         max_qos: QoS,
         config: &BrokerConfig,
+        queue_qos0: bool,
+        clean_offline: bool,
     ) -> Offer {
         let id = if delivery.qos == QoS::AtMostOnce {
             None
         } else {
-            self.last_mid = self.last_mid.wrapping_add(1).max(1);
-            PacketId::new(self.last_mid)
+            Some(self.allocate_mid())
         };
         if delivery.dedup_id.is_some() && delivery.dedup_id == self.last_delivered {
             return Offer::Suppressed;
         }
-        if !online && delivery.qos == QoS::AtMostOnce && !config.queue_qos0_messages {
+        if !online
+            && (clean_offline
+                || delivery.qos == QoS::AtMostOnce && !(config.queue_qos0_messages || queue_qos0))
+        {
             return Offer::Suppressed;
         }
         let ready = online && self.flight_available(delivery.qos, config);
@@ -338,6 +473,23 @@ impl Inbox {
                 .is_some_and(|entry| self.flight_available(entry.delivery.qos, config))
     }
 
+    pub(crate) fn has_reserved(&self) -> bool {
+        self.next_unsent != 0
+    }
+
+    pub(crate) fn reserve_ready_qos1(&mut self) -> Option<Outbound> {
+        let entry = self.in_flight.get_mut(self.next_unsent)?;
+        // An ACK has no timestamp. Expiring messages use the timed path.
+        if entry.phase != Phase::Publish
+            || entry.delivery.qos != QoS::AtLeastOnce
+            || entry.delivery.message.expires.is_some()
+        {
+            return None;
+        }
+        self.next_unsent += 1;
+        Some(reserve_publish(entry))
+    }
+
     pub(crate) fn next_outbound(
         &mut self,
         config: &BrokerConfig,
@@ -366,17 +518,7 @@ impl Inbox {
                     });
                 }
                 Phase::Publish => {
-                    let packet = Outbound::Publish {
-                        delivery: entry.delivery.clone(),
-                        id: entry.id,
-                        dup: entry.dup,
-                    };
-                    entry.dup = true;
-                    entry.phase = if entry.delivery.qos == QoS::AtLeastOnce {
-                        Phase::AwaitAck
-                    } else {
-                        Phase::AwaitRec
-                    };
+                    let packet = reserve_publish(entry);
                     self.next_unsent += 1;
                     return Some(packet);
                 }
@@ -442,6 +584,24 @@ impl Inbox {
         }
     }
 
+    // database.c: db__messages_delete uses separate clean flags for the two directions.
+    pub(crate) fn bridge_reset(&mut self, clean_outgoing: bool, clean_incoming: bool) {
+        self.reset_outbound();
+        if clean_outgoing {
+            self.in_flight.clear();
+            self.queued.clear();
+            self.flight_stats = Counters::default();
+            self.queue_stats = Counters::default();
+            self.last_delivered = None;
+            self.send_used = 0;
+        }
+        if clean_incoming {
+            self.incoming.clear();
+            self.incoming_bytes = 0;
+            self.incoming_slots = 0;
+        }
+    }
+
     // database.c: db__message_reconnect_reset and db__check_acl_of_all_messages.
     // db__expire_all_messages prunes both directions on reconnection.
     pub(crate) fn resume(
@@ -470,7 +630,7 @@ impl Inbox {
             }
             allowed
         });
-        self.incoming_slots = self.incoming.len().min(config.max_inflight_messages);
+        self.incoming_slots = self.incoming.len().min(self.incoming_maximum(config));
         self.incoming.retain(|_, entry| {
             let allowed = !entry.message.expired(now) && allowed(&entry.message.topic, true);
             if !allowed {
@@ -483,7 +643,7 @@ impl Inbox {
         }
         if let Some(maximum) = self.receive_maximum {
             self.send_used = self.flight_stats.qos_count.min(usize::from(maximum));
-            self.incoming_slots = self.incoming.len().min(config.max_inflight_messages);
+            self.incoming_slots = self.incoming.len().min(self.incoming_maximum(config));
             self.promote(config);
         }
     }
@@ -511,7 +671,7 @@ impl Inbox {
             self.remove_incoming(id);
         }
         if self.incoming_available(config) {
-            if config.max_inflight_messages != 0 {
+            if self.incoming_maximum(config) != 0 {
                 self.incoming_slots += 1;
             }
             self.incoming_bytes += message.payload.len();
@@ -545,8 +705,13 @@ impl Inbox {
     }
 
     fn incoming_available(&self, config: &BrokerConfig) -> bool {
-        below(self.incoming_slots, config.max_inflight_messages)
+        below(self.incoming_slots, self.incoming_maximum(config))
             && below(self.incoming_bytes, config.max_inflight_bytes)
+    }
+
+    fn incoming_maximum(&self, config: &BrokerConfig) -> usize {
+        self.bridge_receive_maximum
+            .map_or(config.max_inflight_messages, usize::from)
     }
 
     // lib/send_mosq.c: send__puback and send__pubcomp credit the quota even
@@ -570,6 +735,23 @@ impl Inbox {
 
 fn below(value: usize, limit: usize) -> bool {
     limit == 0 || value < limit
+}
+
+fn reserve_publish(entry: &mut Outgoing) -> Outbound {
+    let packet = Outbound::Publish {
+        delivery: entry.delivery.clone(),
+        id: entry.id,
+        dup: entry.dup,
+    };
+    // database.c: db__message_write_inflight_out_single marks the attempt
+    // before any retry; reconnect preserves DUP.
+    entry.dup = true;
+    entry.phase = if entry.delivery.qos == QoS::AtLeastOnce {
+        Phase::AwaitAck
+    } else {
+        Phase::AwaitRec
+    };
+    packet
 }
 
 fn ack_entry(entry: &mut Outgoing, kind: Ack) -> bool {
@@ -597,6 +779,7 @@ mod tests {
                     id: Arc::from("source"),
                     username: None,
                     security: 0,
+                    dynamic_security: None,
                 },
                 topic: "topic".into(),
                 payload: Bytes::from_static(bytes),

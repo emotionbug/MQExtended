@@ -1,0 +1,337 @@
+use std::{convert::Infallible, fmt::Write as _, path::Path, sync::Arc, time::Duration};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
+use hyper::{
+    Method, Request, Response, StatusCode,
+    body::{Frame, Incoming},
+    header,
+    server::conn::http1,
+    service::service_fn,
+};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use mqx_broker::{Broker, MOSQUITTO_VERSION, SecurityHandle};
+use percent_encoding::percent_decode_str;
+use serde_json::json;
+use tokio::{fs::File, io::AsyncReadExt};
+use tokio_util::io::ReaderStream;
+
+use crate::{Connection, ListenerProtocol, Server, ServerConfig};
+
+type Error = Box<dyn std::error::Error + Send + Sync>;
+type Body = UnsyncBoxBody<Bytes, Error>;
+
+/// The HTTP API shares the listener's reloadable security handle, but does not
+/// create MQTT sessions or increment counters when serving HTTP requests.
+#[derive(Clone)]
+pub struct HttpApi {
+    listeners: Bytes,
+    anonymous: Arc<[bool]>,
+}
+
+impl HttpApi {
+    pub fn new(config: &ServerConfig, server: &Server) -> Self {
+        // src/http_api.c: http_api__process_listeners reports config order,
+        // including its own endpoint, and tests cert/key presence, not handshakes.
+        let mut response = String::from("{\n\t\"listeners\":\t[");
+        let mut anonymous = Vec::with_capacity(config.listeners.len());
+        let mut first = true;
+        for (index, listener) in config.listeners.iter().enumerate() {
+            let protocol = match listener.protocol {
+                ListenerProtocol::Mqtt => "mqtt",
+                ListenerProtocol::Websockets => "websockets",
+                ListenerProtocol::HttpApi => "httpapi",
+            };
+            let allowed = config.allow_anonymous_for(listener);
+            anonymous.push(allowed);
+            let tls = listener.tls.certfile.is_some() && listener.tls.keyfile.is_some();
+            let mtls = listener.tls.require_certificate;
+            // listeners__start_local_only adds a distinct config entry for each
+            // MQTT loopback socket that actually opened.
+            let copies = if config.local_only && listener.protocol == ListenerProtocol::Mqtt {
+                server.listener_socket_count(index)
+            } else {
+                1
+            };
+            for _ in 0..copies {
+                if !first {
+                    response.push_str(", ");
+                }
+                first = false;
+                write!(response, "{{\n\t\t\t\"port\":\t{},\n\t\t\t\"protocol\":\t\"{protocol}\",\n\t\t\t\"tls\":\t{tls},\n\t\t\t\"mtls\":\t{mtls},\n\t\t\t\"allow_anonymous\":\t{allowed}\n\t\t}}", listener.port).unwrap();
+            }
+        }
+        response.push_str("]\n}");
+        Self {
+            listeners: Bytes::from(response),
+            anonymous: anonymous.into(),
+        }
+    }
+
+    pub async fn serve(
+        &self,
+        connection: Connection,
+        broker: &Broker,
+        security: &SecurityHandle,
+    ) -> Result<(), hyper::Error> {
+        let root = connection.listener.http_dir.as_deref();
+        let anonymous = self.anonymous[connection.listener_index];
+        http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(20))
+            .serve_connection(
+                TokioIo::new(connection.stream),
+                service_fn(|request| async move {
+                    Ok::<_, Infallible>(
+                        self.request(request, broker, security, anonymous, root)
+                            .await,
+                    )
+                }),
+            )
+            .await
+    }
+
+    async fn request(
+        &self,
+        request: Request<Incoming>,
+        broker: &Broker,
+        security: &SecurityHandle,
+        anonymous: bool,
+        root: Option<&Path>,
+    ) -> Response<Body> {
+        // src/http_api.c: http_api_handler checks method before credentials.
+        if request.method() != Method::GET {
+            return respond(StatusCode::METHOD_NOT_ALLOWED, "Invalid HTTP Method\n");
+        }
+        let path = percent_decode_str(request.uri().path()).decode_utf8_lossy();
+        let credentials = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| basic_credentials(value.as_bytes()));
+        let pair = credentials.as_deref().and_then(|value| {
+            let colon = value.iter().position(|&byte| byte == b':')?;
+            Some((&value[..colon], &value[colon + 1..]))
+        });
+        let (username, password) = match pair {
+            Some((user, password)) => {
+                let user = user.split(|&byte| byte == 0).next().unwrap();
+                let Ok(user) = std::str::from_utf8(user) else {
+                    return unauthorized();
+                };
+                (Some(user), Some(password))
+            }
+            None => (None, None),
+        };
+        if !broker
+            .http_read_allowed(security, username, password, anonymous, &path)
+            .await
+        {
+            return unauthorized();
+        }
+        match path.as_ref() {
+            "/api/v1/version" => api_response(MOSQUITTO_VERSION),
+            "/api/v1/listeners" => api_response(self.listeners.clone()),
+            "/api/v1/systree" => {
+                // src/http_api.c: http_api__process_systree; json_help.c:
+                // cJSON_AddIntToObject prints signed integer literals without f64 rounding.
+                let mut data = String::from("{\n");
+                for (index, (name, value)) in broker.sys_tree().entries().enumerate() {
+                    if index != 0 {
+                        data.push_str(",\n");
+                    }
+                    write!(data, "\t\"{name}\":\t{value}").unwrap();
+                }
+                data.push_str("\n}");
+                api_response(data)
+            }
+            "/api/v1/mqx/cluster" => {
+                let data = cluster_status(broker);
+                let mut response = api_response(data.to_string());
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+                response
+            }
+            "/metrics" => {
+                let mut response = respond(StatusCode::OK, prometheus(broker));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8".parse().unwrap(),
+                );
+                response
+            }
+            _ if path
+                .as_bytes()
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"/api/")) =>
+            {
+                not_found()
+            }
+            _ => static_file(root, &path).await,
+        }
+    }
+}
+
+fn cluster_status(broker: &Broker) -> serde_json::Value {
+    let Some(metrics) = broker.raft_metrics() else {
+        return json!({ "mode": "standalone", "mqx_version": env!("CARGO_PKG_VERSION") });
+    };
+    let membership = broker
+        .cluster_membership()
+        .map(|membership| membership.status());
+    json!({
+        "mode": "cluster",
+        "mqx_version": env!("CARGO_PKG_VERSION"),
+        "membership": membership,
+        "raft": {
+            "node_id": metrics.node_id,
+            "term": metrics.current_term,
+            "leader": metrics.leader,
+            "running": metrics.running,
+            "last_log_index": metrics.last_log_index,
+            "committed_index": metrics.committed_index,
+            "applied_index": metrics.applied_index,
+            "snapshot_index": metrics.snapshot_index,
+            "purged_index": metrics.purged_index,
+        },
+    })
+}
+
+fn prometheus(broker: &Broker) -> String {
+    let stats = broker.metrics();
+    let mut body = String::new();
+    for (metric, kind, value) in [
+        ("connections", "gauge", stats.connections),
+        ("sessions", "gauge", stats.sessions),
+        (
+            "messages_received_total",
+            "counter",
+            stats.messages_received,
+        ),
+        ("messages_sent_total", "counter", stats.messages_sent),
+        ("bytes_received_total", "counter", stats.bytes_received),
+        ("bytes_sent_total", "counter", stats.bytes_sent),
+        ("retained_messages", "gauge", stats.retained),
+        ("subscriptions", "gauge", stats.subscriptions),
+        ("shared_subscriptions", "gauge", stats.shared_subscriptions),
+    ] {
+        writeln!(body, "# TYPE mqx_{metric} {kind}\nmqx_{metric} {value}").unwrap();
+    }
+    if let Some(metrics) = broker.raft_metrics() {
+        for (metric, value) in [
+            ("commit", metrics.committed_index),
+            ("apply", metrics.applied_index),
+        ] {
+            // Absent progress is not index zero.
+            if let Some(value) = value {
+                writeln!(
+                    body,
+                    "# TYPE mqx_raft_{metric}_index gauge\nmqx_raft_{metric}_index {value}"
+                )
+                .unwrap();
+            }
+        }
+    }
+    let histogram = stats.proposal_latency;
+    let name = "mqx_raft_proposal_duration_seconds";
+    writeln!(body, "# TYPE {name} histogram").unwrap();
+    for (bound, count) in histogram.buckets {
+        writeln!(body, "{name}_bucket{{le=\"{bound}\"}} {count}").unwrap();
+    }
+    writeln!(
+        body,
+        "{name}_bucket{{le=\"+Inf\"}} {}\n{name}_sum {}\n{name}_count {}",
+        histogram.count, histogram.sum_seconds, histogram.count
+    )
+    .unwrap();
+    body
+}
+
+fn basic_credentials(value: &[u8]) -> Option<Vec<u8>> {
+    let encoded = value.get(6..)?;
+    if !value[..6].eq_ignore_ascii_case(b"Basic ") {
+        return None;
+    }
+    STANDARD.decode(encoded).ok()
+}
+
+fn unauthorized() -> Response<Body> {
+    let mut response = respond(StatusCode::UNAUTHORIZED, "Not authorised\n");
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        "Basic realm=\"Mosquitto API\"".parse().unwrap(),
+    );
+    response
+}
+
+fn not_found() -> Response<Body> {
+    respond(StatusCode::NOT_FOUND, "Not found.\n")
+}
+
+fn respond(status: StatusCode, body: impl Into<Bytes>) -> Response<Body> {
+    let mut response = Response::new(
+        Full::new(body.into())
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+    );
+    *response.status_mut() = status;
+    response
+}
+
+fn api_response(body: impl Into<Bytes>) -> Response<Body> {
+    let mut response = respond(StatusCode::OK, body);
+    response
+        .headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    response
+}
+
+async fn static_file(root: Option<&Path>, url: &str) -> Response<Body> {
+    // src/http_api.c: http__canonical_filename resolves links before checking
+    // the directory boundary. The explicit root directory's doubled slash
+    // never matches the resolved canonical filename.
+    let Some(root) = root.filter(|root| root.parent().is_some()) else {
+        return not_found();
+    };
+    if !url.starts_with('/') {
+        return not_found();
+    }
+    let mut requested = root.to_path_buf();
+    requested.push(url.trim_start_matches('/'));
+    if url.ends_with('/') {
+        requested.push("index.html");
+    }
+    let Ok(path) = tokio::fs::canonicalize(requested).await else {
+        return not_found();
+    };
+    if !path.starts_with(root) || path == root {
+        return not_found();
+    }
+    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+        return not_found();
+    };
+    if !metadata.is_file() {
+        return not_found();
+    }
+    let Ok(file) = File::open(path).await else {
+        return not_found();
+    };
+    let Ok(metadata) = file.metadata().await else {
+        return respond(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error.\n",
+        );
+    };
+    if !metadata.is_file() {
+        return not_found();
+    }
+    let stream = ReaderStream::with_capacity(file.take(metadata.len()), 65_536);
+    let stream = tokio_stream::StreamExt::map(stream, |chunk| chunk.map(Frame::data));
+    let body = StreamBody::new(stream).map_err(Into::into).boxed_unsync();
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, metadata.len().into());
+    response
+}

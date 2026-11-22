@@ -27,6 +27,8 @@ Differential tests need the Mosquitto reference binaries and are `#[ignore]` by 
 | --- | --- |
 | `MOSQUITTO_BUILD_DIR` | Mosquitto 2.1.4 build directory (`src/mosquitto`, `client/mosquitto_{pub,sub}`, `apps/mosquitto_passwd/`) |
 | `MOSQUITTO_WS_BUILD_DIR` | A second Mosquitto build with `WITH_WEBSOCKETS=ON`, for `mqx-ws` |
+| `MOSQUITTO_HTTP_BUILD_DIR` | A third build with `WITH_HTTP_API=ON`, for `$SYS` and HTTP API scenarios |
+| `MOSQUITTO_PLUGIN_BUILD_DIR` | A fourth build with `WITH_PLUGINS=ON`, for dynamic-security scenarios driven by `mosquitto_ctrl` |
 | `MQEXTENDED_BIN` | The `mqextended` binary under test; defaults to `target/debug/mqextended` |
 
 ```sh

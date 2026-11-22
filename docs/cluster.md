@@ -22,6 +22,9 @@ Cluster settings live in the same `mosquitto.conf` as everything else. The `clus
 | `cluster_lease_interval <ms>` | How often a node renews its liveness lease | 1000 |
 | `cluster_lease_timeout <ms>` | Lease age after which a node is declared down | 5000 |
 | `cluster_request_timeout <ms>` | Deadline for a replicated write, including leader changes | 5000 |
+| `cluster_join true` | Start an empty node as a new member of a running cluster instead of bootstrapping one | false |
+| `cluster_membership_generation <n>` | Version of the `cluster_peer` list; raise it to request a membership change | 0 |
+| `cluster_state_format <1\|2>` | On-disk and wire format this node writes; see [upgrades](#upgrades) | 2 |
 
 Example for node 2 of three:
 
@@ -53,7 +56,31 @@ Issue node certificates from a CA used only for the cluster, one per node, with 
 
 ## Bootstrap and restart
 
-Start all nodes with identical `cluster_peer` lines, in any order. The first start bootstraps the cluster exactly once; later starts rejoin from `cluster_data_dir`. Never reuse a data directory under a different `cluster_node_id`, and never copy one node's data directory to another.
+Start all nodes with identical `cluster_peer` lines and no `cluster_membership_generation`, in any order. The first start bootstraps the cluster exactly once; later starts rejoin from `cluster_data_dir`, and from then on the replicated membership, not the config file, decides who the members are. Never reuse a data directory under a different `cluster_node_id`, and never copy one node's data directory to another.
+
+## Changing membership
+
+Membership changes run while the cluster serves traffic. The leader adds a new node as a learner, waits until it has caught up, checks that both the current and the proposed voter sets have a reachable majority, and only then switches voters; it refuses a change that would lose quorum and reports why.
+
+To add a node:
+
+1. Pick a node id that has never been used in this cluster and issue its `mqx-node-<id>` certificate.
+2. Start it with an empty `cluster_data_dir`, `cluster_join true`, and `cluster_peer` lines for itself and the current voters.
+3. On every current voter, put the full desired peer list in the config, set `cluster_membership_generation` to a number higher than the one in use, and send SIGHUP.
+4. Wait until the new node shows as a voter in the cluster status before routing clients to it.
+
+To remove a node, delete its `cluster_peer` line on every remaining voter, raise `cluster_membership_generation`, and send SIGHUP. The removed node disconnects its MQTT clients (they reconnect through the load balancer) but keeps answering the HTTP status endpoints; stop it once the cluster lists its id as retired.
+
+To replace a node that died for good, do both in one change: a new id joins as above, and the desired peer list leaves out the dead id. A retired id stays retired across restarts; a node started with a retired id or with the data directory of a removed node is refused. If a majority is lost, bring the missing voters back. Re-bootstrapping a cluster that still has data discards it.
+
+## Upgrades
+
+Upgrade one node at a time. A node refuses log entries, snapshots and node identity files whose format version it does not know, so every node must be able to read a format before any node starts writing it:
+
+1. Roll the new binary out to every node while it keeps writing the old format (`cluster_state_format 1` when coming from a release before format 2).
+2. Once every node runs the new binary, roll the setting to the new format, again one node at a time.
+
+Don't change membership in the middle of an upgrade.
 
 ## What clients observe when a node fails
 

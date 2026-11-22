@@ -2,6 +2,7 @@ use std::{
     fmt,
     io::{self, IoSlice},
     net::SocketAddr,
+    path::Path,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -9,6 +10,8 @@ use std::{
 use bytes::{Buf, Bytes};
 use mqx_proxy::{ProxyAddresses, ProxyInfo, ProxyOptions, read_proxy_header};
 use mqx_ws::WsOptions;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
@@ -20,8 +23,26 @@ use crate::{CertIdentity, TlsConfig};
 /// MQTT byte stream after any PROXY, TLS, and WebSocket negotiations.
 pub struct ConnectionStream(Stream);
 
+pub(crate) enum SocketStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl SocketStream {
+    pub(crate) fn set_tcp_nodelay(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_nodelay(true),
+            #[cfg(unix)]
+            Self::Unix(_) => Ok(()),
+        }
+    }
+}
+
 enum Stream {
     Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
     Layered(Box<dyn TransportIo>),
 }
 
@@ -32,21 +53,36 @@ impl fmt::Debug for ConnectionStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
             Stream::Tcp(stream) => f.debug_tuple("Tcp").field(stream).finish(),
+            #[cfg(unix)]
+            Stream::Unix(stream) => f.debug_tuple("Unix").field(stream).finish(),
             Stream::Layered(_) => f.write_str("LayeredStream"),
         }
     }
 }
 
 impl ConnectionStream {
-    pub(crate) fn tcp(stream: TcpStream) -> Self {
+    fn tcp(stream: TcpStream) -> Self {
         Self(Stream::Tcp(stream))
+    }
+
+    #[cfg(unix)]
+    fn unix(stream: UnixStream) -> Self {
+        Self(Stream::Unix(stream))
+    }
+
+    pub(crate) fn plain(stream: SocketStream) -> Self {
+        match stream {
+            SocketStream::Tcp(stream) => Self::tcp(stream),
+            #[cfg(unix)]
+            SocketStream::Unix(stream) => Self::unix(stream),
+        }
     }
 
     /// Returns the socket if no application transport is wrapping it.
     pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match &self.0 {
             Stream::Tcp(stream) => Some(stream),
-            Stream::Layered(_) => None,
+            _ => None,
         }
     }
 
@@ -63,6 +99,8 @@ impl AsyncRead for ConnectionStream {
     ) -> Poll<io::Result<()>> {
         match &mut self.get_mut().0 {
             Stream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(unix)]
+            Stream::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
             Stream::Layered(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
         }
     }
@@ -76,6 +114,8 @@ impl AsyncWrite for ConnectionStream {
     ) -> Poll<io::Result<usize>> {
         match &mut self.get_mut().0 {
             Stream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(unix)]
+            Stream::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
             Stream::Layered(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
         }
     }
@@ -87,6 +127,8 @@ impl AsyncWrite for ConnectionStream {
     ) -> Poll<io::Result<usize>> {
         match &mut self.get_mut().0 {
             Stream::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(unix)]
+            Stream::Unix(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             Stream::Layered(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
         }
     }
@@ -94,6 +136,8 @@ impl AsyncWrite for ConnectionStream {
     fn is_write_vectored(&self) -> bool {
         match &self.0 {
             Stream::Tcp(stream) => stream.is_write_vectored(),
+            #[cfg(unix)]
+            Stream::Unix(stream) => stream.is_write_vectored(),
             Stream::Layered(stream) => stream.is_write_vectored(),
         }
     }
@@ -101,6 +145,8 @@ impl AsyncWrite for ConnectionStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.get_mut().0 {
             Stream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(unix)]
+            Stream::Unix(stream) => Pin::new(stream).poll_flush(cx),
             Stream::Layered(stream) => Pin::new(&mut **stream).poll_flush(cx),
         }
     }
@@ -108,30 +154,36 @@ impl AsyncWrite for ConnectionStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.get_mut().0 {
             Stream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(unix)]
+            Stream::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
             Stream::Layered(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
         }
     }
 }
 
-pub(crate) enum PeerAddress {
+pub(crate) enum PeerAddress<'a> {
     Ip(SocketAddr),
     Unix(Box<[u8]>),
+    LocalUnix(&'a Path),
 }
 
-impl PeerAddress {
+impl PeerAddress<'_> {
     pub(crate) fn ip(&self) -> Option<SocketAddr> {
         match self {
             Self::Ip(addr) => Some(*addr),
-            Self::Unix(_) => None,
+            Self::Unix(_) | Self::LocalUnix(_) => None,
         }
     }
 }
 
-impl fmt::Display for PeerAddress {
+impl fmt::Display for PeerAddress<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ip(addr) => fmt::Display::fmt(addr, f),
+            Self::Ip(addr) => write!(f, "{}:{}", addr.ip(), addr.port()),
             Self::Unix(path) => f.write_str(&String::from_utf8_lossy(path)),
+            // Mosquitto src/net.c: net__socket_get_address uses the listener's
+            // pathname (getsockname), and net__socket_accept logs remote port 0.
+            Self::LocalUnix(path) => write!(f, "{}:0", path.display()),
         }
     }
 }
@@ -156,8 +208,46 @@ pub(crate) fn plain_identity(tls: &TlsConfig) -> CertIdentity {
 }
 
 pub(crate) async fn negotiate(
-    mut stream: TcpStream,
-    peer: &mut PeerAddress,
+    stream: SocketStream,
+    peer: &mut PeerAddress<'_>,
+    proxy: Option<ProxyOptions>,
+    acceptor: Option<TlsAcceptor>,
+    tls: &TlsConfig,
+    ws: Option<&WsOptions>,
+) -> Result<Option<(ConnectionStream, CertIdentity)>, NegotiationError> {
+    match stream {
+        SocketStream::Tcp(stream) => {
+            negotiate_stream(
+                stream,
+                ConnectionStream::tcp,
+                peer,
+                proxy,
+                acceptor,
+                tls,
+                ws,
+            )
+            .await
+        }
+        #[cfg(unix)]
+        SocketStream::Unix(stream) => {
+            negotiate_stream(
+                stream,
+                ConnectionStream::unix,
+                peer,
+                proxy,
+                acceptor,
+                tls,
+                ws,
+            )
+            .await
+        }
+    }
+}
+
+async fn negotiate_stream<S: TransportIo + 'static>(
+    mut stream: S,
+    plain: impl FnOnce(S) -> ConnectionStream,
+    peer: &mut PeerAddress<'_>,
     proxy: Option<ProxyOptions>,
     acceptor: Option<TlsAcceptor>,
     tls: &TlsConfig,
@@ -197,7 +287,7 @@ pub(crate) async fn negotiate(
     };
 
     let stream = if acceptor.is_none() && ws.is_none() && prefix.is_empty() {
-        ConnectionStream::tcp(stream)
+        plain(stream)
     } else if prefix.is_empty() {
         upgrade(stream, acceptor, tls, ws, &mut identity).await?
     } else {
@@ -243,12 +333,12 @@ async fn upgrade<S: TransportIo + 'static>(
 
 // PROXY over-read bytes must feed the next layer, even if they start a TLS
 // ClientHello or a WebSocket HTTP request rather than an MQTT packet.
-struct Replay {
-    stream: TcpStream,
+struct Replay<S> {
+    stream: S,
     prefix: Bytes,
 }
 
-impl AsyncRead for Replay {
+impl<S: TransportIo> AsyncRead for Replay<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -264,7 +354,7 @@ impl AsyncRead for Replay {
     }
 }
 
-impl AsyncWrite for Replay {
+impl<S: TransportIo> AsyncWrite for Replay<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

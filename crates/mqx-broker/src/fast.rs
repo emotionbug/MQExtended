@@ -65,4 +65,5 @@ impl Publication {
 pub(crate) enum Request {
     Fence(u64),
     Publish(Publication),
+    SysSample,
 }

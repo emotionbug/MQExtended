@@ -1,3 +1,5 @@
+mod bridge;
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -8,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use mqx_bridge::BridgeConfig;
 use mqx_cluster::{ClusterConfig, ClusterSecurity, MAX_SNAPSHOT_SIZE};
 
 use crate::ServerError;
@@ -18,15 +21,69 @@ pub(crate) const CMD_PORT_LIMIT: usize = 10;
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listeners: Vec<ListenerConfig>,
+    pub bridges: Vec<BridgeConfig>,
     pub local_only: bool,
     pub per_listener_settings: bool,
     pub set_tcp_nodelay: bool,
     pub security: SecurityConfig,
+    /// The active plugin, even when it is not attached to a listener.
+    pub dynamic_security: Option<DynamicSecurityConfig>,
     pub limits: BrokerLimits,
     pub log: LogConfig,
+    pub user: String,
+    pub pid_file: Option<PathBuf>,
+    pub sys_interval: u16,
+    pub persistence: PersistenceConfig,
     pub cluster: Option<ClusterConfig>,
     /// Parse-time operator notices, emitted after the logging destinations are configured.
     pub notices: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicSecurityConfig {
+    pub config_file: PathBuf,
+    pub password_init_file: Option<PathBuf>,
+    /// Whether the plugin's callbacks run before the built-in file callbacks.
+    pub before_file: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PersistenceConfig {
+    pub enabled: bool,
+    pub file: Option<PathBuf>,
+    pub location: Option<PathBuf>,
+    pub autosave_interval: u32,
+    pub autosave_on_changes: bool,
+}
+
+impl Default for PersistenceConfig {
+    // Mosquitto src/conf.c: config__init_reload and config__check.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            file: None,
+            location: None,
+            autosave_interval: 1800,
+            autosave_on_changes: false,
+        }
+    }
+}
+
+impl PersistenceConfig {
+    pub fn mosquitto_path(&self) -> PathBuf {
+        let file = self
+            .file
+            .as_deref()
+            .unwrap_or_else(|| Path::new("mosquitto.db"));
+        let Some(location) = self.location.as_ref().filter(|p| !p.as_os_str().is_empty()) else {
+            return file.into();
+        };
+        // config__check concatenates even if persistence_file begins with '/'.
+        let mut path = location.as_os_str().to_owned();
+        path.push(std::path::MAIN_SEPARATOR_STR);
+        path.push(file.as_os_str());
+        path.into()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +112,7 @@ pub struct BrokerLimits {
 pub struct ListenerConfig {
     pub port: u16,
     pub host: Option<String>,
+    pub unix_socket_path: Option<PathBuf>,
     pub socket_domain: SocketDomain,
     pub protocol: ListenerProtocol,
     /// Zero is unlimited, including the negative values accepted by Mosquitto.
@@ -68,6 +126,7 @@ pub struct ListenerConfig {
     pub use_username_as_clientid: bool,
     pub mount_point: Option<String>,
     pub security: SecurityConfig,
+    pub dynamic_security: Option<DynamicSecurityConfig>,
     pub tls: TlsConfig,
     pub bind_interface: Option<String>,
     pub websockets_origins: Vec<String>,
@@ -125,6 +184,7 @@ pub enum SocketDomain {
 pub enum ListenerProtocol {
     Mqtt,
     Websockets,
+    HttpApi,
 }
 
 pub use mqx_proxy::ProxyVersion as ProxyProtocol;
@@ -165,6 +225,8 @@ pub enum TlsVersion {
 pub struct LogConfig {
     pub destinations: BTreeSet<LogDestination>,
     pub types: BTreeSet<LogType>,
+    /// Syslog facility number, before shifting it into the PRI field.
+    pub facility: u8,
     pub connection_messages: bool,
     pub timestamp: bool,
     pub timestamp_format: Option<String>,
@@ -237,6 +299,7 @@ impl Default for ListenerConfig {
         Self {
             port: DEFAULT_PORT,
             host: None,
+            unix_socket_path: None,
             protocol: ListenerProtocol::Mqtt,
             socket_domain: SocketDomain::Any,
             max_connections: 0,
@@ -249,6 +312,7 @@ impl Default for ListenerConfig {
             use_username_as_clientid: false,
             mount_point: None,
             security: SecurityConfig::default(),
+            dynamic_security: None,
             tls: TlsConfig::default(),
             bind_interface: None,
             websockets_origins: Vec::new(),
@@ -269,6 +333,7 @@ impl Default for LogConfig {
                 LogType::Notice,
                 LogType::Information,
             ]),
+            facility: 3, // LOG_DAEMON; conf.c: config__init_reload.
             connection_messages: true,
             timestamp: true,
             timestamp_format: None,
@@ -318,12 +383,17 @@ impl ServerConfig {
     /// See src/conf.c: config__parse_args; src/listeners.c: listeners__start_local_only.
     pub fn with_command_line_ports(mut self, ports: &[u16]) -> Self {
         if self.local_only && !ports.is_empty() {
+            let dynamic_security = self
+                .listeners
+                .first()
+                .and_then(|listener| listener.dynamic_security.as_ref());
             self.listeners = ports
                 .iter()
                 .copied()
                 .map(|port| {
                     let mut listener = Self::local_listener(port);
                     listener.security.allow_anonymous = self.security.allow_anonymous;
+                    listener.dynamic_security = dynamic_security.cloned();
                     listener
                 })
                 .collect();
@@ -359,17 +429,23 @@ impl ServerConfig {
     }
 }
 
+#[derive(Default)]
+struct DynamicSecurityPlugin {
+    name: Option<String>,
+    config_file: Option<PathBuf>,
+    password_init_file: Option<PathBuf>,
+    global: bool,
+    listeners: Vec<usize>,
+}
+
 struct Parser {
     config: ServerConfig,
     default_listener: Option<usize>,
     security_seen: bool,
+    dynamic_security_plugins: Vec<DynamicSecurityPlugin>,
     log_dest_seen: bool,
     log_type_seen: bool,
     log_file_seen: bool,
-    pid_file_seen: bool,
-    persistence_file_seen: bool,
-    persistence_location_seen: bool,
-    persistence_enabled_at: Option<(PathBuf, usize, &'static str)>,
     cluster: Option<((PathBuf, usize), ClusterSection)>,
 }
 
@@ -378,24 +454,28 @@ impl Default for Parser {
         Self {
             config: ServerConfig {
                 listeners: Vec::new(),
+                bridges: Vec::new(),
                 local_only: true,
                 per_listener_settings: false,
                 set_tcp_nodelay: false,
                 security: SecurityConfig::default(),
+                dynamic_security: None,
                 limits: BrokerLimits::default(),
                 log: LogConfig::default(),
+                // Mosquitto src/conf.c: config__parse_args.
+                user: "mosquitto".into(),
+                pid_file: None,
+                sys_interval: 10,
+                persistence: PersistenceConfig::default(),
                 cluster: None,
                 notices: Vec::new(),
             },
             default_listener: None,
             security_seen: false,
+            dynamic_security_plugins: Vec::new(),
             log_dest_seen: false,
             log_type_seen: false,
             log_file_seen: false,
-            pid_file_seen: false,
-            persistence_file_seen: false,
-            persistence_location_seen: false,
-            persistence_enabled_at: None,
             cluster: None,
         }
     }
@@ -403,13 +483,22 @@ impl Default for Parser {
 
 impl Parser {
     fn finish(mut self) -> Result<ServerConfig, ServerError> {
-        if let Some((path, line, directive)) = self.persistence_enabled_at {
-            return Err(unsupported(directive, "on-disk persistence").at(&path, line));
-        }
-        if let Some(((path, line), section)) = self.cluster {
+        bridge::finish(&mut self.config.bridges)
+            .map_err(|error| ServerError::Arguments(format!("Error: {}", error.0)))?;
+        if let Some(((path, line), section)) = self.cluster.take() {
             self.config.cluster = Some(section.finish().map_err(|error| error.at(&path, line))?);
+            if self.config.persistence.enabled {
+                self.config.notices.push(
+                    "Ignoring standalone persistence in cluster mode; state is durable in Raft."
+                        .into(),
+                );
+            }
         }
         for listener in &self.config.listeners {
+            if listener.protocol == ListenerProtocol::HttpApi {
+                // http_api.c: http_api__start configures only HTTP's cert/key pair.
+                continue;
+            }
             let tls = &listener.tls;
             listener.proxy_options()?;
             let message = match (&tls.certfile, &tls.keyfile) {
@@ -454,7 +543,59 @@ impl Parser {
                 });
             }
         }
+        self.finish_plugins()?;
         Ok(self.config)
+    }
+
+    // Mosquitto plugins/dynamic-security/plugin.c: mosquitto_plugin_init.
+    fn finish_plugins(&mut self) -> Result<(), ServerError> {
+        let config = &mut self.config;
+        for plugin in self.dynamic_security_plugins.drain(..) {
+            // plugin_init.c: plugin__load_single skips a plugin without any
+            // scope; plugin__security_init_single then rejects its version 0.
+            if !plugin.global && plugin.listeners.is_empty() {
+                let name = plugin.name.as_deref().unwrap_or("dynamic-security");
+                return Err(ServerError::Arguments(format!(
+                    "Plugin '{name}' must be attached to a listener with plugin_use."
+                )));
+            }
+            let Some(config_file) = plugin.config_file else {
+                config.notices.push("Warning: Dynamic security plugin has no plugin_opt_config_file defined. The plugin will not be activated.".into());
+                continue;
+            };
+            let duplicate = || {
+                ServerError::Arguments(
+                    "Error: Dynamic security plugin can currently only be loaded once.".into(),
+                )
+            };
+            if config.dynamic_security.is_some() {
+                return Err(duplicate());
+            }
+            let dynamic_security = DynamicSecurityConfig {
+                config_file,
+                password_init_file: plugin.password_init_file,
+                // mosquitto.c loads v5 plugins before security_default.c registers
+                // built-ins. plugin_basic_auth.c/plugin_acl_check.c run global
+                // callbacks first, even when local callbacks registered earlier.
+                before_file: plugin.global || config.per_listener_settings,
+            };
+            if plugin.global {
+                for listener in &mut config.listeners {
+                    listener.dynamic_security = Some(dynamic_security.clone());
+                }
+            } else if !config.local_only {
+                for index in plugin.listeners {
+                    let listener = &mut config.listeners[index];
+                    if listener.dynamic_security.is_some() {
+                        // plugin_callbacks.c rejects repeat registrations in one scope.
+                        return Err(duplicate());
+                    }
+                    listener.dynamic_security = Some(dynamic_security.clone());
+                }
+            }
+            config.dynamic_security = Some(dynamic_security);
+        }
+        Ok(())
     }
 
     fn read_file(&mut self, path: &Path, included: bool) -> Result<(), ServerError> {
@@ -467,8 +608,11 @@ impl Parser {
     }
 
     // Mosquitto src/conf.c: config__read_file_core. Includes don't inherit the caller's current listener.
+    // The current plugin is likewise per-file, but named loads can be used by later files.
     fn read(&mut self, input: &[u8], path: &Path, included: bool) -> Result<(), ServerError> {
         let mut current = None;
+        let mut connection = None;
+        let mut plugin = None;
         for (index, raw) in input.split(|&byte| byte == b'\n').enumerate() {
             if matches!(raw.first(), None | Some(b'#' | b'\r')) {
                 continue;
@@ -495,26 +639,33 @@ impl Parser {
                 for file in include_files(Path::new(value))? {
                     self.read_file(&file, true)?;
                 }
-            } else if matches!(name, "persistence" | "retained_persistence") {
-                self.persistence_enabled_at =
-                    Value { name, value }.boolean().map_err(err)?.then(|| {
-                        (
-                            path.into(),
-                            index + 1,
-                            if name == "persistence" {
-                                "persistence"
-                            } else {
-                                "retained_persistence"
-                            },
-                        )
-                    });
             } else if name.starts_with("cluster_") {
                 let (_, section) = self
                     .cluster
                     .get_or_insert_with(|| ((path.into(), index + 1), ClusterSection::default()));
                 section.directive(Value { name, value }).map_err(err)?;
+            } else if name == "connection" {
+                let name = Value { name, value }.word().map_err(err)?;
+                if self.config.bridges.iter().any(|bridge| bridge.name == name) {
+                    return Err(err(format!("Duplicate bridge name '{name}'.").into()));
+                }
+                connection = Some(self.config.bridges.len());
+                self.config.bridges.push(BridgeConfig::new(name.into()));
+            } else if bridge::is_directive(name) {
+                let index = connection.ok_or_else(|| {
+                    err(
+                        format!("The '{name}' option requires a bridge to be defined first.")
+                            .into(),
+                    )
+                })?;
+                bridge::directive(
+                    &mut self.config.bridges[index],
+                    Value { name, value },
+                    &mut self.config.notices,
+                )
+                .map_err(err)?;
             } else {
-                self.directive(Value { name, value }, &mut current)
+                self.directive(Value { name, value }, &mut current, &mut plugin)
                     .map_err(err)?;
             }
         }
@@ -545,7 +696,12 @@ impl Parser {
         index
     }
 
-    fn directive(&mut self, v: Value<'_>, current: &mut Option<usize>) -> ParseResult<()> {
+    fn directive(
+        &mut self,
+        v: Value<'_>,
+        current: &mut Option<usize>,
+        plugin: &mut Option<usize>,
+    ) -> ParseResult<()> {
         let name = v.name;
         match name {
             "listener" => {
@@ -554,19 +710,23 @@ impl Parser {
                 port_value.name = "listener port";
                 let port = port_value.integer()?;
                 words.next();
-                let host = words.next().filter(|word| !word.starts_with('#'));
-                if port == 0 {
-                    return Err(if host.is_some() {
-                        unsupported(name, "Unix socket listeners (port 0)")
-                    } else {
-                        "A listener with port 0 must provide a Unix socket path.".into()
-                    });
-                }
-                let port = checked_port(port)?;
+                let endpoint = words.next().filter(|word| !word.starts_with('#'));
+                // Mosquitto src/conf.c: config__read_file_core stores a port-zero
+                // endpoint as a Unix socket path, not a TCP bind hostname.
+                let (port, host, unix_socket_path) = if cfg!(unix) && port == 0 {
+                    let path = endpoint
+                        .and_then(|word| word.split('\0').next())
+                        .filter(|path| !path.is_empty())
+                        .ok_or("A listener with port 0 must provide a Unix socket path.")?;
+                    (0, None, Some(PathBuf::from(path)))
+                } else {
+                    (checked_port(port)?, endpoint.map(str::to_owned), None)
+                };
                 self.config.local_only = false;
                 *current = Some(self.push_listener(ListenerConfig {
                     port,
-                    host: host.map(str::to_owned),
+                    host,
+                    unix_socket_path,
                     ..ListenerConfig::default()
                 }));
             }
@@ -754,7 +914,7 @@ impl Parser {
                     "protocol" => match v.word()? {
                         "mqtt" => listener.protocol = ListenerProtocol::Mqtt,
                         "websockets" => listener.protocol = ListenerProtocol::Websockets,
-                        "http_api" => return Err(unsupported(name, "http_api")),
+                        "http_api" => listener.protocol = ListenerProtocol::HttpApi,
                         value => return Err(invalid(name, value)),
                     },
                     "socket_domain" => {
@@ -883,15 +1043,14 @@ impl Parser {
                 self.config.log.timestamp_format =
                     Some(v.unique_string(self.config.log.timestamp_format.is_some())?)
             }
-            // These options have no effect on MQTT 3.x clients. Keep Mosquitto's value checks.
-            "sys_interval" => {
-                v.uint16()?;
-            }
+            "sys_interval" => self.config.sys_interval = v.uint16()?,
             "log_facility" => {
                 let value = v.integer()?;
                 if !(0..=7).contains(&value) {
                     return Err(invalid(name, value));
                 }
+                // Mosquitto src/conf.c: config__read_file_core maps 0–7 to LOG_LOCAL0–7.
+                self.config.log.facility = 16 + value as u8;
             }
             // conf.c: config__read_file_core caps the interval in minutes.
             "retain_expiry_interval" => {
@@ -907,26 +1066,38 @@ impl Parser {
                 self.config.limits.retain_expiry_interval =
                     Some(Duration::from_secs(minutes.min(10_000_000) as u64 * 60));
             }
-            "autosave_interval" | "websockets_log_level" => {
+            // conf.c: config__read_file_core clamps negative values to zero.
+            "autosave_interval" => {
+                self.config.persistence.autosave_interval = v.integer()?.max(0) as u32;
+            }
+            "websockets_log_level" => {
                 v.integer()?;
             }
             "autosave_on_changes" => {
-                v.boolean()?;
+                self.config.persistence.autosave_on_changes = v.boolean()?;
             }
-            "user" => {
-                v.string()?;
-            }
+            // Mosquitto src/conf.c: config__read_file_core; user is last-wins,
+            // pid_file is unique. Neither is reread into the live process.
+            "user" => self.config.user = v.string()?,
             "pid_file" => {
-                v.unique_string(self.pid_file_seen)?;
-                self.pid_file_seen = true;
+                self.config.pid_file =
+                    Some(v.unique_string(self.config.pid_file.is_some())?.into());
+            }
+            // conf.c: config__read_file_core uses one flag for both spellings.
+            "persistence" | "retained_persistence" => {
+                self.config.persistence.enabled = v.boolean()?;
             }
             "persistence_file" => {
-                v.unique_string(self.persistence_file_seen)?;
-                self.persistence_file_seen = true;
+                self.config.persistence.file = Some(
+                    v.unique_string(self.config.persistence.file.is_some())?
+                        .into(),
+                );
             }
             "persistence_location" => {
-                v.unique_string(self.persistence_location_seen)?;
-                self.persistence_location_seen = true;
+                self.config.persistence.location = Some(
+                    v.unique_string(self.config.persistence.location.is_some())?
+                        .into(),
+                );
             }
             "dhparamfile" => self
                 .config
@@ -964,67 +1135,118 @@ impl Parser {
             "tls_engine" | "tls_engine_kpass_sha1" => {
                 return Err(unsupported(name, "OpenSSL engines"));
             }
-            "auth_plugin"
-            | "auth_plugin_deny_special_chars"
-            | "plugin"
-            | "global_plugin"
-            | "plugin_load"
-            | "plugin_use" => return Err(unsupported(name, "plugins")),
-            _ if name.starts_with("auth_opt_") || name.starts_with("plugin_opt_") => {
-                return Err(unsupported(name, "plugins"));
+            "auth_plugin" | "plugin" | "global_plugin" => {
+                let listener = if name == "global_plugin" || !self.config.per_listener_settings {
+                    None
+                } else {
+                    Some(require_listener(*current, name)?)
+                };
+                let index = self.load_plugin(name, None, v.value)?;
+                let loaded = &mut self.dynamic_security_plugins[index];
+                if let Some(listener) = listener {
+                    loaded.listeners.push(listener);
+                } else {
+                    loaded.global = true;
+                }
+                self.security_seen = true;
+                *plugin = Some(index);
             }
-            "connection"
-            | "address"
-            | "addresses"
-            | "clientid"
-            | "remote_clientid"
-            | "local_clientid"
-            | "cleansession"
-            | "local_cleansession"
-            | "idle_timeout"
-            | "keepalive_interval"
-            | "local_password"
-            | "local_username"
-            | "notifications"
-            | "notifications_local_only"
-            | "notification_topic"
-            | "password"
-            | "remote_password"
-            | "restart_timeout"
-            | "round_robin"
-            | "start_type"
-            | "threshold"
-            | "topic"
-            | "try_private"
-            | "username"
-            | "remote_username"
-            | "bridge_attempt_unsubscribe"
-            | "bridge_cafile"
-            | "bridge_alpn"
-            | "bridge_ciphers"
-            | "bridge_ciphers_tls1.3"
-            | "bridge_bind_address"
-            | "bridge_capath"
-            | "bridge_certfile"
-            | "bridge_identity"
-            | "bridge_insecure"
-            | "bridge_require_ocsp"
-            | "bridge_max_packet_size"
-            | "bridge_max_topic_alias"
-            | "bridge_outgoing_retain"
-            | "bridge_keyfile"
-            | "bridge_protocol_version"
-            | "bridge_psk"
-            | "bridge_receive_maximum"
-            | "bridge_reload_type"
-            | "bridge_session_expiry_interval"
-            | "bridge_tcp_keepalive"
-            | "bridge_tcp_user_timeout"
-            | "bridge_tls_use_os_certs"
-            | "bridge_tls_version" => return Err(unsupported(name, "bridges")),
+            "plugin_load" => {
+                let declaration = v.value.trim_start_matches(' ');
+                let (plugin_name, path) = declaration.split_once(' ').unwrap_or((declaration, ""));
+                if plugin_name.is_empty() {
+                    return Err(empty(name));
+                }
+                *plugin = Some(self.load_plugin(name, Some(plugin_name), path)?);
+            }
+            "plugin_use" => {
+                let explicit = current.filter(|index| Some(*index) != self.default_listener);
+                let listener = require_listener(explicit, name)?;
+                let plugin_name = v.string()?;
+                let index = self
+                    .find_plugin(&plugin_name)
+                    .ok_or_else(|| format!("Plugin '{plugin_name}' not previously loaded."))?;
+                self.dynamic_security_plugins[index]
+                    .listeners
+                    .push(listener);
+                *plugin = Some(index);
+            }
+            "auth_plugin_deny_special_chars" => {
+                if plugin.is_none() {
+                    return Err("An auth_plugin_deny_special_chars option exists in the config file without a plugin.".into());
+                }
+                // Mosquitto src/plugin_acl_check.c applies this to legacy plugins, not v5.
+                v.boolean()?;
+            }
+            _ if name.starts_with("auth_opt_") || name.starts_with("plugin_opt_") => {
+                let index = plugin.ok_or_else(|| {
+                    format!("The '{name}' option requires plugin/global_plugin/plugin_load to be defined first.")
+                })?;
+                let key = name
+                    .strip_prefix("plugin_opt_")
+                    .or_else(|| name.strip_prefix("auth_opt_"))
+                    .expect("plugin option prefix");
+                if key.len() < 3 {
+                    return Err("Invalid 'plugin_opt_' config option.".into());
+                }
+                if v.value.is_empty() {
+                    return Err(empty(key));
+                }
+                // config__read_file_core skips only leading spaces/tabs, and
+                // mosquitto_plugin_init keeps the last recognized option.
+                let path = v.value.trim_start_matches([' ', '\t']);
+                let loaded = &mut self.dynamic_security_plugins[index];
+                if key.eq_ignore_ascii_case("config_file") {
+                    loaded.config_file = Some(path.into());
+                } else if key.eq_ignore_ascii_case("password_init_file") {
+                    loaded.password_init_file = Some(path.into());
+                }
+            }
             _ => return Err(format!("Unknown configuration variable '{name}'.").into()),
         }
         Ok(())
+    }
+
+    fn find_plugin(&self, name: &str) -> Option<usize> {
+        self.dynamic_security_plugins
+            .iter()
+            .position(|plugin| plugin.name.as_deref() == Some(name))
+    }
+
+    // Mosquitto src/conf.c: config__plugin_load. Match the distribution's
+    // basename without opening a shared library or resolving the path.
+    fn load_plugin(
+        &mut self,
+        directive: &str,
+        name: Option<&str>,
+        path: &str,
+    ) -> ParseResult<usize> {
+        if let Some(name) = name
+            && self.find_plugin(name).is_some()
+        {
+            return Err(format!("Duplicate plugin name '{name}'.").into());
+        }
+        if path.is_empty() {
+            return Err(match name {
+                Some(name) => format!("Missing plugin path for plugin name '{name}'.").into(),
+                None => empty(directive),
+            });
+        }
+        let basename = path.rsplit(std::path::is_separator).next().unwrap_or(path);
+        if !matches!(
+            basename,
+            "mosquitto_dynamic_security.so"
+                | "mosquitto_dynamic_security.dll"
+                | "mosquitto_dynamic_security.dylib"
+        ) {
+            return Err(unsupported(directive, &format!("plugin '{path}'")));
+        }
+        let index = self.dynamic_security_plugins.len();
+        self.dynamic_security_plugins.push(DynamicSecurityPlugin {
+            name: name.map(str::to_owned),
+            ..DynamicSecurityPlugin::default()
+        });
+        Ok(index)
     }
 
     fn deprecated(&mut self, name: &str, alternative: &str) {
@@ -1105,6 +1327,9 @@ struct ClusterSection {
     node_id: Option<u64>,
     bind: Option<SocketAddr>,
     peers: BTreeMap<u64, SocketAddr>,
+    join: Option<bool>,
+    membership_generation: Option<u64>,
+    state_format: Option<u16>,
     data_dir: Option<PathBuf>,
     heartbeat: Option<Duration>,
     election: Option<(Duration, Duration)>,
@@ -1149,6 +1374,9 @@ impl ClusterSection {
             "cluster_peer" | "cluster_election_timeout" => 2,
             "cluster_node_id"
             | "cluster_bind"
+            | "cluster_join"
+            | "cluster_membership_generation"
+            | "cluster_state_format"
             | "cluster_heartbeat_interval"
             | "cluster_lease_interval"
             | "cluster_lease_timeout"
@@ -1167,6 +1395,17 @@ impl ClusterSection {
         match name {
             "cluster_node_id" if self.node_id.is_none() => self.node_id = Some(positive(first)?),
             "cluster_bind" if self.bind.is_none() => self.bind = Some(address(first)?),
+            "cluster_join" if self.join.is_none() => self.join = Some(value.boolean()?),
+            "cluster_membership_generation" if self.membership_generation.is_none() => {
+                self.membership_generation = Some(first.parse().map_err(|_| invalid(name, first))?);
+            }
+            "cluster_state_format" if self.state_format.is_none() => {
+                self.state_format = Some(match first {
+                    "1" => 1,
+                    "2" => 2,
+                    _ => return Err(invalid(name, first)),
+                });
+            }
             "cluster_peer" => {
                 let id = positive(first)?;
                 let addr = address(second.expect("two arguments"))?;
@@ -1219,11 +1458,19 @@ impl ClusterSection {
         let id = self.node_id.ok_or_else(|| requires("cluster_node_id"))?;
         let bind = self.bind.ok_or_else(|| requires("cluster_bind"))?;
         let data_dir = self.data_dir.ok_or_else(|| requires("cluster_data_dir"))?;
-        if !self.peers.contains_key(&id) {
+        let join = self.join.unwrap_or(false);
+        let generation = self.membership_generation.unwrap_or(0);
+        if (join || generation == 0) && !self.peers.contains_key(&id) {
             return Err(format!(
                 "Cluster configuration requires a 'cluster_peer' entry for node {id}."
             )
             .into());
+        }
+        if self.peers.is_empty() || (join && self.peers.len() < 2) {
+            return Err("Cluster configuration requires peers, including an existing seed for 'cluster_join true'.".into());
+        }
+        if self.state_format == Some(1) && (join || generation != 0) {
+            return Err("Dynamic membership requires 'cluster_state_format 2'.".into());
         }
         let allow_plaintext = self.insecure_plaintext == Some(true);
         let security = match (self.cafile, self.certfile, self.keyfile) {
@@ -1253,6 +1500,11 @@ impl ClusterSection {
             }
         };
         let mut config = ClusterConfig::new(id, bind, self.peers, data_dir, security);
+        config.join = join;
+        config.membership_generation = generation;
+        if let Some(format) = self.state_format {
+            config.state_format = format;
+        }
         if let Some(interval) = self.heartbeat {
             config.heartbeat_interval = interval;
         }

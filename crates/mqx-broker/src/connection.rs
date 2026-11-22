@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use mqx_auth::BasicAuth;
+use mqx_auth::DynamicSecurity;
 use mqx_codec::v5::{self as codec5, Packet as Packet5, Property, ReasonCode as R};
 use mqx_codec::{
     ConnAck, Connect, ConnectReturnCode as Code, DecodeContext, DecodeError, Packet,
@@ -26,9 +26,11 @@ use tokio::{
 
 use crate::{
     Broker, BrokerConfig, BrokerError, CertIdentity, ConnectionInfo, Live, Security,
+    SecurityHandle,
     inbox::{Ack, Outbound, Publisher, Receive},
     runtime::ClaimResult,
     state::{Claim, Operation, Publication, Reply, SubscriptionRequest},
+    sys::Metric,
 };
 
 pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
@@ -38,7 +40,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     accepted_at: Instant,
 ) -> Result<(), BrokerError> {
     let config = &broker.0.config;
-    let mut wire = Wire::new(stream);
+    let mut wire = Wire::new(stream, broker.clone());
     let mut shutdown = broker.0.shutdown.subscribe();
     // context.c: context__init gives peers 20 seconds of keepalive before CONNECT.
     let initial_deadline = accepted_at + keepalive_period(20);
@@ -133,13 +135,21 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await;
     }
+    let client_id = Arc::<str>::from(std::mem::take(&mut connect.client_id));
+    let dynamic = broker.dynamic_policy_snapshot(&listener.security);
+    let dynamic_security_revision = dynamic.as_ref().map(|(revision, _)| *revision);
+    let dynamic = listener.security.1.zip(dynamic.map(|(_, policy)| policy));
     let security_snapshot = security.borrow_and_update().clone();
-    if !identity.authorized(security_snapshot).await {
+    if !identity
+        .authorized(&client_id, security_snapshot, dynamic.as_ref())
+        .await
+    {
         if options.is_some() {
             return refuse_v5(&mut wire, &mut shutdown, config, &info, R::NOT_AUTHORIZED).await;
         }
         return refuse(&mut wire, &mut shutdown, Code::NotAuthorized).await;
     }
+    drop(dynamic);
     if *shutdown.borrow() {
         return Ok(());
     }
@@ -147,11 +157,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let assigned_id = options
         .as_ref()
         .filter(|options| options.assigned_id)
-        .map(|_| Property::AssignedClientIdentifier(connect.client_id.clone()));
+        .map(|_| Property::AssignedClientIdentifier(client_id.to_string()));
     let publisher = Publisher {
-        id: Arc::from(connect.client_id),
+        id: client_id,
         username: identity.username.clone(),
         security: 0, // Filled by the log backend before claiming the session.
+        dynamic_security: listener.security.1,
     };
     let (live, present) = match broker
         .claim(
@@ -164,13 +175,22 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 will: connect.will,
                 v5: v5_settings,
                 now: Duration::ZERO, // Filled by the log backend when proposing.
+                internal_bridge: None,
+                dynamic_security_revision,
             },
+            info.peer_addr.map(|peer| peer.ip()),
         )
         .await?
     {
         ClaimResult::Accepted(live, present) => (live, present),
         ClaimResult::Full if options.is_some() => {
             return refuse_v5(&mut wire, &mut shutdown, config, &info, R::SERVER_BUSY).await;
+        }
+        ClaimResult::Unauthorized => {
+            if options.is_some() {
+                return refuse_v5(&mut wire, &mut shutdown, config, &info, R::NOT_AUTHORIZED).await;
+            }
+            return refuse(&mut wire, &mut shutdown, Code::NotAuthorized).await;
         }
         ClaimResult::Full | ClaimResult::Stale => return Ok(()),
     };
@@ -182,7 +202,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         expiry_override: None,
         detached: false,
     };
-    if config.connection_messages {
+    if broker.connection_messages() {
         log_connected(
             info.peer_addr,
             &session.live.lease.id,
@@ -236,15 +256,23 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let clustered = broker.is_clustered();
     let result = 'active: loop {
         if session.live.taken.load(Ordering::Acquire) {
-            break Ok(End::Takeover);
+            break Ok(if session.live.kicked.load(Ordering::Relaxed) {
+                End::Kicked
+            } else {
+                End::Takeover
+            });
         }
         if *shutdown.borrow() {
             break Ok(End::Shutdown);
         }
-        if security.has_changed().unwrap_or(false)
-            && !reauthenticate(&identity, &mut security).await
-        {
-            break Ok(End::Security);
+        if security.has_changed().unwrap_or(false) {
+            let snapshot = security.borrow_and_update().clone();
+            if !identity
+                .reauthenticate(broker, &listener.security, &session.live.lease.id, snapshot)
+                .await
+            {
+                break Ok(End::Security);
+            }
         }
         if wire.idle() {
             if too_long {
@@ -348,6 +376,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                             // empty v3.1 SUBSCRIBE and sends an empty SUBACK.
                             let [hi, lo] = id.get().to_be_bytes();
                             wire.output.extend_from_slice(&[0x90, 2, hi, lo]);
+                            wire.enqueue(4);
                         }
                         Ok(Step::End(end)) => break Ok(end),
                         Err(error) => break Err(error),
@@ -371,20 +400,30 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             _ = shutdown.changed() => break Ok(End::Shutdown),
             // Mark and use the exact security snapshot observed by this wakeup.
             snapshot = wait_security(&mut security) => {
-                if !identity.authorized(snapshot).await { break Ok(End::Security); }
+                if !identity.reauthenticate(broker, &listener.security, &session.live.lease.id, snapshot).await {
+                    break Ok(End::Security);
+                }
             }
             _ = timeout(deadline) => break Ok(End::Timeout),
             result = wire.progress(!too_long) => if let Err(error) = result { break 'active Err(error.into()); },
             _ = session.live.ready.notified() => delivering = true,
         }
     };
-    session.graceful = matches!(result, Ok(End::Disconnect | End::Security));
+    let result =
+        if matches!(result, Ok(End::Takeover)) && session.live.kicked.load(Ordering::Acquire) {
+            Ok(End::Kicked)
+        } else {
+            result
+        };
+    session.graceful = matches!(result, Ok(End::Disconnect | End::Security | End::Kicked));
     if options.is_some()
         && let Some(reason) = disconnect_reason(&result)
     {
         wire.terminate_v5(reason).await;
+    } else if matches!(result, Ok(End::Kicked)) {
+        wire.flush_ready().await;
     }
-    if config.connection_messages {
+    if broker.connection_messages() {
         log_disconnected(info.peer_addr, &session.live.lease.id, &result);
     }
     let detached = broker
@@ -404,6 +443,7 @@ fn disconnect_reason(result: &Result<End, BrokerError>) -> Option<R> {
     // via do_disconnect directly, without an MQTT packet.
     match result {
         Ok(End::Takeover) => Some(R::SESSION_TAKEN_OVER),
+        Ok(End::Kicked) => Some(R::ADMINISTRATIVE_ACTION),
         Err(BrokerError::Protocol) => Some(R::PROTOCOL_ERROR),
         Err(BrokerError::ProtocolV5(reason)) => Some(*reason),
         Err(BrokerError::DecodeV5(error)) => match error.response {
@@ -422,34 +462,37 @@ struct Identity {
 }
 
 impl Identity {
-    // plugin_basic_auth.c: mosquitto_basic_auth. A password file that abstains
-    // on anonymous credentials lets allow_anonymous decide; a denial never does.
-    async fn authorized(&self, snapshot: Arc<Security>) -> bool {
-        if self.certificate {
-            return true;
-        }
-        match (
-            snapshot.password.as_ref(),
-            self.username.as_ref(),
-            self.password.as_ref(),
-        ) {
-            (Some(_), Some(username), Some(password)) => {
-                let username = username.clone();
-                let password = password.clone();
-                tokio::task::spawn_blocking(move || {
-                    snapshot
-                        .password
-                        .as_ref()
-                        .unwrap()
-                        .check(Some(&username), Some(&password))
-                        == BasicAuth::Allow
-                })
+    async fn authorized(
+        &self,
+        client_id: &Arc<str>,
+        snapshot: Arc<Security>,
+        dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
+    ) -> bool {
+        self.certificate
+            || snapshot
+                .authenticate(
+                    client_id,
+                    self.username.as_ref(),
+                    self.password.as_ref(),
+                    self.allow_anonymous,
+                    dynamic,
+                )
                 .await
-                .unwrap_or(false)
-            }
-            (Some(_), Some(_), None) => false,
-            _ => self.allow_anonymous,
-        }
+    }
+
+    async fn reauthenticate(
+        &self,
+        broker: &Broker,
+        security: &SecurityHandle,
+        client_id: &Arc<str>,
+        snapshot: Arc<Security>,
+    ) -> bool {
+        let dynamic = security.1.zip(
+            broker
+                .dynamic_policy_snapshot(security)
+                .map(|(_, policy)| policy),
+        );
+        self.authorized(client_id, snapshot, dynamic.as_ref()).await
     }
 }
 
@@ -459,14 +502,6 @@ async fn wait_security(receiver: &mut watch::Receiver<Arc<Security>>) -> Arc<Sec
         .await
         .expect("the connection owns its security handle");
     receiver.borrow_and_update().clone()
-}
-
-async fn reauthenticate(
-    identity: &Identity,
-    receiver: &mut watch::Receiver<Arc<Security>>,
-) -> bool {
-    let snapshot = receiver.borrow_and_update().clone();
-    identity.authorized(snapshot).await
 }
 
 enum Preparation {
@@ -712,6 +747,8 @@ impl Active<'_> {
                         *qos = max_qos;
                     }
                 }
+                let logged = tracing::enabled!(target: "mqx::subscribe", tracing::Level::INFO)
+                    .then(|| sub.filters.clone());
                 let filters = sub
                     .filters
                     .into_iter()
@@ -725,6 +762,15 @@ impl Active<'_> {
                         Ok(Step::EmptySubAck(sub.packet_id))
                     }
                     Reply::Subscribed(return_codes) => {
+                        // Mosquitto handle_subscribe.c: handle__subscribe logs the
+                        // mounted filter and granted QoS after installing the leaf.
+                        if let Some(logged) = logged {
+                            for ((filter, qos), code) in logged.into_iter().zip(&return_codes) {
+                                if matches!(code, mqx_codec::SubscribeReturnCode::Success(_)) {
+                                    tracing::info!(target: "mqx::subscribe", "{} {} {filter}", self.live.lease.id, qos as u8);
+                                }
+                            }
+                        }
                         Ok(Step::Reply(Frame::Legacy(Packet::SubAck(SubAck {
                             packet_id: sub.packet_id,
                             return_codes,
@@ -736,6 +782,7 @@ impl Active<'_> {
             Packet::Unsubscribe(mut unsub) => {
                 for filter in &mut unsub.filters {
                     mount(filter, mount_point);
+                    tracing::info!(target: "mqx::unsubscribe", "{} {filter}", self.live.lease.id);
                 }
                 let step = action_result(self.act(Operation::Unsubscribe(unsub.filters)).await?)?;
                 Ok(step.or_reply(Frame::Legacy(Packet::UnsubAck(unsub.packet_id)), false))
@@ -753,12 +800,13 @@ impl Active<'_> {
                 let reply = self
                     .receive(Publication::legacy(publish, self.broker.now()))
                     .await?;
+                let control = matches!(reply, Reply::ControlAccepted { .. });
                 let step = action_result(reply)?;
                 Ok(match id {
                     Some(id) if qos == QoS::ExactlyOnce => {
                         step.or_reply(Frame::Legacy(Packet::PubRec(id)), false)
                     }
-                    Some(id) => step.or_reply(Frame::Legacy(Packet::PubAck(id)), true),
+                    Some(id) => step.or_reply(Frame::Legacy(Packet::PubAck(id)), !control),
                     None => step,
                 })
             }
@@ -799,12 +847,17 @@ impl Active<'_> {
             Some(message) if qos == QoS::ExactlyOnce => {
                 let mut inbox = inbox.lock().unwrap();
                 match inbox.receive(id, message, config) {
-                    Receive::Duplicate => Reply::ProtocolError,
-                    Receive::Quota if inbox.receive_maximum.is_some() => {
-                        inbox.credit_incoming();
-                        Reply::PublishReason(R::QUOTA_EXCEEDED.0)
+                    Receive::Quota => {
+                        self.broker.0.traffic.add(Metric::Dropped, 1);
+                        if inbox.receive_maximum.is_some() {
+                            inbox.credit_incoming();
+                            Reply::PublishReason(R::QUOTA_EXCEEDED.0)
+                        } else {
+                            Reply::NoChange
+                        }
                     }
-                    Receive::Accepted | Receive::Quota => Reply::NoChange,
+                    Receive::Duplicate => Reply::ProtocolError,
+                    Receive::Accepted => Reply::NoChange,
                 }
             }
             Some(message) => {
@@ -812,6 +865,7 @@ impl Active<'_> {
                 if allowed {
                     self.act(Operation::Forward(message, now)).await?
                 } else {
+                    self.broker.0.traffic.add(Metric::Dropped, 1);
                     Reply::PublishReason(R::QUOTA_EXCEEDED.0)
                 }
             }
@@ -834,7 +888,9 @@ impl Active<'_> {
 
     async fn ack(&self, id: mqx_codec::PacketId, ack: Ack) -> Result<Step, BrokerError> {
         if let Some(inbox) = &self.live.inbox {
-            if inbox.lock().unwrap().ack(id, ack, &self.broker.0.config) {
+            let acknowledged = inbox.lock().unwrap().ack(id, ack, &self.broker.0.config);
+            if acknowledged {
+                self.broker.count_transient_ack(ack);
                 Ok(Step::Continue)
             } else {
                 Err(BrokerError::Protocol)
@@ -847,7 +903,10 @@ impl Active<'_> {
 
 fn action_result(reply: Reply) -> Result<Step, BrokerError> {
     match reply {
-        Reply::NoChange | Reply::PublishReason(_) | Reply::Unsubscribed(_) => Ok(Step::Continue),
+        Reply::NoChange
+        | Reply::ControlAccepted { .. }
+        | Reply::PublishReason(_)
+        | Reply::Unsubscribed(_) => Ok(Step::Continue),
         Reply::Stale => Ok(Step::End(End::Takeover)),
         Reply::ProtocolError => Err(BrokerError::Protocol),
         _ => unreachable!(),
@@ -880,6 +939,7 @@ enum End {
     Security,
     Shutdown,
     Takeover,
+    Kicked,
     Unsupported,
     KeepaliveRefused,
 }
@@ -891,9 +951,13 @@ enum Frame {
 
 struct Wire<S> {
     stream: S,
+    broker: Broker,
     input: BytesMut,
     output: BytesMut,
     written: usize,
+    selected_end: usize,
+    queued: i64,
+    queued_bytes: i64,
     flush: bool,
     eof: bool,
     v5: Option<v5::WireState>,
@@ -901,12 +965,16 @@ struct Wire<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
-    fn new(stream: S) -> Self {
+    fn new(stream: S, broker: Broker) -> Self {
         Self {
             stream,
+            broker,
             input: BytesMut::new(),
             output: BytesMut::new(),
             written: 0,
+            selected_end: 0,
+            queued: 0,
+            queued_bytes: 0,
             flush: false,
             eof: false,
             v5: None,
@@ -916,6 +984,54 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
 
     fn idle(&self) -> bool {
         self.output.is_empty() && !self.flush
+    }
+
+    fn account_received(&self, command: u8, result: &Result<Option<Frame>, BrokerError>) {
+        // packet_mosq.c: packet__read_single counts complete frames;
+        // read_handle.c: handle__packet counts CONNECT/PUBLISH before validation.
+        let complete = match result {
+            Ok(packet) => packet.is_some(),
+            Err(BrokerError::Decode(DecodeError::PacketTooLarge { .. })) => false,
+            Err(BrokerError::DecodeV5(error))
+                if matches!(error.kind, codec5::DecodeErrorKind::PacketTooLarge { .. }) =>
+            {
+                false
+            }
+            Err(_) => frame_size(&self.input).is_some_and(|size| size <= self.input.len()),
+        };
+        if complete {
+            let stats = &self.broker.0.traffic;
+            stats.add(Metric::Received, 1);
+            match command >> 4 {
+                1 => stats.add(Metric::Connect, 1),
+                3 => stats.add(Metric::PublishReceived, 1),
+                _ => {}
+            }
+        }
+    }
+
+    fn enqueue(&mut self, size: usize) {
+        // packet_mosq.c: packet__queue_append / packet__get_next_out.
+        self.queued += 1;
+        self.queued_bytes += size as i64;
+        self.broker.0.traffic.add(Metric::Queued, 1);
+        self.broker.0.traffic.add(Metric::QueuedBytes, size as i64);
+    }
+
+    fn select_packet(&mut self, offset: usize) {
+        let size = if self.queued == 1 {
+            self.output.len() - offset
+        } else {
+            frame_size(&self.output[offset..]).expect("encoded MQTT frame")
+        };
+        self.selected_end = offset + size;
+        self.queued -= 1;
+        self.queued_bytes -= size as i64;
+        self.broker.0.traffic.add(Metric::Queued, -1);
+        self.broker
+            .0
+            .traffic
+            .add(Metric::QueuedBytes, -(size as i64));
     }
 
     fn connect(&mut self, config: &BrokerConfig) -> Result<Option<Frame>, BrokerError> {
@@ -934,15 +1050,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         {
             return Err(BrokerError::Protocol);
         }
-        if matches!(
+        let result = if matches!(
             codec5::peek_connect_protocol_level(&self.input),
             Ok(Some(5 | 0x85))
         ) {
-            return Ok(
-                codec5::decode(&mut self.input, codec5::DecodeContext::new(max))?.map(Frame::V5),
-            );
-        }
-        Ok(decode(&mut self.input, DecodeContext::new(max, None))?.map(Frame::Legacy))
+            codec5::decode(&mut self.input, codec5::DecodeContext::new(max))
+                .map(|packet| packet.map(Frame::V5))
+                .map_err(BrokerError::from)
+        } else {
+            decode(&mut self.input, DecodeContext::new(max, None))
+                .map(|packet| packet.map(Frame::Legacy))
+                .map_err(BrokerError::from)
+        };
+        self.account_received(0x10, &result);
+        result
     }
 
     fn packet(
@@ -953,6 +1074,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         if let Some(error) = self.pending_error.take() {
             return Err(error);
         }
+        let command = self.input.first().copied().unwrap_or_default();
+        let result = self.decode_packet(config, legacy_protocol);
+        self.account_received(command, &result);
+        result
+    }
+
+    fn decode_packet(
+        &mut self,
+        config: &BrokerConfig,
+        legacy_protocol: ProtocolVersion,
+    ) -> Result<Option<Frame>, BrokerError> {
         let Some(v5) = &self.v5 else {
             if self
                 .input
@@ -1003,11 +1135,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     }
 
     fn output(&mut self, packet: &Packet) -> Result<(), BrokerError> {
-        Ok(encode(packet, &mut self.output)?)
+        let before = self.output.len();
+        encode(packet, &mut self.output)?;
+        self.enqueue(self.output.len() - before);
+        Ok(())
     }
 
     fn output_v5(&mut self, packet: &Packet5) -> Result<(), BrokerError> {
-        Ok(codec5::encode(packet, &mut self.output)?)
+        let before = self.output.len();
+        codec5::encode(packet, &mut self.output)?;
+        self.enqueue(self.output.len() - before);
+        Ok(())
     }
 
     fn output_frame(&mut self, packet: &Frame) -> Result<(), BrokerError> {
@@ -1018,10 +1156,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     }
 
     fn connack_v5(&mut self, packet: &Packet5) -> Result<bool, BrokerError> {
-        self.output_v5(packet)?;
+        codec5::encode(packet, &mut self.output)?;
         let fits = self.v5.as_ref().is_none_or(|v5| v5.fits(self.output.len()));
         if !fits {
             self.output.clear();
+        } else {
+            self.enqueue(self.output.len());
         }
         Ok(fits)
     }
@@ -1053,6 +1193,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         else {
             return Ok(None);
         };
+        // send_publish.c: send__publish counts payload before the packet
+        // maximum check in send__real_publish.
+        self.broker
+            .0
+            .traffic
+            .add(Metric::PayloadSent, delivery.message.payload.len() as i64);
         if let Some(v5) = &mut self.v5 {
             let (topic, alias) = v5.outgoing_topic(topic);
             // Reject payloads that cannot fit even before accounting for
@@ -1104,6 +1250,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 self.output.clear();
                 return Ok(id);
             }
+            self.enqueue(self.output.len());
         } else {
             self.output(&Packet::Publish(Publish {
                 dup,
@@ -1114,6 +1261,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 payload: delivery.message.payload.clone(),
             }))?;
         }
+        self.broker.0.traffic.add(Metric::PublishSent, 1);
         Ok(None)
     }
 
@@ -1171,14 +1319,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         poll_fn(|cx| {
             let mut progress = false;
             if !self.output.is_empty() {
+                if self.selected_end == self.written {
+                    self.select_packet(self.written);
+                }
                 match Pin::new(&mut self.stream).poll_write(cx, &self.output[self.written..]) {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                     }
                     Poll::Ready(Ok(written)) => {
+                        self.broker.0.traffic.add(Metric::BytesSent, written as i64);
                         self.written += written;
+                        let mut sent = 0;
+                        while self.selected_end <= self.written {
+                            sent += 1;
+                            if self.selected_end == self.written {
+                                break;
+                            }
+                            self.select_packet(self.selected_end);
+                        }
+                        if sent != 0 {
+                            self.broker.0.traffic.add(Metric::Sent, sent);
+                        }
                         if self.written == self.output.len() {
                             self.written = 0;
+                            self.selected_end = 0;
                             self.output.clear();
                             self.flush = true;
                         }
@@ -1206,7 +1370,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 let read = self.stream.read_buf(&mut self.input);
                 match pin!(read).poll(cx) {
                     Poll::Ready(result) => {
-                        self.eof = result? == 0;
+                        let read = result?;
+                        self.eof = read == 0;
+                        if read != 0 {
+                            self.broker
+                                .0
+                                .traffic
+                                .add(Metric::BytesReceived, read as i64);
+                        }
                         progress = true;
                     }
                     Poll::Pending => {}
@@ -1220,6 +1391,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         })
         .await
     }
+}
+
+impl<S> Drop for Wire<S> {
+    fn drop(&mut self) {
+        if self.queued != 0 {
+            self.broker.0.traffic.add(Metric::Queued, -self.queued);
+            self.broker
+                .0
+                .traffic
+                .add(Metric::QueuedBytes, -self.queued_bytes);
+        }
+    }
+}
+
+fn frame_size(input: &[u8]) -> Option<usize> {
+    let mut remaining = 0;
+    for (index, &byte) in input.iter().skip(1).take(4).enumerate() {
+        remaining |= usize::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Some(remaining + index + 2);
+        }
+    }
+    None
 }
 
 pub(super) struct Address(pub(super) Option<SocketAddr>);
@@ -1250,10 +1444,12 @@ fn log_connected(
     let addr = Address(addr);
     if let Some(username) = &identity.username {
         tracing::info!(
+            target: "mqx::notice",
             "New {kind} connected from {addr} as {id} (p{protocol}, c{clean}, k{keepalive}, u'{username}')."
         );
     } else {
         tracing::info!(
+            target: "mqx::notice",
             "New {kind} connected from {addr} as {id} (p{protocol}, c{clean}, k{keepalive})."
         );
     }
@@ -1264,23 +1460,24 @@ fn log_disconnected(addr: Option<SocketAddr>, id: &str, result: &Result<End, Bro
     // loop.c: do_disconnect distinguishes an MQTT DISCONNECT from EOF/failure.
     let reason = match result {
         Ok(End::Disconnect | End::DisconnectWithWill | End::Security | End::Shutdown) => {
-            tracing::info!("Client {id} [{addr}] disconnected.");
+            tracing::info!(target: "mqx::notice", "Client {id} [{addr}] disconnected.");
             return;
         }
         Ok(End::Eof) => "connection closed by client",
         Ok(End::Timeout) => "exceeded timeout",
         Ok(End::Takeover) => "session taken over",
+        Ok(End::Kicked) => "administrative action",
         Ok(End::Unsupported) => {
             "used disallowed feature (QoS too high, retain not supported, or bad AUTH method)"
         }
         Ok(End::KeepaliveRefused) => "bad socket read/write: Invalid function arguments provided.",
         Err(BrokerError::Io(error)) => {
-            tracing::info!("Client {id} [{addr}] disconnected: {error}.");
+            tracing::info!(target: "mqx::notice", "Client {id} [{addr}] disconnected: {error}.");
             return;
         }
         Err(BrokerError::Decode(DecodeError::PacketTooLarge { .. })) => "oversize packet",
         Err(BrokerError::Decode(_)) => "malformed packet",
         Err(_) => "protocol error",
     };
-    tracing::info!("Client {id} [{addr}] disconnected: {reason}.");
+    tracing::info!(target: "mqx::notice", "Client {id} [{addr}] disconnected: {reason}.");
 }

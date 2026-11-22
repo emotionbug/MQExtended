@@ -4,7 +4,7 @@ mod process;
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,12 @@ pub enum Error {
     NodeStopped(usize),
     #[error("node {0} is already running")]
     NodeRunning(usize),
+    #[error("node {index} did not exit within {timeout:?} of SIGTERM:\n{log}")]
+    StopTimeout {
+        index: usize,
+        timeout: Duration,
+        log: String,
+    },
     #[error("cluster did not agree on a live Raft leader within {timeout:?}:\n{logs}")]
     NoLeader { timeout: Duration, logs: String },
 }
@@ -255,6 +261,20 @@ impl Harness {
         Ok(Self::with_brokers(Brokers::start(kind, config, None)?))
     }
 
+    /// Starts a standalone broker from an explicit build, e.g. one built with plugins.
+    pub fn start_with_binary(
+        kind: BrokerKind,
+        binary: &Path,
+        config: BrokerConfig<'_>,
+    ) -> Result<Self, Error> {
+        Ok(Self::with_brokers(Brokers::start_with_binary(
+            kind,
+            binary.canonicalize()?,
+            config,
+            None,
+        )?))
+    }
+
     /// Starts the cluster and waits for an accepted CONNECT on every node.
     pub fn start_cluster(config: BrokerConfig<'_>, cluster: ClusterConfig) -> Result<Self, Error> {
         Ok(Self::with_brokers(Brokers::start(
@@ -311,6 +331,35 @@ impl Harness {
     /// Starts a stopped node with the same configuration, ports and data directory.
     pub fn restart_node(&mut self, index: usize) -> Result<(), Error> {
         self.brokers.restart(index)
+    }
+
+    /// SIGTERMs and reaps a node, as an operator stopping it would. Its ports and
+    /// data directory stay reserved for `restart_node`.
+    pub fn stop_node(&mut self, index: usize) -> Result<(), Error> {
+        self.brokers.stop(index)
+    }
+
+    /// Sends SIGUSR1, requesting an immediate persistence backup.
+    #[cfg(unix)]
+    pub fn backup_node(&self, index: usize) -> Result<(), Error> {
+        self.brokers.backup(index)
+    }
+
+    /// Replaces the scenario's directives in a node's configuration with `conf`
+    /// (listener, password/ACL and cluster lines are kept). A running node gets
+    /// SIGHUP and applies it asynchronously; a stopped node uses it on restart.
+    pub fn reload_node(&mut self, index: usize, conf: &str) -> Result<(), Error> {
+        self.brokers.reload(index, conf)
+    }
+
+    /// The MQTT listener address of a running node.
+    pub fn node_addr(&self, index: usize) -> Result<SocketAddr, Error> {
+        self.brokers.addr(index)
+    }
+
+    /// Everything the node has logged so far, including before a stop.
+    pub fn node_log(&self, index: usize) -> Result<String, Error> {
+        self.brokers.log(index)
     }
 
     /// Waits for all running nodes to report the same live leader in their logs.

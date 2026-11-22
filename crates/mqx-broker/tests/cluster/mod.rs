@@ -4,6 +4,10 @@ use mqx_cluster::ClusterConfig;
 
 use super::*;
 
+// A fixture drops its reservations before Raft takes ownership of the ports.
+// Do not let another fixture reserve those same ports during the handoff.
+static STARTUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct ClusterFixture {
     brokers: [Broker; 3],
     _storage: tempfile::TempDir,
@@ -11,6 +15,7 @@ struct ClusterFixture {
 
 impl ClusterFixture {
     async fn new(config: BrokerConfig) -> Self {
+        let startup = STARTUP_LOCK.lock().await;
         let sockets: Vec<_> = (0..3)
             .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
@@ -49,6 +54,7 @@ impl ClusterFixture {
             Broker::clustered(config, c),
         )
         .unwrap();
+        drop(startup);
         Self {
             brokers: [a, b, c],
             _storage: storage,

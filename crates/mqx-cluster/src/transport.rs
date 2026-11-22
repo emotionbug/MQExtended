@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::io::{self, Cursor};
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as SyncMutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -11,9 +12,9 @@ use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{BoxStream, Stream, StreamExt, unfold};
 use openraft::alias::VoteOf;
-use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Timeout, Unreachable};
 use openraft::network::v2::RaftNetworkV2;
-use openraft::network::{RPCOption, RaftNetworkFactory};
+use openraft::network::{RPCOption, RPCTypes, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendResult, SnapshotResponse, StreamAppendResult,
     TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
@@ -21,20 +22,23 @@ use openraft::raft::{
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit, watch};
 use tokio::time::{Instant, timeout_at};
 use tokio_rustls::TlsStream;
 
 use crate::ClusterError;
+use crate::membership::{MemberRole, MembershipStatus};
 use crate::mtls::{Tls, certificate_node, node_name};
 use crate::mux::{CallError, Client};
 use crate::node::Types;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, atomic_write};
 use crate::snapshot_file::SnapshotData;
 
 const MAGIC: &[u8; 4] = b"MQX3";
+pub(crate) const CLUSTER_ID_FILE: &str = "cluster.id";
 const HEADER_LEN: usize = 53;
 pub(crate) const MAX_APPEND_ENTRIES: u64 = 128;
+pub(crate) const APPEND_WINDOW: usize = 8;
 pub(crate) const MAX_CONTROL_FRAME: usize = 64 * 1024;
 const MAX_BODY_CAPACITY: usize = 3 * (crate::MAX_PACKET_SIZE + 2 * crate::PACKET_ENVELOPE);
 const BODY_CAPACITY: usize = if MAX_BODY_CAPACITY < Semaphore::MAX_PERMITS {
@@ -77,6 +81,7 @@ pub(crate) enum Op {
     MeshRequest,
     MeshSend,
     Session,
+    Retired,
 }
 
 impl TryFrom<u8> for Op {
@@ -95,6 +100,7 @@ impl TryFrom<u8> for Op {
             9 => Ok(Self::MeshRequest),
             10 => Ok(Self::MeshSend),
             11 => Ok(Self::Session),
+            12 => Ok(Self::Retired),
             _ => Err(invalid_data("unknown cluster RPC")),
         }
     }
@@ -129,51 +135,76 @@ impl Limits {
 #[derive(Default)]
 struct PeerSlot {
     outgoing: Mutex<Option<Arc<Client>>>,
-    incoming: Mutex<()>,
+    incoming: Arc<Mutex<()>>,
 }
 
 pub(crate) struct Endpoint {
     pub(crate) node_id: u64,
-    pub(crate) peers: BTreeMap<u64, SocketAddr>,
-    pub(crate) membership_digest: [u8; 32],
+    pub(crate) seeds: BTreeMap<u64, SocketAddr>,
+    pub(crate) status: watch::Receiver<MembershipStatus>,
+    digest: OnceLock<[u8; 32]>,
+    pin: Mutex<()>,
+    dir: PathBuf,
     pub(crate) tls: Option<Tls>,
     pub(crate) max_snapshot_size: u64,
     pub(crate) limits: Limits,
-    slots: BTreeMap<u64, PeerSlot>,
+    slots: SyncMutex<BTreeMap<u64, Arc<PeerSlot>>>,
 }
 
 impl Endpoint {
     pub(crate) fn new(
         node_id: u64,
-        peers: BTreeMap<u64, SocketAddr>,
-        membership_digest: [u8; 32],
+        seeds: BTreeMap<u64, SocketAddr>,
+        (dir, membership_digest): (PathBuf, Option<[u8; 32]>),
+        status: watch::Receiver<MembershipStatus>,
         tls: Option<Tls>,
         max_snapshot_size: u64,
         limits: Limits,
     ) -> Self {
-        let slots = peers.keys().map(|&id| (id, PeerSlot::default())).collect();
+        let digest = OnceLock::new();
+        if let Some(membership_digest) = membership_digest {
+            let _ = digest.set(membership_digest);
+        }
         Self {
             node_id,
-            peers,
-            membership_digest,
+            seeds,
+            status,
+            digest,
+            pin: Mutex::new(()),
+            dir,
             tls,
             max_snapshot_size,
             limits,
-            slots,
+            slots: SyncMutex::default(),
         }
     }
 
-    async fn session(&self, node_id: u64, deadline: Instant) -> io::Result<Arc<Client>> {
-        let slot = self
-            .slots
-            .get(&node_id)
-            .ok_or_else(|| invalid_data("unknown peer"))?;
+    fn slot(&self, id: u64) -> Arc<PeerSlot> {
+        self.slots.lock().unwrap().entry(id).or_default().clone()
+    }
+
+    pub(crate) fn address(&self, id: u64) -> Option<SocketAddr> {
+        let status = self.status.borrow();
+        if status.members.is_empty() {
+            self.seeds.get(&id).copied()
+        } else {
+            status.members.get(&id).map(|member| member.address)
+        }
+    }
+
+    async fn session(
+        &self,
+        node_id: u64,
+        address: SocketAddr,
+        deadline: Instant,
+    ) -> io::Result<Arc<Client>> {
+        let slot = self.slot(node_id);
         timeout_at(deadline, async {
             let mut session = slot.outgoing.lock().await;
             if let Some(live) = session.as_ref().filter(|client| !client.is_closed()) {
                 return Ok(live.clone());
             }
-            let mut stream = self.connect(node_id, deadline).await?;
+            let mut stream = self.connect(node_id, address, deadline).await?;
             self.header(&mut stream, node_id, Op::Session).await?;
             stream.flush().await?;
             if stream.read_u8().await? != 0 {
@@ -195,38 +226,79 @@ impl Endpoint {
         deadline: Instant,
         connect_deadline: Instant,
     ) -> Result<Bytes, CallError> {
+        let address = self
+            .address(node_id)
+            .ok_or_else(|| CallError::Unsent(invalid_data("unknown peer")))?;
+        self.call_at(node_id, address, op, body, deadline, connect_deadline)
+            .await
+    }
+
+    async fn call_at(
+        &self,
+        node_id: u64,
+        address: SocketAddr,
+        op: Op,
+        body: Bytes,
+        deadline: Instant,
+        connect_deadline: Instant,
+    ) -> Result<Bytes, CallError> {
         if body.len() > self.limits.request(op) {
             return Err(CallError::Unsent(invalid_data(
                 "cluster request exceeds the configured size limit",
             )));
         }
-        self.session(node_id, connect_deadline)
+        self.session(node_id, address, connect_deadline)
             .await
             .map_err(CallError::Unsent)?
             .call(op, body, deadline)
             .await
     }
 
-    pub(crate) fn accept_session(&self, from: u64) -> io::Result<MutexGuard<'_, ()>> {
-        self.slots[&from]
+    pub(crate) fn accept_session(&self, from: u64) -> io::Result<OwnedMutexGuard<()>> {
+        self.slot(from)
             .incoming
-            .try_lock()
+            .clone()
+            .try_lock_owned()
             .map_err(|_| io::ErrorKind::WouldBlock.into())
     }
 
     pub(crate) async fn close(&self) {
-        for slot in self.slots.values() {
+        let slots = std::mem::take(&mut *self.slots.lock().unwrap());
+        for slot in slots.into_values() {
             if let Some(client) = slot.outgoing.lock().await.take() {
                 client.close();
             }
         }
     }
 
-    pub(crate) async fn connect(&self, target: u64, deadline: Instant) -> io::Result<Connection> {
-        let address = self
-            .peers
-            .get(&target)
-            .ok_or_else(|| invalid_data("unknown peer"))?;
+    pub(crate) async fn query_retired(
+        &self,
+        id: u64,
+        address: SocketAddr,
+        deadline: Instant,
+    ) -> io::Result<bool> {
+        let result = timeout_at(deadline, async {
+            let mut stream = self.connect(id, address, deadline).await?;
+            self.header(&mut stream, id, Op::Retired).await?;
+            stream.flush().await?;
+            stream.read_u8().await
+        })
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut)??;
+        match result {
+            0 => Ok(false),
+            1 => Ok(true),
+            2 => Err(io::ErrorKind::NotConnected.into()),
+            _ => Err(invalid_data("invalid retired-node response")),
+        }
+    }
+
+    async fn connect(
+        &self,
+        target: u64,
+        address: SocketAddr,
+        deadline: Instant,
+    ) -> io::Result<Connection> {
         timeout_at(deadline, async {
             let stream = TcpStream::connect(address).await?;
             stream.set_nodelay(true)?;
@@ -251,18 +323,39 @@ impl Endpoint {
                 .peer_certificates()
                 .and_then(|chain| chain.first())
                 .and_then(certificate_node)
-                .filter(|id| self.peers.contains_key(id))
-                .ok_or_else(|| {
-                    invalid_data("TLS certificate does not identify a configured cluster member")
-                })?;
+                .ok_or_else(|| invalid_data("TLS certificate does not identify a cluster node"))?;
             (Connection::Tls(stream.into()), Some(node_id))
         } else {
             (Connection::Plain(stream), None)
         };
-        // TLS authentication and member authorization precede reading any header bytes.
+        // Bind the protocol sender to the authenticated TLS identity.
         let mut header = [0; HEADER_LEN];
         stream.read_exact(&mut header).await?;
-        let (from, op) = self.check_header(&header, authenticated)?;
+        let (from, op, digest) = self.check_header(&header, authenticated)?;
+        if self.digest.get().is_none() {
+            // Only a configured seed can establish a joining node's identity.
+            let _pin = self.pin.lock().await;
+            if self.digest.get().is_none() {
+                if !matches!(op, Op::Session | Op::Snapshot)
+                    || !self.seeds.contains_key(&from)
+                    || from == self.node_id
+                {
+                    return Err(invalid_data("join sender is not a configured seed"));
+                }
+                let dir = self.dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    atomic_write(&dir, CLUSTER_ID_FILE, |file| {
+                        std::io::Write::write_all(file, &digest)
+                    })
+                })
+                .await
+                .map_err(io::Error::other)??;
+                let _ = self.digest.set(digest);
+            }
+        }
+        if self.digest.get() != Some(&digest) {
+            return Err(invalid_data("wrong cluster identity"));
+        }
         Ok((stream, from, op))
     }
 
@@ -272,38 +365,43 @@ impl Endpoint {
         target: u64,
         op: Op,
     ) -> io::Result<()> {
-        stream.write_all(&self.rpc_header(target, op)).await
+        stream.write_all(&self.rpc_header(target, op)?).await
     }
 
-    fn rpc_header(&self, target: u64, op: Op) -> [u8; HEADER_LEN] {
+    fn rpc_header(&self, target: u64, op: Op) -> io::Result<[u8; HEADER_LEN]> {
         let mut header = [0; HEADER_LEN];
         header[..4].copy_from_slice(MAGIC);
-        header[4..36].copy_from_slice(&self.membership_digest);
+        header[4..36].copy_from_slice(
+            self.digest
+                .get()
+                .ok_or_else(|| invalid_data("cluster identity is not established"))?,
+        );
         header[36..44].copy_from_slice(&self.node_id.to_be_bytes());
         header[44..52].copy_from_slice(&target.to_be_bytes());
         header[52] = op as u8;
-        header
+        Ok(header)
     }
 
     fn check_header(
         &self,
         header: &[u8; HEADER_LEN],
         authenticated: Option<u64>,
-    ) -> io::Result<(u64, Op)> {
+    ) -> io::Result<(u64, Op, [u8; 32])> {
         let from = u64::from_be_bytes(header[36..44].try_into().unwrap());
         if authenticated.is_some_and(|id| id != from) {
             return Err(invalid_data(
                 "cluster header does not match the TLS peer identity",
             ));
         }
+        let digest = header[4..36].try_into().unwrap();
         if &header[..4] != MAGIC
-            || header[4..36] != self.membership_digest
+            || self.digest.get().is_some_and(|known| *known != digest)
             || header[44..52] != self.node_id.to_be_bytes()
-            || !self.peers.contains_key(&from)
+            || from == 0
         {
-            return Err(invalid_data("wrong protocol or cluster membership"));
+            return Err(invalid_data("wrong protocol or cluster identity"));
         }
-        Ok((from, Op::try_from(header[52])?))
+        Ok((from, Op::try_from(header[52])?, digest))
     }
 }
 
@@ -435,20 +533,27 @@ impl Limits {
     }
 }
 
-pub(crate) struct Network(pub(crate) Arc<Endpoint>);
+pub(crate) struct Network {
+    pub(crate) endpoint: Arc<Endpoint>,
+    pub(crate) append_timeout: Duration,
+}
 
 pub(crate) struct Peer {
     endpoint: Arc<Endpoint>,
+    append_timeout: Duration,
     target: u64,
+    address: Option<SocketAddr>,
 }
 
 impl RaftNetworkFactory<Types> for Network {
     type Network = Peer;
 
-    async fn new_client(&mut self, target: u64, _node: &openraft::BasicNode) -> Peer {
+    async fn new_client(&mut self, target: u64, node: &openraft::BasicNode) -> Peer {
         Peer {
-            endpoint: self.0.clone(),
+            endpoint: self.endpoint.clone(),
+            append_timeout: self.append_timeout,
             target,
+            address: node.addr.parse().ok(),
         }
     }
 }
@@ -459,30 +564,63 @@ impl Peer {
         op: Op,
         req: &Req,
         option: &RPCOption,
+        completion_timeout: Option<Duration>,
     ) -> Result<Res, RPCError<Types>>
     where
         Req: Serialize + Sync,
         Res: DeserializeOwned,
         Err: DeserializeOwned + std::error::Error + 'static,
     {
-        let deadline = Instant::now() + option.soft_ttl();
+        let started = Instant::now();
+        let connect_timeout = option.soft_ttl();
+        let timeout = completion_timeout.unwrap_or(connect_timeout);
         let body = encode(req).map_err(unreachable)?;
         let response = self
             .endpoint
-            .call(self.target, op, body.into(), deadline, deadline)
+            .call_at(
+                self.target,
+                self.address().map_err(unreachable)?,
+                op,
+                body.into(),
+                started + timeout,
+                started + connect_timeout.min(timeout),
+            )
             .await
-            .map_err(|error| unreachable(error.into()))?;
+            .map_err(|error| {
+                let error = io::Error::from(error);
+                if matches!(op, Op::Append) && error.kind() == io::ErrorKind::TimedOut {
+                    RPCError::Timeout(Timeout {
+                        action: RPCTypes::AppendEntries,
+                        id: self.endpoint.node_id,
+                        target: self.target,
+                        timeout: started.elapsed(),
+                    })
+                } else {
+                    unreachable(error)
+                }
+            })?;
         let result: Result<Res, Err> = decode(&response).map_err(unreachable)?;
         result.map_err(|error| RPCError::Unreachable(Unreachable::new(&error)))
+    }
+
+    fn address(&self) -> io::Result<SocketAddr> {
+        self.address
+            .ok_or_else(|| invalid_data("invalid Raft node address"))
     }
 
     async fn append(
         &self,
         request: AppendEntriesRequest<Types>,
         option: &RPCOption,
+        completion_timeout: Option<Duration>,
     ) -> Result<AppendResult<Types>, RPCError<Types>> {
         let reply: StreamAppendResult<Types> = self
-            .call::<_, _, openraft::errors::RaftError<Types>>(Op::Append, &request, option)
+            .call::<_, _, openraft::errors::RaftError<Types>>(
+                Op::Append,
+                &request,
+                option,
+                completion_timeout,
+            )
             .await?;
         Ok(reply.map_err(Into::into))
     }
@@ -500,7 +638,8 @@ impl RaftNetworkV2<Types> for Peer {
         req: AppendEntriesRequest<Types>,
         option: RPCOption,
     ) -> Result<AppendResult<Types>, RPCError<Types>> {
-        self.append(req, &option).await
+        let completion_timeout = (!req.entries.is_empty()).then_some(self.append_timeout);
+        self.append(req, &option, completion_timeout).await
     }
 
     fn stream_append<'s, S>(
@@ -518,15 +657,21 @@ impl RaftNetworkV2<Types> for Peer {
         Box::pin(async move {
             // The server queues append frames by session order. Buffer replies in
             // that order and stop at the first failed or partial acknowledgement.
+            // Even an empty commit update or probe can wait behind a WAL
+            // flush. HeartbeatWorker separately bounds its one-frame stream.
             let pipeline = input
                 .map(move |request| {
                     let option = option.clone();
                     async move {
                         let last = request.last_log_id();
-                        (peer.append(request, &option).await, last)
+                        (
+                            peer.append(request, &option, Some(peer.append_timeout))
+                                .await,
+                            last,
+                        )
                     }
                 })
-                .buffered(8);
+                .buffered(APPEND_WINDOW);
             let output = unfold(Some(Box::pin(pipeline)), |state| async {
                 let mut pipeline = state?;
                 let (result, last) = pipeline.next().await?;
@@ -542,7 +687,7 @@ impl RaftNetworkV2<Types> for Peer {
         req: VoteRequest<Types>,
         option: RPCOption,
     ) -> Result<VoteResponse<Types>, RPCError<Types>> {
-        self.call::<_, _, openraft::errors::RaftError<Types>>(Op::Vote, &req, &option)
+        self.call::<_, _, openraft::errors::RaftError<Types>>(Op::Vote, &req, &option, None)
             .await
     }
 
@@ -551,7 +696,7 @@ impl RaftNetworkV2<Types> for Peer {
         req: VoteRequest<Types>,
         option: RPCOption,
     ) -> Result<VoteResponse<Types>, RPCError<Types>> {
-        self.call::<_, _, openraft::errors::RaftError<Types>>(Op::PreVote, &req, &option)
+        self.call::<_, _, openraft::errors::RaftError<Types>>(Op::PreVote, &req, &option, None)
             .await
     }
 
@@ -560,7 +705,7 @@ impl RaftNetworkV2<Types> for Peer {
         req: TransferLeaderRequest<Types>,
         option: RPCOption,
     ) -> Result<TransferLeaderResponse<Types>, RPCError<Types>> {
-        self.call::<_, _, openraft::errors::Fatal<Types>>(Op::Transfer, &req, &option)
+        self.call::<_, _, openraft::errors::Fatal<Types>>(Op::Transfer, &req, &option, None)
             .await
     }
 
@@ -573,7 +718,10 @@ impl RaftNetworkV2<Types> for Peer {
     ) -> Result<SnapshotResponse<Types>, StreamingError<Types>> {
         let deadline = Instant::now() + option.soft_ttl();
         let send = async {
-            let mut stream = self.endpoint.connect(self.target, deadline).await?;
+            let mut stream = self
+                .endpoint
+                .connect(self.target, self.address()?, deadline)
+                .await?;
             self.endpoint
                 .header(&mut stream, self.target, Op::Snapshot)
                 .await?;
@@ -650,13 +798,30 @@ impl Mesh {
         if *self.stop.borrow() {
             return Err(ClusterError::Shutdown);
         }
-        if !self.endpoint.peers.contains_key(&node_id) {
+        let deadline = Instant::now() + self.timeout;
+        if self.endpoint.status.borrow().members.is_empty() {
+            let mut status = self.endpoint.status.clone();
+            timeout_at(
+                deadline,
+                status.wait_for(|status| !status.members.is_empty()),
+            )
+            .await
+            .map_err(|_| ClusterError::Deadline)?
+            .map_err(|_| ClusterError::Shutdown)?;
+        }
+        if !self
+            .endpoint
+            .status
+            .borrow()
+            .members
+            .get(&node_id)
+            .is_some_and(|m| m.role == MemberRole::Voter)
+        {
             return Err(ClusterError::UnknownNode(node_id));
         }
         if body.len() > self.endpoint.limits.mesh {
             return Err(invalid_data("mesh body exceeds the cluster mesh limit").into());
         }
-        let deadline = Instant::now() + self.timeout;
         self.endpoint
             .call(node_id, op, body, deadline, deadline)
             .await
@@ -685,6 +850,123 @@ impl Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::{Leadership, LogId};
+
+    #[tokio::test]
+    async fn append_stream_waits_for_a_delayed_empty_commit_update() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let limits = Limits {
+            command: 1024,
+            append: 128 * 1024,
+            mesh: 1024,
+        };
+        let endpoint = Arc::new(Endpoint::new(
+            1,
+            BTreeMap::from([(2, address)]),
+            (PathBuf::new(), Some([42; 32])),
+            watch::channel(MembershipStatus::default()).1,
+            None,
+            1,
+            limits,
+        ));
+        let mut peer = Peer {
+            endpoint: endpoint.clone(),
+            append_timeout: Duration::from_secs(2),
+            target: 2,
+            address: Some(address),
+        };
+        let option = RPCOption::new(Duration::from_millis(100));
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut stream = Connection::Plain(stream);
+            let mut header = [0; HEADER_LEN];
+            stream.read_exact(&mut header).await.unwrap();
+            stream.write_u8(0).await.unwrap();
+            for expected_entries in [1, 0] {
+                let id = stream.read_u64().await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), Op::Append as u8);
+                let frame = limits
+                    .read_frame(&mut stream, limits.append, true)
+                    .await
+                    .unwrap();
+                let append: AppendEntriesRequest<Types> = decode(&frame).unwrap();
+                assert_eq!(append.entries.len(), expected_entries);
+                if expected_entries == 0 {
+                    assert_eq!(append.prev_log_id, append.leader_commit);
+                    assert!(append.leader_commit.is_some());
+                }
+                tokio::time::sleep(Duration::from_millis(125)).await;
+                let reply: Result<StreamAppendResult<Types>, openraft::errors::RaftError<Types>> =
+                    Ok(Ok(append.last_log_id()));
+                stream.write_u64(id).await.unwrap();
+                stream.write_u8(0).await.unwrap();
+                write_control(&mut stream, &reply).await.unwrap();
+            }
+            // Stay connected without replying to the next request.
+            finished.await.unwrap();
+        });
+        endpoint
+            .session(2, address, Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        let log_id = LogId::new(
+            Leadership {
+                term: 1,
+                node_id: 1,
+            },
+            0,
+        );
+        let append = AppendEntriesRequest::<Types> {
+            vote: VoteOf::<Types>::new_committed(1, 1),
+            prev_log_id: None,
+            entries: vec![openraft::alias::EntryOf::<Types> {
+                log_id,
+                payload: openraft::alias::EntryPayloadOf::<Types>::Blank,
+            }],
+            leader_commit: None,
+        };
+        let commit_update = AppendEntriesRequest {
+            vote: append.vote,
+            prev_log_id: Some(log_id),
+            entries: vec![],
+            leader_commit: Some(log_id),
+        };
+        let mut responses = peer
+            .stream_append(
+                futures_util::stream::iter([append, commit_update.clone()]),
+                option.clone(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                responses.next().await.unwrap().unwrap().unwrap(),
+                Some(log_id)
+            );
+        }
+        assert!(responses.next().await.is_none());
+        drop(responses);
+
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                peer.append_entries(commit_update, option)
+            )
+            .await
+            .expect("empty append must retain the heartbeat budget"),
+            Err(RPCError::Timeout(Timeout {
+                action: RPCTypes::AppendEntries,
+                id: 1,
+                target: 2,
+                ..
+            }))
+        ));
+        finish.send(()).unwrap();
+        server.await.unwrap();
+    }
 
     #[test]
     fn rpc_header_sender_is_bound_to_the_authenticated_identity() {
@@ -696,7 +978,8 @@ mod tests {
             Endpoint::new(
                 node_id,
                 peers.clone(),
-                [42; 32],
+                (PathBuf::new(), Some([42; 32])),
+                watch::channel(MembershipStatus::default()).1,
                 None,
                 1,
                 Limits {
@@ -706,7 +989,7 @@ mod tests {
                 },
             )
         };
-        let header = endpoint(1).rpc_header(2, Op::ReadIndex);
+        let header = endpoint(1).rpc_header(2, Op::ReadIndex).unwrap();
         assert!(endpoint(2).check_header(&header, Some(1)).is_ok());
         assert!(endpoint(2).check_header(&header, Some(2)).is_err());
     }

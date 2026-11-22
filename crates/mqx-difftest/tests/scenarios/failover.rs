@@ -55,6 +55,60 @@ fn persistent_inbox_resumes_on_different_node_after_kill() {
 
 #[test]
 #[ignore = "requires cluster-enabled mqextended"]
+fn persistent_fanout_keeps_each_subscribers_send_state_after_kill() {
+    let mut h = start_cluster(config("allow_anonymous true\nmax_inflight_messages 1"));
+    let h = &mut h;
+    let topic = "failover/fanout";
+    let publisher = on(h, 1, options("publisher"), false);
+    let a_settings = persistent("subscriber-a");
+    let b_settings = persistent("subscriber-b");
+    let a = on(h, 2, a_settings.clone(), false);
+    let b = on(h, 2, b_settings.clone(), false);
+    for subscriber in [a, b] {
+        subscribe(h, subscriber, 1, &[(topic, Q1)]);
+    }
+    publish_from(h, publisher, publish(topic, b"first", Q1, 41));
+    for subscriber in [a, b] {
+        received(
+            h,
+            subscriber,
+            Packet::Publish(publish(topic, b"first", Q1, 1)),
+        );
+    }
+    publish_from(h, publisher, publish(topic, b"second", Q1, 42));
+    // Only A frees its send window before the node is killed. Its second
+    // message must be resent; B's second message has never been attempted.
+    send(h, a, Packet::PubAck(id(1)));
+    received(h, a, Packet::Publish(publish(topic, b"second", Q1, 2)));
+    h.kill_node(2).unwrap();
+    closed(h, a);
+    closed(h, b);
+
+    let a = on(h, 3, a_settings, true);
+    accept_publish(
+        h,
+        a,
+        Publish {
+            dup: true,
+            ..publish(topic, b"second", Q1, 2)
+        },
+    );
+    ping(h, a);
+    let b = on(h, 3, b_settings, true);
+    accept_publish(
+        h,
+        b,
+        Publish {
+            dup: true,
+            ..publish(topic, b"first", Q1, 1)
+        },
+    );
+    accept_publish(h, b, publish(topic, b"second", Q1, 2));
+    ping(h, b);
+}
+
+#[test]
+#[ignore = "requires cluster-enabled mqextended"]
 fn dead_node_lease_publishes_will_once_to_each_survivor() {
     let mut h = start_cluster(config(ANONYMOUS));
     let h = &mut h;

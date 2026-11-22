@@ -37,11 +37,14 @@ jobs:
           path: |
             /tmp/cjson-install
             /tmp/mosquitto
-          key: mosquitto-${{ env.MOSQUITTO_VERSION }}-${{ runner.os }}-v1
+          key: mosquitto-${{ env.MOSQUITTO_VERSION }}-${{ runner.os }}-v3
+      - name: Install build and runtime packages
+        # The HTTP API reference links libmicrohttpd dynamically, so it is needed on cache hits too.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libssl-dev libmicrohttpd-dev
       - name: Build Mosquitto references
         if: steps.mosquitto-cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libssl-dev
+          set -eu
           git clone --depth 1 https://github.com/DaveGamble/cJSON.git /tmp/cJSON
           cmake -S /tmp/cJSON -B /tmp/cJSON/build -DCMAKE_INSTALL_PREFIX=/tmp/cjson-install \
             -DENABLE_CJSON_TEST=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -52,11 +55,21 @@ jobs:
           cmake --build /tmp/mosquitto/build -j"$(nproc)"
           cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-ws $common -DWITH_WEBSOCKETS=ON -DWITH_WEBSOCKETS_BUILTIN=ON
           cmake --build /tmp/mosquitto/build-ws -j"$(nproc)"
+          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-http -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+            -DWITH_HTTP_API=ON -DHTTP_API_DIR=/tmp/mosquitto/www -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+            -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/mosquitto/build-http -j"$(nproc)"
+          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-plugins -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+            -DWITH_PLUGINS=ON -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_WEBSOCKETS=OFF -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+            -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
       - run: cargo build -p mqx-server
       - name: Differential and failover tests
         env:
           MOSQUITTO_BUILD_DIR: /tmp/mosquitto/build
           MOSQUITTO_WS_BUILD_DIR: /tmp/mosquitto/build-ws
+          MOSQUITTO_HTTP_BUILD_DIR: /tmp/mosquitto/build-http
+          MOSQUITTO_PLUGIN_BUILD_DIR: /tmp/mosquitto/build-plugins
           MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
         # mqx-bench's ignored test needs release builds; run it locally.
         run: cargo test --workspace --exclude mqx-bench --all-features -- --ignored

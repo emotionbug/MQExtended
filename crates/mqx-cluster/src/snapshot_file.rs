@@ -12,7 +12,7 @@ use tokio::task::spawn_blocking;
 use crate::snapshot::SnapshotMeta;
 use crate::transport::{Connection, MAX_CONTROL_FRAME, decode, encode, invalid_data, read_length};
 
-const MAGIC: &[u8; 8] = b"MQXSNAP1";
+const MAGIC: &[u8; 7] = b"MQXSNAP";
 const CHUNK: usize = 64 * 1024;
 // Hold the slot through install, not just upload, to bound both staged disk use
 // and the number of application snapshots materialized for StateMachine::restore.
@@ -24,6 +24,8 @@ pub(crate) struct SnapshotData {
     stage: Option<Arc<Staged>>,
     size: u64,
     app_start: u64,
+    pub(crate) format: u16,
+    pub(crate) app_version: u16,
     pub(crate) leases: Bytes,
 }
 
@@ -43,8 +45,26 @@ impl SnapshotData {
         if &magic != MAGIC {
             return Err(invalid_data("unknown snapshot format"));
         }
-        let meta = decode(&read_small(&mut reader)?)?;
-        let leases = read_small(&mut reader)?;
+        let format = match read_byte(&mut reader)? {
+            version @ (b'1' | b'2') => u16::from(version - b'0'),
+            version => {
+                return Err(invalid_data(format!(
+                    "unsupported snapshot format version byte {version}"
+                )));
+            }
+        };
+        let app_version = if format == 1 {
+            1
+        } else {
+            let mut version = [0; 2];
+            reader.read_exact(&mut version)?;
+            u16::from_be_bytes(version)
+        };
+        let meta = decode(&read_bounded(
+            &mut reader,
+            size.min(MAX_CONTROL_FRAME as u64),
+        )?)?;
+        let leases = read_bounded(&mut reader, size.min(lease_limit(format)))?;
         let len = read_u64(&mut reader)?;
         let app_start = reader.stream_position()?;
         if app_start.checked_add(len) != Some(size) {
@@ -57,6 +77,8 @@ impl SnapshotData {
                 stage: None,
                 size,
                 app_start,
+                format,
+                app_version,
                 leases,
             },
         ))
@@ -68,13 +90,21 @@ impl SnapshotData {
         meta: &SnapshotMeta,
         leases: Bytes,
         app: &[u8],
+        (format, app_version): (u16, u16),
     ) -> io::Result<Self> {
         let meta = encode(meta)?;
         let mut temp = crate::snapshot::private_tempfile(dir)?;
         let file = temp.as_file_mut();
         file.write_all(MAGIC)?;
-        for body in [meta.as_slice(), &leases] {
-            let len = checked_len(body.len(), MAX_CONTROL_FRAME as u64)?;
+        file.write_all(&[b'0' + format as u8])?;
+        if format != 1 {
+            file.write_all(&app_version.to_be_bytes())?;
+        }
+        for (body, limit) in [
+            (meta.as_slice(), MAX_CONTROL_FRAME as u64),
+            (&leases, lease_limit(format)),
+        ] {
+            let len = checked_len(body.len(), limit)?;
             file.write_all(&len.to_be_bytes())?;
             file.write_all(body)?;
         }
@@ -90,6 +120,8 @@ impl SnapshotData {
             stage: None,
             size,
             app_start,
+            format,
+            app_version,
             leases,
         })
     }
@@ -171,15 +203,30 @@ impl SnapshotData {
     }
 }
 
+fn read_byte(reader: &mut impl Read) -> io::Result<u8> {
+    let mut byte = [0];
+    reader.read_exact(&mut byte)?;
+    Ok(byte[0])
+}
+
 fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     let mut bytes = [0; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn read_small(reader: &mut impl Read) -> io::Result<Bytes> {
+fn lease_limit(format: u16) -> u64 {
+    if format == 1 {
+        MAX_CONTROL_FRAME as u64
+    } else {
+        // This section includes the permanent retired IDs as well as live leases.
+        crate::MAX_SNAPSHOT_SIZE
+    }
+}
+
+fn read_bounded(reader: &mut impl Read, limit: u64) -> io::Result<Bytes> {
     let len = read_u64(reader)?;
-    if len > MAX_CONTROL_FRAME as u64 {
+    if len > limit {
         return Err(invalid_data("snapshot metadata exceeds the size limit"));
     }
     let mut bytes = vec![0; len as usize];
@@ -207,5 +254,17 @@ mod tests {
         let result = SnapshotData::receive(&mut input, root.path().to_path_buf(), 1024).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert_eq!(root.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn refuses_unknown_snapshot_format_before_decoding_fields() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"MQXSNAP9").unwrap();
+        assert!(
+            SnapshotData::open(file)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported snapshot format version")
+        );
     }
 }

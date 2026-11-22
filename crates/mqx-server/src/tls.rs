@@ -1,3 +1,7 @@
+mod bridge;
+
+pub use bridge::connect_bridge_tls;
+
 use std::{borrow::Cow, fmt::Write as _, fs, path::Path, sync::Arc};
 
 use ::ring::digest::{Context as DigestContext, SHA1_FOR_LEGACY_USE_ONLY};
@@ -16,10 +20,25 @@ use x509_parser::{
     x509::{AttributeTypeAndValue, X509Name},
 };
 
-use crate::{CertIdentity, ListenerConfig, ServerError, TlsConfig, TlsVersion};
+use crate::{CertIdentity, ListenerConfig, ListenerProtocol, ServerError, TlsConfig, TlsVersion};
 
 pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<TlsAcceptor>, ServerError> {
-    let tls = &listener.tls;
+    let http_tls;
+    let tls = if listener.protocol == ListenerProtocol::HttpApi {
+        // http_api.c: http_api__start passes only cert/key into libmicrohttpd.
+        // require_certificate still appears in the listener inventory.
+        if listener.tls.certfile.is_none() || listener.tls.keyfile.is_none() {
+            return Ok(None);
+        }
+        http_tls = TlsConfig {
+            certfile: listener.tls.certfile.clone(),
+            keyfile: listener.tls.keyfile.clone(),
+            ..TlsConfig::default()
+        };
+        &http_tls
+    } else {
+        &listener.tls
+    };
     let error = |message| ServerError::Tls {
         port: listener.port,
         message,
@@ -53,23 +72,9 @@ pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<TlsAcceptor>,
     };
 
     // Mosquitto src/net.c: net__tls_server_ctx, net__load_certificates, net__load_crl_file.
-    let mut provider = ring::default_provider();
-    if tls.ciphers.is_some() || tls.ciphers_tls13.is_some() {
-        let mut suites = Vec::new();
-        let (tls13, tls12) = provider.cipher_suites.split_at(3);
-        if let Some(config) = &tls.ciphers_tls13 {
-            suites.extend(cipher_list(tls13, config, "ciphers_tls1.3").map_err(error)?);
-        } else {
-            suites.extend_from_slice(tls13);
-        }
-        if let Some(config) = &tls.ciphers {
-            suites.extend(cipher_list(tls12, config, "ciphers").map_err(error)?);
-        } else {
-            suites.extend_from_slice(tls12);
-        }
-        provider.cipher_suites = suites;
-    }
-    let provider = Arc::new(provider);
+    let provider = Arc::new(
+        cipher_provider(tls.ciphers.as_deref(), tls.ciphers_tls13.as_deref()).map_err(error)?,
+    );
     let versions = match tls.version {
         TlsVersion::Tls12OrNewer => &[&TLS13, &TLS12][..],
         TlsVersion::Tls13 => &[&TLS13][..],
@@ -98,6 +103,29 @@ pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<TlsAcceptor>,
         .map_err(|e| error(format!("certfile/keyfile: {e}")))?;
     config.ignore_client_order = true;
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+fn cipher_provider(
+    ciphers: Option<&str>,
+    ciphers_tls13: Option<&str>,
+) -> Result<rustls::crypto::CryptoProvider, String> {
+    let mut provider = ring::default_provider();
+    if ciphers.is_some() || ciphers_tls13.is_some() {
+        let mut suites = Vec::new();
+        let (tls13, tls12) = provider.cipher_suites.split_at(3);
+        if let Some(config) = ciphers_tls13 {
+            suites.extend(cipher_list(tls13, config, "ciphers_tls1.3")?);
+        } else {
+            suites.extend_from_slice(tls13);
+        }
+        if let Some(config) = ciphers {
+            suites.extend(cipher_list(tls12, config, "ciphers")?);
+        } else {
+            suites.extend_from_slice(tls12);
+        }
+        provider.cipher_suites = suites;
+    }
+    Ok(provider)
 }
 
 fn pem_contents<T: PemObject>(path: &Path, directive: &str) -> Result<Vec<T>, String> {

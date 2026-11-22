@@ -37,6 +37,26 @@ cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-ws -DCMAKE_PREFIX_PATH=/tmp/cjso
 cmake --build /tmp/mosquitto/build-ws -j"$(nproc)"
 ```
 
+The `$SYS` and HTTP API differential tests need a third build with `WITH_HTTP_API=ON`, which links libmicrohttpd (`libmicrohttpd-dev`); point `MOSQUITTO_HTTP_BUILD_DIR` at it:
+
+```sh
+cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-http -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+      -DWITH_HTTP_API=ON -DHTTP_API_DIR=/tmp/mosquitto/www -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+      -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/mosquitto/build-http -j"$(nproc)"
+```
+
+Without root, unpack the packages instead of installing them: `apt download libmicrohttpd-dev libmicrohttpd12t64`, `dpkg-deb -x` both into a directory, point `PKG_CONFIG_PATH` at its `usr/lib/x86_64-linux-gnu/pkgconfig` and add its library directory to `-DCMAKE_BUILD_RPATH`.
+
+The dynamic-security differential tests need a fourth build with plugins and `mosquitto_ctrl`; point `MOSQUITTO_PLUGIN_BUILD_DIR` at it:
+
+```sh
+cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-plugins -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+      -DWITH_PLUGINS=ON -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_WEBSOCKETS=OFF -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+      -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
+```
+
 ## Commands
 
 See [testing](testing.md#commands) for checks. Workspace-wide lint settings live in the root `Cargo.toml`; crates opt in with `[lints] workspace = true`.

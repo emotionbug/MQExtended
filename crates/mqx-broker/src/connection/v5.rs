@@ -264,9 +264,23 @@ impl Active<'_> {
                             identifier,
                         }
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                let logged = tracing::enabled!(target: "mqx::subscribe", tracing::Level::INFO)
+                    .then(|| {
+                        filters
+                            .iter()
+                            .map(|sub| (sub.filter.clone(), sub.qos))
+                            .collect::<Vec<_>>()
+                    });
                 match self.act(Operation::Subscribe(filters, now)).await? {
                     Reply::Subscribed(codes) => {
+                        if let Some(logged) = logged {
+                            for ((filter, qos), code) in logged.into_iter().zip(&codes) {
+                                if matches!(code, mqx_codec::SubscribeReturnCode::Success(_)) {
+                                    tracing::info!(target: "mqx::subscribe", "{} {} {filter}", self.live.lease.id, qos as u8);
+                                }
+                            }
+                        }
                         Ok(Step::Reply(Frame::V5(SubAck(SubscriptionAck {
                             packet_id: packet.packet_id,
                             properties: Vec::new(),
@@ -288,6 +302,7 @@ impl Active<'_> {
             Unsubscribe(mut packet) => {
                 for filter in &mut packet.filters {
                     mount(filter, mount_point);
+                    tracing::info!(target: "mqx::unsubscribe", "{} {filter}", self.live.lease.id);
                 }
                 match self.act(Operation::Unsubscribe(packet.filters)).await? {
                     Reply::Unsubscribed(reasons) => {
@@ -312,6 +327,7 @@ impl Active<'_> {
                 let mut publication = wire.publication(packet, now)?;
                 mount(&mut publication.packet.topic, mount_point);
                 let reply = self.receive(publication).await?;
+                let control = matches!(reply, Reply::ControlAccepted { .. });
                 let reason = match reply {
                     Reply::PublishReason(reason) => R(reason),
                     _ => R::SUCCESS,
@@ -321,9 +337,10 @@ impl Active<'_> {
                     Some(id) if qos == QoS::ExactlyOnce => {
                         step.or_reply(Frame::V5(PubRec(publish_ack(id, reason))), false)
                     }
-                    Some(id) => {
-                        step.or_reply(Frame::V5(PubAck(publish_ack(id, reason))), reason.0 < 0x80)
-                    }
+                    Some(id) => step.or_reply(
+                        Frame::V5(PubAck(publish_ack(id, reason))),
+                        !control && reason.0 < 0x80,
+                    ),
                     None => step,
                 })
             }

@@ -1,7 +1,10 @@
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use mqx_cluster::ClusterError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+};
 
 use crate::{
     inbox::PublishProperty,
@@ -13,13 +16,13 @@ use super::{Inner, Log};
 // Leave room for MessagePack framing and Raft entry overhead. A single
 // larger mutation uses the cluster's existing admission behavior unchanged.
 const INPUT_BUDGET: usize = 1536 * 1024;
-const MAX_GROUPS: usize = 32;
+const MAX_GROUPS: usize = 128;
+const MAX_IN_FLIGHT_GROUPS: usize = 64;
 const ENVELOPE: usize = 64 * 1024;
 
 pub(super) struct Limits {
     input: usize,
     reply: usize,
-    next_outbound: usize,
 }
 
 impl Limits {
@@ -27,7 +30,6 @@ impl Limits {
         Self {
             input: INPUT_BUDGET.min(command.saturating_sub(ENVELOPE)),
             reply: append.saturating_sub(ENVELOPE),
-            next_outbound: command.saturating_add(ENVELOPE),
         }
     }
 }
@@ -56,7 +58,21 @@ fn publication_cost(payload_len: usize, topic_len: usize, properties: &[PublishP
 }
 
 impl Proposal {
-    fn cost(&self, limits: &Limits) -> (usize, usize) {
+    fn can_pipeline(&self) -> bool {
+        matches!(&self.entry, BatchEntry::Act(entry) if entry.operations.iter().all(|operation| {
+            matches!(
+                operation,
+                Operation::Receive(_)
+                    | Operation::ReceiveAdmitted(_)
+                    | Operation::Forward(..)
+                    | Operation::Release(..)
+                    | Operation::Ack(..)
+                    | Operation::ReserveOutbound(_)
+            )
+        }))
+    }
+
+    fn cost(&self) -> (usize, usize) {
         let entry = match &self.entry {
             BatchEntry::Act(entry) => entry,
             BatchEntry::Claim { request, .. } => {
@@ -98,9 +114,6 @@ impl Proposal {
                         ),
                         0,
                     ),
-                    // Bound this by the largest admitted command plus space
-                    // for the response wrapper, not by today's packet size.
-                    Operation::NextOutbound(_) => (0, limits.next_outbound),
                     Operation::Subscribe(filters, _) => (
                         filters.iter().map(|entry| 128 + entry.filter.len()).sum(),
                         32 * filters.len(),
@@ -118,11 +131,25 @@ impl Proposal {
 
 pub(super) async fn run(inner: Weak<Inner>, mut requests: mpsc::Receiver<Proposal>) {
     let mut next = None;
+    let mut in_flight = JoinSet::new();
     loop {
+        while let Some(result) = in_flight.try_join_next() {
+            result.expect("broker proposal task panicked");
+        }
+        if in_flight.len() >= MAX_IN_FLIGHT_GROUPS {
+            in_flight
+                .join_next()
+                .await
+                .unwrap()
+                .expect("broker proposal task panicked");
+        }
         let Some(first) = (match next.take() {
             Some(next) => Some(next),
             None => requests.recv().await,
         }) else {
+            while let Some(result) = in_flight.join_next().await {
+                result.expect("broker proposal task panicked");
+            }
             return;
         };
         let Some(inner) = inner.upgrade() else {
@@ -132,17 +159,21 @@ pub(super) async fn run(inner: Weak<Inner>, mut requests: mpsc::Receiver<Proposa
             unreachable!()
         };
         let limits = &log.batch_limits;
-        let (mut input, mut output) = first.cost(limits);
-        let mut group = Vec::with_capacity(MAX_GROUPS);
+        let eager = first.can_pipeline();
+        let (mut input, mut output) = first.cost();
+        let mut group = Vec::with_capacity(1 + requests.len().min(MAX_GROUPS - 1));
         group.push(first);
-        // Other connections can enqueue throughout the preceding commit.
-        // No fixed batching delay is added to the quiet path.
+        // Gather other sockets' queued mutations without holding up the
+        // first one when there is nothing to batch.
         while group.len() < MAX_GROUPS && input < limits.input && output < limits.reply {
             let Ok(request) = requests.try_recv() else {
                 break;
             };
-            let (more_input, more_output) = request.cost(limits);
-            if input + more_input > limits.input || output + more_output > limits.reply {
+            let (more_input, more_output) = request.cost();
+            if request.can_pipeline() != eager
+                || input + more_input > limits.input
+                || output + more_output > limits.reply
+            {
                 next = Some(request);
                 break;
             }
@@ -150,51 +181,74 @@ pub(super) async fn run(inner: Weak<Inner>, mut requests: mpsc::Receiver<Proposa
             output += more_output;
             group.push(request);
         }
-        if group.len() == 1
-            && !matches!(&group[0].entry, BatchEntry::Act(entry) if entry.operations.len() != 1)
-        {
-            let Proposal { entry, result } = group.pop().unwrap();
-            let command = match entry {
-                BatchEntry::Claim {
-                    owner,
-                    token,
-                    request,
-                } => Command::Claim {
-                    owner,
-                    token,
-                    request,
-                },
-                BatchEntry::Act(entry) => {
-                    Command::Act(entry.lease, entry.operations.into_iter().next().unwrap())
-                }
-            };
-            let reply = log.submit(command).await;
-            let _ = result.send(reply.map(|reply| vec![reply]).map_err(as_uncertain));
-            continue;
-        }
-        let mut waiters = Vec::with_capacity(group.len());
-        let batch = group
-            .into_iter()
-            .map(|Proposal { entry, result }| {
-                waiters.push(result);
-                entry
-            })
-            .collect();
-        match log.submit(Command::Batch(batch)).await {
-            Ok(Reply::Batched(replies)) => {
-                assert_eq!(waiters.len(), replies.len());
-                for (waiter, reply) in waiters.into_iter().zip(replies) {
-                    let _ = waiter.send(Ok(reply));
-                }
+        // A live connection awaits each mutation, so only independent sockets
+        // can have data-plane groups in flight together. Drain before a claim,
+        // subscription fence or disconnect (including cancellation cleanup).
+        if eager && input <= limits.input {
+            in_flight.spawn(submit(inner, group, true));
+        } else {
+            while let Some(result) = in_flight.join_next().await {
+                result.expect("broker proposal task panicked");
             }
-            Err(error) => {
-                let message = error.to_string();
-                for waiter in waiters {
-                    let _ = waiter.send(Err(ClusterError::WriteUncertain(message.clone())));
-                }
-            }
-            Ok(_) => unreachable!("broker batch did not return its replies"),
+            submit(inner, group, eager).await;
         }
+    }
+}
+
+async fn submit(inner: Arc<Inner>, mut group: Vec<Proposal>, eager: bool) {
+    let Log::Replicated(log) = &inner.log else {
+        unreachable!()
+    };
+    if !eager
+        && group.len() == 1
+        && !matches!(&group[0].entry, BatchEntry::Act(entry) if entry.operations.len() != 1)
+    {
+        let Proposal { entry, result } = group.pop().unwrap();
+        let command = match entry {
+            BatchEntry::Claim {
+                owner,
+                token,
+                request,
+            } => Command::Claim {
+                owner,
+                token,
+                request,
+            },
+            BatchEntry::Act(entry) => {
+                Command::Act(entry.lease, entry.operations.into_iter().next().unwrap())
+            }
+        };
+        let reply = log.submit(command).await;
+        let _ = result.send(reply.map(|reply| vec![reply]).map_err(as_uncertain));
+        return;
+    }
+    let mut waiters = Vec::with_capacity(group.len());
+    let batch = group
+        .into_iter()
+        .map(|Proposal { entry, result }| {
+            waiters.push(result);
+            entry
+        })
+        .collect();
+    let command = if eager {
+        Command::EagerBatch(batch)
+    } else {
+        Command::Batch(batch)
+    };
+    match log.submit(command).await {
+        Ok(Reply::Batched(replies)) => {
+            assert_eq!(waiters.len(), replies.len());
+            for (waiter, reply) in waiters.into_iter().zip(replies) {
+                let _ = waiter.send(Ok(reply));
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            for waiter in waiters {
+                let _ = waiter.send(Err(ClusterError::WriteUncertain(message.clone())));
+            }
+        }
+        Ok(_) => unreachable!("broker batch did not return its replies"),
     }
 }
 

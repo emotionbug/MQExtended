@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use crate::{BrokerConfig, BrokerKind, Client, Connection, Error, Reading};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 // Don't let two tests choose the same released port before either child binds.
@@ -80,18 +81,18 @@ fn mosquitto_binary(relative: &str) -> Result<PathBuf, Error> {
     required_binary("MOSQUITTO_BUILD_DIR", PathBuf::from(build).join(relative))
 }
 
-fn prepare_config(dir: &Path, config: &BrokerConfig<'_>) -> Result<String, Error> {
-    let mut conf = String::new();
+/// Writes the password and ACL files and returns the directives that load them.
+fn prepare_files(dir: &Path, config: &BrokerConfig<'_>) -> Result<String, Error> {
+    let mut prefix = String::new();
     if !config.passwords.is_empty() {
         generate_password_file(dir, config.passwords)?;
-        conf.push_str("password_file passwords\n");
+        prefix.push_str("password_file passwords\n");
     }
     if let Some(acl) = config.acl {
         fs::write(dir.join("acl"), acl)?;
-        conf.push_str("acl_file acl\n");
+        prefix.push_str("acl_file acl\n");
     }
-    conf.push_str(config.conf);
-    Ok(conf)
+    Ok(prefix)
 }
 
 fn generate_password_file(dir: &Path, users: &[(&str, &str)]) -> Result<(), Error> {
@@ -125,9 +126,46 @@ struct BrokerProcess {
     dir: TempDir,
     addr: SocketAddr,
     readiness: Option<(SocketAddr, BytesMut)>,
+    /// 1-based node index, its cluster mesh and the password/ACL directives, kept
+    /// so that `write_config` can regenerate `mosquitto.conf` for a reload.
+    index: usize,
+    mesh: Vec<SocketAddr>,
+    prefix: String,
 }
 
 impl BrokerProcess {
+    fn write_config(&self, conf: &str) -> io::Result<()> {
+        fs::write(
+            self.dir.path().join("mosquitto.conf"),
+            node_config(
+                self.addr,
+                &format!("{}{conf}", self.prefix),
+                self.index,
+                &self.mesh,
+                self.readiness.as_ref().map(|(addr, _)| *addr),
+            ),
+        )
+    }
+
+    /// Sends `signal` (a `kill(1)` signal name) to the running child.
+    fn signal(&self, signal: &str) -> io::Result<()> {
+        let child = self.child.as_ref().expect("signalled broker is running");
+        let status = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(child.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "kill -{signal} failed with {status}"
+            )))
+        }
+    }
+
     fn spawn(&mut self, bin: &Path, kind: BrokerKind) -> Result<(), Error> {
         let log = File::create(self.dir.path().join("broker.log"))?;
         let mut command = Command::new(bin);
@@ -283,7 +321,15 @@ impl Brokers {
         config: BrokerConfig<'_>,
         cluster: Option<ClusterConfig>,
     ) -> Result<Self, Error> {
-        let bin = kind.binary()?;
+        Self::start_with_binary(kind, kind.binary()?, config, cluster)
+    }
+
+    pub(super) fn start_with_binary(
+        kind: BrokerKind,
+        bin: PathBuf,
+        config: BrokerConfig<'_>,
+        cluster: Option<ClusterConfig>,
+    ) -> Result<Self, Error> {
         let (size, placement) = cluster.map_or((1, Placement::FirstNode), |cluster| {
             (cluster.nodes.get(), cluster.placement)
         });
@@ -293,8 +339,8 @@ impl Brokers {
         let dirs = (0..size)
             .map(|_| {
                 let dir = tempfile::tempdir()?;
-                let conf = prepare_config(dir.path(), &config)?;
-                Ok((dir, conf))
+                let prefix = prepare_files(dir.path(), &config)?;
+                Ok((dir, prefix))
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let startup = STARTUP_LOCK.lock().expect("broker startup lock poisoned");
@@ -307,7 +353,7 @@ impl Brokers {
             .map(TcpListener::local_addr)
             .collect::<io::Result<Vec<_>>>()?;
         let mut nodes = Vec::with_capacity(size);
-        for (offset, ((dir, conf), listener)) in dirs.into_iter().zip(listeners).enumerate() {
+        for (offset, ((dir, prefix), listener)) in dirs.into_iter().zip(listeners).enumerate() {
             let addr = listener.local_addr()?;
             let readiness_listener = readiness_listeners.next();
             let readiness = readiness_listener
@@ -319,26 +365,17 @@ impl Brokers {
             if cluster.is_some() {
                 fs::create_dir(dir.path().join("raft-data"))?;
             }
-            fs::write(
-                dir.path().join("mosquitto.conf"),
-                node_config(
-                    addr,
-                    &conf,
-                    offset + 1,
-                    &mesh_addrs,
-                    readiness.as_ref().map(|(addr, _)| *addr),
-                ),
-            )?;
-            nodes.push((
-                BrokerProcess {
-                    child: None,
-                    dir,
-                    addr,
-                    readiness,
-                },
-                listener,
-                readiness_listener,
-            ));
+            let node = BrokerProcess {
+                child: None,
+                dir,
+                addr,
+                readiness,
+                index: offset + 1,
+                mesh: mesh_addrs.clone(),
+                prefix,
+            };
+            node.write_config(config.conf)?;
+            nodes.push((node, listener, readiness_listener));
         }
         let mut brokers = Self {
             kind,
@@ -377,6 +414,57 @@ impl Brokers {
         let node = &self.nodes[check_index(index, self.nodes.len())?];
         node.child.as_ref().ok_or(Error::NodeStopped(index))?;
         Ok(node.addr)
+    }
+
+    pub(super) fn log(&self, index: usize) -> Result<String, Error> {
+        Ok(self.nodes[check_index(index, self.nodes.len())?].log())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn backup(&self, index: usize) -> Result<(), Error> {
+        let node = &self.nodes[check_index(index, self.nodes.len())?];
+        node.child.as_ref().ok_or(Error::NodeStopped(index))?;
+        node.signal("USR1")?;
+        Ok(())
+    }
+
+    /// Rewrites a node's configuration with `conf` in place of the scenario's
+    /// directives. A running node gets SIGHUP; a stopped one uses it on restart.
+    pub(super) fn reload(&mut self, index: usize, conf: &str) -> Result<(), Error> {
+        let offset = check_index(index, self.nodes.len())?;
+        let node = &mut self.nodes[offset];
+        node.write_config(conf)?;
+        if node.child.is_some() {
+            node.check_child(self.kind, index)?;
+            node.signal("HUP")?;
+        }
+        Ok(())
+    }
+
+    /// SIGTERMs a node and reaps it, keeping its ports and data directory for `restart`.
+    pub(super) fn stop(&mut self, index: usize) -> Result<(), Error> {
+        let offset = check_index(index, self.nodes.len())?;
+        let node = &mut self.nodes[offset];
+        if node.child.is_none() {
+            return Err(Error::NodeStopped(index));
+        }
+        node.check_child(self.kind, index)?;
+        node.signal("TERM")?;
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        let child = node.child.as_mut().expect("checked above");
+        while child.try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                node.kill()?;
+                return Err(Error::StopTimeout {
+                    index,
+                    timeout: STOP_TIMEOUT,
+                    log: node.log(),
+                });
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        node.child = None;
+        Ok(())
     }
 
     pub(super) fn kill(&mut self, index: usize) -> Result<(), Error> {
