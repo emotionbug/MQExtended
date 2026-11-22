@@ -53,7 +53,7 @@ fn sparkplug_config() -> String {
     );
     let module = build.join(format!(
         "plugins/sparkplug-aware/mosquitto_sparkplug_aware.{}",
-        std::env::consts::DLL_EXTENSION
+        if cfg!(windows) { "dll" } else { "so" }
     ));
     format!("allow_anonymous true\nplugin {}", module.display())
 }

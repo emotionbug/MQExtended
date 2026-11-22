@@ -466,7 +466,7 @@ fn inventory_includes_file_and_sparkplug_plugins_in_registration_order() {
     let settings = tempfile::tempdir().unwrap();
     let acl = settings.path().join("acl");
     fs::write(&acl, "topic readwrite $CONTROL/#\n").unwrap();
-    let ext = std::env::consts::DLL_EXTENSION;
+    let ext = if cfg!(windows) { "dll" } else { "so" };
     let conf = format!(
         "{CONFIG}{ENABLED}plugin {}/sparkplug-aware/mosquitto_sparkplug_aware.{ext}\n\
          plugin {}/acl-file/mosquitto_acl_file.{ext}\nplugin_opt_acl_file {}\n",
