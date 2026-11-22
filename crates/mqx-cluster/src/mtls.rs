@@ -1,11 +1,11 @@
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::verify_server_cert_signed_by_trust_anchor;
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
 use rustls::server::{ParsedCertificate, WebPkiClientVerifier};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig,
@@ -43,19 +43,21 @@ impl Tls {
         };
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(ca_file)?)) {
-            roots.add(cert?).map_err(invalid_data)?;
+        for cert in CertificateDer::pem_reader_iter(File::open(ca_file)?) {
+            roots
+                .add(cert.map_err(invalid_data)?)
+                .map_err(invalid_data)?;
         }
         let roots = Arc::new(roots);
-        let chain: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_file)?))
-            .collect::<io::Result<_>>()?;
+        let chain: Vec<_> = CertificateDer::pem_reader_iter(File::open(cert_file)?)
+            .collect::<Result<_, _>>()
+            .map_err(invalid_data)?;
         if chain.first().and_then(certificate_node) != Some(node_id) {
             return Err(ClusterError::InvalidConfig(format!(
                 "cluster leaf certificate needs one Common Name: {NODE_PREFIX}{node_id}"
             )));
         }
-        let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_file)?))?
-            .ok_or_else(|| invalid_data("missing cluster TLS private key"))?;
+        let key = PrivateKeyDer::from_pem_reader(File::open(key_file)?).map_err(invalid_data)?;
         let client_auth =
             WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
                 .build()

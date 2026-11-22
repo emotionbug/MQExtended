@@ -12,7 +12,6 @@ openraft = { version = "=0.10.1", default-features = false, features = ["serde",
 raft-log = "0.4.7"
 rmp-serde = "1"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tempfile = "3.27.0"
