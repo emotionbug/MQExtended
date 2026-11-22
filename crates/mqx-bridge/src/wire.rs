@@ -133,7 +133,7 @@ impl Wire {
 
     pub(crate) async fn send(&mut self, packet: Packet) -> Result<bool, crate::Error> {
         self.output.clear();
-        let connect = matches!(packet, Packet::Connect(_));
+        let publish = matches!(packet, Packet::Publish(_));
         let alias = if self.protocol == Protocol::V5 {
             let mut packet = packet;
             let alias = if let Packet::Publish(publish) = &mut packet {
@@ -150,7 +150,9 @@ impl Wire {
             )?;
             None
         };
-        if !connect && self.packet_limit != 0 && self.output.len() > self.packet_limit {
+        // lib/send_publish.c: send__real_publish applies the packet limit.
+        // Bridge control packets use the raw send helpers without this check.
+        if publish && self.packet_limit != 0 && self.output.len() > self.packet_limit {
             return Ok(false);
         }
         self.stream.write_all(&self.output).await?;

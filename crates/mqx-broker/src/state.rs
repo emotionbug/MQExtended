@@ -245,13 +245,34 @@ pub(crate) enum Operation {
     BridgeNotify(Publication),
     BridgeMid,
     BridgeRemove,
+    // Only used for bare dollar-root `/#` subscriptions. Preserve the
+    // retained replay (and packet IDs) of Subscribe in existing Raft logs.
+    SubscribeDollarRoot(Vec<SubscriptionRequest>, Duration),
+    // Only proposed when reserving a QoS 0 behind a lone expired flight.
+    // ReserveOutbound must retain its original apply semantics for WAL replay.
+    ReserveOutboundWithQos0Expiry(Duration),
 }
 
 impl Operation {
+    pub(crate) fn subscribe(filters: Vec<SubscriptionRequest>, now: Duration) -> Self {
+        if filters.iter().any(|entry| {
+            entry.filter.starts_with('$')
+                && entry
+                    .filter
+                    .strip_suffix("/#")
+                    .is_some_and(|root| !root.contains('/'))
+        }) {
+            Self::SubscribeDollarRoot(filters, now)
+        } else {
+            Self::Subscribe(filters, now)
+        }
+    }
+
     pub(crate) fn needs_fence(&self) -> bool {
         matches!(
             self,
             Self::Subscribe(..)
+                | Self::SubscribeDollarRoot(..)
                 | Self::Unsubscribe(_)
                 | Self::BridgePrepare { .. }
                 | Self::BridgeRemove
@@ -304,6 +325,11 @@ pub(crate) enum Effect {
         packet: Outbound,
     },
     Kick(Epoch),
+    BridgeOffline(Epoch),
+    BridgeQueued {
+        owner: Epoch,
+        pending: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -517,15 +543,25 @@ impl State {
 
     pub(crate) fn next_expiry(&self) -> Option<Duration> {
         [
-            self.expirations
-                .first_key_value()
-                .map(|(&(time, _), _)| time),
+            self.next_session_expiry(),
             self.wills.first_key_value().map(|(&(time, _), _)| time),
             self.retain_sweep,
         ]
         .into_iter()
         .flatten()
         .min()
+    }
+
+    pub(crate) fn next_session_expiry(&self) -> Option<Duration> {
+        self.expirations
+            .first_key_value()
+            .map(|(&(time, _), _)| time)
+    }
+
+    pub(crate) fn has_capacity_for(&self, id: &str) -> bool {
+        self.config.global_max_clients == 0
+            || self.sessions.len() < self.config.global_max_clients
+            || self.sessions.contains_key(id)
     }
 
     pub(crate) fn acl_text(&self, id: u64) -> Option<&Option<Bytes>> {
@@ -584,13 +620,6 @@ impl State {
             .collect();
     }
 
-    pub(crate) fn bridge_pending(&self, lease: &Lease) -> usize {
-        self.sessions
-            .get(&lease.id)
-            .filter(|session| session.epoch == lease.epoch)
-            .and_then(|session| session.inbox.as_ref())
-            .map_or(0, Inbox::outgoing_count)
-    }
     pub(crate) fn publisher_only(&self, lease: &Lease) -> bool {
         self.sessions.get(&lease.id).is_some_and(|session| {
             session.epoch == lease.epoch
@@ -677,11 +706,41 @@ impl State {
     }
 
     pub(crate) fn has_outbound(&self, lease: &Lease) -> bool {
+        self.claimed_session(lease)
+            .and_then(|s| s.inbox.as_ref())
+            .is_some_and(|inbox| inbox.has_outbound(&self.config))
+    }
+
+    pub(crate) fn outbound_reservation(&self, lease: &Lease, now: Duration) -> Option<Operation> {
+        let session = self.claimed_session(lease)?;
+        let inbox = session.inbox.as_ref()?;
+        if !inbox.has_outbound(&self.config) {
+            return None;
+        }
+        Some(if session.internal_bridge.is_none() && inbox.expired_before_qos0(now) {
+            Operation::ReserveOutboundWithQos0Expiry(now)
+        } else {
+            Operation::ReserveOutbound(now)
+        })
+    }
+
+    fn claimed_session(&self, lease: &Lease) -> Option<&Session> {
         self.sessions
             .get(&lease.id)
             .filter(|s| s.owner.is_some() && s.epoch == lease.epoch)
+    }
+
+    pub(crate) fn offline_lazy_pending(&self, lease: &Lease) -> Option<usize> {
+        self.sessions
+            .get(&lease.id)
+            .filter(|s| s.epoch == lease.epoch)
+            .filter(|s| {
+                s.internal_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.lazy && !bridge.online)
+            })
             .and_then(|s| s.inbox.as_ref())
-            .is_some_and(|inbox| inbox.has_outbound(&self.config))
+            .map(Inbox::outgoing_count)
     }
 
     pub(crate) fn has_reserved_outbound(&self, lease: &Lease) -> bool {
@@ -696,7 +755,7 @@ impl State {
         rmp_serde::to_vec(self).expect("broker state is serializable")
     }
 
-    pub(crate) fn restore(&mut self, bytes: &[u8]) -> Result<(), mqx_cluster::ClusterError> {
+    pub(crate) fn restore(&mut self, bytes: &[u8]) -> Result<Self, mqx_cluster::ClusterError> {
         fn invalid(error: impl std::fmt::Display) -> mqx_cluster::ClusterError {
             mqx_cluster::ClusterError::Restore(error.to_string())
         }
@@ -737,8 +796,7 @@ impl State {
                 .map_err(invalid)?;
         }
         restored.rebuild_bridge_index();
-        *self = restored;
-        Ok(())
+        Ok(std::mem::replace(self, restored))
     }
 
     pub(crate) fn apply(&mut self, command: Command) -> Outcome {
@@ -1070,11 +1128,7 @@ impl State {
             return Reply::Stale;
         }
         let id = claim.publisher.id.clone();
-        if !self.sessions.contains_key(&id)
-            && claim.internal_bridge.is_none()
-            && self.config.global_max_clients != 0
-            && self.sessions.len() >= self.config.global_max_clients
-        {
+        if claim.internal_bridge.is_none() && !self.has_capacity_for(&id) {
             return Reply::Full;
         }
         let mut present = false;
@@ -1185,6 +1239,7 @@ impl State {
             return Reply::Stale;
         };
         let admitted_local = matches!(&operation, Operation::ReceiveAdmitted(_));
+        let check_root_leaf = matches!(&operation, Operation::SubscribeDollarRoot(..));
         match operation {
             Operation::Disconnect {
                 graceful,
@@ -1230,7 +1285,7 @@ impl State {
                         filter,
                     );
                 }
-                self.subscribe(&lease.id, filters, now, effects)
+                self.subscribe(&lease.id, filters, now, false, effects)
             }
             Operation::BridgeOnline {
                 max_qos,
@@ -1249,11 +1304,14 @@ impl State {
                 Reply::NoChange
             }
             Operation::BridgeOffline { now, graceful } => {
-                session
+                let bridge = session
                     .internal_bridge
                     .as_mut()
-                    .expect("internal bridge session")
-                    .online = false;
+                    .expect("internal bridge session");
+                bridge.online = false;
+                if bridge.lazy {
+                    effects.push(Effect::BridgeOffline(session.epoch));
+                }
                 if let Some(will) = self.take_will(&lease.id)
                     && !graceful
                 {
@@ -1276,8 +1334,8 @@ impl State {
                 self.remove_session(&lease.id);
                 Reply::NoChange
             }
-            Operation::Subscribe(filters, now) => {
-                let reply = self.subscribe(&lease.id, filters, now, effects);
+            Operation::Subscribe(filters, now) | Operation::SubscribeDollarRoot(filters, now) => {
+                let reply = self.subscribe(&lease.id, filters, now, check_root_leaf, effects);
                 // handle_subscribe.c: handle__subscribe counts once per packet.
                 self.persistence_changes += u64::from(matches!(reply, Reply::Subscribed(_)));
                 reply
@@ -1404,12 +1462,18 @@ impl State {
                 let Some(inbox) = &mut session.inbox else {
                     return Reply::LocalInbox;
                 };
+                if session.owner == Some(Owner::LOCAL) && session.internal_bridge.is_none() {
+                    inbox.expire_before_qos0(now);
+                }
                 Reply::Outbound(inbox.next_outbound(&self.config, now))
             }
-            Operation::ReserveOutbound(now) => {
+            Operation::ReserveOutbound(now) | Operation::ReserveOutboundWithQos0Expiry(now) => {
                 let Some(inbox) = &mut session.inbox else {
                     return Reply::LocalInbox;
                 };
+                if matches!(operation, Operation::ReserveOutboundWithQos0Expiry(_)) {
+                    inbox.expire_before_qos0(now);
+                }
                 if let Some(packet) = inbox.next_outbound(&self.config, now) {
                     effects.push(Effect::ReservedOutbound {
                         owner: session.epoch,
@@ -1450,6 +1514,7 @@ impl State {
         id: &Arc<str>,
         filters: Vec<SubscriptionRequest>,
         now: Duration,
+        check_root_leaf: bool,
         effects: &mut Vec<Effect>,
     ) -> Reply {
         let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
@@ -1518,7 +1583,7 @@ impl State {
                 if retain_handling == 0
                     || retain_handling == 1 && !session.filters.contains_key(filter.as_str())
                 {
-                    self.retained.visit(path, now, |message| {
+                    self.retained.visit(path, now, check_root_leaf, |message| {
                         if acl.session_allowed(session, &message.topic, Access::Read)
                             && (!self.config.check_retain_source
                                 || message.source.id.is_empty()
@@ -1729,7 +1794,17 @@ fn deliver(
             }
             Offer::Dropped => counters.add(Metric::Dropped, 1),
             // database.c: db__message_insert_outgoing counts only queued inserts.
-            Offer::Queued => *persistence_changes += 1,
+            Offer::Queued => {
+                *persistence_changes += 1;
+                // database.c: db__message_insert_outgoing arms a lazy bridge
+                // only for a new insertion while its transport is offline.
+                if !online && queue_qos0 && session.owner.is_some() {
+                    effects.push(Effect::BridgeQueued {
+                        owner: session.epoch,
+                        pending: inbox.outgoing_count(),
+                    });
+                }
+            }
             Offer::Suppressed => {}
         }
     } else {

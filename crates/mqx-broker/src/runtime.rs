@@ -11,7 +11,7 @@ use std::{
     net::IpAddr,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -114,6 +114,7 @@ pub(super) struct Live {
     pub(super) taken: AtomicBool,
     pub(super) kicked: AtomicBool,
     pub(super) ready: Notify,
+    bridge_queue_peak: AtomicUsize,
     peer_ip: Option<IpAddr>,
     sequence: AtomicU64,
     outbox: Mutex<Outbox>,
@@ -149,6 +150,7 @@ impl Live {
             taken: AtomicBool::new(false),
             kicked: AtomicBool::new(false),
             ready: Notify::new(),
+            bridge_queue_peak: AtomicUsize::new(0),
             peer_ip,
             sequence: AtomicU64::new(0),
             outbox: Mutex::new(Outbox::default()),
@@ -176,6 +178,12 @@ impl Live {
             .into());
         }
         Ok(outbox.packets.pop_front())
+    }
+
+    fn bridge_queued(&self, pending: usize) {
+        if self.bridge_queue_peak.fetch_max(pending, Ordering::Relaxed) < pending {
+            self.ready.notify_one();
+        }
     }
 }
 
@@ -492,20 +500,19 @@ impl Broker {
             .v5
             .as_ref()
             .map(|v5| v5.outgoing_maximum(&self.0.config));
-        claim.now = self.now();
         match &self.0.log {
             Log::Local { .. } => {
                 let mut runtime = self.0.runtime.lock().unwrap();
-                let now = self.now();
+                claim.now = self.now();
                 if runtime
                     .local
                     .as_ref()
                     .unwrap()
                     .state
                     .next_expiry()
-                    .is_some_and(|time| time <= now)
+                    .is_some_and(|time| time <= claim.now)
                 {
-                    runtime.apply_local(Command::Expire(now), &self.0.config, None);
+                    runtime.apply_local(Command::Expire(claim.now), &self.0.config, None);
                 }
                 claim.publisher.security = security.0.id;
                 let reply = runtime.apply_local(
@@ -532,6 +539,7 @@ impl Broker {
             Log::Replicated(log) => {
                 log.ensure_boot().await?;
                 claim.publisher.security = log.security(security, false).await?;
+                claim.now = self.now();
                 let token = new_token()?;
                 {
                     let mut runtime = self.0.runtime.lock().unwrap();
@@ -550,13 +558,35 @@ impl Broker {
                     token,
                     finished: false,
                 };
-                let reply = log
-                    .propose_one(BatchEntry::Claim {
-                        owner: log.owner,
-                        token,
-                        request: claim,
-                    })
-                    .await?;
+                let retry = (self.0.config.global_max_clients != 0
+                    && claim.internal_bridge.is_none())
+                .then(|| claim.clone());
+                let proposal = |request| BatchEntry::Claim {
+                    owner: log.owner,
+                    token,
+                    request,
+                };
+                let mut reply = log.propose_one(proposal(claim)).await?;
+                if reply == Reply::Full && let Some(mut request) = retry {
+                    // The failed claim is applied locally now. A due offline
+                    // session can fill the limit until the next maintenance
+                    // tick. Commit an ordinary expiry before retrying this
+                    // definitive refusal, without changing Claim replay.
+                    let now = self.now();
+                    let (has_capacity, expiry_due) = log.cluster.read(|machine| {
+                        (
+                            machine.state.has_capacity_for(&request.publisher.id),
+                            machine.state.next_session_expiry().is_some_and(|at| at <= now),
+                        )
+                    });
+                    if has_capacity || expiry_due {
+                        if expiry_due {
+                            log.submit(Command::Expire(now)).await?;
+                        }
+                        request.now = self.now();
+                        reply = log.propose_one(proposal(request)).await?;
+                    }
+                }
                 let (lease, present) = match reply {
                     Reply::Claimed { lease, present } => (lease, present),
                     Reply::Full => {
@@ -857,27 +887,26 @@ impl Broker {
 
     pub(super) async fn next_outbound(&self, live: &Live) -> Result<Option<Outbound>, BrokerError> {
         if let Some(inbox) = &live.inbox {
-            return Ok(inbox
-                .lock()
-                .unwrap()
-                .next_outbound(&self.0.config, self.now()));
+            let mut inbox = inbox.lock().unwrap();
+            let now = self.now();
+            inbox.expire_before_qos0(now);
+            return Ok(inbox.next_outbound(&self.0.config, now));
         }
         if let Log::Replicated(log) = &self.0.log {
             if let Some(packet) = live.pop_reserved()? {
                 return Ok(Some(packet));
             }
-            if !log
+            let now = self.now();
+            let Some(operation) = log
                 .cluster
-                .read(|machine| machine.state.has_outbound(&live.lease))
-            {
+                .read(|machine| machine.state.outbound_reservation(&live.lease, now))
+            else
                 // A later committed delivery wakes the transport on apply.
                 return Ok(None);
-            }
+            };
             // Advance the replicated cursor before sending. The owning replica
             // already has the payload, so only a small reply crosses Raft RPC.
-            let reply = self
-                .act(live, Operation::ReserveOutbound(self.now()))
-                .await?;
+            let reply = self.act(live, operation).await?;
             match reply {
                 Reply::OutboundReserved | Reply::NoChange => {
                     let packet = live.pop_reserved()?;
@@ -1330,16 +1359,25 @@ impl StateMachine for Machine {
     }
 
     fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
-        let previous = self.state.applied;
-        let previous_dynamic = self.state.dynamic_policy().map(|(revision, _)| revision);
-        self.state.restore(bytes)?;
+        let previous = self.state.restore(bytes)?;
+        let previous_dynamic = previous.dynamic_policy().map(|(revision, _)| revision);
+        let skipped = self.state.applied > previous.applied;
         let mut runtime = self.runtime.lock().unwrap();
         if previous_dynamic != self.state.dynamic_policy().map(|(revision, _)| revision) {
             runtime.save_dynamic_security(&self.state);
         }
         runtime.live.retain(|_, live| {
             if self.state.owns(self.owner, &live.lease) {
-                if self.state.applied > previous && self.state.has_reserved_outbound(&live.lease) {
+                // An offline inbox only grows between attempts. Recover
+                // enqueue wakes skipped while installing a newer snapshot.
+                if skipped
+                    && let Some(before) = previous.offline_lazy_pending(&live.lease)
+                    && let Some(after) = self.state.offline_lazy_pending(&live.lease)
+                    && after > before
+                {
+                    live.bridge_queued(after);
+                }
+                if skipped && self.state.has_reserved_outbound(&live.lease) {
                     live.interrupt_outbound();
                 } else if self.state.has_outbound(&live.lease) {
                     live.ready.notify_one();
@@ -1411,6 +1449,18 @@ impl Runtime {
                 Effect::Ready(lease) => {
                     if let Some(live) = self.live.get(&lease.epoch) {
                         live.ready.notify_one();
+                    }
+                }
+                Effect::BridgeOffline(owner) => {
+                    if let Some(live) = self.live.get(&owner) {
+                        // Reset in apply order so a subsequent queued delivery
+                        // cannot be cleared by a late transport wakeup.
+                        live.bridge_queue_peak.store(0, Ordering::Relaxed);
+                    }
+                }
+                Effect::BridgeQueued { owner, pending } => {
+                    if let Some(live) = self.live.get(&owner) {
+                        live.bridge_queued(pending);
                     }
                 }
                 Effect::ReservedOutbound { owner, packet } => {
@@ -1671,5 +1721,90 @@ async fn cluster_maintenance(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{inbox::Publisher, state::SessionSettings};
+
+    #[tokio::test]
+    async fn an_expired_mqtt5_session_cannot_block_cluster_admission() {
+        let storage = tempfile::tempdir().unwrap();
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let broker = Broker::clustered(
+            BrokerConfig {
+                global_max_clients: 1,
+                ..BrokerConfig::default()
+            },
+            ClusterConfig::new(
+                1,
+                address,
+                BTreeMap::from([(1, address)]),
+                storage.path().join("node"),
+                mqx_cluster::ClusterSecurity::InsecurePlaintext,
+            ),
+        )
+        .await
+        .unwrap();
+        let security = SecurityHandle::default();
+        let claim = |id: &str| Claim {
+            publisher: Publisher {
+                id: Arc::from(id),
+                username: None,
+                security: 0,
+                dynamic_security: None,
+            },
+            clean_start: true,
+            bridge: false,
+            max_qos: QoS::ExactlyOnce,
+            will: None,
+            v5: Some(SessionSettings {
+                session_expiry: 1,
+                receive_maximum: None,
+                will_delay: 0,
+                will_expiry: 0,
+                will_properties: Vec::new(),
+            }),
+            now: Duration::ZERO,
+            internal_bridge: None,
+            dynamic_security_revision: None,
+        };
+        let ClaimResult::Accepted(old, false) =
+            broker.claim(&security, claim("offline"), None).await.unwrap()
+        else {
+            panic!("the original client should be admitted");
+        };
+        assert!(matches!(
+            broker.claim(&security, claim("new"), None).await.unwrap(),
+            ClaimResult::Full
+        ));
+
+        // Isolate admission from the maintenance ticker and commit a
+        // disconnect whose MQTT 5 expiry deadline has passed.
+        broker.shutdown();
+        broker.0.shutdown.closed().await;
+        let Log::Replicated(log) = &broker.0.log else {
+            unreachable!();
+        };
+        log.submit(Command::Act(
+            old.lease.clone(),
+            Operation::Disconnect {
+                graceful: true,
+                now: wall_now().saturating_sub(Duration::from_secs(3)),
+                expiry: None,
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            broker.claim(&security, claim("new"), None).await.unwrap(),
+            ClaimResult::Accepted(_, false)
+        ));
+        broker.shutdown_cluster().await.unwrap();
     }
 }

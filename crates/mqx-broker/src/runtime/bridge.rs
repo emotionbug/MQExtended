@@ -181,23 +181,11 @@ impl BridgeSession {
         };
     }
 
-    pub fn pending(&self) -> usize {
-        match &self.broker.0.log {
-            Log::Local { .. } => self
-                .broker
-                .0
-                .runtime
-                .lock()
-                .unwrap()
-                .local
-                .as_ref()
-                .unwrap()
-                .state
-                .bridge_pending(&self.live.lease),
-            Log::Replicated(log) => log
-                .cluster
-                .read(|machine| machine.state.bridge_pending(&self.live.lease)),
+    pub async fn wait_for_lazy_restart(&self, threshold: usize) {
+        while self.live.bridge_queue_peak.load(Ordering::Relaxed) < threshold.max(1) {
+            self.ready().await;
         }
+        self.live.bridge_queue_peak.store(0, Ordering::Relaxed);
     }
 
     pub async fn ready(&self) {

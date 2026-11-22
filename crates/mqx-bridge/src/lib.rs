@@ -204,6 +204,14 @@ async fn run(
                         false
                     }
                 };
+                // mosquitto.c: post_shutdown_cleanup publishes local bridge
+                // wills instead of clearing them on broker shutdown.
+                if *shutdown.borrow()
+                    && session.leased()
+                    && let Err(error) = session.offline(false).await
+                {
+                    tracing::debug!("Bridge {} could not publish its will: {error}", config.name);
+                }
                 if let Err(error) = session.close(remove).await {
                     tracing::debug!(
                         "Bridge {} could not release its session: {error}",
@@ -371,11 +379,7 @@ impl<'a> Peer<'a> {
             match config.start {
                 Start::Automatic => time::sleep(Duration::from_millis(self.backoff_ms)).await,
                 Start::Once => std::future::pending::<()>().await,
-                Start::Lazy => {
-                    while session.pending() < config.threshold {
-                        time::sleep(POLL).await;
-                    }
-                }
+                Start::Lazy => session.wait_for_lazy_restart(config.threshold).await,
             }
         };
         tokio::select! {
@@ -437,7 +441,10 @@ impl<'a> Peer<'a> {
             result = self.connected(config, session, &mut wire, keepalive) => result,
         };
         let reason = match &result {
-            Ok(End::Lost | End::Reconfigure) => Some(R::SUCCESS),
+            // bridge.c: bridge__destroy sends DISCONNECT on replacement.
+            // Shutdown and lost ownership close the socket so the remote
+            // broker can publish the bridge will.
+            Ok(End::Reconfigure) => Some(R::SUCCESS),
             Err(Error::DecodeV5(error))
                 // bridge_topic.c invokes topic_matches_sub before checking a
                 // topic name. Its invalid-topic result closes without reply.
@@ -448,7 +455,7 @@ impl<'a> Peer<'a> {
             _ => None,
         };
         if let Some(reason) = reason
-            && session.leased()
+            && session.active()
         {
             tracing::debug!("Bridge {} sending DISCONNECT", self.local_id);
             let _ = time::timeout(
@@ -693,35 +700,27 @@ impl<'a> Peer<'a> {
                     "Bridge {id} sending SUBSCRIBE (Mid: {mid}, Topic: {filter}, QoS: {}, Options: 0x{options:02x})",
                     qos as u8
                 );
-                if !wire
-                    .send(Packet::Subscribe(v5::Subscribe {
-                        packet_id: mid,
-                        properties: Vec::new(),
-                        subscriptions: vec![v5::Subscription {
-                            filter: filter.clone(),
-                            qos,
-                            no_local: mqtt5,
-                            retain_as_published: mqtt5,
-                            retain_handling: v5::RetainHandling::SendAlways,
-                        }],
-                    }))
-                    .await?
-                {
-                    return Err(Error::Protocol);
-                }
+                wire.send(Packet::Subscribe(v5::Subscribe {
+                    packet_id: mid,
+                    properties: Vec::new(),
+                    subscriptions: vec![v5::Subscription {
+                        filter: filter.clone(),
+                        qos,
+                        no_local: mqtt5,
+                        retain_as_published: mqtt5,
+                        retain_handling: v5::RetainHandling::SendAlways,
+                    }],
+                }))
+                .await?;
             } else if config.attempt_unsubscribe {
                 let mid = session.packet_id().await?;
                 tracing::debug!("Bridge {id} sending UNSUBSCRIBE (Mid: {mid}, Topic: {filter})");
-                if !wire
-                    .send(Packet::Unsubscribe(v5::Unsubscribe {
-                        packet_id: mid,
-                        properties: Vec::new(),
-                        filters: vec![filter.clone()],
-                    }))
-                    .await?
-                {
-                    return Err(Error::Protocol);
-                }
+                wire.send(Packet::Unsubscribe(v5::Unsubscribe {
+                    packet_id: mid,
+                    properties: Vec::new(),
+                    filters: vec![filter.clone()],
+                }))
+                .await?;
             }
         }
         session
@@ -870,7 +869,7 @@ impl<'a> Peer<'a> {
             }
             Packet::PubRel(p) => {
                 tracing::debug!("Sending PUBREL to {} (m{})", self.local_id, p.packet_id);
-                Some(p.packet_id)
+                None
             }
             _ => unreachable!("bridge inbox only yields PUBLISH and PUBREL"),
         };
