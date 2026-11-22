@@ -1,0 +1,39 @@
+[package]
+name = "mqx-server"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mqextended"
+path = "src/main.rs"
+
+[dependencies]
+mqx-auth.workspace = true
+mqx-broker.workspace = true
+mqx-codec.workspace = true
+mqx-topic.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono = "0.4.45"
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+x509-parser = "0.18.1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["net"] }
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tempfile = "3.27.0"
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31.3", features = ["signal"] }
+
+[lints]
+workspace = true

@@ -18,6 +18,22 @@ Transient (clean-session) sessions exist only in the memory of the node serving 
 - **Wills are replicated at CONNECT.** A node that dies cannot publish its clients' wills; the node that removes it does.
 - **Limits follow Mosquitto defaults.** Queue length 1000 (`max_queued_messages`), in-flight window 20 (`max_inflight_messages`), no session expiry, QoS 0 not queued for offline sessions (`queue_qos0_messages false`). See [Mosquitto compatibility](mosquitto-compatibility.md#defaults).
 
+## Replication semantics
+
+- **Apply runs on every node, in log order.** Side effects of an applied command (closing a taken-over connection, publishing a will) must check whether this node is the one that should act; the state itself is identical everywhere.
+- **`submit` can be uncertain.** When a proposal may have committed but the reply was lost, `submit` returns `WriteUncertain`. Commands therefore carry the identity needed to be applied idempotently (client id + epoch, message id), so a retry cannot double-apply.
+- **Node `Down` is liveness, not membership.** A lease expiry commits a `Down` event at one log index on every node; the node stays a Raft voter. A restarted node renews its lease and is marked `Alive`.
+- **Peer traffic is unauthenticated.** The Raft/mesh port must live on a trusted private network.
+
 ## On-disk layout
 
-Defined in M3 with the Raft storage. Single-node mode uses the same state machine and storage with a one-member cluster.
+Single-node mode uses the same layout with a one-member cluster.
+
+```text
+<data_dir>/
+├── node.mpk        # node id and the static bootstrap peers (msgpack)
+├── wal/            # Raft log entries, vote, commit frontier (raft-log chunk files)
+└── snapshot.mpk    # Raft snapshot metadata, node leases, application state
+```
+
+Entries and votes are fsynced before they are acknowledged; the commit frontier is fsynced before entries are applied. A snapshot is written to a temporary file, fsynced, renamed and the directory fsynced before the log is compacted behind it. Restart restores the snapshot and replays the committed log tail.

@@ -4,12 +4,17 @@ MQExtended is a clustered MQTT broker in Rust that replaces Mosquitto without ch
 
 ## Repository map
 
-- `crates/mqx-topic` — Topic name/filter validation and matching, ported from Mosquitto's `libcommon/topic_common.c`
-- `crates/mqx-codec` — Sans-IO MQTT 3.1 / 3.1.1 codec with Mosquitto's wire validation
+- `crates/mqx-topic` — Topic name/filter validation and matching, ported from Mosquitto's `libcommon/topic_common.c`; subscription index
+- `crates/mqx-codec` — Sans-IO MQTT 3.1 / 3.1.1 codec with Mosquitto's wire validation; `v5` module for MQTT 5
 - `crates/mqx-auth` — `password_file` (`$6$`, `$7$`) and `acl_file` parsing and checks
+- `crates/mqx-proxy` — Sans-IO PROXY protocol v1/v2 reader (`enable_proxy_protocol`)
+- `crates/mqx-ws` — MQTT-over-WebSocket transport with Mosquitto's built-in handshake rules
+- `crates/mqx-broker` — Protocol engine: sessions, QoS flows, retained, will, keepalive, takeover; state through a command-based state machine
+- `crates/mqx-cluster` — Generic replicated state machine on openraft: durable log, snapshots, node leases, mesh RPC
+- `crates/mqx-server` — The `mqextended` binary: `mosquitto.conf` parsing, listeners, TLS, wiring
+- `crates/mqx-difftest` — Differential test harness running the same scenarios against Mosquitto and `mqextended`
+- `scripts/` — Generators for parity tables extracted from Mosquitto's test suite
 - `docs/` — System and process knowledge (see below)
-
-Planned crates (see [docs/product.md](docs/product.md#direction)): `mqx-broker` (protocol engine), `mqx-cluster` (replicated state), `mqx-server` (binary).
 
 ## Docs
 

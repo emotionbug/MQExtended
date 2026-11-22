@@ -7,10 +7,10 @@ clients ── L4 address (owned by the network) ──┬── node A ─┐
                                                ├── node B ─┼── node mesh (forwarding, takeover)
                                                └── node C ─┘
 each node:
-  mqx-server   listeners (TCP/TLS/WS), config, admin API
+  mqx-server   mosquitto.conf, listeners: TCP / TLS / WebSocket (mqx-ws), PROXY protocol (mqx-proxy)
     └ mqx-broker   sessions, QoS flows, retained, will, keepalive
         ├ mqx-auth    password_file / acl_file decisions
-        ├ mqx-codec   MQTT 3.1 / 3.1.1 wire format
+        ├ mqx-codec   MQTT 3.1 / 3.1.1 / 5 wire format
         ├ mqx-topic   validation, matching, subscription index
         └ mqx-cluster replicated state machine (Raft) + mesh RPC
 ```
@@ -20,13 +20,16 @@ each node:
 | Crate | Responsibility |
 | --- | --- |
 | `mqx-topic` | Topic validation and matching identical to Mosquitto; the subscription index used for routing |
-| `mqx-codec` | Encode/decode MQTT 3.1 / 3.1.1 packets; Mosquitto's per-protocol wire validation; no I/O |
+| `mqx-codec` | Encode/decode MQTT 3.1 / 3.1.1 packets (and MQTT 5 in `v5`); Mosquitto's per-protocol wire validation; no I/O |
 | `mqx-auth` | Load `password_file` / `acl_file`; answer allow / deny / ignore exactly as Mosquitto's built-in plugins |
+| `mqx-proxy` | Read PROXY protocol v1/v2 headers and their TLS TLVs as Mosquitto's `enable_proxy_protocol` does; no I/O in the parser |
+| `mqx-ws` | Upgrade HTTP to WebSocket with Mosquitto's built-in handshake rules; expose the MQTT byte stream as `AsyncRead`/`AsyncWrite` |
 | `mqx-broker` | Protocol engine per connection; session lifecycle; delivery; talks to state only through the replicated-log interface |
-| `mqx-cluster` | Raft-backed implementation of that interface; membership; node leases; mesh RPC between nodes |
-| `mqx-server` | Binary: `mosquitto.conf` subset, listeners, TLS, PROXY protocol, admin API, metrics |
+| `mqx-cluster` | Generic replicated state machine on openraft (durable log, snapshots, bootstrap); node leases; mesh RPC between nodes. Knows nothing about MQTT |
+| `mqx-server` | The `mqextended` binary: `mosquitto.conf` parsing, listeners, TLS, signals, wiring of the crates above |
+| `mqx-difftest` | Test-only: runs one scenario against Mosquitto and `mqextended` and compares client transcripts |
 
-Lower crates never depend on higher ones. `mqx-codec`, `mqx-topic` and `mqx-auth` stay sans-IO so their parity tests run without sockets.
+Lower crates never depend on higher ones. `mqx-codec`, `mqx-topic`, `mqx-auth` and the `mqx-proxy` parser stay sans-IO so their parity tests run without sockets. `mqx-cluster` is generic over the state machine so the broker can be tested without Raft and the cluster without MQTT.
 
 ## Request flows
 

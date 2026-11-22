@@ -28,6 +28,15 @@ cmake --build /tmp/mosquitto/build -j"$(nproc)"
 
 The binaries land in `build/src/mosquitto`, `build/client/mosquitto_{pub,sub}` and `build/apps/mosquitto_passwd/mosquitto_passwd`. Point `MOSQUITTO_BUILD_DIR` at `build/`. The source tree is also the reference you port from; keep it next to the build.
 
+The `mqx-ws` differential test needs a second build with Mosquitto's built-in WebSocket support; point `MOSQUITTO_WS_BUILD_DIR` at it:
+
+```sh
+cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-ws -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+      -DWITH_WEBSOCKETS=ON -DWITH_WEBSOCKETS_BUILTIN=ON -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+      -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/mosquitto/build-ws -j"$(nproc)"
+```
+
 ## Commands
 
 See [testing](testing.md#commands) for checks. Workspace-wide lint settings live in the root `Cargo.toml`; crates opt in with `[lints] workspace = true`.

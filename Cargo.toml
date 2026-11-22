@@ -1,6 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["crates/mqx-topic", "crates/mqx-codec", "crates/mqx-auth"]
+members = [
+    "crates/mqx-topic",
+    "crates/mqx-codec",
+    "crates/mqx-auth",
+    "crates/mqx-broker",
+    "crates/mqx-server",
+    "crates/mqx-difftest",
+    "crates/mqx-cluster",
+    "crates/mqx-proxy",
+    "crates/mqx-ws",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,10 +20,15 @@ publish = false
 
 [workspace.dependencies]
 mqx-topic = { path = "crates/mqx-topic" }
+mqx-codec = { path = "crates/mqx-codec" }
+mqx-auth = { path = "crates/mqx-auth" }
+mqx-broker = { path = "crates/mqx-broker" }
 
 bytes = "1.12"
 thiserror = "2.0"
 proptest = "1.12"
+tokio = { version = "1.54", features = ["full"] }
+tracing = "0.1.44"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

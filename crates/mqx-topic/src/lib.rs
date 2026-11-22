@@ -6,6 +6,10 @@
 //! that cannot be changed. Inputs are treated like C strings: anything after
 //! an embedded NUL byte is ignored, as Mosquitto would never see it.
 
+mod subscription_index;
+
+pub use subscription_index::SubscriptionIndex;
+
 use thiserror::Error;
 
 /// Maximum topic length in bytes (`mosquitto_pub_topic_check`).

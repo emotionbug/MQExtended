@@ -166,8 +166,9 @@ pub enum BasicAuth {
     Deny,
 }
 
-/// Why a password file was rejected. Mosquitto refuses to start (or keeps
-/// running with the old data on reload) in all of these cases.
+/// Why a password file was rejected. Mosquitto refuses to start in all of
+/// these cases, and exits with status 3 when one appears on a SIGHUP reload
+/// (test/broker/23-security-password-file-reload.py).
 #[derive(Debug, Error)]
 pub enum PasswordFileError {
     #[error("unable to open password file {path}: {source}")]

@@ -21,13 +21,21 @@ Extract cases from Mosquitto's test suite instead of retyping them, and say whic
 
 ## Differential tests
 
-Differential tests need the Mosquitto reference binaries and are `#[ignore]` by default:
+Differential tests need the Mosquitto reference binaries and are `#[ignore]` by default.
+
+| Variable | Points at |
+| --- | --- |
+| `MOSQUITTO_BUILD_DIR` | Mosquitto 2.1.4 build directory (`src/mosquitto`, `client/mosquitto_{pub,sub}`, `apps/mosquitto_passwd/`) |
+| `MOSQUITTO_WS_BUILD_DIR` | A second Mosquitto build with `WITH_WEBSOCKETS=ON`, for `mqx-ws` |
+| `MQEXTENDED_BIN` | The `mqextended` binary under test; defaults to `target/debug/mqextended` |
 
 ```sh
 MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build cargo test -p <crate> -- --ignored
 ```
 
-A differential test skips loudly (fails) when `MOSQUITTO_BUILD_DIR` is set but a binary is missing; it must never silently pass. Build the reference as described in [development](development.md#mosquitto-reference-build).
+A differential test fails when a binary it needs is missing; it must never silently pass. Build the references as described in [development](development.md#mosquitto-reference-build).
+
+Broker behaviour is compared with `mqx-difftest`: each scenario is a script for a raw MQTT client (built on `mqx-codec`) that runs once against Mosquitto and once against `mqextended`, and the two transcripts of received packets must be identical, packet ids and flags included. Every scenario also runs twice against Mosquitto to prove the scenario itself is deterministic. Mine new scenarios from Mosquitto's `test/broker/*.py` and cite the file.
 
 ## Commands
 
