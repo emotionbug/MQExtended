@@ -1677,7 +1677,8 @@ impl Router<'_> {
             message: message.clone(),
             qos,
             retain,
-            dedup_id: (!retain && !self.config.allow_duplicate_messages)
+            // database.c: db__message_insert_outgoing does not suppress v5 copies.
+            dedup_id: (!self.config.allow_duplicate_messages && session.v5.is_none() && !retain)
                 .then_some(crate::inbox::DedupId::Log(self.id)),
             subscription_identifier: sub.identifier,
         };

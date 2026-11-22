@@ -1441,17 +1441,23 @@ impl Runtime {
         }
     }
 
-    fn deliver(&mut self, epoch: Epoch, packet: Delivery, config: &BrokerConfig) {
+    fn deliver(&mut self, epoch: Epoch, mut packet: Delivery, config: &BrokerConfig) {
         let Some(live) = self.live.get(&epoch) else {
             return;
         };
         let Some(inbox) = &live.inbox else {
             return;
         };
-        let result = inbox
-            .lock()
-            .unwrap()
-            .offer(packet, true, QoS::ExactlyOnce, config);
+        let result = {
+            let mut inbox = inbox.lock().unwrap();
+            // database.c: db__message_insert_outgoing uses the recipient's version.
+            // A transient inbox has a receive maximum only for MQTT 5, so the
+            // mesh publication does not need to carry the protocol version.
+            if packet.dedup_id.is_some() && inbox.receive_maximum.is_some() {
+                packet.dedup_id = None;
+            }
+            inbox.offer(packet, true, QoS::ExactlyOnce, config)
+        };
         if matches!(result, Offer::Dropped | Offer::FirstDrop) {
             self.transient_drops += 1;
         }

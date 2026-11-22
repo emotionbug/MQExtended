@@ -45,6 +45,7 @@ The reference is **Mosquitto 2.1.4** (tag `v2.1.4`). When Mosquitto and the MQTT
 - On a slow link, a large PUBLISH may take longer than 1.5 times the Keep Alive interval. Progress receiving its body resets the timer while more than 1000 bytes remain (`lib/packet_mosq.c`: `packet__read_single`); a stalled transfer still times out.
 - MQTT 3.1 has no 23-byte client id limit, and CONNACK `session_present` stays 0 for 3.1 clients.
 - Outgoing packet ids are consumed even when a message is then dropped as a duplicate or for a full queue (`mosquitto__mid_generate`), so packet ids on the wire match Mosquitto's.
+- `allow_duplicate_messages false` suppresses overlapping live copies only for pre-v5 recipients. MQTT 5 keeps separate deliveries from overlapping filters, each with its subscription's QoS and identifier if set (`src/database.c`: `db__message_insert_outgoing`).
 - Connection log lines use 2.1's protocol numbers: `p3` for MQTT 3.1, `p4` for 3.1.1.
 - MQTT 5 follows the same handlers' v5 branches: `max_topic_alias` and `max_topic_alias_broker`, `accept_protocol_versions` including `5`, and the listener's `disable_protocol_v5`. A CONNECT whose protocol name is `MQTT` followed by a NUL byte is accepted at levels 4 and 5, and `MQIsdp` at level 5 gets the legacy refusal `20 02 00 01` (`handle__connect`'s `strncmp` comparisons).
 - With `enable_control_api true`, `$CONTROL/broker/v1` provides the read-only listener and plugin inventory (`src/broker_control.c`); see [monitoring](monitoring.md#mqtt-broker-control-api) for permissions and SIGHUP behavior.
