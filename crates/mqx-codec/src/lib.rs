@@ -1,9 +1,12 @@
 //! Sans-I/O MQTT 3.1 and 3.1.1 framing and packet validation.
 //!
 //! The application owns connection state, packet direction, and broker policy.
+//!
+//! MQTT 5.0 framing and packet validation are available in [`v5`].
 
 mod decode;
 mod encode;
+pub mod v5;
 
 use bytes::Bytes;
 use thiserror::Error;
