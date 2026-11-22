@@ -11,7 +11,7 @@ use std::{
 
 use nix::{
     sys::signal::{Signal, kill},
-    unistd::{Pid, geteuid},
+    unistd::Pid,
 };
 use tokio::{
     net::{TcpStream, UnixDatagram},
@@ -353,123 +353,260 @@ async fn logger_reloads_destinations_and_connection_notices() {
     assert!(log.ends_with(&format!(": {TERMINATING}\n")));
 }
 
+#[cfg(target_os = "linux")]
+fn assert_process_ids(pid: Pid, uid: nix::unistd::Uid, gid: nix::unistd::Gid) {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    for (field, expected) in [("Uid:", uid.as_raw()), ("Gid:", gid.as_raw())] {
+        let ids: Vec<u32> = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .unwrap()
+            .split_ascii_whitespace()
+            .map(|id| id.parse().unwrap())
+            .collect();
+        // Linux reports real, effective, saved and filesystem IDs in that order.
+        assert_eq!(ids, [expected; 4], "process {pid} {field}");
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn root_only_identity_mapping_and_privilege_drop_order() {
-    use nix::unistd::{Uid, User, chown};
+    use nix::{
+        sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+        unistd::{Gid, Uid, User, chown, getegid, geteuid, getpid, getsid},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixStream,
+    };
 
-    if !geteuid().is_root() {
-        eprintln!("root-only process checks require effective UID 0");
+    let Some(opt_in) = std::env::var_os("MQX_ROOT_PROCESS_SMOKE") else {
         return;
-    }
-    let nobody = User::from_name("nobody")
-        .unwrap()
-        .expect("a nobody account is required");
-    let dir = tempfile::tempdir().unwrap();
-    let notify_path = dir.path().join("notify");
-    let notify = UnixDatagram::bind(&notify_path).unwrap();
-    fs::set_permissions(&notify_path, fs::Permissions::from_mode(0o666)).unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    let owned = dir.path().join("owned");
-    fs::create_dir(&owned).unwrap();
+    };
+    assert_eq!(opt_in, "1");
+    assert!(geteuid().is_root(), "the smoke requires effective UID 0");
+    assert_eq!(getegid().as_raw(), 0, "the smoke requires effective GID 0");
+    // The namespace reaps or kills any detached child, even if it fails before
+    // publishing its pid file. Never run this test against the host PID namespace.
+    assert_eq!(getpid().as_raw(), 1, "run in a private PID namespace");
+    assert_eq!(fs::read_link("/proc/self").unwrap(), Path::new("1"));
+
+    const ABSENT: &str = "mqx-process-test-absent";
+    assert!(User::from_name(ABSENT).unwrap().is_none());
+    let nobody = User::from_name("nobody").unwrap().expect("no nobody account");
+    assert!(!nobody.uid.is_root());
+    assert_ne!(nobody.gid.as_raw(), 0);
     let uid = (60000..=65000)
         .map(Uid::from_raw)
         .find(|&uid| User::from_uid(uid).unwrap().is_none())
         .unwrap();
     let gid = nobody.gid;
-    chown(&owned, Some(uid), Some(gid)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let mode = |path: &Path, mode| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(&notify_path, 0o222);
+    mode(dir.path(), 0o711);
+    let run = dir.path().join("run");
+    fs::create_dir(&run).unwrap();
+    mode(&run, 0o700);
+    chown(&run, Some(uid), Some(gid)).unwrap();
+
+    // Mosquitto src/mosquitto.c: main parses the config before dropping
+    // privileges, then applies the umask, daemonises and opens runtime files.
     let path = dir.path().join("broker.conf");
-    let pid = owned.join("broker.pid");
-    fs::write(
-        &path,
-        format!(
-            "{}user absent-account\npid_file owned/broker.pid\nlog_timestamp false\n",
-            config(listen_address())
-        ),
-    )
-    .unwrap();
+    let pid_file = run.join("broker.pid");
+    let socket_file = run.join("mqtt.sock");
+    let log_file = run.join("broker.log");
+    let config = "listener 0 run/mqtt.sock\nallow_anonymous true\n\
+                  pid_file run/broker.pid\nsys_interval 0\nlog_timestamp false\n";
+    fs::write(&path, format!("user {ABSENT}\n{config}")).unwrap();
+    mode(&path, 0o600);
+    let broker = || {
+        let mut cmd = command(BIN, dir.path());
+        cmd.args(["-c", "broker.conf"])
+            .env("NOTIFY_SOCKET", &notify_path)
+            .env("UMASK_SET", "0077");
+        cmd
+    };
+    let no_startup_artifacts = || {
+        assert!(!pid_file.exists());
+        assert!(!socket_file.exists());
+        assert!(matches!(
+            notify.try_recv(&mut [0; 32]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    };
     for (puid, pgid, error) in [
-        ("baduid", "badgid", "Error: PGID not a valid ID 'badgid'"),
-        ("-1", "0", "Error: PUID must not be negative"),
+        ("baduid", "badgid", "PGID not a valid ID 'badgid'"),
+        ("-1", "0", "PUID must not be negative"),
+        ("2147483648", "0", "PUID must not be less than 2147483647"),
+        ("", "0", "PUID not a valid ID ''"),
     ] {
-        let output = command(BIN, dir.path())
-            .args(["-c", "broker.conf"])
-            .env("PUID", puid)
-            .env("PGID", pgid)
-            .output()
-            .await
-            .unwrap();
+        // The privilege error must come from the original process, not a
+        // forked daemon whose launcher would already have reported success.
+        let output = timeout(
+            WAIT,
+            broker()
+                .arg("-d")
+                .env("SNAP_NAME", "mosquitto-other")
+                .env("PUID", puid)
+                .env("PGID", pgid)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(output.status.code(), Some(3));
         assert!(String::from_utf8_lossy(&output.stderr).contains(error));
-        assert!(!pid.exists());
+        no_startup_artifacts();
     }
-    let output = command(BIN, dir.path())
-        .args(["-c", "broker.conf"])
-        .output()
-        .await
-        .unwrap();
+    let output = timeout(WAIT, broker().output()).await.unwrap().unwrap();
     assert_eq!(output.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "Unable to drop privileges to 'absent-account' because this user does not exist."
-    ));
-
-    let mut child = command(BIN, dir.path())
-        .args(["-c", "broker.conf"])
-        .env("PUID", uid.to_string())
-        .env("PGID", gid.to_string())
-        .env("NOTIFY_SOCKET", &notify_path)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    ready(&notify).await;
-    let metadata = fs::metadata(&pid).unwrap();
-    assert_eq!(
-        (metadata.uid(), metadata.gid()),
-        (uid.as_raw(), gid.as_raw())
-    );
-    stop(&mut child).await;
-    let output = child.wait_with_output().await.unwrap();
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .starts_with(&format!("Info: running mosquitto as user id: {uid}.\n"))
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "Unable to drop privileges to '{ABSENT}' because this user does not exist."
+        ))
     );
+    no_startup_artifacts();
 
-    let mut snap = command(BIN, dir.path())
-        .args(["-c", "broker.conf"])
-        .env("SNAP_NAME", "mosquitto")
-        .env("PUID", "invalid-but-ignored")
-        .env("NOTIFY_SOCKET", &notify_path)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    ready(&notify).await;
-    assert_eq!(fs::metadata(&pid).unwrap().uid(), 0);
-    stop(&mut snap).await;
-    let output = snap.wait_with_output().await.unwrap();
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("Info: running mosquitto as user"));
+    let (root_uid, root_gid) = (Uid::from_raw(0), Gid::from_raw(0));
+    let uid_env = format!(" +{uid}");
+    let gid_env = gid.to_string();
+    for (puid, pgid, snap, (expected_uid, expected_gid)) in [
+        (
+            Some(uid_env.as_str()),
+            Some(gid_env.as_str()),
+            None,
+            (uid, gid),
+        ),
+        (Some(uid_env.as_str()), None, None, (uid, root_gid)),
+        (None, Some(gid_env.as_str()), None, (root_uid, gid)),
+        (Some("0"), Some("0"), None, (root_uid, root_gid)),
+        (
+            Some("baduid"),
+            Some("badgid"),
+            Some("mosquitto"),
+            (root_uid, root_gid),
+        ),
+    ] {
+        let mut cmd = broker();
+        for (name, value) in [("PUID", puid), ("PGID", pgid), ("SNAP_NAME", snap)] {
+            if let Some(value) = value {
+                cmd.env(name, value);
+            }
+        }
+        let mut child = cmd.stderr(Stdio::piped()).spawn().unwrap();
+        ready(&notify).await;
+        assert_process_ids(id(&child), expected_uid, expected_gid);
+        let metadata = fs::metadata(&pid_file).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid()),
+            (expected_uid.as_raw(), expected_gid.as_raw())
+        );
+        drop(UnixStream::connect(&socket_file).await.unwrap());
+        stop(&mut child).await;
+        no_startup_artifacts();
+        let output = child.wait_with_output().await.unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("Warning: Mosquitto should not be run as root/administrator."),
+            snap.is_none() && (expected_uid.is_root() || expected_gid == root_gid),
+            "{stderr}"
+        );
+        if snap.is_some() {
+            assert!(!stderr.contains("Info: running mosquitto as user"));
+        } else if expected_uid == uid {
+            assert!(stderr.starts_with(&format!("Info: running mosquitto as user id: {uid}.\n")));
+        }
+    }
 
-    fs::write(dir.path().join("passwords"), "").unwrap();
-    fs::set_permissions(
-        dir.path().join("passwords"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    chown(&run, Some(nobody.uid), Some(gid)).unwrap();
+    let passwords = dir.path().join("passwords");
+    fs::write(&passwords, "").unwrap();
+    mode(&passwords, 0o600);
+    fs::write(&path, format!("user nobody\npassword_file passwords\n{config}")).unwrap();
+    let output = timeout(WAIT, broker().output()).await.unwrap().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Unable to load password_file 'passwords'"), "{stderr}");
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+    assert!(!stderr.contains("Opening unix listen socket"), "{stderr}");
+    no_startup_artifacts();
+
+    // Keep the password file root-owned; only the target group can read it.
+    chown(&passwords, None, Some(gid)).unwrap();
+    mode(&passwords, 0o640);
     fs::write(
         &path,
         format!(
-            "{}user nobody\npassword_file passwords\nlog_timestamp false\n",
-            config(listen_address())
+            "user nobody\npassword_file passwords\n{config}\
+             log_dest stdout\nlog_dest stderr\nlog_dest file run/broker.log\n"
         ),
     )
     .unwrap();
-    let output = command(BIN, dir.path())
-        .args(["-c", "broker.conf"])
-        .output()
-        .await
+    let parent = broker()
+        .arg("-d")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert_ne!(output.status.code(), Some(0));
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    let parent_id = id(&parent);
+    let output = timeout(WAIT, parent.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
     assert!(stderr.starts_with("Info: running mosquitto as user: nobody.\n"));
-    assert!(!stderr.contains("Opening ipv4 listen socket"));
+    assert!(output.stdout.is_empty());
+    assert!(!stderr.contains(RUNNING), "{stderr}");
+
+    ready(&notify).await;
+    let pid = Pid::from_raw(fs::read_to_string(&pid_file).unwrap().parse().unwrap());
+    assert!(pid.as_raw() > 1);
+    assert_ne!(parent_id, pid);
+    assert_eq!(getsid(Some(pid)).unwrap(), pid);
+    assert_process_ids(pid, nobody.uid, gid);
+    for fd in 0..=2 {
+        let target = fs::read_link(format!("/proc/{pid}/fd/{fd}")).unwrap();
+        assert_eq!(target, Path::new("/dev/null"), "descriptor {fd}");
+    }
+    for file in [&pid_file, &log_file] {
+        let metadata = fs::metadata(file).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+            (nobody.uid.as_raw(), gid.as_raw(), 0o600),
+            "{}",
+            file.display()
+        );
+    }
+    assert!(fs::read_to_string(&log_file).unwrap().contains(RUNNING));
+    timeout(WAIT, async {
+        let mut stream = UnixStream::connect(&socket_file).await.unwrap();
+        stream
+            .write_all(b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev")
+            .await
+            .unwrap();
+        let mut response = [0; 4];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"\x20\x02\x00\x00");
+    })
+    .await
+    .expect("the daemon did not answer MQTT CONNECT");
+    kill(pid, Signal::SIGTERM).unwrap();
+    eventually(|| match waitpid(pid, Some(WaitPidFlag::WNOHANG)).unwrap() {
+        WaitStatus::StillAlive => false,
+        WaitStatus::Exited(_, 0) => true,
+        status => panic!("daemon exited with {status:?}"),
+    })
+    .await;
+    no_startup_artifacts();
+    assert!(fs::read_to_string(&log_file).unwrap().contains(TERMINATING));
 }
 
 const SAVE_ERROR: &str = "Error during saving in-memory database";

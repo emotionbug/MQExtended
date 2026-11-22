@@ -49,6 +49,29 @@ Only generated client ids and clock-dependent expiry values are normalized, afte
 
 Failover tests have no Mosquitto counterpart; they assert MQTT's guarantees directly while killing (SIGKILL) and restarting nodes: persistent queues and DUP resends survive, a lost node's wills are published once, retained messages and subscriptions survive, takeover works across nodes, publishing resumes after leader loss.
 
+## Root process smoke
+
+The Linux `root-process` job runs on a dedicated GitHub-hosted VM after a push to `main`, not on pull requests. It builds as the runner user, then runs only the selected process test and the repository-built `mqextended` as root. It does not run a Mosquitto reference binary as root.
+
+The smoke checks the broker's actual UID and GID, numeric environment overrides, and file permissions before and after the privilege drop. It verifies that unreadable credentials prevent readiness and that the detached daemon redirects its descriptors, serves a Unix socket, and cleans up on shutdown. Files and sockets live in a temporary directory. The private PID namespace contains any detached child even if startup fails before it writes a pid file.
+
+To reproduce on a disposable Linux VM, first build as an unprivileged user. Save the `Executable` path printed by Cargo:
+
+```sh
+cargo test --locked -p mqx-server --test process --no-run
+```
+
+From a root shell **in that VM**, set `test_bin` to that absolute path and run:
+
+```sh
+env -i MQX_ROOT_PROCESS_SMOKE=1 \
+  /usr/bin/timeout --kill-after=5s 90s \
+  /usr/bin/unshare --fork --pid --mount-proc --kill-child -- \
+  "$test_bin" --exact root_only_identity_mapping_and_privilege_drop_order
+```
+
+Confirm the harness runs one test. Without `MQX_ROOT_PROCESS_SMOKE`, the root checks do not run. The smoke requires a non-root `nobody` account, UID/GID changes and supplementary groups, and access to the dropped process's `/proc` descriptors. A rootless namespace that maps only UID/GID 0 cannot exercise this. Do not change host policies or accounts to enable it; use the disposable runner instead.
+
 ## Commands
 
 ```sh

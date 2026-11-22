@@ -73,3 +73,29 @@ jobs:
           MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
         # mqx-bench's ignored test needs release builds; run it locally.
         run: cargo test --workspace --exclude mqx-bench --all-features -- --ignored
+
+  root-process:
+    # Only a trusted revision may run a repository-built binary as root.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and run the root process smoke
+        shell: bash
+        run: |
+          test_name=root_only_identity_mapping_and_privilege_drop_order
+          test_bin="$(
+            cargo test --locked -p mqx-server --test process --no-run --message-format=json |
+              jq -er 'select(.reason == "compiler-artifact" and .target.name == "process" and (.target.kind | index("test")) and .executable != null) | .executable'
+          )"
+          "$test_bin" --exact "$test_name" --list | grep -Fx "$test_name: test"
+          sudo -- /usr/bin/env -i MQX_ROOT_PROCESS_SMOKE=1 \
+            /usr/bin/timeout --kill-after=5s 90s \
+            /usr/bin/unshare --fork --pid --mount-proc --kill-child -- \
+            "$test_bin" --exact "$test_name"
