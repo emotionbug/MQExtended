@@ -103,7 +103,11 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(wire.pending_error.take().expect("failed first publication"));
     }
     let replies = wire
-        .prefetch(session.broker.receive_many(&session.live, publications))
+        .prefetch(
+            session
+                .broker
+                .receive_many(&session.live, publications, session.sparkplug_aware),
+        )
         .await?;
     for (id, reply) in ids.into_iter().zip(replies) {
         let reason = match reply {

@@ -360,13 +360,15 @@ impl BridgeSession {
             packet_id: packet.packet_id,
             payload: packet.payload,
         };
+        let publication = Publication {
+            packet,
+            properties,
+            expires,
+            now,
+        };
+        let birth = self.broker.0.config.sparkplug_aware && publication.sparkplug_birth();
         match self
-            .apply(Operation::Receive(Publication {
-                packet,
-                properties,
-                expires,
-                now,
-            }))
+            .apply(Operation::receive(publication, false, birth))
             .await?
         {
             Reply::NoChange => Ok(R::SUCCESS),

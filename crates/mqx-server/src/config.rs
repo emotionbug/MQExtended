@@ -1,4 +1,7 @@
 mod bridge;
+mod plugin;
+
+pub use plugin::FilePlugins;
 
 use std::{
     cmp::Ordering,
@@ -28,6 +31,9 @@ pub struct ServerConfig {
     pub security: SecurityConfig,
     /// The active plugin, even when it is not attached to a listener.
     pub dynamic_security: Option<DynamicSecurityConfig>,
+    pub sparkplug_aware: bool,
+    /// Explicit plugins in initialization order.
+    pub plugin_inventory: Vec<&'static str>,
     pub limits: BrokerLimits,
     pub log: LogConfig,
     pub user: String,
@@ -128,6 +134,7 @@ pub struct ListenerConfig {
     pub mount_point: Option<String>,
     pub security: SecurityConfig,
     pub dynamic_security: Option<DynamicSecurityConfig>,
+    pub sparkplug_aware: bool,
     pub tls: TlsConfig,
     pub bind_interface: Option<String>,
     pub websockets_origins: Vec<String>,
@@ -198,6 +205,7 @@ pub struct SecurityConfig {
     pub auto_id_prefix: Option<String>,
     pub password_file: Option<PathBuf>,
     pub acl_file: Option<PathBuf>,
+    pub file_plugins: FilePlugins,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -291,6 +299,7 @@ impl Default for SecurityConfig {
             auto_id_prefix: None,
             password_file: None,
             acl_file: None,
+            file_plugins: FilePlugins::default(),
         }
     }
 }
@@ -315,6 +324,7 @@ impl Default for ListenerConfig {
             mount_point: None,
             security: SecurityConfig::default(),
             dynamic_security: None,
+            sparkplug_aware: false,
             tls: TlsConfig::default(),
             bind_interface: None,
             websockets_origins: Vec::new(),
@@ -374,6 +384,16 @@ impl ServerConfig {
         parser.finish()
     }
 
+    /// Reads reloadable directives without parsing startup-only plugin declarations.
+    pub fn load_for_reload(path: impl AsRef<Path>) -> Result<Self, ServerError> {
+        let mut parser = Parser {
+            reloading: true,
+            ..Parser::default()
+        };
+        parser.read_file(path.as_ref(), false)?;
+        parser.finish()
+    }
+
     /// Parses the main configuration; relative filenames resolve from the working directory.
     pub fn parse(input: &str) -> Result<Self, ServerError> {
         let mut parser = Parser::default();
@@ -396,6 +416,7 @@ impl ServerConfig {
                     let mut listener = Self::local_listener(port);
                     listener.security.allow_anonymous = self.security.allow_anonymous;
                     listener.dynamic_security = dynamic_security.cloned();
+                    listener.sparkplug_aware = self.sparkplug_aware;
                     listener
                 })
                 .collect();
@@ -403,7 +424,7 @@ impl ServerConfig {
         self
     }
 
-    /// Returns the source of the listener's password file, ACL, and zero-length client id policy.
+    /// Returns the source of the built-in file directives and zero-length client ID policy.
     pub fn security_for<'a>(&'a self, listener: &'a ListenerConfig) -> &'a SecurityConfig {
         if self.per_listener_settings {
             &listener.security
@@ -431,20 +452,12 @@ impl ServerConfig {
     }
 }
 
-#[derive(Default)]
-struct DynamicSecurityPlugin {
-    name: Option<String>,
-    config_file: Option<PathBuf>,
-    password_init_file: Option<PathBuf>,
-    global: bool,
-    listeners: Vec<usize>,
-}
-
 struct Parser {
     config: ServerConfig,
     default_listener: Option<usize>,
     security_seen: bool,
-    dynamic_security_plugins: Vec<DynamicSecurityPlugin>,
+    plugins: Vec<plugin::Plugin>,
+    reloading: bool,
     log_dest_seen: bool,
     log_type_seen: bool,
     log_file_seen: bool,
@@ -462,6 +475,8 @@ impl Default for Parser {
                 set_tcp_nodelay: false,
                 security: SecurityConfig::default(),
                 dynamic_security: None,
+                sparkplug_aware: false,
+                plugin_inventory: Vec::new(),
                 limits: BrokerLimits::default(),
                 log: LogConfig::default(),
                 // Mosquitto src/conf.c: config__parse_args.
@@ -475,7 +490,8 @@ impl Default for Parser {
             },
             default_listener: None,
             security_seen: false,
-            dynamic_security_plugins: Vec::new(),
+            plugins: Vec::new(),
+            reloading: false,
             log_dest_seen: false,
             log_type_seen: false,
             log_file_seen: false,
@@ -548,57 +564,6 @@ impl Parser {
         }
         self.finish_plugins()?;
         Ok(self.config)
-    }
-
-    // Mosquitto plugins/dynamic-security/plugin.c: mosquitto_plugin_init.
-    fn finish_plugins(&mut self) -> Result<(), ServerError> {
-        let config = &mut self.config;
-        for plugin in self.dynamic_security_plugins.drain(..) {
-            // plugin_init.c: plugin__load_single skips a plugin without any
-            // scope; plugin__security_init_single then rejects its version 0.
-            if !plugin.global && plugin.listeners.is_empty() {
-                let name = plugin.name.as_deref().unwrap_or("dynamic-security");
-                return Err(ServerError::Arguments(format!(
-                    "Plugin '{name}' must be attached to a listener with plugin_use."
-                )));
-            }
-            let Some(config_file) = plugin.config_file else {
-                config.notices.push("Warning: Dynamic security plugin has no plugin_opt_config_file defined. The plugin will not be activated.".into());
-                continue;
-            };
-            let duplicate = || {
-                ServerError::Arguments(
-                    "Error: Dynamic security plugin can currently only be loaded once.".into(),
-                )
-            };
-            if config.dynamic_security.is_some() {
-                return Err(duplicate());
-            }
-            let dynamic_security = DynamicSecurityConfig {
-                config_file,
-                password_init_file: plugin.password_init_file,
-                // mosquitto.c loads v5 plugins before security_default.c registers
-                // built-ins. plugin_basic_auth.c/plugin_acl_check.c run global
-                // callbacks first, even when local callbacks registered earlier.
-                before_file: plugin.global || config.per_listener_settings,
-            };
-            if plugin.global {
-                for listener in &mut config.listeners {
-                    listener.dynamic_security = Some(dynamic_security.clone());
-                }
-            } else if !config.local_only {
-                for index in plugin.listeners {
-                    let listener = &mut config.listeners[index];
-                    if listener.dynamic_security.is_some() {
-                        // plugin_callbacks.c rejects repeat registrations in one scope.
-                        return Err(duplicate());
-                    }
-                    listener.dynamic_security = Some(dynamic_security.clone());
-                }
-            }
-            config.dynamic_security = Some(dynamic_security);
-        }
-        Ok(())
     }
 
     fn read_file(&mut self, path: &Path, included: bool) -> Result<(), ServerError> {
@@ -1123,7 +1088,9 @@ impl Parser {
             "enable_control_api" => self.config.enable_control_api = v.boolean()?,
             "disable_client_cert_date_checks" => {
                 let index = require_listener(*current, name)?;
-                self.config.listeners[index].tls.disable_client_cert_date_checks = v.boolean()?;
+                self.config.listeners[index]
+                    .tls
+                    .disable_client_cert_date_checks = v.boolean()?;
             }
             "tls_keyform" => {
                 if v.string()? == "engine" {
@@ -1135,118 +1102,10 @@ impl Parser {
             "tls_engine" | "tls_engine_kpass_sha1" => {
                 return Err(unsupported(name, "OpenSSL engines"));
             }
-            "auth_plugin" | "plugin" | "global_plugin" => {
-                let listener = if name == "global_plugin" || !self.config.per_listener_settings {
-                    None
-                } else {
-                    Some(require_listener(*current, name)?)
-                };
-                let index = self.load_plugin(name, None, v.value)?;
-                let loaded = &mut self.dynamic_security_plugins[index];
-                if let Some(listener) = listener {
-                    loaded.listeners.push(listener);
-                } else {
-                    loaded.global = true;
-                }
-                self.security_seen = true;
-                *plugin = Some(index);
-            }
-            "plugin_load" => {
-                let declaration = v.value.trim_start_matches(' ');
-                let (plugin_name, path) = declaration.split_once(' ').unwrap_or((declaration, ""));
-                if plugin_name.is_empty() {
-                    return Err(empty(name));
-                }
-                *plugin = Some(self.load_plugin(name, Some(plugin_name), path)?);
-            }
-            "plugin_use" => {
-                let explicit = current.filter(|index| Some(*index) != self.default_listener);
-                let listener = require_listener(explicit, name)?;
-                let plugin_name = v.string()?;
-                let index = self
-                    .find_plugin(&plugin_name)
-                    .ok_or_else(|| format!("Plugin '{plugin_name}' not previously loaded."))?;
-                self.dynamic_security_plugins[index]
-                    .listeners
-                    .push(listener);
-                *plugin = Some(index);
-            }
-            "auth_plugin_deny_special_chars" => {
-                if plugin.is_none() {
-                    return Err("An auth_plugin_deny_special_chars option exists in the config file without a plugin.".into());
-                }
-                // Mosquitto src/plugin_acl_check.c applies this to legacy plugins, not v5.
-                v.boolean()?;
-            }
-            _ if name.starts_with("auth_opt_") || name.starts_with("plugin_opt_") => {
-                let index = plugin.ok_or_else(|| {
-                    format!("The '{name}' option requires plugin/global_plugin/plugin_load to be defined first.")
-                })?;
-                let key = name
-                    .strip_prefix("plugin_opt_")
-                    .or_else(|| name.strip_prefix("auth_opt_"))
-                    .expect("plugin option prefix");
-                if key.len() < 3 {
-                    return Err("Invalid 'plugin_opt_' config option.".into());
-                }
-                if v.value.is_empty() {
-                    return Err(empty(key));
-                }
-                // config__read_file_core skips only leading spaces/tabs, and
-                // mosquitto_plugin_init keeps the last recognized option.
-                let path = v.value.trim_start_matches([' ', '\t']);
-                let loaded = &mut self.dynamic_security_plugins[index];
-                if key.eq_ignore_ascii_case("config_file") {
-                    loaded.config_file = Some(path.into());
-                } else if key.eq_ignore_ascii_case("password_init_file") {
-                    loaded.password_init_file = Some(path.into());
-                }
-            }
+            _ if plugin::is_directive(name) => self.plugin_directive(v, *current, plugin)?,
             _ => return Err(format!("Unknown configuration variable '{name}'.").into()),
         }
         Ok(())
-    }
-
-    fn find_plugin(&self, name: &str) -> Option<usize> {
-        self.dynamic_security_plugins
-            .iter()
-            .position(|plugin| plugin.name.as_deref() == Some(name))
-    }
-
-    // Mosquitto src/conf.c: config__plugin_load. Match the distribution's
-    // basename without opening a shared library or resolving the path.
-    fn load_plugin(
-        &mut self,
-        directive: &str,
-        name: Option<&str>,
-        path: &str,
-    ) -> ParseResult<usize> {
-        if let Some(name) = name
-            && self.find_plugin(name).is_some()
-        {
-            return Err(format!("Duplicate plugin name '{name}'.").into());
-        }
-        if path.is_empty() {
-            return Err(match name {
-                Some(name) => format!("Missing plugin path for plugin name '{name}'.").into(),
-                None => empty(directive),
-            });
-        }
-        let basename = path.rsplit(std::path::is_separator).next().unwrap_or(path);
-        if !matches!(
-            basename,
-            "mosquitto_dynamic_security.so"
-                | "mosquitto_dynamic_security.dll"
-                | "mosquitto_dynamic_security.dylib"
-        ) {
-            return Err(unsupported(directive, &format!("plugin '{path}'")));
-        }
-        let index = self.dynamic_security_plugins.len();
-        self.dynamic_security_plugins.push(DynamicSecurityPlugin {
-            name: name.map(str::to_owned),
-            ..DynamicSecurityPlugin::default()
-        });
-        Ok(index)
     }
 
     fn deprecated(&mut self, name: &str, alternative: &str) {

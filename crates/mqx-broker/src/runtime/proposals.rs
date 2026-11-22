@@ -99,7 +99,12 @@ impl Proposal {
             .iter()
             .fold((base, 0), |(input, reply), operation| {
                 let (body, result) = match operation {
-                    Operation::Receive(publish) | Operation::ReceiveAdmitted(publish) => {
+                    Operation::Receive(publish)
+                    | Operation::ReceiveAdmitted(publish)
+                    | Operation::ReceiveBirth {
+                        publication: publish,
+                        ..
+                    } => {
                         let body = publication_cost(
                             publish.packet.payload.len(),
                             publish.packet.topic.len(),
@@ -107,7 +112,7 @@ impl Proposal {
                         );
                         (body, body + 128 * 1024)
                     }
-                    Operation::Forward(message, _) => (
+                    Operation::Forward(message, _) | Operation::ForwardBirth { message, .. } => (
                         publication_cost(
                             message.payload.len(),
                             message.topic.len(),

@@ -8,7 +8,7 @@ mod transport;
 use std::{io, path::PathBuf};
 
 pub use config::{
-    BrokerLimits, DynamicSecurityConfig, ListenerConfig, ListenerProtocol, LogConfig,
+    BrokerLimits, DynamicSecurityConfig, FilePlugins, ListenerConfig, ListenerProtocol, LogConfig,
     LogDestination, LogType, PersistenceConfig, ProxyProtocol, SecurityConfig, ServerConfig,
     SocketDomain, TlsConfig, TlsVersion, parse_command_line_port,
 };

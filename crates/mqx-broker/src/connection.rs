@@ -203,6 +203,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut session = Active {
         broker,
         live,
+        sparkplug_aware: info.listener.sparkplug_aware,
         graceful: false,
         expiry_override: None,
         detached: false,
@@ -732,6 +733,7 @@ async fn timeout(deadline: Option<Instant>) {
 struct Active<'a> {
     broker: &'a Broker,
     live: Arc<Live>,
+    sparkplug_aware: bool,
     graceful: bool,
     expiry_override: Option<u32>,
     detached: bool,
@@ -850,11 +852,12 @@ impl Active<'_> {
     }
 
     async fn receive(&self, publication: Publication) -> Result<Reply, BrokerError> {
+        let birth = self.sparkplug_aware && publication.sparkplug_birth();
         let qos = publication.packet.qos;
         let id = publication.packet.packet_id;
         let now = publication.now;
         let config = &self.broker.0.config;
-        let (message, reason) = match self.broker.receive(&self.live, publication).await? {
+        let (message, reason) = match self.broker.receive(&self.live, publication, birth).await? {
             Reply::ReceiveLocal(message, reason) => (message, reason),
             reply => return Ok(reply),
         };
@@ -883,10 +886,19 @@ impl Active<'_> {
             }
             Some(message) => {
                 let allowed = inbox.lock().unwrap().can_publish_qos1(id, config);
-                if allowed {
+                if !allowed {
+                    self.broker.0.traffic.add(Metric::Dropped, 1);
+                }
+                if birth {
+                    self.act(Operation::ForwardBirth {
+                        message,
+                        now,
+                        admitted: allowed,
+                    })
+                    .await?
+                } else if allowed {
                     self.act(Operation::Forward(message, now)).await?
                 } else {
-                    self.broker.0.traffic.add(Metric::Dropped, 1);
                     Reply::PublishReason(R::QUOTA_EXCEEDED.0)
                 }
             }

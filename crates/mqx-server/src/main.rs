@@ -1,4 +1,5 @@
 mod dynsec_config;
+mod file_security;
 mod persistence;
 mod process;
 
@@ -14,7 +15,6 @@ use std::{
     time::Duration,
 };
 
-use mqx_auth::{AclFileError, PasswordFile};
 use mqx_bridge::Bridges;
 use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, SecurityHandle};
 use mqx_cluster::ClusterError;
@@ -25,6 +25,7 @@ use mqx_server::{
     parse_command_line_port, startup_log,
 };
 
+use file_security::SecurityHandles;
 use persistence::Persistence;
 use process::{PidFile, StartupError, TERMINATING};
 
@@ -254,6 +255,7 @@ fn add_local_http(config: &mut ServerConfig) {
                 .listeners
                 .first()
                 .and_then(|listener| listener.dynamic_security.clone()),
+            sparkplug_aware: config.sparkplug_aware,
             ..ListenerConfig::default()
         });
     }
@@ -264,7 +266,7 @@ fn reload_config(
     cli: &Cli,
     bound: &ServerConfig,
 ) -> Result<ServerConfig, ServerError> {
-    let mut fresh = ServerConfig::load(path)?.with_command_line_ports(&cli.ports);
+    let mut fresh = ServerConfig::load_for_reload(path)?.with_command_line_ports(&cli.ports);
     add_local_http(&mut fresh);
     if let Some(location) = std::env::var_os("MOSQUITTO_PERSISTENCE_LOCATION") {
         fresh.persistence.location = Some(location.into());
@@ -291,6 +293,7 @@ fn reload_config(
             .ok_or_else(changed_layout)?;
         fresh.listeners.swap(i, i + offset);
     }
+    fresh.retain_startup_plugins(bound)?;
     Ok(fresh)
 }
 
@@ -302,8 +305,13 @@ async fn run_broker(
     shutdown: &mut ShutdownLog,
 ) -> Result<(), ServerError> {
     add_local_http(&mut config);
-    let live_log = std::cell::RefCell::new(config.log.clone());
-    let security = Arc::new(security_handles(&config)?);
+    let live_config = std::cell::RefCell::new(None);
+    let has_plugin_files = config.security.file_plugins.paths() != (None, None)
+        || config
+            .listeners
+            .iter()
+            .any(|listener| listener.security.file_plugins.paths() != (None, None));
+    let security = Arc::new(SecurityHandles::new(&config)?);
     let policies: Arc<Vec<Arc<ListenerPolicy>>> = Arc::new(
         config
             .listeners
@@ -509,16 +517,15 @@ async fn run_broker(
                             cli.override_log_types(&mut fresh.log);
                             broker.set_connection_messages(fresh.log.connection_messages);
                             logging.reload(&fresh.log);
-                            live_log.replace(fresh.log);
                             if let Some(persistence) = &persistence {
-                                persistence.reload(fresh.persistence);
+                                persistence.reload(std::mem::take(&mut fresh.persistence));
                             }
                             broker.start_sys_tree(fresh.sys_interval);
-                            bridges.borrow_mut().reload(fresh.bridges);
+                            bridges.borrow_mut().reload(std::mem::take(&mut fresh.bridges));
                             if let Some((membership, (node_id, format))) =
                                 membership.as_ref().zip(cluster_identity)
                             {
-                                match fresh.cluster {
+                                match fresh.cluster.take() {
                                     Some(cluster) if cluster.node_id == node_id && cluster.state_format == format => {
                                         if cluster.membership_generation != 0
                                             && let Err(error) = membership.configure(cluster.membership_generation, cluster.peers)
@@ -529,14 +536,28 @@ async fn run_broker(
                                     _ => tracing::warn!("Changing cluster identity or state format requires a restart"),
                                 }
                             }
+                            live_config.replace(Some(fresh));
                         }
                         Err(error) => {
                             tracing::warn!("Unable to reload configuration: {error}");
-                            logging.reload(&live_log.borrow());
+                            let reload = {
+                                let old = live_config.borrow();
+                                let old = old.as_ref().unwrap_or(&config);
+                                logging.reload(&old.log);
+                                // signals.c still calls plugin reload callbacks
+                                // when the configuration reread fails.
+                                has_plugin_files.then(|| security.reload(old)).transpose()
+                            };
+                            if reload?.is_some()
+                                && membership.as_ref().is_none_or(|membership| membership.is_serving())
+                                && registered.load(Ordering::Acquire)
+                            {
+                                security.register(&broker).await?;
+                            }
                         }
                     }
                 } else {
-                    logging.reload(&live_log.borrow());
+                    logging.reload(&config.log);
                 }
                 Ok::<_, ServerError>(())
             },
@@ -558,7 +579,10 @@ async fn run_broker(
                     use std::io::Write as _;
                     let _ = std::io::stdout().lock().write_all(broker.subscription_tree().as_bytes());
                 }
-                BrokerSignal::Rotate => logging.reload(&live_log.borrow()),
+                BrokerSignal::Rotate => {
+                    let live = live_config.borrow();
+                    logging.reload(&live.as_ref().unwrap_or(&config).log);
+                }
                 BrokerSignal::Reload => unreachable!("handled by the listener"),
             },
             || broker.shutdown(),
@@ -621,6 +645,7 @@ fn broker_config(config: &ServerConfig) -> BrokerConfig {
         global_max_connections: 0,
         global_max_clients: limits.global_max_clients,
         connection_messages: config.log.connection_messages,
+        sparkplug_aware: config.sparkplug_aware,
     }
 }
 
@@ -651,130 +676,7 @@ fn listener_policy(
         max_topic_alias: listener.max_topic_alias,
         max_topic_alias_broker: listener.max_topic_alias_broker,
         mount_point: listener.mount_point.clone(),
+        sparkplug_aware: listener.sparkplug_aware,
         security,
-    }
-}
-
-/// One handle per listener with `per_listener_settings true`, otherwise one handle shared
-/// by every listener.
-struct SecurityHandles {
-    handles: Vec<SecurityHandle>,
-    per_listener: bool,
-}
-
-impl SecurityHandles {
-    fn for_listener(&self, index: usize) -> SecurityHandle {
-        let (group, slot) = if self.per_listener {
-            (index, 0)
-        } else {
-            (0, index)
-        };
-        self.handles[group].clone().for_listener(slot)
-    }
-
-    fn reload(&self, config: &ServerConfig) -> Result<(), ServerError> {
-        let fresh = load_credentials(config)?;
-        for (index, (handle, credentials)) in self.handles.iter().zip(fresh).enumerate() {
-            let anonymous = if self.per_listener {
-                Box::from([config.allow_anonymous_for(&config.listeners[index])]) as Box<[bool]>
-            } else {
-                config
-                    .listeners
-                    .iter()
-                    .map(|l| config.allow_anonymous_for(l))
-                    .collect()
-            };
-            credentials.install(|password, acl| handle.replace_text(password, acl, anonymous))?;
-        }
-        Ok(())
-    }
-
-    async fn register(&self, broker: &Broker) -> Result<(), ServerError> {
-        for handle in &self.handles {
-            broker
-                .register_security(handle)
-                .await
-                .map_err(ServerError::Cluster)?;
-        }
-        Ok(())
-    }
-}
-
-fn security_handles(config: &ServerConfig) -> Result<SecurityHandles, ServerError> {
-    Ok(SecurityHandles {
-        handles: load_credentials(config)?
-            .into_iter()
-            .enumerate()
-            .map(|(index, credentials)| {
-                credentials.install(|password, acl| {
-                    // Listeners use the same security IDs on every cluster node. Zero is reserved.
-                    SecurityHandle::with_id(index as u64 + 1, password, acl)
-                })
-            })
-            .collect::<Result<_, _>>()?,
-        per_listener: config.per_listener_settings,
-    })
-}
-
-struct Credentials<'a> {
-    password: Option<PasswordFile>,
-    acl: Option<(&'a Path, Vec<u8>)>,
-}
-
-impl Credentials<'_> {
-    fn install<R>(
-        self,
-        import: impl FnOnce(Option<PasswordFile>, Option<Vec<u8>>) -> Result<R, AclFileError>,
-    ) -> Result<R, ServerError> {
-        let (path, acl) = match self.acl {
-            Some((path, text)) => (Some(path), Some(text)),
-            None => (None, None),
-        };
-        import(self.password, acl).map_err(|source| ServerError::AclFile {
-            path: path
-                .expect("ACL parsing failed only when an ACL was supplied")
-                .into(),
-            source,
-        })
-    }
-}
-
-fn load_credentials(config: &ServerConfig) -> Result<Vec<Credentials<'_>>, ServerError> {
-    fn load(security: &SecurityConfig) -> Result<Credentials<'_>, ServerError> {
-        let password = security
-            .password_file
-            .as_ref()
-            .map(|path| {
-                PasswordFile::load(path).map_err(|source| ServerError::PasswordFile {
-                    path: path.clone(),
-                    source,
-                })
-            })
-            .transpose()?;
-        let acl = security
-            .acl_file
-            .as_deref()
-            .map(|path| {
-                std::fs::read(path)
-                    .map(|data| (path, data))
-                    .map_err(|source| ServerError::AclFile {
-                        path: path.into(),
-                        source: AclFileError::Io {
-                            path: path.into(),
-                            source,
-                        },
-                    })
-            })
-            .transpose()?;
-        Ok(Credentials { password, acl })
-    }
-    if config.per_listener_settings {
-        config
-            .listeners
-            .iter()
-            .map(|listener| load(config.security_for(listener)))
-            .collect()
-    } else {
-        Ok(vec![load(&config.security)?])
     }
 }

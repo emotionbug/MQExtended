@@ -37,6 +37,29 @@ pub(crate) struct Message {
 }
 
 impl Message {
+    pub(crate) const CERTIFICATE_PREFIX: &str = "$sparkplug/certificates/";
+
+    pub(crate) fn sparkplug_certificate(&self, retain: bool) -> Arc<Self> {
+        let mut topic = String::with_capacity(Self::CERTIFICATE_PREFIX.len() + self.topic.len());
+        topic.push_str(Self::CERTIFICATE_PREFIX);
+        topic.push_str(&self.topic);
+        Arc::new(Self {
+            source: Publisher {
+                id: Arc::default(),
+                username: None,
+                security: 0,
+                dynamic_security: None,
+            },
+            topic: topic.into_boxed_str(),
+            payload: self.payload.clone(),
+            qos: self.qos,
+            retain,
+            properties: self.properties.clone(),
+            // property__process_publish removes expiry from callback properties.
+            expires: None,
+        })
+    }
+
     // database.c: db__message_store reserves zero and UINT32_MAX for no expiry.
     pub(crate) fn expiry(now: Duration, interval: u32) -> Option<Duration> {
         (interval != 0 && interval != u32::MAX)

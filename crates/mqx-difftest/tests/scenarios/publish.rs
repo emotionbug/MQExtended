@@ -47,6 +47,74 @@ fn acl_config() -> BrokerConfig<'static> {
     }
 }
 
+fn sparkplug_config() -> String {
+    let build = std::path::PathBuf::from(
+        std::env::var_os("MOSQUITTO_PLUGIN_BUILD_DIR").expect("set MOSQUITTO_PLUGIN_BUILD_DIR"),
+    );
+    let module = build.join(format!(
+        "plugins/sparkplug-aware/mosquitto_sparkplug_aware.{}",
+        std::env::consts::DLL_EXTENSION
+    ));
+    format!("allow_anonymous true\nplugin {}", module.display())
+}
+
+// plugins/sparkplug-aware/on_message.c and test/broker/20-sparkplug-aware.py.
+scenario!(
+    sparkplug_certificates,
+    BrokerConfig {
+        conf: &sparkplug_config(),
+        acl: Some("topic read $sparkplug/#\ntopic readwrite spBv1.0/group/#\n"),
+        ..BrokerConfig::default()
+    }
+);
+fn sparkplug_certificates(h: &mut Harness) {
+    let reader = client(h, "certificate-reader");
+    let publisher = client(h, "edge-node");
+    let node = "spBv1.0/group/NBIRTH/node";
+    let node_cert = "$sparkplug/certificates/spBv1.0/group/NBIRTH/node";
+    let device = "spBv1.0/group/DBIRTH/node/device";
+    let device_cert = "$sparkplug/certificates/spBv1.0/group/DBIRTH/node/device";
+    subscribe(h, reader, 1, &[("$sparkplug/certificates/#", Q1)]);
+    for ignored in [
+        "spBv1.0/group/NDATA/node",
+        "spBv1.0/group/DBIRTH/node",
+        "spBv1.0/group/NBIRTH/node/extra",
+        "spBv1.0/denied/NBIRTH/node",
+    ] {
+        publish_from(h, publisher, publish(ignored, b"not a certificate", Q1, 1));
+    }
+    // The plugin observes the incoming QoS 2 PUBLISH, not its later PUBREL.
+    send(
+        h,
+        publisher,
+        Packet::Publish(publish(node, b"\0birth", Q2, 2)),
+    );
+    received(h, publisher, Packet::PubRec(id(2)));
+    accept_publish(h, reader, publish(node_cert, b"\0birth", Q1, 1));
+    // Keep the QoS 2 flight pending while the same client sends a QoS 1 birth.
+    publish_from(h, publisher, publish(device, b"first device", Q1, 8));
+    accept_publish(h, reader, publish(device_cert, b"first device", Q1, 2));
+    send(h, publisher, Packet::PubRel(id(2)));
+    received(h, publisher, Packet::PubComp(id(2)));
+    publish_from(h, publisher, publish(device, b"device", Q0, 0));
+    accept_publish(h, reader, publish(device_cert, b"device", Q0, 0));
+
+    // An empty BIRTH clears its retained copy without touching the other one.
+    publish_from(h, publisher, publish(node, b"", Q1, 3));
+    accept_publish(h, reader, publish(node_cert, b"", Q1, 3));
+    let late = client(h, "late-reader");
+    subscribe(h, late, 1, &[("$sparkplug/certificates/#", Q1)]);
+    accept_publish(
+        h,
+        late,
+        Publish {
+            retain: true,
+            ..publish(device_cert, b"device", Q0, 0)
+        },
+    );
+    ping(h, late);
+}
+
 // test/broker/03-pattern-matching.py: # includes its parent; + matches an empty level.
 scenario!(wildcard_matching, config(ANONYMOUS));
 fn wildcard_matching(h: &mut Harness) {

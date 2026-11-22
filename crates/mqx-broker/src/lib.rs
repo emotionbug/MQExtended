@@ -57,6 +57,8 @@ pub struct BrokerConfig {
     pub global_max_connections: usize,
     pub global_max_clients: usize,
     pub connection_messages: bool,
+    /// Global plugin callbacks also receive publications from outgoing bridges.
+    pub sparkplug_aware: bool,
 }
 
 impl Default for BrokerConfig {
@@ -85,6 +87,7 @@ impl Default for BrokerConfig {
             global_max_connections: 0,
             global_max_clients: 0,
             connection_messages: true,
+            sparkplug_aware: false,
         }
     }
 }
@@ -105,6 +108,7 @@ pub struct ListenerPolicy {
     pub max_topic_alias: u16,
     pub max_topic_alias_broker: u16,
     pub mount_point: Option<String>,
+    pub sparkplug_aware: bool,
     pub security: SecurityHandle,
 }
 
@@ -124,6 +128,7 @@ impl Default for ListenerPolicy {
             max_topic_alias: 10,
             max_topic_alias_broker: 10,
             mount_point: None,
+            sparkplug_aware: false,
             security: SecurityHandle::default(),
         }
     }

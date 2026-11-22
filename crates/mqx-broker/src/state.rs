@@ -194,6 +194,15 @@ impl Publication {
         }
     }
 
+    // plugins/sparkplug-aware/on_message.c: plugin__message_in_callback.
+    pub(crate) fn sparkplug_birth(&self) -> bool {
+        let topic = self.packet.topic.as_str();
+        topic.len() <= usize::from(u16::MAX) - Message::CERTIFICATE_PREFIX.len()
+            && topic.starts_with("spBv1.0/")
+            && (mqx_topic::matches("spBv1.0/+/NBIRTH/+", topic) == Ok(true)
+                || mqx_topic::matches("spBv1.0/+/DBIRTH/+/+", topic) == Ok(true))
+    }
+
     pub(crate) fn into_message(self, source: Publisher) -> Arc<Message> {
         Arc::new(Message {
             source,
@@ -251,9 +260,32 @@ pub(crate) enum Operation {
     // Only proposed when reserving a QoS 0 behind a lone expired flight.
     // ReserveOutbound must retain its original apply semantics for WAL replay.
     ReserveOutboundWithQos0Expiry(Duration),
+    ReceiveBirth {
+        publication: Publication,
+        admitted_local: bool,
+    },
+    // Local nontrivial QoS 1 admission completes after the ACL decision.
+    ForwardBirth {
+        message: Arc<Message>,
+        now: Duration,
+        admitted: bool,
+    },
 }
 
 impl Operation {
+    pub(crate) fn receive(publication: Publication, admitted_local: bool, birth: bool) -> Self {
+        if birth {
+            Self::ReceiveBirth {
+                publication,
+                admitted_local,
+            }
+        } else if admitted_local {
+            Self::ReceiveAdmitted(publication)
+        } else {
+            Self::Receive(publication)
+        }
+    }
+
     pub(crate) fn subscribe(filters: Vec<SubscriptionRequest>, now: Duration) -> Self {
         if filters.iter().any(|entry| {
             entry.filter.starts_with('$')
@@ -1244,7 +1276,15 @@ impl State {
         else {
             return Reply::Stale;
         };
-        let admitted_local = matches!(&operation, Operation::ReceiveAdmitted(_));
+        let admitted_local = matches!(
+            &operation,
+            Operation::ReceiveAdmitted(_)
+                | Operation::ReceiveBirth {
+                    admitted_local: true,
+                    ..
+                }
+        );
+        let birth = matches!(&operation, Operation::ReceiveBirth { .. });
         let check_root_leaf = matches!(&operation, Operation::SubscribeDollarRoot(..));
         match operation {
             Operation::Disconnect {
@@ -1387,7 +1427,9 @@ impl State {
                 self.persistence_changes += 1;
                 Reply::Unsubscribed(reasons)
             }
-            Operation::Receive(publication) | Operation::ReceiveAdmitted(publication) => {
+            Operation::Receive(publication)
+            | Operation::ReceiveAdmitted(publication)
+            | Operation::ReceiveBirth { publication, .. } => {
                 let publish = &publication.packet;
                 let rejection = publish_rejection(&self.config, acl, session, publish);
                 let qos = publish.qos;
@@ -1405,34 +1447,41 @@ impl State {
                 }
                 let now = publication.now;
                 let message = publication.into_message(session.publisher.clone());
-                if let Some(id) = id.filter(|_| !admitted_local) {
-                    let Some(inbox) = &mut session.inbox else {
-                        return Reply::ReceiveLocal(Some(message), R::SUCCESS.0);
-                    };
-                    if qos == QoS::ExactlyOnce {
-                        return match inbox.receive(id, message, &self.config) {
-                            Receive::Accepted => Reply::NoChange,
-                            Receive::Quota => {
-                                self.sys_counters.add(Metric::Dropped, 1);
-                                if session.v5.is_some() {
-                                    inbox.credit_incoming();
-                                }
-                                Reply::PublishReason(R::QUOTA_EXCEEDED.0)
-                            }
-                            Receive::Duplicate => Reply::ProtocolError,
+                // handle__accepted_publish: the message-in callback runs after
+                // ACL checks but before quota, duplicate handling and PUBREL.
+                let deferred =
+                    !admitted_local && qos == QoS::AtLeastOnce && session.inbox.is_none();
+                let copy = (birth && !deferred)
+                    .then(|| message.sparkplug_certificate(self.config.retain_available));
+                let reply = 'publish: {
+                    if let Some(id) = id.filter(|_| !admitted_local) {
+                        let Some(inbox) = &mut session.inbox else {
+                            break 'publish Reply::ReceiveLocal(Some(message), R::SUCCESS.0);
                         };
+                        if qos == QoS::ExactlyOnce {
+                            break 'publish match inbox.receive(id, message, &self.config) {
+                                Receive::Accepted => Reply::NoChange,
+                                Receive::Quota => {
+                                    self.sys_counters.add(Metric::Dropped, 1);
+                                    if session.v5.is_some() {
+                                        inbox.credit_incoming();
+                                    }
+                                    Reply::PublishReason(R::QUOTA_EXCEEDED.0)
+                                }
+                                Receive::Duplicate => Reply::ProtocolError,
+                            };
+                        }
+                        if !inbox.can_publish_qos1(id, &self.config) {
+                            self.sys_counters.add(Metric::Dropped, 1);
+                            break 'publish Reply::PublishReason(R::QUOTA_EXCEEDED.0);
+                        }
                     }
-                    if !inbox.can_publish_qos1(id, &self.config) {
-                        self.sys_counters.add(Metric::Dropped, 1);
-                        return Reply::PublishReason(R::QUOTA_EXCEEDED.0);
-                    }
+                    self.forward(message, now, effects)
+                };
+                if let Some(copy) = copy {
+                    self.publish(copy, now, effects);
                 }
-                let matched = self.publish(message, now, effects);
-                Reply::PublishReason(if matched {
-                    R::SUCCESS.0
-                } else {
-                    R::NO_MATCHING_SUBSCRIBERS.0
-                })
+                reply
             }
             Operation::Release(id, now) => {
                 let Some(inbox) = &mut session.inbox else {
@@ -1443,12 +1492,20 @@ impl State {
                 }
                 Reply::NoChange
             }
-            Operation::Forward(message, now) => {
-                Reply::PublishReason(if self.publish(message, now, effects) {
-                    R::SUCCESS.0
+            Operation::Forward(message, now) => self.forward(message, now, effects),
+            Operation::ForwardBirth {
+                message,
+                now,
+                admitted,
+            } => {
+                let copy = message.sparkplug_certificate(self.config.retain_available);
+                let reply = if admitted {
+                    self.forward(message, now, effects)
                 } else {
-                    R::NO_MATCHING_SUBSCRIBERS.0
-                })
+                    Reply::PublishReason(R::QUOTA_EXCEEDED.0)
+                };
+                self.publish(copy, now, effects);
+                reply
             }
             Operation::Ack(id, ack) => {
                 let Some(inbox) = &mut session.inbox else {
@@ -1491,6 +1548,19 @@ impl State {
                 }
             }
         }
+    }
+
+    fn forward(
+        &mut self,
+        message: Arc<Message>,
+        now: Duration,
+        effects: &mut Vec<Effect>,
+    ) -> Reply {
+        Reply::PublishReason(if self.publish(message, now, effects) {
+            R::SUCCESS.0
+        } else {
+            R::NO_MATCHING_SUBSCRIBERS.0
+        })
     }
 
     fn remove_session(&mut self, id: &Arc<str>) {

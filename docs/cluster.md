@@ -98,6 +98,8 @@ When upgrading a build that predates the MQTT broker control API, use a cold upg
 
 Also use a cold upgrade when crossing the introduction of `SubscribeDollarRoot` and `ReserveOutboundWithQos0Expiry`. A subscription such as `$app/#`, or a QoS 0 delivery past an expired in-flight message, can emit these commands even with `cluster_state_format 1`. Drain clients and bridge traffic, stop and back up the cluster, upgrade every voter and learner, then restore traffic. New binaries replay historical `Subscribe` and `ReserveOutbound` entries with their original semantics; old binaries cannot replay the new commands.
 
+Do not enable `mosquitto_sparkplug_aware` until every node runs a build that supports it. The first matching birth publication can write `ReceiveBirth` or `ForwardBirth` to the log. Existing log entries are not reinterpreted when you enable the plugin.
+
 ## What clients observe when a node fails
 
 - Clients connected to the failed node lose their connection and reconnect through the load balancer to a surviving node.

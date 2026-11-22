@@ -662,6 +662,7 @@ impl Broker {
         &self,
         live: &Live,
         publication: Publication,
+        birth: bool,
     ) -> Result<Reply, BrokerError> {
         self.0.traffic.add(
             Metric::PayloadReceived,
@@ -675,22 +676,16 @@ impl Broker {
                 .inbox
                 .as_ref()
                 .is_some_and(|inbox| inbox.lock().unwrap().simple_qos1());
-        if let Log::Replicated(log) = &self.0.log
+        if !birth
+            && let Log::Replicated(log) = &self.0.log
             && let Some((index, route)) = log.plan(live, &publication, admitted_local)
         {
             return self
                 .forward_fast(log, live, index, route, publication)
                 .await;
         }
-        self.act(
-            live,
-            if admitted_local {
-                Operation::ReceiveAdmitted(publication)
-            } else {
-                Operation::Receive(publication)
-            },
-        )
-        .await
+        self.act(live, Operation::receive(publication, admitted_local, birth))
+            .await
     }
 
     // Only a publisher with no possible self-delivery may aggregate PUBACKs:
@@ -714,6 +709,7 @@ impl Broker {
         &self,
         live: &Live,
         publications: Vec<Publication>,
+        sparkplug_aware: bool,
     ) -> Result<Vec<Reply>, BrokerError> {
         let Log::Replicated(log) = &self.0.log else {
             unreachable!()
@@ -744,7 +740,12 @@ impl Broker {
                 continue;
             }
             let local = publication.packet.qos == QoS::AtLeastOnce && live.inbox.is_some();
-            let mut plan = log.plan(live, &publication, local);
+            let birth = sparkplug_aware && publication.sparkplug_birth();
+            let mut plan = if birth {
+                None
+            } else {
+                log.plan(live, &publication, local)
+            };
             if plan.is_some() && !durable.is_empty() {
                 responses.extend(
                     log.propose(live.lease.clone(), std::mem::take(&mut durable))
@@ -766,11 +767,7 @@ impl Broker {
                     return Ok(responses);
                 }
             } else {
-                durable.push(if local {
-                    Operation::ReceiveAdmitted(publication)
-                } else {
-                    Operation::Receive(publication)
-                });
+                durable.push(Operation::receive(publication, local, birth));
             }
         }
         if !durable.is_empty() {
