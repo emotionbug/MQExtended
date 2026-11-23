@@ -73,7 +73,32 @@ pub(super) fn parse(
     if options.require_certificate && !tls.certificate_verified {
         return Err(ProxyError::CertificateRequired);
     }
-    let addresses = match family {
+    Ok(Some((
+        ProxyInfo::Proxied {
+            addresses: addresses(family, body),
+            tls: tls.owned(),
+        },
+        leftover,
+    )))
+}
+
+/// The addresses of a complete PROXY v2 frame whose TLVs were rejected.
+/// Mosquitto src/proxy_v2.c:proxy_v2__read sets the context address before
+/// read_tlv, so its rejection notices name the proxied source.
+pub(super) fn rejected_addresses(input: &[u8]) -> Option<ProxyAddresses> {
+    let preamble = input.first_chunk::<FIXED_LEN>()?;
+    let family = match preamble[13] {
+        0x11 => Family::Ipv4,
+        0x21 => Family::Ipv6,
+        0x31 => Family::Unix,
+        _ => return None,
+    };
+    let frame = input.get(..framed_len(preamble))?;
+    Some(addresses(family, &frame[FIXED_LEN..]))
+}
+
+fn addresses(family: Family, body: &[u8]) -> ProxyAddresses {
+    match family {
         Family::Ipv4 => ProxyAddresses::Ip {
             source: SocketAddr::from((
                 Ipv4Addr::new(body[0], body[1], body[2], body[3]),
@@ -97,14 +122,7 @@ pub(super) fn parse(
             }
         }
         Family::Unspecified => unreachable!(),
-    };
-    Ok(Some((
-        ProxyInfo::Proxied {
-            addresses,
-            tls: tls.owned(),
-        },
-        leftover,
-    )))
+    }
 }
 
 fn port(body: &[u8], offset: usize) -> u16 {

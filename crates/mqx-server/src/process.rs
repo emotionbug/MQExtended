@@ -260,17 +260,50 @@ impl Drop for PidFile {
     }
 }
 
-// Mosquitto src/mosquitto.c: main sends only READY=1, ignores send errors and
+// Mosquitto src/mosquitto.c: main sends READY=1, ignores send errors and
 // passes unset_environment=0 to sd_notify. No STOPPING=1 is sent.
 pub(crate) fn notify_ready() {
+    notify(b"READY=1");
+}
+
+/// Mosquitto src/watchdog.c: watchdog__check sends WATCHDOG=1 without
+/// checking WATCHDOG_PID.
+pub(crate) fn notify_watchdog() {
+    notify(b"WATCHDOG=1");
+}
+
+fn notify(message: &[u8]) {
     #[cfg(unix)]
     if let Some(path) = env::var_os("NOTIFY_SOCKET") {
-        let _ = notify_socket(&path);
+        let _ = notify_socket(&path, message);
     }
+    #[cfg(not(unix))]
+    let _ = message;
+}
+
+/// The serve loop's watchdog period from WATCHDOG_USEC, if it asks for one.
+pub(crate) fn watchdog() -> Option<std::time::Duration> {
+    #[cfg(unix)]
+    return env::var_os("WATCHDOG_USEC")
+        .as_deref()
+        .and_then(watchdog_period);
+    #[cfg(not(unix))]
+    None
+}
+
+/// Mosquitto src/watchdog.c: watchdog__init halves WATCHDOG_USEC in whole
+/// seconds; watchdog__check pings when `now > next_ping` with second
+/// resolution, so the first ping follows within a second and the period is
+/// one second longer than the half.
+#[cfg(unix)]
+fn watchdog_period(value: &std::ffi::OsStr) -> Option<std::time::Duration> {
+    let usec = parse_long(value, 10).filter(|&usec| usec > 0)?;
+    let half = u64::try_from(usec / 1_000_000 / 2).ok()?;
+    (half > 0).then(|| std::time::Duration::from_secs(half + 1))
 }
 
 #[cfg(unix)]
-fn notify_socket(path: &std::ffi::OsStr) -> io::Result<()> {
+fn notify_socket(path: &std::ffi::OsStr, message: &[u8]) -> io::Result<()> {
     use std::os::unix::net::UnixDatagram;
 
     let socket = UnixDatagram::unbound()?;
@@ -287,7 +320,7 @@ fn notify_socket(path: &std::ffi::OsStr) -> io::Result<()> {
         }
 
         return socket
-            .send_to_addr(b"READY=1", &SocketAddr::from_abstract_name(name)?)
+            .send_to_addr(message, &SocketAddr::from_abstract_name(name)?)
             .map(|_| ());
     }
     let path = Path::new(path);
@@ -297,7 +330,7 @@ fn notify_socket(path: &std::ffi::OsStr) -> io::Result<()> {
             "NOTIFY_SOCKET is not an absolute path",
         ));
     }
-    socket.send_to(b"READY=1", path).map(|_| ())
+    socket.send_to(message, path).map(|_| ())
 }
 
 #[cfg(test)]
@@ -353,6 +386,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn watchdog_period_follows_watchdog_init_parsing() {
+        use std::{ffi::OsStr, time::Duration};
+
+        assert_eq!(
+            watchdog_period(OsStr::new("180000000")),
+            Some(Duration::from_secs(91))
+        );
+        assert_eq!(
+            watchdog_period(OsStr::new(" +2000000")),
+            Some(Duration::from_secs(2))
+        );
+        for ignored in ["", "abc", "2000000 ", "0", "-4000000", "1999999"] {
+            assert_eq!(watchdog_period(OsStr::new(ignored)), None, "{ignored:?}");
+        }
+    }
+
+    #[cfg(unix)]
     fn read_ready(socket: &std::os::unix::net::UnixDatagram) {
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
@@ -370,7 +421,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notify.sock");
         let socket = UnixDatagram::bind(&path).unwrap();
-        notify_socket(path.as_os_str()).unwrap();
+        notify_socket(path.as_os_str(), b"READY=1").unwrap();
         read_ready(&socket);
     }
 
@@ -392,7 +443,7 @@ mod tests {
                 .unwrap();
         // An environment variable cannot carry a NUL, but the sender handles the full
         // address byte sequence without treating it as a pathname.
-        notify_socket(OsStr::new(&format!("@{name}"))).unwrap();
+        notify_socket(OsStr::new(&format!("@{name}")), b"READY=1").unwrap();
         read_ready(&socket);
     }
 }

@@ -6,7 +6,7 @@ MQExtended provides Mosquitto's `$SYS` topics, MQTT broker control API and HTTP 
 
 `$SYS/broker/...` carries the same topics, payload formats and retain flags as Mosquitto 2.1.4 (`src/sys_tree.c`), so existing dashboards keep working.
 
-- `sys_interval <seconds>` sets the period (default 10, `0` turns the periodic tree off; the version and other startup topics are still published). SIGHUP applies a new value.
+- `sys_interval <seconds>` sets the period (default 10). `0` turns `$SYS` off entirely, including the version and other startup topics. SIGHUP applies a new value.
 - `$SYS/broker/version` reports `mosquitto version 2.1.4`, the behaviour MQExtended reproduces. The MQExtended release is in the [cluster endpoint](#cluster-status).
 - `$SYS/broker/heap/*` is not published. Mosquitto only has it in builds with memory tracking; MQExtended has no equivalent allocator counter.
 

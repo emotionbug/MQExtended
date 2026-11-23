@@ -76,6 +76,7 @@ pub struct Server {
     set_tcp_nodelay: bool,
     connection_messages: bool,
     observed_broker: Option<mqx_broker::Broker>,
+    watchdog: Option<Duration>,
 }
 
 /// Non-terminating Unix process signals dispatched by the listener loop.
@@ -84,6 +85,8 @@ pub enum BrokerSignal {
     Backup,
     Diagnostics,
     Rotate,
+    /// The service manager's watchdog period elapsed; see [`Server::with_watchdog`].
+    Watchdog,
 }
 
 struct BoundListener {
@@ -120,9 +123,76 @@ struct ListenerOptions {
     config: Arc<ListenerConfig>,
     index: usize,
     limit: Option<Arc<Semaphore>>,
-    tls: watch::Sender<Option<ListenerAcceptor>>,
-    proxy: Option<ProxyOptions>,
+    live: watch::Sender<LiveTls>,
     websockets: Option<WsOptions>,
+}
+
+/// Listener settings Mosquitto reads from the listener on every connection,
+/// so a configuration reload changes them for new connections.
+#[derive(Clone)]
+struct LiveTls {
+    acceptor: Option<ListenerAcceptor>,
+    tls: Arc<crate::TlsConfig>,
+    proxy: Option<ProxyOptions>,
+}
+
+/// Replaces certificates and per-connection TLS options on bound MQTT
+/// listeners without rebinding sockets.
+pub struct CertificateReloader(Vec<Arc<ListenerOptions>>);
+
+impl CertificateReloader {
+    /// Apply listener TLS settings from a successfully parsed configuration.
+    /// With no new configuration, reread the most recently selected paths.
+    pub fn refresh(&mut self, fresh: Option<&ServerConfig>) {
+        for listener in &self.0 {
+            let live = listener.live.borrow().clone();
+            let mut tls = (*live.tls).clone();
+            let mut proxy = live.proxy;
+            if let Some(fresh) = fresh {
+                let new = &fresh.listeners[listener.index].tls;
+                // Mosquitto src/conf.c: config__read_file_core keeps a path the
+                // reloaded file omits; listener__set_defaults resets the flags.
+                for (active, next) in [
+                    (&mut tls.certfile, &new.certfile),
+                    (&mut tls.keyfile, &new.keyfile),
+                    (&mut tls.crlfile, &new.crlfile),
+                ] {
+                    if next.is_some() && active != next {
+                        active.clone_from(next);
+                    }
+                }
+                tls.require_certificate = new.require_certificate;
+                tls.use_identity_as_username = new.use_identity_as_username;
+                tls.use_subject_as_username = new.use_subject_as_username;
+                tls.disable_client_cert_date_checks = new.disable_client_cert_date_checks;
+                if let Some(proxy) = &mut proxy {
+                    proxy.require_certificate = new.require_certificate;
+                    proxy.use_identity_as_username = new.use_identity_as_username;
+                }
+            }
+            // Mosquitto src/listeners.c: listeners__reload_all_certificates
+            // reloads only listeners that opened an SSL context at startup,
+            // with the paths read by config__read; src/net.c:
+            // net__load_certificates also reapplies require_certificate and
+            // loads the reread crlfile.
+            let acceptor = if live.acceptor.is_some() {
+                match tls::mqtt_acceptor(listener.config.port, &tls) {
+                    Ok(acceptor) => acceptor,
+                    Err(error) => {
+                        tracing::error!("Certificate reload failed: {error}");
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            listener.live.send_replace(LiveTls {
+                acceptor,
+                tls: Arc::new(tls),
+                proxy,
+            });
+        }
+    }
 }
 
 impl Server {
@@ -144,6 +214,11 @@ impl Server {
         }
         for (index, listener) in config.listeners.iter().enumerate() {
             let http = listener.protocol == ListenerProtocol::HttpApi;
+            // Mosquitto src/listeners.c: listeners__start_local_only starts
+            // the optional HTTP endpoint only after an MQTT socket has opened.
+            if config.local_only && http && listeners.is_empty() {
+                break;
+            }
             let proxy = if http {
                 None
             } else {
@@ -154,7 +229,17 @@ impl Server {
                     packet_buffer_size: config.limits.packet_buffer_size,
                     origins: listener.websockets_origins.clone(),
                 });
-            let acceptor = tls::acceptor(listener)?;
+            // Mosquitto src/listeners.c: listeners__start ignores
+            // http_api__start's result, so an HTTP listener that cannot load
+            // its certificate, resolve its host or bind is skipped.
+            let acceptor = match tls::acceptor(listener) {
+                Ok(acceptor) => acceptor,
+                Err(error) if http => {
+                    tracing::error!("{error}");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut sockets = Vec::new();
             // Mosquitto src/net.c: net__socket_listen selects AF_UNIX for port 0;
             // src/http_api.c: http_api__start uses its separate TCP bind path.
@@ -167,7 +252,15 @@ impl Server {
                     source,
                 })?);
             } else {
-                for address in listener_addresses(listener, config.local_only).await? {
+                let addresses = match listener_addresses(listener, config.local_only).await {
+                    Ok(addresses) => addresses,
+                    Err(error) if http => {
+                        tracing::error!("Unable to start http api listener ({error}).");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                for address in addresses {
                     let dual_stack = http && listener.host.is_none();
                     // Mosquitto src/listeners.c: built-in websockets share
                     // net.c's IPv4/IPv6 socket path, unlike libwebsockets.
@@ -188,6 +281,9 @@ impl Server {
                             }
                             sockets.push(ListeningSocket::Tcp(socket));
                         }
+                        // http_api.c: http_api__start does not log
+                        // MHD_start_daemon failing to bind.
+                        Err(_) if http => {}
                         Err(source) => {
                             let unavailable_family = source.kind() == io::ErrorKind::Unsupported;
                             let error = ServerError::Bind {
@@ -204,7 +300,11 @@ impl Server {
                 }
             }
             if !sockets.is_empty() {
-                let (tls, _) = watch::channel(acceptor);
+                let (live, _) = watch::channel(LiveTls {
+                    acceptor,
+                    tls: Arc::new(listener.tls.clone()),
+                    proxy,
+                });
                 listeners.push(BoundListener {
                     sockets,
                     options: Arc::new(ListenerOptions {
@@ -212,18 +312,25 @@ impl Server {
                         index,
                         limit: (!http && listener.max_connections > 0)
                             .then(|| Arc::new(Semaphore::new(listener.max_connections))),
-                        tls,
-                        proxy,
+                        live,
                         websockets,
                     }),
                 });
-            } else if !config.local_only {
+            } else if !config.local_only && !http {
                 return Err(first_failure.expect("no address bound"));
             }
         }
-        if listeners.is_empty() {
-            return Err(first_failure
-                .unwrap_or_else(|| ServerError::Arguments("No listeners configured.".into())));
+        // Mosquitto src/listeners.c: listeners__start counts only MQTT
+        // sockets; the HTTP API alone does not keep the broker running.
+        if listeners
+            .iter()
+            .all(|listener| listener.options.config.protocol == ListenerProtocol::HttpApi)
+        {
+            return Err(first_failure.unwrap_or_else(|| {
+                ServerError::Arguments(
+                    "Error: Unable to start any listening sockets, exiting.".into(),
+                )
+            }));
         }
         Ok(Self {
             listeners,
@@ -232,7 +339,15 @@ impl Server {
             set_tcp_nodelay: config.set_tcp_nodelay,
             connection_messages: config.log.connection_messages,
             observed_broker: None,
+            watchdog: None,
         })
+    }
+
+    /// Emit [`BrokerSignal::Watchdog`] from the serve loop, first one second
+    /// after `ready` and then every `period`, so a stalled loop stops pinging.
+    pub fn with_watchdog(mut self, period: Option<Duration>) -> Self {
+        self.watchdog = period;
+        self
     }
 
     pub fn with_broker_observation(mut self, broker: mqx_broker::Broker) -> Self {
@@ -297,7 +412,7 @@ impl Server {
                     .unix_socket_path
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
-                tls: protocol.is_some() && bound.options.tls.borrow().is_some(),
+                tls: protocol.is_some() && bound.options.live.borrow().acceptor.is_some(),
             });
         }
         ControlInventory::new(listeners, &config.plugin_inventory)
@@ -311,16 +426,26 @@ impl Server {
         RF: Future<Output = Result<(), E>>,
         E: Display,
     {
-        self.run_with_signals(handler, reload, || {}, async |_| {}, || {})
-            .await
+        self.run_with_signals(
+            handler,
+            async |certificates: &mut CertificateReloader| {
+                certificates.refresh(None);
+                reload().await
+            },
+            || {},
+            async |_| {},
+            || {},
+        )
+        .await
     }
 
-    /// Installs signal handlers before calling `ready`. Reload refreshes TLS
-    /// without rebinding sockets; `shutdown` asks the broker to close clients.
-    pub async fn run_with_signals<H, F, R, RF, E, S>(
+    /// Installs signal handlers before calling `ready`. The reload callback
+    /// refreshes certificates without rebinding sockets; `shutdown` asks the
+    /// broker to close clients.
+    pub async fn run_with_signals<H, F, E, S>(
         self,
         handler: H,
-        reload: R,
+        reload: impl AsyncFn(&mut CertificateReloader) -> Result<(), E>,
         ready: impl FnOnce(),
         auxiliary: impl AsyncFn(BrokerSignal),
         shutdown: S,
@@ -328,8 +453,6 @@ impl Server {
     where
         H: Fn(Connection) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
-        R: Fn() -> RF,
-        RF: Future<Output = Result<(), E>>,
         E: Display,
         S: FnOnce(),
     {
@@ -360,6 +483,14 @@ impl Server {
                     _ = terminate.recv() => (),
                 }
             };
+            // Mosquitto src/loop.c: mosquitto_main_loop calls watchdog__check
+            // on every iteration, after main has sent READY=1.
+            let mut watchdog = self.watchdog.map(|period| {
+                let start = tokio::time::Instant::now() + Duration::from_secs(1);
+                let mut ticks = tokio::time::interval_at(start, period);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticks
+            });
             let signals = async || {
                 // Mosquitto src/signals.c: signal__flag_check processes
                 // these flags between iterations of the main loop.
@@ -369,6 +500,12 @@ impl Server {
                     () = rotation() => BrokerSignal::Rotate,
                     _ = hangup.recv() => BrokerSignal::Reload,
                     _ = diagnostics.recv() => BrokerSignal::Diagnostics,
+                    _ = async {
+                        match &mut watchdog {
+                            Some(ticks) => ticks.tick().await,
+                            None => pending().await,
+                        }
+                    } => BrokerSignal::Watchdog,
                 }
             };
             ready();
@@ -386,7 +523,7 @@ impl Server {
             ready();
             self.serve(
                 handler,
-                || async { Ok::<_, E>(()) },
+                async |_: &mut CertificateReloader| Ok::<_, E>(()),
                 async || pending().await,
                 auxiliary,
                 stop,
@@ -414,7 +551,7 @@ impl Server {
     {
         self.serve(
             handler,
-            || async { Ok::<_, io::Error>(()) },
+            async |_: &mut CertificateReloader| Ok::<_, io::Error>(()),
             async || pending().await,
             async |_| {},
             stop,
@@ -423,10 +560,10 @@ impl Server {
         .await
     }
 
-    async fn serve<H, F, R, RF, E, U, S>(
+    async fn serve<H, F, E, U, S>(
         self,
         handler: H,
-        reload: R,
+        reload: impl AsyncFn(&mut CertificateReloader) -> Result<(), E>,
         mut signals: impl AsyncFnMut() -> BrokerSignal,
         auxiliary: impl AsyncFn(BrokerSignal),
         stop: U,
@@ -435,8 +572,6 @@ impl Server {
     where
         H: Fn(Connection) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
-        R: Fn() -> RF,
-        RF: Future<Output = Result<(), E>>,
         E: Display,
         U: Future<Output = ()>,
         S: FnOnce(),
@@ -444,11 +579,11 @@ impl Server {
         let (cancel, _) = watch::channel(false);
         let mut serving = JoinSet::new();
         let handler = Arc::new(handler);
-        let mut reload_listeners = Vec::new();
+        let mut certificates = CertificateReloader(Vec::new());
         for listener in self.listeners {
             let mqtt = listener.options.config.protocol != ListenerProtocol::HttpApi;
-            if mqtt && listener.options.tls.borrow().is_some() {
-                reload_listeners.push(listener.options.clone());
+            if mqtt {
+                certificates.0.push(listener.options.clone());
             }
             for socket in listener.sockets {
                 let worker = SocketWorker {
@@ -492,13 +627,7 @@ impl Server {
                     // Mosquitto src/signals.c: signal__flag_check; configuration reload
                     // refreshes certificates without rebinding any listening socket.
                     tracing::info!("Reloading config.");
-                    for listener in &reload_listeners {
-                        match tls::acceptor(&listener.config) {
-                            Ok(acceptor) => { listener.tls.send_replace(acceptor); }
-                            Err(error) => tracing::error!("Certificate reload failed: {error}"),
-                        }
-                    }
-                    if let Err(error) = reload().await {
+                    if let Err(error) = reload(&mut certificates).await {
                         // Mosquitto src/signals.c: signal__flag_check stops on security init failure.
                         break Err(ServerError::SecurityReload(error.to_string()));
                     }
@@ -597,7 +726,7 @@ impl SocketWorker {
                             connection_messages,
                             mqx_broker::SocketObservation::connection_messages,
                         );
-                        let acceptor = options.tls.borrow().clone();
+                        let LiveTls { acceptor, tls, proxy } = options.live.borrow().clone();
                         let mut peer = match peer_addr {
                             Some(address) => PeerAddress::Ip(address),
                             None => PeerAddress::LocalUnix(
@@ -608,10 +737,10 @@ impl SocketWorker {
                         let listener = &options.config;
                         // Mosquitto src/net.c: net__socket_accept logs direct
                         // transport sockets before negotiation, not PROXY sockets.
-                        if connection_messages() && options.proxy.is_none() {
+                        if connection_messages() && proxy.is_none() {
                             tracing::info!(target: "mqx::notice", "New connection from {peer} on port {}.", listener.port);
                         }
-                        let (stream, cert_identity) = if options.proxy.is_some()
+                        let (stream, cert_identity) = if proxy.is_some()
                             || acceptor.is_some() || options.websockets.is_some()
                         {
                             // Mosquitto src/context.c: context__init and src/keepalive.c:
@@ -620,7 +749,7 @@ impl SocketWorker {
                                 biased;
                                 _ = cancel.changed() => return,
                                 result = timeout_at(accepted_at + PROXY_HEADER_TIMEOUT, transport::negotiate(
-                                    stream, &mut peer, options.proxy, acceptor, &listener.tls, options.websockets.as_ref(),
+                                    stream, &mut peer, proxy, acceptor, &tls, options.websockets.as_ref(),
                                 )) => result,
                             };
                             match negotiated {
@@ -640,7 +769,7 @@ impl SocketWorker {
                                 }
                             }
                         } else {
-                            (ConnectionStream::plain(stream), transport::plain_identity(&listener.tls))
+                            (ConnectionStream::plain(stream), transport::plain_identity(&tls))
                         };
                         handler(Connection {
                             stream,

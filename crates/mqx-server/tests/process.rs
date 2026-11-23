@@ -30,6 +30,7 @@ fn command(binary: impl AsRef<Path>, dir: &Path) -> Command {
         .current_dir(dir)
         .env("TOKIO_WORKER_THREADS", "2")
         .env_remove("NOTIFY_SOCKET")
+        .env_remove("WATCHDOG_USEC")
         .env_remove("SNAP_NAME")
         .env_remove("PUID")
         .env_remove("PGID")
@@ -223,6 +224,50 @@ async fn invalid_umask_and_pid_file_fail_before_logging_or_listeners() {
                 .unwrap()
                 .ends_with(&format!("{diagnostic}\n{TERMINATING}\n"))
         );
+    }
+}
+
+#[tokio::test]
+async fn occupied_mqtt_listener_uses_the_reference_startup_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(
+        dir.path().join("broker.conf"),
+        config(socket.local_addr().unwrap()),
+    )
+    .unwrap();
+    let output = timeout(
+        WAIT,
+        command(BIN, dir.path())
+            .args(["-c", "broker.conf"])
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+
+    // listeners.c: listeners__start_single_mqtt also returns 1 when the
+    // certificate cannot be loaded or the host does not resolve.
+    fs::write(dir.path().join("junk.pem"), "junk\n").unwrap();
+    for listener in [
+        format!(
+            "{}certfile junk.pem\nkeyfile junk.pem\n",
+            config(listen_address())
+        ),
+        "user root\nlistener 1888 no.such.host.invalid\n".to_owned(),
+    ] {
+        fs::write(dir.path().join("broker.conf"), &listener).unwrap();
+        let output = timeout(
+            WAIT,
+            command(BIN, dir.path())
+                .args(["-c", "broker.conf"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{listener}");
     }
 }
 
@@ -822,4 +867,222 @@ async fn built_in_websockets_use_reference_listener_log() {
     );
     let ours = lifecycle_logs(Path::new(BIN), dir.path(), &args).await;
     compare_build_features(ours, upstream);
+}
+
+#[tokio::test]
+async fn http_listener_inventory_reports_a_unix_listener_by_path() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let address = listen_address();
+    let socket = "mqtt\"local\".sock";
+    fs::write(
+        dir.path().join("broker.conf"),
+        format!(
+            "{}protocol http_api\nlistener 0 {socket}\n",
+            config(address)
+        ),
+    )
+    .unwrap();
+    let mut child = command(BIN, dir.path())
+        .args(["-c", "broker.conf"])
+        .env("NOTIFY_SOCKET", &notify_path)
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+
+    let response = timeout(WAIT, async {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"GET /api/v1/listeners HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    })
+    .await
+    .unwrap();
+    let (header, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(header.starts_with("HTTP/1.1 200 "), "{header}");
+    let listeners: serde_json::Value = serde_json::from_str(body).unwrap();
+    let listener = &listeners["listeners"][1];
+    assert_eq!(listener["path"], socket);
+    assert_eq!(listener["protocol"], "mqtt");
+    assert!(listener.get("port").is_none());
+    stop(&mut child).await;
+}
+
+#[tokio::test]
+async fn systemd_watchdog_pings_follow_ready_only_when_requested() {
+    let dir = tempfile::tempdir().unwrap();
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let address = listen_address();
+    fs::write(dir.path().join("broker.conf"), config(address)).unwrap();
+
+    // watchdog.c: WATCHDOG_USEC=2000000 gives a one-second half interval.
+    let mut child = command(BIN, dir.path())
+        .args(["-c", "broker.conf"])
+        .env("NOTIFY_SOCKET", &notify_path)
+        .env("WATCHDOG_USEC", "2000000")
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+    for _ in 0..3 {
+        let mut packet = [0; 32];
+        let size = timeout(WAIT, notify.recv(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&packet[..size], b"WATCHDOG=1");
+    }
+    stop(&mut child).await;
+    while notify.try_recv(&mut [0; 32]).is_ok() {}
+
+    for watchdog in [None, Some("abc"), Some("1999999")] {
+        let mut command = command(BIN, dir.path());
+        command
+            .args(["-c", "broker.conf"])
+            .env("NOTIFY_SOCKET", &notify_path);
+        if let Some(watchdog) = watchdog {
+            command.env("WATCHDOG_USEC", watchdog);
+        }
+        let mut child = command.spawn().unwrap();
+        ready(&notify).await;
+        let mut packet = [0; 32];
+        assert!(
+            timeout(Duration::from_millis(2500), notify.recv(&mut packet))
+                .await
+                .is_err(),
+            "{watchdog:?}"
+        );
+        stop(&mut child).await;
+    }
+}
+
+#[tokio::test]
+async fn sighup_applies_reread_listener_settings_to_new_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broker.conf");
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let mounted = listen_address();
+    let plain = listen_address();
+    let base = format!("{}listener {} 127.0.0.1\n", config(plain), mounted.port());
+    fs::write(&path, format!("{base}mount_point a/\n")).unwrap();
+    let mut child = command(BIN, dir.path())
+        .args(["-c", "broker.conf"])
+        .env("NOTIFY_SOCKET", &notify_path)
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+
+    // conf.c: config__read_file_core resets and rereads the listener in place.
+    fs::write(
+        &path,
+        format!("{base}mount_point b/\nlog_dest file reloaded.log\n"),
+    )
+    .unwrap();
+    kill(id(&child), Signal::SIGHUP).unwrap();
+    eventually(|| dir.path().join("reloaded.log").exists()).await;
+
+    let connect = async |address, id: &[u8]| {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let mut packet = vec![0x10, 12 + id.len() as u8, 0, 4];
+        packet.extend_from_slice(b"MQTT\x04\x02\x00\x3c\x00");
+        packet.push(id.len() as u8);
+        packet.extend_from_slice(id);
+        stream.write_all(&packet).await.unwrap();
+        let mut ack = [0; 4];
+        timeout(WAIT, stream.read_exact(&mut ack))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack, [0x20, 2, 0, 0]);
+        stream
+    };
+    let mut observer = connect(plain, b"observer").await;
+    observer
+        .write_all(b"\x82\x06\x00\x01\x00\x01#\x00")
+        .await
+        .unwrap();
+    let mut suback = [0; 5];
+    timeout(WAIT, observer.read_exact(&mut suback))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut publisher = connect(mounted, b"publisher").await;
+    publisher.write_all(b"\x30\x04\x00\x01xA").await.unwrap();
+    let mut publish = [0; 8];
+    timeout(WAIT, observer.read_exact(&mut publish))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&publish, b"\x30\x06\x00\x03b/xA");
+    stop(&mut child).await;
+}
+
+#[tokio::test]
+async fn rejected_proxy_headers_log_the_reference_notices() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let v1 = listen_address();
+    let v2 = listen_address();
+    fs::write(
+        dir.path().join("broker.conf"),
+        format!(
+            "{}enable_proxy_protocol 1\nlistener {} 127.0.0.1\nenable_proxy_protocol 2\n\
+            proxy_protocol_v2_require_tls true\nlog_dest file broker.log\nconnection_messages false\n",
+            config(v1),
+            v2.port()
+        ),
+    )
+    .unwrap();
+    let mut child = command(BIN, dir.path())
+        .args(["-c", "broker.conf"])
+        .env("NOTIFY_SOCKET", &notify_path)
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+
+    let refused = async |address, header: &[u8]| {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(header).await.unwrap();
+        let mut rest = Vec::new();
+        let _ = timeout(WAIT, stream.read_to_end(&mut rest)).await.unwrap();
+        assert!(rest.is_empty());
+    };
+    refused(v1, b"PROXY BOGUS\r\n").await;
+    // IPv4 192.0.2.7:47568 -> 127.0.0.1:1888 with no SSL TLV.
+    let mut v2_header = b"\r\n\r\n\0\r\nQUIT\n\x21\x11\x00\x0c".to_vec();
+    v2_header.extend_from_slice(&[192, 0, 2, 7, 127, 0, 0, 1, 0xb9, 0xd0, 0x07, 0x60]);
+    refused(v2, &v2_header).await;
+    // A truncated TLV after the same addresses.
+    let mut corrupt = b"\r\n\r\n\0\r\nQUIT\n\x21\x11\x00\x0e".to_vec();
+    corrupt.extend_from_slice(&v2_header[16..]);
+    corrupt.extend_from_slice(&[0x20, 0x00]);
+    refused(v2, &corrupt).await;
+
+    let log = dir.path().join("broker.log");
+    let expected = [
+        "Connection rejected, corrupt PROXY header.",
+        "Connection from 192.0.2.7:47568 rejected, client did not connect using TLS.",
+        "Connection from 192.0.2.7:47568 rejected, corrupt PROXY header.",
+    ];
+    eventually(|| {
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        expected.iter().all(|line| text.contains(line))
+    })
+    .await;
+    stop(&mut child).await;
 }

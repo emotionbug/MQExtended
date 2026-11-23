@@ -13,7 +13,7 @@ pub use config::{
     SocketDomain, TlsConfig, TlsVersion, parse_command_line_port,
 };
 pub use http_api::HttpApi;
-pub use listener::{BrokerSignal, CertIdentity, Connection, Server};
+pub use listener::{BrokerSignal, CertIdentity, CertificateReloader, Connection, Server};
 pub use logging::{LogTopics, Logging, init_logging, startup_log};
 pub use tls::connect_bridge_tls;
 pub use transport::ConnectionStream;
@@ -63,4 +63,8 @@ pub enum ServerError {
     Logging(#[source] tracing::subscriber::SetGlobalDefaultError),
     #[error("Cluster broker: {0}")]
     Cluster(#[source] mqx_broker::BrokerError),
+    /// A listener failed to open; Mosquitto src/mosquitto.c: main returns
+    /// listeners__start's status 1 for bind, address and TLS load failures.
+    #[error(transparent)]
+    Listen(Box<ServerError>),
 }

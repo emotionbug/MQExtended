@@ -153,6 +153,13 @@ pub enum ProxyError {
     TlsRequired,
     #[error("the listener requires a PROXY v2 verified client certificate")]
     CertificateRequired,
+    /// A PROXY v2 header named its source but its TLVs or TLS policy were
+    /// rejected. Only [`read_proxy_header`] returns this.
+    #[error("PROXY v2 connection rejected: {reason}")]
+    Rejected {
+        addresses: ProxyAddresses,
+        reason: Box<ProxyError>,
+    },
     #[cfg(feature = "tokio")]
     #[error("reading PROXY header: {0}")]
     Io(#[from] std::io::Error),
@@ -195,8 +202,27 @@ pub async fn read_proxy_header<S: tokio::io::AsyncRead + Unpin>(
             return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
         }
         filled += read;
-        if let Some((info, leftover)) = parse_proxy_header(&buffer[..filled], options)? {
-            return Ok((info, bytes::Bytes::copy_from_slice(leftover)));
+        match parse_proxy_header(&buffer[..filled], options) {
+            Ok(Some((info, leftover))) => {
+                return Ok((info, bytes::Bytes::copy_from_slice(leftover)));
+            }
+            Ok(None) => {}
+            Err(
+                reason @ (ProxyError::MalformedTlv
+                | ProxyError::InvalidTlsString { .. }
+                | ProxyError::DuplicateCommonName
+                | ProxyError::TlsRequired
+                | ProxyError::CertificateRequired),
+            ) => {
+                return Err(match v2::rejected_addresses(&buffer[..filled]) {
+                    Some(addresses) => ProxyError::Rejected {
+                        addresses,
+                        reason: Box::new(reason),
+                    },
+                    None => reason,
+                });
+            }
+            Err(error) => return Err(error),
         }
     }
 

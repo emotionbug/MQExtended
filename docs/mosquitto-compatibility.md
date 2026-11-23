@@ -135,6 +135,9 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 | An invalid dynamic-security config file stops the broker | Mosquitto would run with an empty policy; refusing to start is the safe reading of the same file ([dynamic security](dynamic-security.md#differences-from-the-c-plugin)) |
 | Bridge reconnect delays follow `restart_timeout` without Mosquitto's event-loop jitter | The remote broker sees the same connect sequence; only the exact retry instants differ |
 | Bridge TLS appends `:!aNULL:!eNULL` to `bridge_ciphers`, and PSK bridges default to `PSK:!aNULL:!eNULL` | Unauthenticated cipher suites are never negotiated; only a remote that offers nothing else is refused |
+| A PROXY v1 header on a TLS listener is read before the TLS handshake | Mosquitto 2.1.4 accepts neither order with TLS 1.2 or 1.3, so no working Mosquitto setup depends on it |
+| PROXY headers split across TCP reads are reassembled | Mosquitto closes such a connection; an intact header is handled the same way |
+| Outgoing WebSocket frames are always binary | Mosquitto's send opcode can follow a half-read incoming frame; clients accept binary MQTT frames |
 
 ## Unsupported directives
 

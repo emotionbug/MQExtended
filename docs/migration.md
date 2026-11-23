@@ -44,11 +44,12 @@ Then restart Mosquitto once in a quiet period and watch two things:
 
 `mqextended` takes Mosquitto's command line (`-c`, `-d`, `-p`, `-v`, `--test-config`) and behaves as the `mosquitto` process does, so the distribution's service unit or container entrypoint only needs the binary path changed:
 
-- It sends systemd `READY=1` when its listeners are open, so `Type=notify` units work.
+- It sends systemd `READY=1` when its listeners are open, so `Type=notify` units work. With `WatchdogSec` (Mosquitto's shipped unit sets 3 minutes) it sends `WATCHDOG=1` at Mosquitto's interval, half the timeout plus one second.
 - Started as root, it drops to `user` (default `mosquitto`) right after reading the config, before opening certificates, credential files or listeners, honouring `PUID`/`PGID` as Mosquitto does. Ports below 1024 then need the same capability setup as for Mosquitto.
 - `-d` daemonises, `pid_file` is written and removed as Mosquitto does, `UMASK_SET` applies.
 - `--version` prints the MQExtended release without opening listeners; use this to identify the binary rather than the Mosquitto compatibility version in `$SYS`.
-- SIGHUP rereads credential paths, ACLs and `allow_anonymous` for bound listeners. Existing MQTT clients are reauthenticated; HTTP requests use the refreshed policy too. Adding or removing a listener, or changing `per_listener_settings`, requires a restart. SIGUSR1 saves the persistence file; SIGRTMIN reopens log files.
+- SIGHUP rereads credential paths, ACLs and `allow_anonymous` for bound listeners. Each listener's options are reset to their defaults and reread, as Mosquitto's `listener__set_defaults` does, and apply to new connections: `mount_point`, `max_qos`, `accept_protocol_versions`, `use_username_as_clientid`, client id and topic alias limits, `require_certificate`, `use_identity_as_username` and `use_subject_as_username`. `certfile`, `keyfile` and `crlfile` are reloaded from the reread configuration; a path the new file leaves out keeps its old value. Existing MQTT clients are reauthenticated; HTTP requests use the refreshed policy too. Adding or removing a listener, changing `per_listener_settings`, `max_connections`, `websockets_origin` or `proxy_protocol_v2_require_tls` requires a restart. SIGUSR1 saves the persistence file; SIGRTMIN reopens log files.
+- Any MQTT listener that cannot start (port in use, unloadable certificate, unresolvable host) exits with status 1. A failed `http_api` listener does not stop the broker, but a configuration whose only listeners are `http_api` does not start.
 
 ## 5. Carry state over
 

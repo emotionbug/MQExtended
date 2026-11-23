@@ -20,9 +20,9 @@ use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, SecurityH
 use mqx_cluster::ClusterError;
 use mqx_codec::QoS;
 use mqx_server::{
-    BrokerSignal, HttpApi, ListenerConfig, ListenerProtocol, LogConfig, LogTopics, Logging,
-    SecurityConfig, Server, ServerConfig, ServerError, connect_bridge_tls, init_logging,
-    parse_command_line_port, startup_log,
+    BrokerSignal, CertificateReloader, HttpApi, ListenerConfig, ListenerProtocol, LogConfig,
+    LogTopics, Logging, SecurityConfig, Server, ServerConfig, ServerError, connect_bridge_tls,
+    init_logging, parse_command_line_port, startup_log,
 };
 
 use file_security::SecurityHandles;
@@ -198,10 +198,10 @@ fn start() -> Result<ExitCode, StartupError> {
         &mut shutdown,
     ));
     shutdown.finish(&result);
-    Ok(if result.is_ok() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(3)
+    Ok(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(ServerError::Listen(_)) => ExitCode::FAILURE,
+        Err(_) => ExitCode::from(3),
     })
 }
 
@@ -312,20 +312,26 @@ async fn run_broker(
             .iter()
             .any(|listener| listener.security.file_plugins.paths() != (None, None));
     let security = Arc::new(SecurityHandles::new(&config)?);
-    let policies: Arc<Vec<Arc<ListenerPolicy>>> = Arc::new(
+    let listener_policies = |config: &ServerConfig| -> Vec<Arc<ListenerPolicy>> {
         config
             .listeners
             .iter()
             .enumerate()
             .map(|(index, listener)| {
                 Arc::new(listener_policy(
-                    &config,
+                    config,
                     listener,
                     security.for_listener(index),
                 ))
             })
-            .collect(),
-    );
+            .collect()
+    };
+    // Mosquitto src/conf.c: config__read_file_core rewrites each listener in
+    // place on reload, so new connections see the reread listener settings.
+    let policies = Arc::new(std::sync::RwLock::new(listener_policies(&config)));
+    let policy = |policies: &std::sync::RwLock<Vec<Arc<ListenerPolicy>>>, index: usize| {
+        policies.read().unwrap_or_else(|e| e.into_inner())[index].clone()
+    };
     let cluster = config.cluster.take();
     let cluster_identity = cluster
         .as_ref()
@@ -335,7 +341,9 @@ async fn run_broker(
         .is_none()
         .then(|| Arc::new(Persistence::new(config.persistence.clone())));
     let (broker, membership, server) = if let Some(mut cluster) = cluster {
-        let server = Server::bind(&config).await?;
+        let server = Server::bind(&config)
+            .await
+            .map_err(|error| ServerError::Listen(Box::new(error)))?;
         let limits = &config.limits;
         let packet_limit = if limits.max_packet_size == 0 {
             0
@@ -389,7 +397,9 @@ async fn run_broker(
         security.register(&broker).await?;
         dynsec_config::register(&broker, config.dynamic_security.as_ref(), true).await?;
         // mosquitto.c: plugin initializers run before the listener opens.
-        let server = Server::bind(&config).await?;
+        let server = Server::bind(&config)
+            .await
+            .map_err(|error| ServerError::Listen(Box::new(error)))?;
         if let Some(persistence) = &persistence {
             persistence.restore(&broker, &config).await?;
         }
@@ -465,8 +475,10 @@ async fn run_broker(
     let serving = broker.clone();
     let http = Arc::new(HttpApi::new(&config, &server));
     let http_inventory = http.clone();
+    let reload_policies = policies.clone();
     let result = server
         .with_broker_observation(broker.clone())
+        .with_watchdog(process::watchdog())
         .run_with_signals(
             move |connection| {
                 let broker = serving.clone();
@@ -475,7 +487,7 @@ async fn run_broker(
                 let ready = ready.clone();
                 async move {
                     if connection.listener.protocol == ListenerProtocol::HttpApi {
-                        let policy = &policies[connection.listener_index];
+                        let policy = policy(&policies, connection.listener_index);
                         if let Err(error) = http.serve(connection, &broker, &policy.security, &*ready).await
                         {
                             tracing::debug!("HTTP connection ended: {error}");
@@ -487,7 +499,7 @@ async fn run_broker(
                     }
                     let info = ConnectionInfo {
                         peer_addr: connection.peer_addr,
-                        listener: policies[connection.listener_index].clone(),
+                        listener: policy(&policies, connection.listener_index),
                         cert_identity: connection.cert_identity.into(),
                     };
                     if let Err(error) = broker
@@ -502,12 +514,15 @@ async fn run_broker(
                     }
                 }
             },
-            || async {
+            async |certificates: &mut CertificateReloader| {
                 if let Some(path) = &cli.file {
                     match reload_config(path, cli, &config) {
                         Ok(mut fresh) => {
                             // signals.c: reload configuration before opening credential files.
+                            certificates.refresh(Some(&fresh));
                             security.reload(&fresh)?;
+                            *reload_policies.write().unwrap_or_else(|e| e.into_inner()) =
+                                listener_policies(&fresh);
                             if membership.as_ref().is_none_or(|membership| membership.is_serving())
                                 && registered.load(Ordering::Acquire)
                             {
@@ -540,6 +555,7 @@ async fn run_broker(
                         }
                         Err(error) => {
                             tracing::warn!("Unable to reload configuration: {error}");
+                            certificates.refresh(None);
                             let reload = {
                                 let old = live_config.borrow();
                                 let old = old.as_ref().unwrap_or(&config);
@@ -557,6 +573,7 @@ async fn run_broker(
                         }
                     }
                 } else {
+                    certificates.refresh(None);
                     logging.reload(&config.log);
                 }
                 Ok::<_, ServerError>(())
@@ -583,6 +600,7 @@ async fn run_broker(
                     let live = live_config.borrow();
                     logging.reload(&live.as_ref().unwrap_or(&config).log);
                 }
+                BrokerSignal::Watchdog => process::notify_watchdog(),
                 BrokerSignal::Reload => unreachable!("handled by the listener"),
             },
             || broker.shutdown(),

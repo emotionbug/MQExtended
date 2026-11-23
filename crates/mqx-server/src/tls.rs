@@ -61,10 +61,14 @@ pub(crate) fn acceptor(listener: &ListenerConfig) -> Result<Option<ListenerAccep
     } else {
         &listener.tls
     };
-    let error = |message| ServerError::Tls {
-        port: listener.port,
-        message,
-    };
+    mqtt_acceptor(listener.port, tls)
+}
+
+pub(crate) fn mqtt_acceptor(
+    port: u16,
+    tls: &TlsConfig,
+) -> Result<Option<ListenerAcceptor>, ServerError> {
+    let error = |message| ServerError::Tls { port, message };
     let (certfile, keyfile) = match (&tls.certfile, &tls.keyfile) {
         (Some(certfile), Some(keyfile)) => (certfile, keyfile),
         (None, None) => return Ok(None),

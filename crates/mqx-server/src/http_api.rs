@@ -90,7 +90,15 @@ impl HttpApi {
                     response.push_str(", ");
                 }
                 first = false;
-                write!(response, "{{\n\t\t\t\"port\":\t{},\n\t\t\t\"protocol\":\t\"{protocol}\",\n\t\t\t\"tls\":\t{tls},\n\t\t\t\"mtls\":\t{mtls},\n\t\t\t\"allow_anonymous\":\t{allowed}\n\t\t}}", listener.port).unwrap();
+                // src/http_api.c: http_api__process_listeners identifies a
+                // Unix listener by its path instead of its zero port.
+                if let Some(path) = &listener.unix_socket_path {
+                    let path = serde_json::to_string(&path.to_string_lossy()).unwrap();
+                    write!(response, "{{\n\t\t\t\"path\":\t{path}").unwrap();
+                } else {
+                    write!(response, "{{\n\t\t\t\"port\":\t{}", listener.port).unwrap();
+                }
+                write!(response, ",\n\t\t\t\"protocol\":\t\"{protocol}\",\n\t\t\t\"tls\":\t{tls},\n\t\t\t\"mtls\":\t{mtls},\n\t\t\t\"allow_anonymous\":\t{allowed}\n\t\t}}").unwrap();
             }
         }
         response.push_str("]\n}");

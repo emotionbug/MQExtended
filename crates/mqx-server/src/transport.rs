@@ -184,7 +184,9 @@ impl fmt::Display for PeerAddress<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ip(addr) => write!(f, "{}:{}", addr.ip(), addr.port()),
-            Self::Unix(path) => f.write_str(&String::from_utf8_lossy(path)),
+            // Mosquitto src/proxy_v2.c: proxy_v2__read stores a proxied Unix
+            // source with remote_port 0, and logs print "%s:%d".
+            Self::Unix(path) => write!(f, "{}:0", String::from_utf8_lossy(path)),
             // Mosquitto src/net.c: net__socket_get_address uses the listener's
             // pathname (getsockname), and net__socket_accept logs remote port 0.
             Self::LocalUnix(path) => write!(f, "{}:0", path.display()),
@@ -208,6 +210,33 @@ pub(crate) fn plain_identity(tls: &TlsConfig) -> CertIdentity {
         CertIdentity::MissingOrInvalid
     } else {
         CertIdentity::None
+    }
+}
+
+/// Mosquitto's notices for a refused PROXY header. They are not gated on
+/// connection_messages; short reads and v2 framing errors are silent.
+fn log_proxy_rejection(options: ProxyOptions, error: &mqx_proxy::ProxyError) {
+    use mqx_proxy::{ProxyError, ProxyVersion};
+
+    match (options.version, error) {
+        // Mosquitto src/proxy_v1.c: proxy_v1__decode and proxy_v1__read.
+        (ProxyVersion::V1, ProxyError::MalformedHeader | ProxyError::TooLong) => {
+            tracing::info!(target: "mqx::notice", "Connection rejected, corrupt PROXY header.");
+        }
+        // Mosquitto src/proxy_v2.c: proxy_v2__read.
+        (ProxyVersion::V2, ProxyError::Rejected { addresses, reason }) => {
+            let peer = match addresses {
+                ProxyAddresses::Ip { source, .. } => PeerAddress::Ip(*source),
+                ProxyAddresses::Unix { source, .. } => PeerAddress::Unix(source.clone()),
+            };
+            let why = match **reason {
+                ProxyError::TlsRequired => "client did not connect using TLS",
+                ProxyError::CertificateRequired => "client did not provide a certificate",
+                _ => "corrupt PROXY header",
+            };
+            tracing::info!(target: "mqx::notice", "Connection from {peer} rejected, {why}.");
+        }
+        _ => {}
     }
 }
 
@@ -259,7 +288,9 @@ async fn negotiate_stream<S: TransportIo + 'static>(
 ) -> Result<Option<(ConnectionStream, CertIdentity)>, NegotiationError> {
     let mut identity = plain_identity(tls);
     let prefix = if let Some(options) = proxy {
-        let (info, prefix) = read_proxy_header(&mut stream, options).await?;
+        let (info, prefix) = read_proxy_header(&mut stream, options)
+            .await
+            .inspect_err(|error| log_proxy_rejection(options, error))?;
         // Mosquitto src/proxy_v2.c: proxy_v2__read; src/proxy_v1.c: proxy_v1__decode.
         // V2 LOCAL is a health check, never an MQTT or WebSocket connection.
         match info {
@@ -410,5 +441,16 @@ impl<S: TransportIo> AsyncWrite for Replay<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeerAddress;
+
+    #[test]
+    fn proxied_unix_source_is_shown_with_port_zero() {
+        let peer = PeerAddress::Unix(b"/tmp/sock".to_vec().into_boxed_slice());
+        assert_eq!(peer.to_string(), "/tmp/sock:0");
     }
 }

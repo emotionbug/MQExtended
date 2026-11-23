@@ -104,6 +104,63 @@ async fn listener_limit_refuses_extra_tcp_connections_before_dispatch() {
     serving.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn local_only_http_cannot_substitute_for_an_unavailable_mqtt_listener() {
+    use mqx_server::{ListenerConfig, ListenerProtocol, ServerError};
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.listeners[0].port = addr.port();
+    config.listeners[0].host = Some(addr.ip().to_string());
+    config.listeners.push(ListenerConfig {
+        protocol: ListenerProtocol::HttpApi,
+        port: 0,
+        host: Some(addr.ip().to_string()),
+        ..ListenerConfig::default()
+    });
+    assert!(matches!(
+        Server::bind(&config).await,
+        Err(ServerError::Bind { .. })
+    ));
+}
+
+#[tokio::test]
+async fn unavailable_http_listener_does_not_stop_mqtt_listeners() {
+    use mqx_server::{ListenerConfig, ListenerProtocol, ServerError};
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let http = |port| ListenerConfig {
+        protocol: ListenerProtocol::HttpApi,
+        port,
+        host: Some(addr.ip().to_string()),
+        ..ListenerConfig::default()
+    };
+    let mut config = ServerConfig {
+        local_only: false,
+        ..ServerConfig::default()
+    };
+    config.listeners[0].port = 0;
+    config.listeners[0].host = Some(addr.ip().to_string());
+    config.listeners.push(http(addr.port()));
+    let server = Server::bind(&config).await.unwrap();
+    assert_eq!(server.local_addrs().count(), 1);
+
+    // listeners.c: listeners__start exits when no MQTT socket opened, even
+    // though the HTTP API listener itself started.
+    config.listeners.remove(0);
+    config.listeners[0].port = 0;
+    let error = Server::bind(&config).await.err().unwrap();
+    assert!(matches!(error, ServerError::Arguments(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("Unable to start any listening sockets"),
+        "{error}"
+    );
+}
+
 const CONNECT: &[u8] = b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev";
 const ACCEPT: [u8; 4] = [0x20, 2, 0, 0];
 const V1: &[u8] = b"PROXY TCP4 192.0.2.7 127.0.0.1 47568 1888\r\n";
@@ -947,4 +1004,251 @@ async fn invalid_tls_directives_report_the_misconfigured_option() {
         };
         assert!(error.to_string().contains(expected), "{error}");
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sighup_rotates_to_the_configured_certificate_and_key_paths() {
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+    use tokio::{net::UnixDatagram, net::UnixStream, process::Command};
+
+    let original = TestPki::new();
+    let rotated = TestPki::new();
+    let dir = original.dir.path();
+    let conf = dir.join("mosquitto.conf");
+    let socket = dir.join("mqtt.sock");
+    let notify_path = dir.join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let startup = format!(
+        "user root\nallow_anonymous true\nlistener 0 {}\n",
+        socket.display()
+    );
+    fs::write(&conf, format!("{startup}{}", original.listener_tls(""))).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mqextended"))
+        .arg("-c")
+        .arg(&conf)
+        .current_dir(dir)
+        .env("NOTIFY_SOCKET", &notify_path)
+        .env("TOKIO_WORKER_THREADS", "2")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = Pid::from_raw(child.id().unwrap().try_into().unwrap());
+    let mut bytes = [0; 32];
+    let size = timeout(DEADLINE, notify.recv(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes[..size], b"READY=1");
+    let connect = async |pki: &TestPki| {
+        timeout(DEADLINE, async {
+            let unix = UnixStream::connect(&socket).await.unwrap();
+            let connector = TlsConnector::from(Arc::new(pki.client_config(false)));
+            let mut stream = connector
+                .connect(ServerName::try_from("localhost").unwrap(), unix)
+                .await
+                .unwrap();
+            stream.write_all(CONNECT).await.unwrap();
+            assert_eq!(read_ack(&mut stream).await, ACCEPT);
+        })
+        .await
+        .unwrap();
+    };
+    connect(&original).await;
+
+    let rotated_dir = rotated.dir.path();
+    fs::write(
+        &conf,
+        format!(
+            "{startup}certfile {}\nkeyfile {}\ncafile {}\nlog_dest file reloaded.log\n",
+            rotated_dir.join("server.pem").display(),
+            rotated_dir.join("server.key").display(),
+            dir.join("ca.pem").display(),
+        ),
+    )
+    .unwrap();
+    kill(pid, Signal::SIGHUP).unwrap();
+    timeout(DEADLINE, async {
+        while !dir.join("reloaded.log").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    connect(&rotated).await;
+
+    kill(pid, Signal::SIGTERM).unwrap();
+    assert!(
+        timeout(DEADLINE, child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
+/// A broker process on a TLS Unix listener that the test reconfigures.
+#[cfg(unix)]
+struct ReloadingBroker {
+    child: tokio::process::Child,
+    conf: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    startup: String,
+}
+
+#[cfg(unix)]
+impl ReloadingBroker {
+    async fn start(pki: &TestPki, tls: &str) -> Self {
+        use tokio::{net::UnixDatagram, process::Command};
+
+        let dir = pki.dir.path();
+        let conf = dir.join("mosquitto.conf");
+        let socket = dir.join("mqtt.sock");
+        let notify_path = dir.join("notify");
+        let notify = UnixDatagram::bind(&notify_path).unwrap();
+        let startup = format!(
+            "user root\nallow_anonymous true\nlistener 0 {}\n{}",
+            socket.display(),
+            pki.listener_tls(tls)
+        );
+        fs::write(&conf, &startup).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_mqextended"))
+            .arg("-c")
+            .arg(&conf)
+            .current_dir(dir)
+            .env("NOTIFY_SOCKET", &notify_path)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut bytes = [0; 32];
+        let size = timeout(DEADLINE, notify.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..size], b"READY=1");
+        Self {
+            child,
+            conf,
+            socket,
+            startup,
+        }
+    }
+
+    fn pid(&self) -> nix::unistd::Pid {
+        nix::unistd::Pid::from_raw(self.child.id().unwrap().try_into().unwrap())
+    }
+
+    async fn connect(&self, client: ClientConfig) -> io::Result<[u8; 4]> {
+        timeout(DEADLINE, async {
+            let unix = tokio::net::UnixStream::connect(&self.socket).await?;
+            let mut stream = TlsConnector::from(Arc::new(client))
+                .connect(ServerName::try_from("localhost").unwrap(), unix)
+                .await?;
+            stream.write_all(CONNECT).await?;
+            let mut ack = [0; 4];
+            stream.read_exact(&mut ack).await?;
+            Ok(ack)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Rewrites the listener's trailing options and waits for SIGHUP to apply.
+    async fn reload(&self, options: &str) {
+        let marker = self.conf.with_file_name("reloaded.log");
+        fs::write(
+            &self.conf,
+            format!(
+                "{}{options}\nlog_dest file {}\n",
+                self.startup,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        nix::sys::signal::kill(self.pid(), nix::sys::signal::Signal::SIGHUP).unwrap();
+        timeout(DEADLINE, async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    async fn stop(mut self) {
+        nix::sys::signal::kill(self.pid(), nix::sys::signal::Signal::SIGTERM).unwrap();
+        let status = timeout(DEADLINE, self.child.wait()).await.unwrap().unwrap();
+        assert!(status.success());
+    }
+}
+
+fn revocation_list(pki: &TestPki) -> std::path::PathBuf {
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2020, 1, 1),
+        next_update: date_time_ymd(2099, 1, 1),
+        crl_number: 1.into(),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: 25.into(),
+            revocation_time: date_time_ymd(2020, 1, 1),
+            reason_code: None,
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    };
+    let path = pki.dir.path().join("revoked.pem");
+    fs::write(&path, crl.signed_by(&pki.ca).unwrap().pem().unwrap()).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sighup_loads_a_newly_configured_crlfile() {
+    let pki = TestPki::new();
+    let broker = ReloadingBroker::start(&pki, "require_certificate true\n").await;
+    assert_eq!(
+        broker.connect(pki.client_config(true)).await.unwrap(),
+        ACCEPT
+    );
+    let crl = revocation_list(&pki);
+    broker
+        .reload(&format!(
+            "require_certificate true\ncrlfile {}",
+            crl.display()
+        ))
+        .await;
+    assert!(broker.connect(pki.client_config(true)).await.is_err());
+    broker.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sighup_rereads_client_certificate_options() {
+    let pki = TestPki::new();
+    let broker = ReloadingBroker::start(&pki, "").await;
+    assert_eq!(
+        broker.connect(pki.client_config(false)).await.unwrap(),
+        ACCEPT
+    );
+
+    // net.c: net__load_certificates reapplies require_certificate.
+    broker.reload("require_certificate true").await;
+    assert!(broker.connect(pki.client_config(false)).await.is_err());
+    assert_eq!(
+        broker.connect(pki.client_config(true)).await.unwrap(),
+        ACCEPT
+    );
+
+    // listeners.c: listener__set_defaults clears options the file omits.
+    broker.reload("").await;
+    assert_eq!(
+        broker.connect(pki.client_config(false)).await.unwrap(),
+        ACCEPT
+    );
+    broker.stop().await;
 }
