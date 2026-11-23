@@ -219,7 +219,12 @@ impl BrokerProcess {
                     format!("did not listen on {}", self.addr),
                 ));
             }
-            if TcpStream::connect_timeout(&self.addr, PROBE_TIMEOUT.min(remaining)).is_ok() {
+            // The reserved port is an ephemeral one, so connecting to it before
+            // the broker binds can connect the socket to itself. That proves
+            // nothing and holds the port the broker is about to bind.
+            if let Ok(stream) = TcpStream::connect_timeout(&self.addr, PROBE_TIMEOUT.min(remaining))
+                && stream.local_addr().ok() != stream.peer_addr().ok()
+            {
                 return Ok(());
             }
             thread::sleep(POLL_INTERVAL);
