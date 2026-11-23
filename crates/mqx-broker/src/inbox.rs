@@ -577,6 +577,26 @@ impl Inbox {
     // database.c: db__message_delete_outgoing, db__message_update_outgoing;
     // lib/handle_pubrec.c: even an unknown PUBREC gets a PUBREL on v3.x.
     pub(crate) fn ack(&mut self, id: PacketId, kind: Ack, config: &BrokerConfig) -> bool {
+        self.acknowledge(id, kind, config, false)
+    }
+
+    // The apply meaning of a replicated `Operation::Ack`, kept for WAL and
+    // snapshot replay: a PUBREC naming a queued QoS 2 id marks it received.
+    pub(crate) fn replay_ack(&mut self, id: PacketId, kind: Ack, config: &BrokerConfig) -> bool {
+        self.acknowledge(id, kind, config, true)
+    }
+
+    pub(crate) fn in_flight(&self, id: PacketId) -> bool {
+        self.in_flight.iter().any(|entry| entry.id == Some(id))
+    }
+
+    fn acknowledge(
+        &mut self,
+        id: PacketId,
+        kind: Ack,
+        config: &BrokerConfig,
+        queued_pubrec: bool,
+    ) -> bool {
         // lib/handle_pubackcomp.c: even unknown ACK/COMP returns send quota.
         // database.c: oversize drops and negative PUBREC remove the message
         // without returning this quota for the current connection.
@@ -590,7 +610,12 @@ impl Inbox {
             if kind != Ack::Received {
                 self.remove_flight(index);
             }
-        } else if let Some(index) = self.queued.iter().position(|entry| entry.id == Some(id)) {
+        } else if (queued_pubrec || kind != Ack::Received)
+            && let Some(index) = self.queued.iter().position(|entry| entry.id == Some(id))
+        {
+            // handle_pubrec.c: handle__pubrec calls db__message_update_outgoing
+            // with persist = true, which never looks at queued messages, so a
+            // PUBREC naming a queued id only gets its PUBREL.
             if !ack_entry(&mut self.queued[index], kind) {
                 return false;
             }
@@ -688,6 +713,17 @@ impl Inbox {
             self.incoming_slots = self.incoming.len().min(self.incoming_maximum(config));
             self.promote(config);
         }
+    }
+
+    // src/handle_connack.c: handle__connack_properties recomputes the send
+    // quota from the messages already in flight when a bridge CONNACK changes
+    // Receive Maximum. Nothing was written before CONNACK except packets a
+    // cluster reserved, so keep the cursor, phases and DUP flags.
+    pub(crate) fn bridge_connack(&mut self, config: &BrokerConfig) {
+        if let Some(maximum) = self.receive_maximum {
+            self.send_used = self.flight_stats.qos_count.min(usize::from(maximum));
+        }
+        self.promote(config);
     }
 
     // handle_publish.c: handle__accepted_publish replaces a pending QoS 2 on
@@ -876,6 +912,61 @@ mod tests {
             );
             assert_publish_id(&mut inbox, &config, id);
         }
+    }
+
+    // lib/handle_pubrec.c: a PUBREC for a queued id must not mark that
+    // message as received; otherwise it is never sent once promoted.
+    #[test]
+    fn pubrec_for_a_queued_id_leaves_the_message_unsent() {
+        let config = BrokerConfig {
+            max_inflight_messages: 1,
+            ..BrokerConfig::default()
+        };
+        let mut inbox = Inbox::default();
+        for expected in [Offer::Ready, Offer::Queued] {
+            let offer = inbox.offer(
+                delivery(b"", QoS::ExactlyOnce),
+                true,
+                QoS::ExactlyOnce,
+                &config,
+            );
+            assert_eq!(offer, expected);
+        }
+        assert_publish_id(&mut inbox, &config, 1);
+        let queued = PacketId::new(2).unwrap();
+        assert!(inbox.ack(queued, Ack::Received, &config));
+        let first = PacketId::new(1).unwrap();
+        assert!(inbox.ack(first, Ack::Received, &config));
+        assert!(inbox.ack(first, Ack::Completed, &config));
+        assert_publish_id(&mut inbox, &config, 2);
+    }
+
+    // A replicated `Operation::Ack` written by an older binary must replay
+    // as it applied then: the queued message is marked received and is not
+    // sent after promotion.
+    #[test]
+    fn replayed_pubrec_for_a_queued_id_keeps_its_original_meaning() {
+        let config = BrokerConfig {
+            max_inflight_messages: 1,
+            ..BrokerConfig::default()
+        };
+        let mut inbox = Inbox::default();
+        for _ in 0..2 {
+            inbox.offer(
+                delivery(b"", QoS::ExactlyOnce),
+                true,
+                QoS::ExactlyOnce,
+                &config,
+            );
+        }
+        assert_publish_id(&mut inbox, &config, 1);
+        assert!(inbox.replay_ack(PacketId::new(2).unwrap(), Ack::Received, &config));
+        let first = PacketId::new(1).unwrap();
+        assert!(inbox.replay_ack(first, Ack::Received, &config));
+        assert!(inbox.replay_ack(first, Ack::Completed, &config));
+        assert!(inbox.next_outbound(&config, Duration::ZERO).is_none());
+        assert!(inbox.replay_ack(PacketId::new(2).unwrap(), Ack::Completed, &config));
+        assert!(inbox.outgoing_count() == 0);
     }
 
     // database.c: db__ready_for_flight and db__ready_for_queue count bytes

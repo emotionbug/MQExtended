@@ -11,7 +11,8 @@ mod property;
 
 pub use crate::{PacketId, QoS};
 pub use decode::{
-    DecodeContext, DecodeError, DecodeErrorKind, ErrorResponse, decode, peek_connect_protocol_level,
+    DecodeContext, DecodeError, DecodeErrorKind, ErrorResponse, decode, decode_filter_prefix,
+    peek_connect_protocol_level,
 };
 pub use encode::{EncodeError, encode};
 pub use property::Property;

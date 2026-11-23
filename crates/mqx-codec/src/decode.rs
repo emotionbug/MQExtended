@@ -161,7 +161,7 @@ impl Frame {
         Err(DecodeError::MalformedRemainingLength)
     }
 
-    fn cursor<'a>(&self, src: &'a BytesMut) -> Cursor<'a> {
+    fn cursor<'a>(&self, src: &'a [u8]) -> Cursor<'a> {
         Cursor {
             bytes: &src[..self.end],
             pos: self.body_start,
@@ -389,6 +389,17 @@ fn decode_publish(
 fn decode_subscribe(cursor: &mut Cursor<'_>, v31: bool) -> Result<Packet, DecodeError> {
     let packet_id = cursor.packet_id()?;
     let mut filters = Vec::new();
+    subscribe_filters(cursor, &mut filters)?;
+    if !v31 && filters.is_empty() {
+        return Err(DecodeError::EmptyList("SUBSCRIBE filters"));
+    }
+    Ok(Packet::Subscribe(Subscribe { packet_id, filters }))
+}
+
+fn subscribe_filters(
+    cursor: &mut Cursor<'_>,
+    filters: &mut Vec<(String, QoS)>,
+) -> Result<(), DecodeError> {
     while !cursor.is_empty() {
         let filter = cursor.string("subscription filter")?;
         // src/handle_subscribe.c: packet__read_string returns NULL for a zero
@@ -404,22 +415,51 @@ fn decode_subscribe(cursor: &mut Cursor<'_>, v31: bool) -> Result<Packet, Decode
         let qos = qos(cursor.byte("subscription QoS")?, "subscription")?;
         filters.push((filter.to_owned(), qos));
     }
-    if !v31 && filters.is_empty() {
-        return Err(DecodeError::EmptyList("SUBSCRIBE filters"));
-    }
-    Ok(Packet::Subscribe(Subscribe { packet_id, filters }))
+    Ok(())
 }
 
 fn decode_unsubscribe(cursor: &mut Cursor<'_>, v31: bool) -> Result<Packet, DecodeError> {
     let packet_id = cursor.packet_id()?;
     let mut filters = Vec::new();
-    while !cursor.is_empty() {
-        filters.push(cursor.topic("unsubscription filter", true)?.to_owned());
-    }
+    unsubscribe_filters(cursor, &mut filters)?;
     if !v31 && filters.is_empty() {
         return Err(DecodeError::EmptyList("UNSUBSCRIBE filters"));
     }
     Ok(Packet::Unsubscribe(Unsubscribe { packet_id, filters }))
+}
+
+fn unsubscribe_filters(
+    cursor: &mut Cursor<'_>,
+    filters: &mut Vec<String>,
+) -> Result<(), DecodeError> {
+    while !cursor.is_empty() {
+        filters.push(cursor.topic("unsubscription filter", true)?.to_owned());
+    }
+    Ok(())
+}
+
+/// After [`decode`] refused a SUBSCRIBE or UNSUBSCRIBE, returns the filters
+/// before the one that failed, if any. src/handle_subscribe.c and
+/// src/handle_unsubscribe.c act on each filter as they read it, so these were
+/// already (un)subscribed when Mosquitto closed the connection. Leaves the
+/// buffer unchanged; the caller still closes as for the decode error.
+pub fn decode_filter_prefix(src: &[u8], context: DecodeContext) -> Option<Packet> {
+    let frame = Frame::parse(src, context).ok()??;
+    let kind = frame.command & 0xf0;
+    if !matches!(kind, SUBSCRIBE | UNSUBSCRIBE) || frame.command != kind | 2 {
+        return None;
+    }
+    let mut cursor = frame.cursor(src);
+    let packet_id = cursor.packet_id().ok()?;
+    if kind == SUBSCRIBE {
+        let mut filters = Vec::new();
+        let _ = subscribe_filters(&mut cursor, &mut filters);
+        (!filters.is_empty()).then_some(Packet::Subscribe(Subscribe { packet_id, filters }))
+    } else {
+        let mut filters = Vec::new();
+        let _ = unsubscribe_filters(&mut cursor, &mut filters);
+        (!filters.is_empty()).then_some(Packet::Unsubscribe(Unsubscribe { packet_id, filters }))
+    }
 }
 
 fn slice(bytes: &Bytes, range: Range<usize>) -> Bytes {

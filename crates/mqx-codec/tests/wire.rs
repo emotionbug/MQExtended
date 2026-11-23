@@ -954,3 +954,52 @@ fn invalid_packet_models_leave_encoding_destination_untouched() {
         assert_eq!(&dst[..], b"prior data");
     }
 }
+
+// src/handle_subscribe.c and src/handle_unsubscribe.c act on each filter as
+// they read it; the filters before an invalid one remain in effect.
+#[test]
+fn refused_subscription_packets_expose_their_valid_filter_prefix() {
+    let subscribe: &[u8] = &[
+        0x82, 14, 0, 1, 0, 1, b'a', 1, 0, 5, b'a', b'/', b'#', b'/', b'b', 1,
+    ];
+    let unsubscribe: &[u8] = &[
+        0xa2, 12, 0, 2, 0, 1, b'a', 0, 5, b'a', b'/', b'#', b'/', b'b',
+    ];
+    for wire in [subscribe, unsubscribe] {
+        assert!(matches!(
+            decode(&mut BytesMut::from(wire), V311),
+            Err(DecodeError::InvalidTopic { .. })
+        ));
+    }
+    assert_eq!(
+        mqx_codec::decode_filter_prefix(subscribe, V311),
+        Some(Packet::Subscribe(Subscribe {
+            packet_id: PacketId::new(1).unwrap(),
+            filters: vec![("a".into(), QoS::AtLeastOnce)],
+        }))
+    );
+    assert_eq!(
+        mqx_codec::decode_filter_prefix(unsubscribe, V31),
+        Some(Packet::Unsubscribe(Unsubscribe {
+            packet_id: PacketId::new(2).unwrap(),
+            filters: vec!["a".into()],
+        }))
+    );
+    // Nothing precedes the failure, or the failure is not in a filter list.
+    for (wire, context) in [
+        (&[0x82, 8, 0, 1, 0, 3, b'a', b'#', b'b', 1][..], V311),
+        (&[0x82, 6, 0, 1, 0, 1, b'a', 3][..], V311),
+        (&[0x80, 6, 0, 1, 0, 1, b'a', 1][..], V311),
+        (&[0x30, 3, 0, 1, b'a'][..], V311),
+        (
+            subscribe,
+            DecodeContext::new(10, Some(ProtocolVersion::V311)),
+        ),
+    ] {
+        assert_eq!(
+            mqx_codec::decode_filter_prefix(wire, context),
+            None,
+            "{wire:?}"
+        );
+    }
+}

@@ -67,6 +67,7 @@ impl Proposal {
                     | Operation::Forward(..)
                     | Operation::Release(..)
                     | Operation::Ack(..)
+                    | Operation::ReceivedInFlight(_)
                     | Operation::ReserveOutbound(_)
                     | Operation::ReserveOutboundWithQos0Expiry(_)
             )

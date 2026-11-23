@@ -232,6 +232,21 @@ impl BridgeSession {
         Ok(())
     }
 
+    // src/handle_connack.c: handle__connack_properties. Only for a CONNACK
+    // that changes the maximum QoS or Receive Maximum passed to `online`.
+    pub async fn connack(
+        &self,
+        max_qos: QoS,
+        receive_maximum: Option<u16>,
+    ) -> Result<(), BrokerError> {
+        self.apply(Operation::BridgeConnack {
+            max_qos,
+            receive_maximum,
+        })
+        .await?;
+        Ok(())
+    }
+
     pub async fn replay_retained(&self, filters: Vec<(String, QoS)>) -> Result<(), BrokerError> {
         self.apply(Operation::Subscribe(
             subscriptions(filters, true),

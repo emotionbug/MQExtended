@@ -418,6 +418,17 @@ impl<'a> Peer<'a> {
                 Err(_) => return Err(Error::Keepalive),
             }
         };
+        // lib/net_mosq.c: net__is_connected and database.c:
+        // db__message_insert_outgoing admit messages once the socket exists;
+        // nothing is written before CONNACK. Keep the previous capabilities
+        // until then, as Mosquitto's context does.
+        let offered = (self.max_qos, self.send_maximum);
+        tokio::select! {
+            biased;
+            _ = session.lost() => return Ok(End::Lost),
+            _ = replacement(changes, config, false) => return Ok(End::Reconfigure),
+            result = session.online(offered.0, offered.1) => result?,
+        }
         let ack = tokio::select! {
             biased;
             _ = session.lost() => return Ok(End::Lost),
@@ -432,7 +443,9 @@ impl<'a> Peer<'a> {
         };
         tracing::debug!("Received CONNACK on connection {}.", self.local_id);
         let keepalive = self.connack(config, &mut wire, ack)?;
-        session.online(self.max_qos, self.send_maximum).await?;
+        if (self.max_qos, self.send_maximum) != offered {
+            session.connack(self.max_qos, self.send_maximum).await?;
+        }
         self.connected_at = Some(Instant::now());
         let result = tokio::select! {
             biased;

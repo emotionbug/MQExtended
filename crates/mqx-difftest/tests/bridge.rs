@@ -617,6 +617,263 @@ fn outgoing_psk_bridge_delivers_through_mosquitto() {
     });
 }
 
+fn certificate_bridge_delivers(kind: BrokerKind, san: bool, options: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let certfile = dir.path().join("server.pem");
+    let keyfile = dir.path().join("server.key");
+    let mut params = rcgen::CertificateParams::new(if san {
+        vec!["localhost".to_owned()]
+    } else {
+        Vec::new()
+    })
+    .unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    let key = rcgen::KeyPair::generate().unwrap();
+    std::fs::write(&certfile, params.self_signed(&key).unwrap().pem()).unwrap();
+    std::fs::write(&keyfile, key.serialize_pem()).unwrap();
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let core = start(
+        BrokerKind::Mosquitto,
+        &format!(
+            "{ANONYMOUS}listener {port} 127.0.0.1\ncertfile {}\nkeyfile {}\n",
+            certfile.display(),
+            keyfile.display(),
+        ),
+    );
+    let edge = start(
+        kind,
+        &format!(
+            "{ANONYMOUS}connection bridge_sample\naddress localhost:{port}\n\
+             bridge_cafile {}\nnotification_topic difftest/bridge-tls\n\
+             {options}topic {READY_TOPIC} out 0\n",
+            certfile.display(),
+        ),
+    );
+    wait_bridge_state(&core, "difftest/bridge-tls", b"1");
+    wait_for_bridge_traffic(&edge, &core);
+}
+
+// lib/tls_mosq.c: tls__set_verify_hostname uses OpenSSL's DNS certificate checks.
+#[test]
+#[ignore = "requires Mosquitto 2.1.4 with TLS and mqextended"]
+fn certificate_bridge_accepts_trusted_dns_common_name_without_a_san() {
+    differential(|kind| certificate_bridge_delivers(kind, false, ""));
+}
+
+// lib/net_mosq.c: net__init_ssl_ctx passes bridge_ciphers to OpenSSL.
+#[test]
+#[ignore = "requires Mosquitto 2.1.4 with TLS and mqextended"]
+fn certificate_bridge_accepts_openssl_cipher_selectors() {
+    differential(|kind| {
+        certificate_bridge_delivers(kind, true, "bridge_ciphers DEFAULT:@SECLEVEL=2\n");
+    });
+}
+
+// lib/net_mosq.c: net__is_connected covers a socket awaiting CONNACK.
+// Hold just that packet between two real brokers so the publish happens
+// after the bridge has connected to the transport but before MQTT is ready.
+#[test]
+#[ignore = "requires Mosquitto 2.1.4 and mqextended"]
+fn clean_bridge_delivers_publications_accepted_while_waiting_for_connack() {
+    differential(|kind| {
+        let version = Version::V311;
+        let topic = "bridge/handshake";
+        let mut core = start(BrokerKind::Mosquitto, ANONYMOUS);
+        let reader = client(
+            &mut core,
+            1,
+            version,
+            "handshake-reader",
+            false,
+            false,
+            false,
+        );
+        local_subscribe(&mut core, reader, version, 1, topic, 1);
+        let proxy = Remote::bind();
+        let bridge = bridge_config(
+            version,
+            proxy.addr(),
+            "local_cleansession true\nnotifications false\nbridge_attempt_unsubscribe false\n",
+            &format!("topic {topic} out 1\n"),
+        );
+        let mut edge = start(kind, &format!("{ANONYMOUS}{bridge}"));
+        let mut bridge_socket = proxy.accept();
+        let mut core_socket = TcpStream::connect(core.node_addr(1).unwrap()).unwrap();
+        core_socket.set_read_timeout(Some(RESPONSE)).unwrap();
+        core_socket
+            .write_all(&read_frame(&mut bridge_socket).unwrap().unwrap())
+            .unwrap();
+        let response = read_frame(&mut core_socket).unwrap().unwrap();
+        assert_eq!(response, connack(version, false, 0, &[]));
+        let writer = client(
+            &mut edge,
+            1,
+            version,
+            "handshake-writer",
+            false,
+            false,
+            false,
+        );
+        let packet = publish(version, topic, b"during handshake", 1, 1, 0);
+        publish_local(&mut edge, writer, &packet, 1, 1);
+        bridge_socket.write_all(&response).unwrap();
+        let forwarded = read_frame(&mut bridge_socket)
+            .unwrap_or_else(|error| {
+                panic!("{kind:?}: bridge discarded the pre-CONNACK message: {error}")
+            })
+            .unwrap();
+        core_socket.write_all(&forwarded).unwrap();
+        local_expect(&mut core, reader, &packet);
+        (edge.into_transcript(), core.into_transcript())
+    });
+}
+
+// Frames the bridge sends before going quiet for `quiet`.
+fn drain(socket: &mut TcpStream, quiet: Duration) -> Vec<Vec<u8>> {
+    socket.set_read_timeout(Some(quiet)).unwrap();
+    let mut frames = Vec::new();
+    loop {
+        match read_frame(socket) {
+            Ok(Some(frame)) => frames.push(frame),
+            Ok(None) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("reading bridge frames: {error}"),
+        }
+    }
+    socket.set_read_timeout(Some(RESPONSE)).unwrap();
+    frames
+}
+
+// MQTT 5 CONNACK with only a Receive Maximum property.
+fn connack_receive_maximum(maximum: u16) -> Vec<u8> {
+    let [hi, lo] = maximum.to_be_bytes();
+    frame(0x20, &[0, 0, 3, 0x21, hi, lo])
+}
+
+// src/handle_connack.c: handle__connack_properties calls
+// db__message_reconnect_reset when CONNACK lowers Receive Maximum. Messages
+// admitted while CONNACK was pending stay in flight; later ones use the quota.
+#[test]
+#[ignore = "requires Mosquitto 2.1.4 and mqextended"]
+fn connack_receive_maximum_applies_to_publications_accepted_during_the_handshake() {
+    differential(|kind| {
+        let topic = "bridge/handshake";
+        let mut remote = Remote::bind();
+        let bridge = bridge_config(
+            Version::V5,
+            remote.addr(),
+            "notifications false\nbridge_attempt_unsubscribe false\nbridge_max_topic_alias 0\n",
+            &format!("topic {topic} out 1\n"),
+        );
+        let mut edge = start(kind, &format!("{ANONYMOUS}{bridge}"));
+        let mut peer = remote.accept();
+        remote.expect(
+            &mut peer,
+            &bridge_connect(Version::V5, default_id(), 60, false, None),
+        );
+        let writer = client(
+            &mut edge,
+            1,
+            Version::V311,
+            "handshake-writer",
+            false,
+            false,
+            false,
+        );
+        for mid in 1..=2 {
+            let packet = publish(Version::V311, topic, &[b'0' + mid as u8], 1, mid, 0);
+            publish_local(&mut edge, writer, &packet, 1, mid);
+        }
+        peer.write_all(&connack_receive_maximum(1)).unwrap();
+        let during_handshake = drain(&mut peer, Duration::from_millis(500));
+        for mid in 1..=2 {
+            peer.write_all(&ack(0x40, mid)).unwrap();
+        }
+        // Each PUBACK returns one quota slot. Let both reach the edge before
+        // the next messages are admitted, or either broker may release two.
+        thread::sleep(Duration::from_millis(300));
+        for mid in 3..=4 {
+            let packet = publish(Version::V311, topic, &[b'0' + mid as u8], 1, mid, 0);
+            publish_local(&mut edge, writer, &packet, 1, mid);
+        }
+        let after_connack = drain(&mut peer, Duration::from_millis(500));
+        peer.write_all(&ack(0x40, 3)).unwrap();
+        let after_ack = drain(&mut peer, Duration::from_millis(500));
+        (during_handshake, after_connack, after_ack)
+    });
+}
+
+// Cluster variant: another node accepts the publication while the bridge
+// owner awaits CONNACK, which then lowers Receive Maximum. The remote sees
+// the message once, from the one node that dialled it.
+#[test]
+#[ignore = "requires cluster-enabled mqextended"]
+fn cluster_bridge_delivers_publications_accepted_while_waiting_for_connack_once() {
+    let topic = "bridge/handshake";
+    let mut remote = Remote::bind();
+    let bridge = bridge_config(
+        Version::V5,
+        remote.addr(),
+        "local_cleansession true\nnotifications false\nbridge_attempt_unsubscribe false\n\
+         bridge_max_topic_alias 0\n",
+        &format!("topic {topic} out 1\n"),
+    );
+    let conf = format!("{ANONYMOUS}log_type all\n{bridge}");
+    let mut cluster = Harness::start_cluster(config(&conf), ClusterConfig::default()).unwrap();
+    let mut peer = remote.accept();
+    remote.expect(
+        &mut peer,
+        &bridge_connect(Version::V5, default_id(), 60, false, None),
+    );
+    let owner = bridge_owner(&cluster, default_id());
+    let other = if owner == 1 { 2 } else { 1 };
+    let writer = client(
+        &mut cluster,
+        other,
+        Version::V311,
+        "handshake-writer",
+        false,
+        false,
+        false,
+    );
+    let packet = publish(Version::V311, topic, b"during handshake", 1, 1, 0);
+    publish_local(&mut cluster, writer, &packet, 1, 1);
+    peer.write_all(&connack_receive_maximum(1)).unwrap();
+    remote.expect(
+        &mut peer,
+        &publish(Version::V5, topic, b"during handshake", 1, 1, 0),
+    );
+    assert_eq!(
+        drain(&mut peer, Duration::from_millis(500)),
+        Vec::<Vec<u8>>::new()
+    );
+    peer.write_all(&ack(0x40, 1)).unwrap();
+    let packet = publish(Version::V311, topic, b"after connack", 1, 2, 0);
+    publish_local(&mut cluster, writer, &packet, 1, 2);
+    remote.expect(
+        &mut peer,
+        &publish(Version::V5, topic, b"after connack", 1, 2, 0),
+    );
+    peer.write_all(&ack(0x40, 2)).unwrap();
+    peer.write_all(PING).unwrap();
+    remote.expect(&mut peer, PONG);
+    assert!(
+        remote.accept_within(Duration::from_millis(250)).is_none(),
+        "more than one live bridge"
+    );
+}
+
 // 06-bridge-b2br-late-connection{,-retain}.py
 #[test]
 #[ignore = "requires Mosquitto 2.1.4 and mqextended"]

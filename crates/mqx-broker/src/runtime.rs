@@ -19,7 +19,7 @@ use std::{
 use bytes::Bytes;
 use mqx_auth::AclFile;
 use mqx_cluster::{Cluster, ClusterConfig, ClusterError, NodeEvent, NodeStatus, StateMachine};
-use mqx_codec::{QoS, v5::ReasonCode as R};
+use mqx_codec::{PacketId, QoS, v5::ReasonCode as R};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -656,6 +656,17 @@ impl Broker {
     ) -> Result<Reply, BrokerError> {
         self.submit(Command::Act(live.lease.clone(), operation))
             .await
+    }
+
+    // A standalone log is never replayed, so it can always use the newer
+    // command; a replicated one writes `Ack` where both mean the same.
+    pub(super) fn pubrec(&self, live: &Live, id: PacketId) -> Operation {
+        match &self.0.log {
+            Log::Local { .. } => Operation::ReceivedInFlight(id),
+            Log::Replicated(log) => log
+                .cluster
+                .read(|machine| machine.state.pubrec(&live.lease, id)),
+        }
     }
 
     pub(super) async fn receive(

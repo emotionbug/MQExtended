@@ -270,6 +270,18 @@ pub(crate) enum Operation {
         now: Duration,
         admitted: bool,
     },
+    // A bridge CONNACK changed what BridgeOnline admitted messages under
+    // while the handshake was pending. BridgeOnline keeps its resume meaning
+    // for WAL replay; old binaries cannot decode this command.
+    BridgeConnack {
+        max_qos: QoS,
+        receive_maximum: Option<u16>,
+    },
+    // A PUBREC for an id that was not in flight when proposed. Unlike
+    // `Ack(_, Received)`, which keeps marking a queued id received on WAL
+    // replay, it updates only in-flight messages (handle_pubrec.c). Old
+    // binaries cannot decode this command.
+    ReceivedInFlight(PacketId),
 }
 
 impl Operation {
@@ -735,6 +747,20 @@ impl State {
             matched,
             targets,
         })
+    }
+
+    // Choose the PUBREC command: an in-flight id applies the same under
+    // either, so only other ids need the command old binaries cannot replay.
+    pub(crate) fn pubrec(&self, lease: &Lease, id: PacketId) -> Operation {
+        if self
+            .claimed_session(lease)
+            .and_then(|s| s.inbox.as_ref())
+            .is_some_and(|inbox| inbox.in_flight(id))
+        {
+            Operation::Ack(id, Ack::Received)
+        } else {
+            Operation::ReceivedInFlight(id)
+        }
     }
 
     pub(crate) fn has_outbound(&self, lease: &Lease) -> bool {
@@ -1349,6 +1375,16 @@ impl State {
                 inbox.resume(|_, _| true, &self.config, now);
                 Reply::NoChange
             }
+            Operation::BridgeConnack {
+                max_qos,
+                receive_maximum,
+            } => {
+                session.max_qos = max_qos;
+                let inbox = session.inbox.as_mut().unwrap();
+                inbox.receive_maximum = receive_maximum;
+                inbox.bridge_connack(&self.config);
+                Reply::NoChange
+            }
             Operation::BridgeOffline { now, graceful } => {
                 let bridge = session
                     .internal_bridge
@@ -1395,7 +1431,11 @@ impl State {
                 };
                 for filter in filters {
                     let acl_allowed = acl.allowed(&session.publisher, &filter, Access::Unsubscribe);
-                    let Some((group, path)) = split_filter(&filter) else {
+                    // handle_unsubscribe.c: handle__unsubscribe validates each
+                    // filter in turn; earlier filters stay removed.
+                    let Some((group, path)) = split_filter(&filter)
+                        .filter(|(_, path)| validate_topic_filter(path).is_ok())
+                    else {
                         return Reply::ProtocolError;
                     };
                     // subs.c: sub__remove leaves the previous reason alone if
@@ -1507,11 +1547,18 @@ impl State {
                 self.publish(copy, now, effects);
                 reply
             }
-            Operation::Ack(id, ack) => {
+            Operation::Ack(..) | Operation::ReceivedInFlight(_) => {
                 let Some(inbox) = &mut session.inbox else {
                     return Reply::LocalInbox;
                 };
-                if inbox.ack(id, ack, &self.config) {
+                let (ack, acknowledged) = match operation {
+                    Operation::Ack(id, ack) => (ack, inbox.replay_ack(id, ack, &self.config)),
+                    Operation::ReceivedInFlight(id) => {
+                        (Ack::Received, inbox.ack(id, Ack::Received, &self.config))
+                    }
+                    _ => unreachable!(),
+                };
+                if acknowledged {
                     self.persistence_changes += u64::from(ack.counts_for_persistence());
                     if inbox.has_outbound(&self.config) {
                         effects.push(Effect::Ready(lease));
@@ -2160,6 +2207,85 @@ mod tests {
         }
         assert_eq!(left.snapshot(), right.snapshot());
         assert_eq!(left.sessions.len(), 1);
+    }
+
+    // lib/handle_pubrec.c: PUBREC for a queued id. Historical `Ack` entries
+    // keep marking the queued message received on replay; the new command
+    // leaves it to be sent once promoted, as Mosquitto does.
+    #[test]
+    fn pubrec_for_a_queued_id_keeps_the_meaning_of_each_command() {
+        let config = Arc::new(BrokerConfig {
+            max_inflight_messages: 1,
+            ..BrokerConfig::default()
+        });
+        let subscriber = Lease {
+            id: Arc::from("subscriber"),
+            epoch: 1,
+        };
+        let first = PacketId::new(1).unwrap();
+        let queued = PacketId::new(2).unwrap();
+        let message = Arc::new(Message {
+            source: Publisher {
+                id: Arc::from("publisher"),
+                username: None,
+                security: 1,
+                dynamic_security: None,
+            },
+            topic: "topic".into(),
+            payload: Bytes::from_static(b"payload"),
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            properties: Vec::new(),
+            expires: None,
+        });
+        let act = |operation| Command::Act(subscriber.clone(), operation);
+        for (pubrec, resent) in [
+            (Operation::Ack(queued, Ack::Received), false),
+            (Operation::ReceivedInFlight(queued), true),
+        ] {
+            let mut state = State::new(config.clone());
+            for command in [
+                claim(subscriber.id.clone(), false),
+                act(Operation::Subscribe(
+                    vec![SubscriptionRequest::legacy((
+                        "topic".into(),
+                        QoS::ExactlyOnce,
+                    ))],
+                    Duration::ZERO,
+                )),
+                act(Operation::Forward(message.clone(), Duration::ZERO)),
+                act(Operation::Forward(message.clone(), Duration::ZERO)),
+                act(Operation::NextOutbound(Duration::ZERO)),
+            ] {
+                state.apply(command);
+            }
+            assert!(matches!(
+                state.pubrec(&subscriber, first),
+                Operation::Ack(id, Ack::Received) if id == first
+            ));
+            assert!(matches!(
+                state.pubrec(&subscriber, queued),
+                Operation::ReceivedInFlight(id) if id == queued
+            ));
+            for command in [
+                act(pubrec),
+                act(Operation::Ack(first, Ack::Received)),
+                act(Operation::Ack(first, Ack::Completed)),
+            ] {
+                assert_eq!(state.apply(command).reply, Reply::NoChange);
+            }
+            let next = state.apply(act(Operation::NextOutbound(Duration::ZERO)));
+            assert_eq!(
+                matches!(
+                    next.reply,
+                    Reply::Outbound(Some(Outbound::Publish { id: Some(id), dup: false, .. }))
+                        if id == queued
+                ),
+                resent,
+                "{:?}",
+                next.reply
+            );
+        }
     }
 
     #[test]

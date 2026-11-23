@@ -48,7 +48,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         if *shutdown.borrow() || Instant::now() >= initial_deadline {
             return Ok(());
         }
-        match wire.connect(config) {
+        match wire.connect(config, info.listener.mount_point.is_none()) {
             Ok(Some(Frame::Legacy(Packet::Connect(connect)))) => break (connect, None, None),
             Ok(Some(Frame::V5(Packet5::Connect(connect)))) => {
                 // handle_connect.c: read_and_verify_protocol_version refuses
@@ -342,7 +342,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     } else {
                         match packet {
                             Frame::Legacy(packet) => {
-                                let step = session.process(packet, &info);
+                                let step = session.process(packet, &info, connect.protocol);
                                 if clustered {
                                     wire.prefetch(step).await
                                 } else {
@@ -403,7 +403,29 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
                 Ok(None) => {}
-                Err(error) => break Err(error),
+                Err(error) => {
+                    // handle_subscribe.c and handle_unsubscribe.c: filters before
+                    // the invalid one already took effect; no SUBACK is sent.
+                    match wire.filter_prefix.take() {
+                        Some(Frame::Legacy(packet)) => {
+                            let _ = session.process(packet, &info, connect.protocol).await;
+                        }
+                        Some(Frame::V5(packet)) => {
+                            let mut aliases = wire.v5.take().unwrap();
+                            let _ = session
+                                .process_v5(
+                                    packet,
+                                    &info,
+                                    &mut aliases,
+                                    options.as_ref().unwrap().session_expiry,
+                                )
+                                .await;
+                            wire.v5 = Some(aliases);
+                        }
+                        None => {}
+                    }
+                    break Err(error);
+                }
             }
             if wire.eof {
                 break Ok(End::Eof);
@@ -593,13 +615,23 @@ fn prepare(
         return Ok(Preparation::Refused(Code::NotAuthorized, R::NOT_AUTHORIZED));
     }
     if let Some(will) = &mut connect.will {
+        // handle_connect.c: will__read mounts the topic, then refuses a
+        // `$CONTROL/` Will with MOSQ_ERR_ACL_DENIED (no CONNACK on any
+        // protocol), before the Will payload size check.
+        mount(&mut will.topic, listener.mount_point.as_deref());
+        // will__read then applies mosquitto_pub_topic_check to the mounted
+        // topic, e.g. its hierarchy limit; that error also sends no CONNACK.
+        if will.topic.starts_with(crate::control::PREFIX)
+            || mqx_topic::validate_topic_name(&will.topic).is_err()
+        {
+            return Ok(Preparation::Close);
+        }
         if config.message_size_limit != 0 && will.payload.len() > config.message_size_limit {
             return Ok(Preparation::Refused(
                 Code::NotAuthorized,
                 R::PACKET_TOO_LARGE,
             ));
         }
-        mount(&mut will.topic, listener.mount_point.as_deref());
     }
     // proxy_v2.c and handle_connect.c: handle_username_from_cert_options
     // discard MQTT credentials for both certificate sources, but only a
@@ -756,7 +788,12 @@ impl Active<'_> {
         self.broker.act(&self.live, operation).await
     }
 
-    async fn process(&self, packet: Packet, info: &ConnectionInfo) -> Result<Step, BrokerError> {
+    async fn process(
+        &self,
+        packet: Packet,
+        info: &ConnectionInfo,
+        protocol: ProtocolVersion,
+    ) -> Result<Step, BrokerError> {
         let config = &self.broker.0.config;
         let mount_point = info.listener.mount_point.as_deref();
         let max_qos = info.listener.max_qos;
@@ -772,6 +809,12 @@ impl Active<'_> {
                 }
                 let logged = tracing::enabled!(target: "mqx::subscribe", tracing::Level::INFO)
                     .then(|| sub.filters.clone());
+                let granted = (protocol == ProtocolVersion::V31).then(|| {
+                    sub.filters
+                        .iter()
+                        .map(|(_, qos)| *qos)
+                        .collect::<Vec<QoS>>()
+                });
                 let filters = sub
                     .filters
                     .into_iter()
@@ -784,13 +827,23 @@ impl Active<'_> {
                     Reply::Subscribed(codes) if codes.is_empty() => {
                         Ok(Step::EmptySubAck(sub.packet_id))
                     }
-                    Reply::Subscribed(return_codes) => {
+                    Reply::Subscribed(mut return_codes) => {
                         // Mosquitto handle_subscribe.c: handle__subscribe logs the
                         // mounted filter and granted QoS after installing the leaf.
                         if let Some(logged) = logged {
                             for ((filter, qos), code) in logged.into_iter().zip(&return_codes) {
                                 if matches!(code, mqx_codec::SubscribeReturnCode::Success(_)) {
                                     tracing::info!(target: "mqx::subscribe", "{} {} {filter}", self.live.lease.id, qos as u8);
+                                }
+                            }
+                        }
+                        // handle_subscribe.c: handle__subscribe replaces a denied QoS
+                        // with 0x80 only for MQTT 3.1.1; MQTT 3.1 gets the granted
+                        // QoS back although the subscription is not installed.
+                        if let Some(granted) = granted {
+                            for (code, qos) in return_codes.iter_mut().zip(granted) {
+                                if *code == mqx_codec::SubscribeReturnCode::Failure {
+                                    *code = mqx_codec::SubscribeReturnCode::Success(qos);
                                 }
                             }
                         }
@@ -802,9 +855,10 @@ impl Active<'_> {
                     reply => action_result(reply),
                 }
             }
-            Packet::Unsubscribe(mut unsub) => {
-                for filter in &mut unsub.filters {
-                    mount(filter, mount_point);
+            Packet::Unsubscribe(unsub) => {
+                // handle_unsubscribe.c: handle__unsubscribe checks ACL and
+                // removes the filter as sent, without the listener mount_point.
+                for filter in &unsub.filters {
                     tracing::info!(target: "mqx::unsubscribe", "{} {filter}", self.live.lease.id);
                 }
                 let step = action_result(self.act(Operation::Unsubscribe(unsub.filters)).await?)?;
@@ -929,7 +983,12 @@ impl Active<'_> {
                 Err(BrokerError::Protocol)
             }
         } else {
-            action_result(self.act(Operation::Ack(id, ack)).await?)
+            let operation = if ack == Ack::Received {
+                self.broker.pubrec(&self.live, id)
+            } else {
+                Operation::Ack(id, ack)
+            };
+            action_result(self.act(operation).await?)
         }
     }
 }
@@ -995,6 +1054,9 @@ struct Wire<S> {
     eof: bool,
     v5: Option<v5::WireState>,
     pending_error: Option<BrokerError>,
+    // The valid filters of a refused SUBSCRIBE or UNSUBSCRIBE, applied
+    // without an acknowledgement before the connection ends.
+    filter_prefix: Option<Frame>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
@@ -1012,6 +1074,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             eof: false,
             v5: None,
             pending_error: None,
+            filter_prefix: None,
         }
     }
 
@@ -1067,7 +1130,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             .add(Metric::QueuedBytes, -(size as i64));
     }
 
-    fn connect(&mut self, config: &BrokerConfig) -> Result<Option<Frame>, BrokerError> {
+    fn connect(
+        &mut self,
+        config: &BrokerConfig,
+        unmounted: bool,
+    ) -> Result<Option<Frame>, BrokerError> {
         // lib/packet_mosq.c: packet__read_single rejects a non-CONNECT first
         // command, and checks the CONNECT limit before the protocol is known.
         const CONNECT_MAX: usize = 100_000;
@@ -1087,7 +1154,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             codec5::peek_connect_protocol_level(&self.input),
             Ok(Some(5 | 0x85))
         ) {
-            codec5::decode(&mut self.input, codec5::DecodeContext::new(max))
+            // handle_connect.c: will__read refuses a `$CONTROL/` Will before
+            // reading its payload; only an unmounted topic can be checked there.
+            let context = codec5::DecodeContext::new(max);
+            let context = if unmounted {
+                context.with_unmounted_will()
+            } else {
+                context
+            };
+            codec5::decode(&mut self.input, context)
                 .map(|packet| packet.map(Frame::V5))
                 .map_err(BrokerError::from)
         } else {
@@ -1126,11 +1201,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             {
                 return Err(BrokerError::Protocol);
             }
-            return Ok(decode(
-                &mut self.input,
-                DecodeContext::new(config.max_packet_size, Some(legacy_protocol)),
-            )?
-            .map(Frame::Legacy));
+            let context = DecodeContext::new(config.max_packet_size, Some(legacy_protocol));
+            return match decode(&mut self.input, context) {
+                Ok(packet) => Ok(packet.map(Frame::Legacy)),
+                Err(error) => {
+                    self.filter_prefix =
+                        mqx_codec::decode_filter_prefix(&self.input, context).map(Frame::Legacy);
+                    Err(error.into())
+                }
+            };
         };
         let command = self.input.first().map_or(0, |header| header & 0xf0);
         // packet_mosq.c: packet__check_in_packet_oversize checks the
@@ -1150,6 +1229,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             Ok(packet) => Ok(packet.map(Frame::V5)),
             Err(mut error) => {
                 use codec5::DecodeErrorKind as Fault;
+                if matches!(command, 0x80 | 0xa0) {
+                    self.filter_prefix =
+                        codec5::decode_filter_prefix(&self.input, context).map(Frame::V5);
+                }
                 if matches!(error.kind, Fault::PacketTooLarge { size, .. } if size > command_cap)
                     || command == 0x10
                 {

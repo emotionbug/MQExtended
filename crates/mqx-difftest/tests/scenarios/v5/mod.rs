@@ -10,6 +10,7 @@ use super::{
 };
 
 mod connect;
+mod engine;
 mod persistence;
 mod publish;
 mod sessions;

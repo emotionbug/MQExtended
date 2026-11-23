@@ -11,7 +11,7 @@ pub mod v5;
 use bytes::Bytes;
 use thiserror::Error;
 
-pub use decode::{DecodeContext, DecodeError, decode};
+pub use decode::{DecodeContext, DecodeError, decode, decode_filter_prefix};
 pub use encode::{EncodeError, encode};
 
 pub const MAX_REMAINING_LENGTH: usize = 268_435_455;

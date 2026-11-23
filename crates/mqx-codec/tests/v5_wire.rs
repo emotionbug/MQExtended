@@ -1208,3 +1208,53 @@ proptest! {
         let _ = peek_connect_protocol_level(&bytes);
     }
 }
+
+// src/handle_subscribe.c and src/handle_unsubscribe.c act on each filter as
+// they read it; the filters before an invalid one remain in effect.
+#[test]
+fn refused_subscription_packets_expose_their_valid_filter_prefix() {
+    let subscribe: &[u8] = &[
+        0x82, 17, 0, 1, 2, 0x0b, 7, 0, 1, b'a', 0x11, 0, 5, b'a', b'/', b'#', b'/', b'b', 1,
+    ];
+    let unsubscribe: &[u8] = &[
+        0xa2, 13, 0, 2, 0, 0, 1, b'a', 0, 5, b'a', b'/', b'#', b'/', b'b',
+    ];
+    for wire in [subscribe, unsubscribe] {
+        assert!(decode(&mut BytesMut::from(wire), BROKER).is_err());
+    }
+    assert_eq!(
+        mqx_codec::v5::decode_filter_prefix(subscribe, BROKER),
+        Some(Packet::Subscribe(Subscribe {
+            packet_id: PacketId::new(1).unwrap(),
+            properties: vec![P::SubscriptionIdentifier(7)],
+            subscriptions: vec![Subscription {
+                filter: "a".into(),
+                qos: QoS::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendIfNew,
+            }],
+        }))
+    );
+    assert_eq!(
+        mqx_codec::v5::decode_filter_prefix(unsubscribe, BROKER),
+        Some(Packet::Unsubscribe(Unsubscribe {
+            packet_id: PacketId::new(2).unwrap(),
+            properties: Vec::new(),
+            filters: vec!["a".into()],
+        }))
+    );
+    for wire in [
+        // Invalid options on the only filter.
+        &[0x82, 7, 0, 1, 0, 0, 1, b'a', 0x30][..],
+        // Invalid properties before any filter.
+        &[0x82, 9, 0, 1, 2, 0x0b, 0, 0, 1, b'a', 1][..],
+        &[0x30, 4, 0, 1, b'a', 0][..],
+    ] {
+        assert_eq!(
+            mqx_codec::v5::decode_filter_prefix(wire, BROKER),
+            None,
+            "{wire:?}"
+        );
+    }
+}

@@ -299,9 +299,10 @@ impl Active<'_> {
                     reply => action_result(reply),
                 }
             }
-            Unsubscribe(mut packet) => {
-                for filter in &mut packet.filters {
-                    mount(filter, mount_point);
+            Unsubscribe(packet) => {
+                // handle_unsubscribe.c: handle__unsubscribe checks ACL and
+                // removes the filter as sent, without the listener mount_point.
+                for filter in &packet.filters {
                     tracing::info!(target: "mqx::unsubscribe", "{} {filter}", self.live.lease.id);
                 }
                 match self.act(Operation::Unsubscribe(packet.filters)).await? {

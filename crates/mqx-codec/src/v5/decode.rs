@@ -820,6 +820,14 @@ fn read_publish_ack(cur: &mut Cursor<'_>, kind: PacketType) -> Result<PublishAck
 }
 
 fn read_subscribe(cur: &mut Cursor<'_>) -> Result<Subscribe, Fault> {
+    read_subscribe_into(cur, &mut None)
+}
+
+// Leaves the filters read before a failing one in `partial`.
+fn read_subscribe_into(
+    cur: &mut Cursor<'_>,
+    partial: &mut Option<Subscribe>,
+) -> Result<Subscribe, Fault> {
     let packet_id = cur.packet_id()?;
     let properties = PropertyBlock::read(cur, PacketType::Subscribe.into())?.values;
     if properties
@@ -828,7 +836,13 @@ fn read_subscribe(cur: &mut Cursor<'_>) -> Result<Subscribe, Fault> {
     {
         return Err(Fault::InvalidPropertyValue(0x0b));
     }
-    let mut subscriptions = Vec::new();
+    let subscriptions = &mut partial
+        .insert(Subscribe {
+            packet_id,
+            properties,
+            subscriptions: Vec::new(),
+        })
+        .subscriptions;
     while !cur.is_empty() {
         let filter = cur.string("subscription filter")?;
         // src/handle_subscribe.c: handle__subscribe skips a NULL string without
@@ -869,17 +883,27 @@ fn read_subscribe(cur: &mut Cursor<'_>) -> Result<Subscribe, Fault> {
     if subscriptions.is_empty() {
         return Err(Fault::EmptyList("subscriptions"));
     }
-    Ok(Subscribe {
-        packet_id,
-        properties,
-        subscriptions,
-    })
+    Ok(partial.take().unwrap())
 }
 
 fn read_unsubscribe(cur: &mut Cursor<'_>) -> Result<Unsubscribe, Fault> {
+    read_unsubscribe_into(cur, &mut None)
+}
+
+// Leaves the filters read before a failing one in `partial`.
+fn read_unsubscribe_into(
+    cur: &mut Cursor<'_>,
+    partial: &mut Option<Unsubscribe>,
+) -> Result<Unsubscribe, Fault> {
     let packet_id = cur.packet_id()?;
     let properties = PropertyBlock::read(cur, PacketType::Unsubscribe.into())?.values;
-    let mut filters = Vec::new();
+    let filters = &mut partial
+        .insert(Unsubscribe {
+            packet_id,
+            properties,
+            filters: Vec::new(),
+        })
+        .filters;
     while !cur.is_empty() {
         let filter = cur.string("unsubscription filter")?;
         if !valid_topic(&filter, true) {
@@ -893,11 +917,41 @@ fn read_unsubscribe(cur: &mut Cursor<'_>) -> Result<Unsubscribe, Fault> {
     if filters.is_empty() {
         return Err(Fault::EmptyList("unsubscription filters"));
     }
-    Ok(Unsubscribe {
-        packet_id,
-        properties,
-        filters,
-    })
+    Ok(partial.take().unwrap())
+}
+
+/// After [`decode`] refused a SUBSCRIBE or UNSUBSCRIBE, returns the filters
+/// before the one that failed, if any. src/handle_subscribe.c and
+/// src/handle_unsubscribe.c act on each filter as they read it, so these were
+/// already (un)subscribed when Mosquitto ended the connection. Leaves the
+/// buffer unchanged; the caller still handles the decode error as before.
+pub fn decode_filter_prefix(src: &[u8], ctx: DecodeContext) -> Option<Packet> {
+    let header = Header::read(src).ok()??;
+    let length = header.end - header.start;
+    let size = 1 + remaining_length_bytes(length) + length;
+    if (ctx.max_packet_size != 0 && size > ctx.max_packet_size)
+        || header.command != header.kind.command()
+    {
+        return None;
+    }
+    let mut cursor = Cursor::new(src.get(header.start..header.end)?);
+    match header.kind {
+        PacketType::Subscribe => {
+            let mut partial = None;
+            let _ = read_subscribe_into(&mut cursor, &mut partial);
+            partial
+                .filter(|packet| !packet.subscriptions.is_empty())
+                .map(Packet::Subscribe)
+        }
+        PacketType::Unsubscribe => {
+            let mut partial = None;
+            let _ = read_unsubscribe_into(&mut cursor, &mut partial);
+            partial
+                .filter(|packet| !packet.filters.is_empty())
+                .map(Packet::Unsubscribe)
+        }
+        _ => None,
+    }
 }
 
 fn read_subscription_ack(cur: &mut Cursor<'_>, kind: PacketType) -> Result<SubscriptionAck, Fault> {
