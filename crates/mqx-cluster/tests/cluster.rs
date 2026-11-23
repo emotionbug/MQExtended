@@ -737,6 +737,8 @@ async fn mesh_stays_fifo_without_blocking_raft_on_its_peer_connection() {
     with_tls(&root, &mut configs);
     let nodes = start(&configs).await;
     let leader = elected(&nodes).await;
+    // The mesh rejects senders the leader has not yet seen as voters.
+    serving(nodes.values()).await;
     let follower = nodes
         .values()
         .find(|node| node.node_id() != leader)
