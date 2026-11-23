@@ -137,7 +137,7 @@ impl Broker {
     }
 
     pub fn bridge_receive_maximum(&self) -> u16 {
-        u16::try_from(self.0.config.max_inflight_messages).unwrap_or(u16::MAX)
+        u16::try_from(self.0.config.startup().max_inflight_messages).unwrap_or(u16::MAX)
     }
 }
 
@@ -350,7 +350,7 @@ impl BridgeSession {
     }
 
     pub async fn receive(&self, packet: Publish5) -> Result<R, BrokerError> {
-        if packet.retain && !self.broker.0.config.retain_available {
+        if packet.retain && !self.broker.0.config.startup().retain_available {
             return Err(BrokerError::ProtocolV5(R::RETAIN_NOT_SUPPORTED));
         }
         let now = self.broker.now();
@@ -381,7 +381,7 @@ impl BridgeSession {
             expires,
             now,
         };
-        let birth = self.broker.0.config.sparkplug_aware && publication.sparkplug_birth();
+        let birth = self.broker.0.config.startup().sparkplug_aware && publication.sparkplug_birth();
         match self
             .apply(Operation::receive(publication, false, birth))
             .await?

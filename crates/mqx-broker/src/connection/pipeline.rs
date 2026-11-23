@@ -59,7 +59,7 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
     protocol: ProtocolVersion,
     mut remaining: usize,
 ) -> Result<Step, BrokerError> {
-    let config = &session.broker.0.config;
+    let config = session.broker.0.config.startup();
     let mut publications = Vec::with_capacity(BATCH_PACKETS);
     let mut ids = Vec::with_capacity(BATCH_PACKETS);
     let mount_point = listener.mount_point.as_deref();

@@ -23,7 +23,7 @@ use mqx_topic::{SubscriptionIndex, validate_topic_filter};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BrokerConfig,
+    BrokerConfig, ReloadableLimits,
     inbox::{Ack, Delivery, Inbox, Message, Offer, Outbound, PublishProperty, Publisher, Receive},
     persistence::PendingImport,
     retained::Retained,
@@ -88,6 +88,7 @@ pub(crate) enum Command {
     InitDynamicSecurity(Arc<DynamicSecurity>),
     DynamicSecurityControl(DynamicControl),
     BrokerControl(BrokerControl),
+    ReloadLimits(ReloadableLimits),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +388,8 @@ pub(crate) struct State {
     #[serde(skip)]
     config: Arc<BrokerConfig>,
     #[serde(skip)]
+    startup_config: Arc<BrokerConfig>,
+    #[serde(skip)]
     acls: BTreeMap<u64, Arc<AclFile>>,
     acl_text: BTreeMap<u64, Option<Bytes>>,
     pub(crate) applied: u64,
@@ -420,6 +423,10 @@ pub(crate) struct State {
     pending_import: Option<PendingImport>,
     #[serde(default)]
     dynamic_security: Option<DynamicPolicy>,
+    // Snapshots are array-encoded: omitting this keeps the old snapshot shape
+    // until a reload is committed. Keep it last, or later fields would shift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limits: Option<ReloadableLimits>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,9 +551,19 @@ impl<'a> DiagnosticBranch<'a> {
 impl State {
     pub(crate) fn new(config: Arc<BrokerConfig>) -> Self {
         Self {
+            startup_config: config.clone(),
             config,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn config(&self) -> &Arc<BrokerConfig> {
+        &self.config
+    }
+
+    fn set_limits(&mut self, limits: ReloadableLimits) {
+        self.config = Arc::new(self.startup_config.with_reloadable_limits(&limits));
+        self.limits = Some(limits);
     }
 
     pub(crate) fn subscription_tree(&self) -> String {
@@ -824,7 +841,12 @@ impl State {
             mqx_cluster::ClusterError::Restore(error.to_string())
         }
         let mut restored: Self = rmp_serde::from_slice(bytes).map_err(invalid)?;
-        restored.config = self.config.clone();
+        restored.startup_config = self.startup_config.clone();
+        if let Some(limits) = restored.limits.take() {
+            restored.set_limits(limits);
+        } else {
+            restored.config = restored.startup_config.clone();
+        }
         for (&id, text) in &restored.acl_text {
             if let Some(text) = text {
                 restored
@@ -867,6 +889,10 @@ impl State {
         let mut effects = Vec::new();
         let eager = matches!(&command, Command::EagerBatch(_));
         let reply = match command {
+            Command::ReloadLimits(limits) => {
+                self.set_limits(limits);
+                Reply::NoChange
+            }
             Command::SetAcl {
                 security,
                 text,
@@ -2028,6 +2054,7 @@ impl<'a> Acls<'a> {
 }
 
 fn outgoing_qos(publish: QoS, subscribe: QoS, config: &BrokerConfig) -> QoS {
+    // subs.c: subs__send and retain.c: retain__process choose QoS at delivery.
     if config.upgrade_outgoing_qos || publish as u8 > subscribe as u8 {
         subscribe
     } else {
@@ -2342,6 +2369,80 @@ mod tests {
         assert!(!state.sessions.contains_key(&id));
     }
 
+    #[test]
+    fn committed_limits_survive_replay_and_snapshot_restore() {
+        let config = Arc::new(BrokerConfig {
+            clientid_prefixes: Some("startup-".into()),
+            max_packet_size: 1024,
+            ..BrokerConfig::default()
+        });
+        let mut state = State::new(config.clone());
+        let owner = Owner {
+            node: 1,
+            incarnation: [1; 16],
+        };
+        state.apply(Command::Boot {
+            owner,
+            previous: None,
+            now: Duration::ZERO,
+        });
+        let Reply::Claimed { lease, .. } = state
+            .apply(make_claim(owner, [2; 16], Arc::from("source"), false, None))
+            .reply
+        else {
+            panic!("publisher must be claimed");
+        };
+        let packet = Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "a".into(),
+            packet_id: None,
+            payload: Bytes::from_static(b"ab"),
+        };
+        let old_snapshot = state.snapshot();
+        assert!(state.fast_route(owner, &lease, &packet, false).is_some());
+
+        let limits = ReloadableLimits {
+            message_size_limit: 1,
+            persistent_client_expiration: Some(Duration::from_secs(3)),
+            queue_qos0_messages: true,
+            upgrade_outgoing_qos: true,
+            allow_duplicate_messages: false,
+            clientid_prefixes: None,
+        };
+        let encoded = rmp_serde::to_vec(&Command::ReloadLimits(limits.clone())).unwrap();
+        state.apply(rmp_serde::from_slice(&encoded).unwrap());
+        let mut restored = State::new(config);
+        restored.restore(&state.snapshot()).unwrap();
+        for replica in [&mut state, &mut restored] {
+            assert_eq!(replica.config().reloadable_limits(), limits);
+            assert_eq!(replica.config().max_packet_size, 1024);
+            assert!(replica.fast_route(owner, &lease, &packet, false).is_none());
+            assert_eq!(
+                replica
+                    .apply(Command::Act(
+                        lease.clone(),
+                        Operation::Receive(Publication {
+                            packet: packet.clone(),
+                            properties: Vec::new(),
+                            expires: None,
+                            now: Duration::ZERO,
+                        }),
+                    ))
+                    .reply,
+                Reply::PublishReason(R::PACKET_TOO_LARGE.0)
+            );
+        }
+
+        restored.restore(&old_snapshot).unwrap();
+        assert!(restored.fast_route(owner, &lease, &packet, false).is_some());
+        assert_eq!(
+            restored.config().clientid_prefixes.as_deref(),
+            Some("startup-")
+        );
+    }
+
     proptest! {
         #[test]
         fn randomized_serialized_replay_matches_snapshot_restore(
@@ -2377,14 +2478,14 @@ mod tests {
                 let filter = ["a/#", "#", "$share/work/#", "$share/other/#"][usize::from(value) % 4];
                 let topic = ["a", "a/b", "c"][usize::from(value) % 3];
                 let mid = PacketId::new(u16::from(value % 4) + 1).unwrap();
-                let command = match op % 11 {
+                let command = match op % 12 {
                     0 | 1 => {
                         let mut claim = make_claim(owner, [index as u8;16], id.clone(), value % 3 == 0, Some(LastWill {
                             topic: "a/will".into(), payload: Bytes::from_static(b"gone"), qos, retain: value % 2 == 0,
                         }));
                         let Command::Claim { request, .. } = &mut claim else { unreachable!() };
                         request.now = now;
-                        if op % 11 == 1 {
+                        if op % 12 == 1 {
                             request.v5 = Some(SessionSettings {
                                 session_expiry: u32::from(value % 6),
                                 receive_maximum: Some(u16::from(value % 5) + 1),
@@ -2406,7 +2507,7 @@ mod tests {
                     4 => Command::Act(lease, Operation::Receive(Publication {
                         packet: Publish {
                             dup: value % 2 == 0, qos, retain: value % 5 == 0, topic: topic.into(),
-                            packet_id: (qos != QoS::AtMostOnce).then_some(mid), payload: Bytes::from(vec![value]),
+                            packet_id: (qos != QoS::AtMostOnce).then_some(mid), payload: Bytes::from(vec![value; usize::from(value % 4)]),
                         },
                         properties: vec![PublishProperty::User("key".into(), "value".into())],
                         expires: Message::expiry(now, u32::from(value % 4)),
@@ -2418,13 +2519,21 @@ mod tests {
                     7 => Command::Act(lease, Operation::Ack(mid, Ack::Acknowledged)),
                     8 => Command::Act(lease, Operation::Disconnect { graceful: value % 2 == 0, now, expiry: None }),
                     9 => Command::Expire(now),
-                    _ => Command::SetAcl {
+                    10 => Command::SetAcl {
                         security: 1, initial: false,
                         text: Some(Bytes::from_static(if value % 2 == 0 { b"topic readwrite #\n" } else { b"topic readwrite a/#\n" })),
                     },
+                    _ => Command::ReloadLimits(ReloadableLimits {
+                        message_size_limit: usize::from(value % 3),
+                        persistent_client_expiration: (value % 2 == 0).then(|| Duration::from_secs(u64::from(value % 12))),
+                        queue_qos0_messages: value & 1 != 0,
+                        upgrade_outgoing_qos: value & 2 != 0,
+                        allow_duplicate_messages: value & 4 != 0,
+                        clientid_prefixes: (value & 8 != 0).then(|| topic.to_owned()),
+                    }),
                 };
                 let command = match command {
-                    Command::Act(lease, operation) if value % 2 == 0 && matches!(op % 11, 4 | 5 | 7) => {
+                    Command::Act(lease, operation) if value % 2 == 0 && matches!(op % 12, 4 | 5 | 7) => {
                         Command::EagerBatch(vec![BatchEntry::Act(Mutations { lease, operations: vec![operation] })])
                     }
                     command => command,
@@ -2439,6 +2548,7 @@ mod tests {
                 restored.applied = index as u64;
                 if index == cut {
                     restored.restore(&a.snapshot()).unwrap();
+                    prop_assert_eq!(a.config().reloadable_limits(), restored.config().reloadable_limits());
                 }
             }
             let final_bytes = a.snapshot();

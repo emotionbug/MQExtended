@@ -24,6 +24,7 @@ use bytes::Bytes;
 use mqx_auth::{AclFile, AclFileError, BasicAuth, DynamicSecurity, PasswordFile};
 use mqx_cluster::ClusterError;
 use mqx_codec::{DecodeError, EncodeError, QoS};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -65,6 +66,58 @@ pub struct BrokerConfig {
     pub connection_messages: bool,
     /// Global plugin callbacks also receive publications from outgoing bridges.
     pub sparkplug_aware: bool,
+}
+
+/// Broker options Mosquitto 2.1.4 applies on SIGHUP (conf.c: config__copy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadableLimits {
+    pub message_size_limit: usize,
+    pub persistent_client_expiration: Option<Duration>,
+    pub queue_qos0_messages: bool,
+    pub upgrade_outgoing_qos: bool,
+    pub allow_duplicate_messages: bool,
+    pub clientid_prefixes: Option<String>,
+}
+
+impl BrokerConfig {
+    /// Extract the limits that can be applied without restarting the broker.
+    pub fn reloadable_limits(&self) -> ReloadableLimits {
+        ReloadableLimits {
+            message_size_limit: self.message_size_limit,
+            persistent_client_expiration: self.persistent_client_expiration,
+            queue_qos0_messages: self.queue_qos0_messages,
+            upgrade_outgoing_qos: self.upgrade_outgoing_qos,
+            allow_duplicate_messages: self.allow_duplicate_messages,
+            clientid_prefixes: self.clientid_prefixes.clone(),
+        }
+    }
+
+    fn with_reloadable_limits(&self, limits: &ReloadableLimits) -> Self {
+        Self {
+            allow_anonymous: self.allow_anonymous,
+            allow_zero_length_clientid: self.allow_zero_length_clientid,
+            auto_id_prefix: self.auto_id_prefix.clone(),
+            clientid_prefixes: limits.clientid_prefixes.clone(),
+            max_keepalive: self.max_keepalive,
+            max_inflight_messages: self.max_inflight_messages,
+            max_inflight_bytes: self.max_inflight_bytes,
+            max_queued_messages: self.max_queued_messages,
+            max_queued_bytes: self.max_queued_bytes,
+            queue_qos0_messages: limits.queue_qos0_messages,
+            message_size_limit: limits.message_size_limit,
+            max_packet_size: self.max_packet_size,
+            retain_expiry_interval: self.retain_expiry_interval,
+            persistent_client_expiration: limits.persistent_client_expiration,
+            retain_available: self.retain_available,
+            upgrade_outgoing_qos: limits.upgrade_outgoing_qos,
+            allow_duplicate_messages: limits.allow_duplicate_messages,
+            check_retain_source: self.check_retain_source,
+            global_max_connections: self.global_max_connections,
+            global_max_clients: self.global_max_clients,
+            connection_messages: self.connection_messages,
+            sparkplug_aware: self.sparkplug_aware,
+        }
+    }
 }
 
 impl Default for BrokerConfig {

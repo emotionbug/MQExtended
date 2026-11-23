@@ -374,6 +374,7 @@ impl Inbox {
         if delivery.dedup_id.is_some() && delivery.dedup_id == self.last_delivered {
             return Offer::Suppressed;
         }
+        // database.c: db__message_insert_outgoing checks QoS 0 admission per insertion.
         if !online
             && (clean_offline
                 || delivery.qos == QoS::AtMostOnce && !(config.queue_qos0_messages || queue_qos0))

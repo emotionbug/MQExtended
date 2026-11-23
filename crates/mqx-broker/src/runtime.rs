@@ -9,7 +9,7 @@ pub use telemetry::SocketObservation;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,8 +27,8 @@ use tokio::{
 };
 
 use crate::{
-    BrokerConfig, BrokerError, ConnectionInfo, PeerTransport, SECURITY_REVISION, Security,
-    SecurityHandle, connection, fast,
+    BrokerConfig, BrokerError, ConnectionInfo, PeerTransport, ReloadableLimits, SECURITY_REVISION,
+    Security, SecurityHandle, connection, fast,
     inbox::{Delivery, Inbox, Offer, Outbound},
     persistence::PersistentState,
     state::{
@@ -43,7 +43,7 @@ use crate::{
 pub struct Broker(pub(super) Arc<Inner>);
 
 pub(super) struct Inner {
-    pub(super) config: Arc<BrokerConfig>,
+    pub(super) config: Arc<ConfigCell>,
     connection_messages: AtomicBool,
     control_inventory: OnceLock<crate::ControlInventory>,
     pub(super) shutdown: watch::Sender<bool>,
@@ -52,6 +52,35 @@ pub(super) struct Inner {
     runtime: Arc<Mutex<Runtime>>,
     log: Log,
     dynamic_security_registration: tokio::sync::Mutex<()>,
+}
+
+pub(super) struct ConfigCell {
+    startup: Arc<BrokerConfig>,
+    effective: RwLock<Arc<BrokerConfig>>,
+}
+
+impl ConfigCell {
+    fn new(startup: Arc<BrokerConfig>) -> Self {
+        Self {
+            effective: RwLock::new(startup.clone()),
+            startup,
+        }
+    }
+
+    // The startup config can be borrowed across awaits for non-reloadable options.
+    pub(super) fn startup(&self) -> &BrokerConfig {
+        &self.startup
+    }
+
+    // Never hand out the lock guard: callers hold other locks (runtime,
+    // inboxes) in both orders, and a waiting writer blocks new readers.
+    pub(super) fn load(&self) -> Arc<BrokerConfig> {
+        self.effective.read().unwrap().clone()
+    }
+
+    fn update(&self, config: &Arc<BrokerConfig>) {
+        *self.effective.write().unwrap() = config.clone();
+    }
 }
 
 // Both backends apply exactly the same commands. Only Raft writes wait for
@@ -190,7 +219,7 @@ impl Broker {
     pub fn new(config: BrokerConfig) -> Self {
         let config = Arc::new(config);
         Self(Arc::new(Inner {
-            config: config.clone(),
+            config: Arc::new(ConfigCell::new(config.clone())),
             connection_messages: AtomicBool::new(config.connection_messages),
             control_inventory: OnceLock::new(),
             shutdown: watch::Sender::new(false),
@@ -226,6 +255,7 @@ impl Broker {
             incarnation: new_token()?,
         };
         let config = Arc::new(config);
+        let config_cell = Arc::new(ConfigCell::new(config.clone()));
         let runtime = Arc::new(Mutex::new(Runtime::default()));
         let (applied_tx, applied) = watch::channel(0);
         let (abandoned, cleanup) = mpsc::unbounded_channel();
@@ -240,7 +270,7 @@ impl Broker {
             cluster,
             Machine {
                 state: State::new(config.clone()),
-                config: config.clone(),
+                config: config_cell.clone(),
                 owner,
                 runtime: runtime.clone(),
                 applied: applied_tx,
@@ -251,7 +281,7 @@ impl Broker {
         let broker = Self(Arc::new(Inner {
             connection_messages: AtomicBool::new(config.connection_messages),
             control_inventory: OnceLock::new(),
-            config,
+            config: config_cell,
             runtime,
             shutdown: watch::Sender::new(false),
             traffic: Traffic::default(),
@@ -290,6 +320,28 @@ impl Broker {
             broker.0.shutdown.subscribe(),
         ));
         Ok(broker)
+    }
+
+    /// Returns the six reloadable values currently in effect on this node.
+    pub fn reloadable_limits(&self) -> ReloadableLimits {
+        self.0.config.load().reloadable_limits()
+    }
+
+    /// Apply the limits immediately in standalone mode. In a cluster, commit
+    /// changed values to the replicated log and wait for active replicas to apply.
+    pub async fn reload_limits(&self, limits: ReloadableLimits) -> Result<(), BrokerError> {
+        if let Log::Replicated(log) = &self.0.log {
+            if self.reloadable_limits() != limits {
+                log.submit(Command::ReloadLimits(limits)).await?;
+            }
+        } else {
+            self.0.runtime.lock().unwrap().apply_local(
+                Command::ReloadLimits(limits),
+                &self.0.config,
+                None,
+            );
+        }
+        Ok(())
     }
 
     /// Install a listener's initial ACL, or commit changed bytes after a reload.
@@ -435,7 +487,7 @@ impl Broker {
         if shutdown {
             let mut effects = Vec::new();
             local.state.flush_shutdown_wills(now, &mut effects);
-            runtime.dispatch(effects, &self.0.config, Owner::LOCAL, None);
+            runtime.dispatch(effects, &self.0.config.load(), Owner::LOCAL, None);
         }
         let state = &runtime.local.as_ref().unwrap().state;
         Some((state.persistence_changes, state.persistent_snapshot(now)))
@@ -477,7 +529,7 @@ impl Broker {
         let mut runtime = self.0.runtime.lock().unwrap();
         let key = Arc::as_ptr(&info.listener) as usize;
         let listener_limit = info.listener.max_connections;
-        let global_limit = self.0.config.global_max_connections;
+        let global_limit = self.0.config.startup().global_max_connections;
         if (global_limit != 0 && runtime.connections >= global_limit)
             || (listener_limit != 0
                 && runtime.listeners.get(&key).copied().unwrap_or(0) >= listener_limit)
@@ -513,7 +565,7 @@ impl Broker {
         let receive_maximum = claim
             .v5
             .as_ref()
-            .map(|v5| v5.outgoing_maximum(&self.0.config));
+            .map(|v5| v5.outgoing_maximum(self.0.config.startup()));
         match &self.0.log {
             Log::Local { .. } => {
                 let mut runtime = self.0.runtime.lock().unwrap();
@@ -577,7 +629,7 @@ impl Broker {
                     token,
                     finished: false,
                 };
-                let retry = (self.0.config.global_max_clients != 0
+                let retry = (self.0.config.startup().global_max_clients != 0
                     && claim.internal_bridge.is_none())
                 .then(|| claim.clone());
                 let proposal = |request| BatchEntry::Claim {
@@ -735,7 +787,7 @@ impl Broker {
                 || live.outbox.lock().unwrap().packets.is_empty(),
                 |inbox| {
                     let inbox = inbox.lock().unwrap();
-                    inbox.simple_qos1() && !inbox.has_outbound(&self.0.config)
+                    inbox.simple_qos1() && !inbox.has_outbound(self.0.config.startup())
                 },
             )
     }
@@ -915,10 +967,11 @@ impl Broker {
     }
 
     fn deliver_fast(&self, publication: fast::Publication) {
-        let config = &self.0.config;
         let mut runtime = self.0.runtime.lock().unwrap();
+        let config = self.0.config.load();
+        // database.c: db__message_insert_outgoing reads the destination's setting.
         for (epoch, packet) in publication.deliveries(!config.allow_duplicate_messages) {
-            runtime.deliver(epoch, packet, config);
+            runtime.deliver(epoch, packet, &config);
         }
     }
 
@@ -927,7 +980,7 @@ impl Broker {
             let mut inbox = inbox.lock().unwrap();
             let now = self.now();
             inbox.expire_before_qos0(now);
-            return Ok(inbox.next_outbound(&self.0.config, now));
+            return Ok(inbox.next_outbound(self.0.config.startup(), now));
         }
         if let Log::Replicated(log) = &self.0.log {
             if let Some(packet) = live.pop_reserved()? {
@@ -1190,6 +1243,7 @@ impl ReplicatedLog {
         let fence = match &command {
             Command::SetAcl { .. }
             | Command::InitDynamicSecurity(_)
+            | Command::ReloadLimits(_)
             | Command::ImportPersistence {
                 finish: Some(_), ..
             } => true,
@@ -1346,7 +1400,7 @@ impl ReplicatedLog {
 
 struct Machine {
     state: State,
-    config: Arc<BrokerConfig>,
+    config: Arc<ConfigCell>,
     owner: Owner,
     runtime: Arc<Mutex<Runtime>>,
     applied: watch::Sender<u64>,
@@ -1366,7 +1420,12 @@ impl Machine {
             if save_dynamic_security {
                 runtime.save_dynamic_security(&self.state);
             }
-            runtime.dispatch(effects, &self.config, self.owner, Some(&self.abandoned));
+            runtime.dispatch(
+                effects,
+                self.state.config(),
+                self.owner,
+                Some(&self.abandoned),
+            );
         }
         self.applied.send_replace(self.state.applied);
     }
@@ -1377,7 +1436,11 @@ impl StateMachine for Machine {
     type Response = Applied;
 
     fn apply(&mut self, index: u64, command: Command) -> Applied {
+        let reload = matches!(&command, Command::ReloadLimits(_));
         let outcome = self.state.apply(command);
+        if reload {
+            self.config.update(self.state.config());
+        }
         self.state.applied = index;
         self.emit(outcome.effects, outcome.reply.dynamic_security_mutated());
         Applied {
@@ -1400,6 +1463,7 @@ impl StateMachine for Machine {
         let previous_dynamic = previous.dynamic_policy().map(|(revision, _)| revision);
         let skipped = self.state.applied > previous.applied;
         let mut runtime = self.runtime.lock().unwrap();
+        self.config.update(self.state.config());
         if previous_dynamic != self.state.dynamic_policy().map(|(revision, _)| revision) {
             runtime.save_dynamic_security(&self.state);
         }
@@ -1434,17 +1498,23 @@ impl Runtime {
     fn apply_local(
         &mut self,
         command: Command,
-        config: &BrokerConfig,
+        config: &ConfigCell,
         security: Option<&SecurityHandle>,
     ) -> Reply {
         let local = self.local.as_mut().unwrap();
         local.update_security(security);
         let changes = local.state.persistence_changes;
+        let reload = matches!(&command, Command::ReloadLimits(_));
         let outcome = local.state.apply(command);
+        if reload {
+            config.update(local.state.config());
+        }
         if outcome.reply.dynamic_security_mutated() {
             self.save_dynamic_security(&self.local.as_ref().unwrap().state);
         }
-        self.dispatch(outcome.effects, config, Owner::LOCAL, None);
+        if !outcome.effects.is_empty() {
+            self.dispatch(outcome.effects, &config.load(), Owner::LOCAL, None);
+        }
         let local = self.local.as_ref().unwrap();
         if local.state.persistence_changes != changes {
             local.notify_persistence_change();

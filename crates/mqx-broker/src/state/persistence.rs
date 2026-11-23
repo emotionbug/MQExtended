@@ -140,6 +140,7 @@ impl State {
         }
         let mut subscriptions = Vec::new();
         for mut entry in sessions {
+            // session_expiry.c: session_expiry__add_from_persistence preserves stored deadlines.
             let expires = entry.expires.or_else(|| {
                 let interval = entry
                     .expiry_interval

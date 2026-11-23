@@ -209,7 +209,7 @@ impl Active<'_> {
         session_expiry: u32,
     ) -> Result<Step, BrokerError> {
         use Packet5::*;
-        let config = &self.broker.0.config;
+        let config = self.broker.0.config.startup();
         let mount_point = info.listener.mount_point.as_deref();
         let max_qos = info.listener.max_qos;
         let now = self.broker.now();

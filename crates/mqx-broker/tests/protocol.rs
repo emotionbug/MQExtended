@@ -929,6 +929,157 @@ async fn offline_qos0_is_queued_only_when_configured_and_expiry_removes_session(
     }
 }
 
+// handle_publish.c: handle__publish reads the live limit even for existing publishers.
+#[tokio::test]
+async fn reloaded_message_size_limit_applies_to_connected_publisher() {
+    let broker = broker(BrokerConfig::default());
+    let mut sink = connected(&broker, "sink", true, false).await;
+    sink.subscribe(&[("size", Q1)], &[Q1]).await;
+    let mut source = connected(&broker, "source", true, false).await;
+    source
+        .send(Packet::Publish(publish("size", b"large", Q1, 11)))
+        .await;
+    source.expect(Packet::PubAck(mid(11))).await;
+    sink.expect(Packet::Publish(publish("size", b"large", Q1, 1)))
+        .await;
+
+    let mut limits = broker.reloadable_limits();
+    limits.message_size_limit = 2;
+    broker.reload_limits(limits).await.unwrap();
+    for (id, payload) in [(12, b"large".as_slice()), (13, b"ok".as_slice())] {
+        source
+            .send(Packet::Publish(publish("size", payload, Q1, id)))
+            .await;
+        source.expect(Packet::PubAck(mid(id))).await;
+    }
+    sink.expect(Packet::Publish(publish("size", b"ok", Q1, 2)))
+        .await;
+    sink.ping().await;
+}
+
+// handle_connect.c: will__read checks the limit only when accepting the Will.
+#[tokio::test]
+async fn reloaded_message_size_limit_checks_new_wills_only() {
+    let broker = broker(BrokerConfig::default());
+    let mut sink = connected(&broker, "sink", true, false).await;
+    sink.subscribe(&[("will", Q0)], &[Q0]).await;
+    let (mut old, _) = Client::spawn(&broker, ConnectionInfo::default());
+    let connect = |id| Connect {
+        will: Some(will("will")),
+        ..request(id, true)
+    };
+    old.connect(connect("old"), Code::Accepted, false).await;
+
+    let mut limits = broker.reloadable_limits();
+    limits.message_size_limit = 2;
+    broker.reload_limits(limits).await.unwrap();
+    let (mut new, _) = Client::spawn(&broker, ConnectionInfo::default());
+    new.connect(connect("new"), Code::NotAuthorized, false)
+        .await;
+    drop(old);
+    sink.expect(Packet::Publish(publish("will", b"gone", Q0, 0)))
+        .await;
+}
+
+// database.c: db__message_insert_outgoing checks the flag for each insertion.
+#[tokio::test]
+async fn reloaded_queue_qos0_admits_only_while_enabled_without_trimming() {
+    let broker = broker(BrokerConfig::default());
+    let mut sink = connected(&broker, "sink", false, false).await;
+    sink.subscribe(&[("offline", Q0)], &[Q0]).await;
+    sink.disconnect().await;
+    let mut source = connected(&broker, "source", true, false).await;
+    let mut limits = broker.reloadable_limits();
+    for (id, enabled, payload) in [
+        (11, false, b"before".as_slice()),
+        (12, true, b"queued".as_slice()),
+        (13, false, b"after".as_slice()),
+    ] {
+        limits.queue_qos0_messages = enabled;
+        broker.reload_limits(limits.clone()).await.unwrap();
+        source
+            .send(Packet::Publish(publish("offline", payload, Q1, id)))
+            .await;
+        source.expect(Packet::PubAck(mid(id))).await;
+    }
+    let mut sink = connected(&broker, "sink", false, true).await;
+    sink.expect(Packet::Publish(publish("offline", b"queued", Q0, 0)))
+        .await;
+    sink.ping().await;
+}
+
+// subs.c: subs__send chooses QoS during routing, not when a queued packet is sent.
+#[tokio::test]
+async fn reloaded_upgrade_outgoing_qos_affects_next_delivery_not_queued_packets() {
+    let broker = broker(BrokerConfig {
+        queue_qos0_messages: true,
+        ..BrokerConfig::default()
+    });
+    let mut sink = connected(&broker, "sink", false, false).await;
+    sink.subscribe(&[("upgrade", Q1)], &[Q1]).await;
+    sink.disconnect().await;
+    let mut source = connected(&broker, "source", true, false).await;
+    source
+        .send(Packet::Publish(publish("upgrade", b"old", Q0, 0)))
+        .await;
+    source.ping().await;
+
+    let mut limits = broker.reloadable_limits();
+    limits.upgrade_outgoing_qos = true;
+    broker.reload_limits(limits).await.unwrap();
+    source
+        .send(Packet::Publish(publish("upgrade", b"new", Q0, 0)))
+        .await;
+    source.ping().await;
+    let mut sink = connected(&broker, "sink", false, true).await;
+    sink.expect(Packet::Publish(publish("upgrade", b"old", Q0, 0)))
+        .await;
+    sink.expect(Packet::Publish(publish("upgrade", b"new", Q1, 1)))
+        .await;
+}
+
+// session_expiry.c: session_expiry__add calculates the deadline once.
+#[tokio::test(start_paused = true)]
+async fn reloaded_expiration_only_changes_deadlines_for_later_disconnects() {
+    let broker = broker(BrokerConfig {
+        persistent_client_expiration: Some(Duration::from_secs(60)),
+        ..BrokerConfig::default()
+    });
+    connected(&broker, "old", false, false)
+        .await
+        .disconnect()
+        .await;
+    let new = connected(&broker, "new", false, false).await;
+    let mut limits = broker.reloadable_limits();
+    limits.persistent_client_expiration = Some(Duration::from_secs(5));
+    broker.reload_limits(limits).await.unwrap();
+    new.disconnect().await;
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    connected(&broker, "old", false, true).await.ping().await;
+    connected(&broker, "new", false, false).await.ping().await;
+}
+
+// handle_connect.c: check_clientid_prefixes is a CONNECT-time check.
+#[tokio::test]
+async fn reloaded_clientid_prefixes_apply_to_next_connect_only() {
+    let broker = broker(BrokerConfig::default());
+    let mut old = connected(&broker, "old", true, false).await;
+    let mut limits = broker.reloadable_limits();
+    limits.clientid_prefixes = Some("new-".into());
+    broker.reload_limits(limits).await.unwrap();
+
+    old.ping().await;
+    let (mut rejected, _) = Client::spawn(&broker, ConnectionInfo::default());
+    rejected
+        .connect(request("no-prefix", true), Code::NotAuthorized, false)
+        .await;
+    connected(&broker, "new-good", true, false)
+        .await
+        .ping()
+        .await;
+}
+
 // test/broker/23-security-password-file-reload.py; security_default.c:
 // mosquitto_security_apply_default disconnects without publishing the will.
 #[tokio::test]

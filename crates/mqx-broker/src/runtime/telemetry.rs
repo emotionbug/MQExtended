@@ -142,7 +142,7 @@ impl Broker {
             &mut effects,
             |store| collect_transient(live, store),
         );
-        runtime.dispatch(effects, &self.0.config, Owner::LOCAL, None);
+        runtime.dispatch(effects, &self.0.config.load(), Owner::LOCAL, None);
     }
 
     pub(super) fn sample_node(&self, owner: Owner) -> NodeSample {

@@ -41,7 +41,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     peer: Address,
     tls: Option<(&str, &str)>,
 ) -> Result<(), BrokerError> {
-    let config = &broker.0.config;
+    let config = broker.0.config.startup();
     let mut wire = Wire::new(stream, broker.clone());
     let mut shutdown = broker.0.shutdown.subscribe();
     // context.c: context__init gives peers 20 seconds of keepalive before CONNECT.
@@ -112,7 +112,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
 
     let listener = &info.listener;
     let mut security = listener.security.0.snapshots.subscribe();
-    let identity = match prepare(config, &info, &mut connect, options.as_ref())? {
+    let preparation = prepare(
+        &broker.0.config.load(),
+        &info,
+        &mut connect,
+        options.as_ref(),
+    )?;
+    let identity = match preparation {
         Preparation::Accepted(identity) => identity,
         Preparation::Refused(code, reason, refusal) => {
             log_refusal(broker, &peer, &connect.client_id, refusal);
@@ -833,7 +839,7 @@ impl Active<'_> {
         info: &ConnectionInfo,
         protocol: ProtocolVersion,
     ) -> Result<Step, BrokerError> {
-        let config = &self.broker.0.config;
+        let config = self.broker.0.config.startup();
         let mount_point = info.listener.mount_point.as_deref();
         let max_qos = info.listener.max_qos;
         match packet {
@@ -949,7 +955,7 @@ impl Active<'_> {
         let qos = publication.packet.qos;
         let id = publication.packet.packet_id;
         let now = publication.now;
-        let config = &self.broker.0.config;
+        let config = self.broker.0.config.startup();
         let (message, reason) = match self.broker.receive(&self.live, publication, birth).await? {
             Reply::ReceiveLocal(message, reason) => (message, reason),
             reply => return Ok(reply),
@@ -1014,7 +1020,10 @@ impl Active<'_> {
 
     async fn ack(&self, id: mqx_codec::PacketId, ack: Ack) -> Result<Step, BrokerError> {
         if let Some(inbox) = &self.live.inbox {
-            let acknowledged = inbox.lock().unwrap().ack(id, ack, &self.broker.0.config);
+            let acknowledged = inbox
+                .lock()
+                .unwrap()
+                .ack(id, ack, &self.broker.0.config.load());
             if acknowledged {
                 self.broker.count_transient_ack(ack);
                 Ok(Step::Continue)

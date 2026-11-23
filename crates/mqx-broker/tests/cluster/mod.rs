@@ -73,6 +73,50 @@ impl ClusterFixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_limits_reach_existing_mesh_clients_and_new_connects() {
+    let cluster = ClusterFixture::new(BrokerConfig::default()).await;
+    let [a, b, c] = &cluster.brokers;
+    let mut source = connected(a, "source", true, false).await;
+    let mut sink = connected(c, "sink", true, false).await;
+    sink.subscribe(&[("route/#", Q1), ("route/exact", Q1)], &[Q1, Q1])
+        .await;
+    source
+        .send(Packet::Publish(publish("route/exact", b"old", Q0, 0)))
+        .await;
+    for _ in 0..2 {
+        sink.expect(Packet::Publish(publish("route/exact", b"old", Q0, 0)))
+            .await;
+    }
+
+    let mut limits = b.reloadable_limits();
+    limits.message_size_limit = 2;
+    limits.upgrade_outgoing_qos = true;
+    limits.allow_duplicate_messages = false;
+    limits.clientid_prefixes = Some("new-".into());
+    b.reload_limits(limits).await.unwrap();
+
+    source
+        .send(Packet::Publish(publish("route/exact", b"large", Q1, 11)))
+        .await;
+    source.expect(Packet::PubAck(mid(11))).await;
+    source
+        .send(Packet::Publish(publish("route/exact", b"ok", Q0, 0)))
+        .await;
+    source.ping().await;
+    sink.expect(Packet::Publish(publish("route/exact", b"ok", Q1, 1)))
+        .await;
+    sink.ping().await;
+    let (mut rejected, _) = Client::spawn(c, ConnectionInfo::default());
+    rejected
+        .connect(request("no-prefix", true), Code::NotAuthorized, false)
+        .await;
+
+    sink.disconnect().await;
+    source.disconnect().await;
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordered_mesh_routes_qos0_and_qos1_and_raft_routes_retained_qos2() {
     let cluster = ClusterFixture::new(BrokerConfig::default()).await;
     let [a, b, c] = &cluster.brokers;
