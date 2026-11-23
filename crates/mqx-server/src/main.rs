@@ -16,7 +16,9 @@ use std::{
 };
 
 use mqx_bridge::Bridges;
-use mqx_broker::{Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, SecurityHandle};
+use mqx_broker::{
+    Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, ReloadableLimits, SecurityHandle,
+};
 use mqx_cluster::ClusterError;
 use mqx_codec::QoS;
 use mqx_server::{
@@ -266,9 +268,9 @@ fn add_local_http(config: &mut ServerConfig) {
     }
 }
 
-/// Broker-wide options that mosquitto.conf(5) marks "Reloaded on reload
-/// signal" but that MQExtended applies only at startup. A cluster's
-/// replicated state machine must see the same values on every node.
+/// Broker-wide options Mosquitto 2.1.4 rereads on SIGHUP but never applies:
+/// conf.c: config__read parses them into a temporary configuration and
+/// config__copy leaves them out. Both brokers keep the startup values.
 fn startup_only_changes(running: &ServerConfig, fresh: &ServerConfig) -> Vec<&'static str> {
     let (old, new) = (&running.limits, &fresh.limits);
     [
@@ -302,36 +304,16 @@ fn startup_only_changes(running: &ServerConfig, fresh: &ServerConfig) -> Vec<&'s
             old.max_packet_size != new.max_packet_size,
         ),
         (
-            "message_size_limit",
-            old.message_size_limit != new.message_size_limit,
-        ),
-        (
-            "persistent_client_expiration",
-            old.persistent_client_expiration != new.persistent_client_expiration,
+            "check_retain_source",
+            old.check_retain_source != new.check_retain_source,
         ),
         (
             "retain_expiry_interval",
             old.retain_expiry_interval != new.retain_expiry_interval,
         ),
         (
-            "queue_qos0_messages",
-            old.queue_qos0_messages != new.queue_qos0_messages,
-        ),
-        (
             "retain_available",
             old.retain_available != new.retain_available,
-        ),
-        (
-            "upgrade_outgoing_qos",
-            old.upgrade_outgoing_qos != new.upgrade_outgoing_qos,
-        ),
-        (
-            "allow_duplicate_messages",
-            old.allow_duplicate_messages != new.allow_duplicate_messages,
-        ),
-        (
-            "clientid_prefixes",
-            old.clientid_prefixes != new.clientid_prefixes,
         ),
         (
             "set_tcp_nodelay",
@@ -341,6 +323,47 @@ fn startup_only_changes(running: &ServerConfig, fresh: &ServerConfig) -> Vec<&'s
     .into_iter()
     .filter_map(|(name, changed)| changed.then_some(name))
     .collect()
+}
+
+/// In a cluster, SIGHUP commits the reloadable limits for every node and a
+/// restart keeps them. Tell the operator when this node's file disagrees.
+fn warn_on_committed_limits(broker: &Broker, file: &ReloadableLimits) {
+    let running = broker.reloadable_limits();
+    let differences: Vec<_> = [
+        (
+            "message_size_limit",
+            running.message_size_limit != file.message_size_limit,
+        ),
+        (
+            "persistent_client_expiration",
+            running.persistent_client_expiration != file.persistent_client_expiration,
+        ),
+        (
+            "queue_qos0_messages",
+            running.queue_qos0_messages != file.queue_qos0_messages,
+        ),
+        (
+            "upgrade_outgoing_qos",
+            running.upgrade_outgoing_qos != file.upgrade_outgoing_qos,
+        ),
+        (
+            "allow_duplicate_messages",
+            running.allow_duplicate_messages != file.allow_duplicate_messages,
+        ),
+        (
+            "clientid_prefixes",
+            running.clientid_prefixes != file.clientid_prefixes,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, differs)| differs.then_some(name))
+    .collect();
+    if !differences.is_empty() {
+        tracing::warn!(
+            "The cluster's committed {} differ from this node's configuration; send SIGHUP to apply the file's values.",
+            differences.join(", ")
+        );
+    }
 }
 
 fn reload_config(
@@ -464,6 +487,7 @@ async fn run_broker(
                 if migration_node {
                     persistence::migrate_cluster(&broker, &config).await?;
                 }
+                warn_on_committed_limits(&broker, &broker_config(&config).reloadable_limits());
                 Ok(())
             };
             if let Err(error) = ready.await {
@@ -498,6 +522,7 @@ async fn run_broker(
         let broker = broker.clone();
         let security = security.clone();
         let dynamic_security = config.dynamic_security.clone();
+        let file_limits = broker_config(&config).reloadable_limits();
         let registered = registered.clone();
         tokio::spawn(async move {
             if joining {
@@ -510,6 +535,7 @@ async fn run_broker(
                     match result {
                         Ok(()) => {
                             registered.store(true, Ordering::Release);
+                            warn_on_committed_limits(&broker, &file_limits);
                             break;
                         }
                         Err(error) => {
@@ -611,6 +637,7 @@ async fn run_broker(
                 if let Some(path) = &cli.file {
                     match reload_config(path, cli, &config) {
                         Ok(mut fresh) => {
+                            let reloaded_limits = broker_config(&fresh).reloadable_limits();
                             let unapplied = startup_only_changes(&config, &fresh);
                             if !unapplied.is_empty() {
                                 tracing::warn!(
@@ -652,6 +679,10 @@ async fn run_broker(
                                     }
                                     _ => tracing::warn!("Changing cluster identity or state format requires a restart"),
                                 }
+                            }
+                            // conf.c: config__copy applies these on reload.
+                            if let Err(error) = broker.reload_limits(reloaded_limits).await {
+                                tracing::warn!("Unable to apply reloaded broker limits: {error}");
                             }
                             live_config.replace(Some(fresh));
                         }
