@@ -61,6 +61,8 @@ mod connect;
 mod failover;
 mod persistence;
 mod publish;
+#[cfg(unix)]
+mod reload_limits;
 mod sessions;
 mod sys;
 mod v5;
