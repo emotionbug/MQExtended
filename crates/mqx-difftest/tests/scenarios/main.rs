@@ -56,8 +56,8 @@ macro_rules! scenario {
     };
 }
 
-mod connect;
 mod codec_parity;
+mod connect;
 mod failover;
 mod persistence;
 mod publish;
