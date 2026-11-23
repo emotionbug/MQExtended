@@ -266,6 +266,83 @@ fn add_local_http(config: &mut ServerConfig) {
     }
 }
 
+/// Broker-wide options that mosquitto.conf(5) marks "Reloaded on reload
+/// signal" but that MQExtended applies only at startup. A cluster's
+/// replicated state machine must see the same values on every node.
+fn startup_only_changes(running: &ServerConfig, fresh: &ServerConfig) -> Vec<&'static str> {
+    let (old, new) = (&running.limits, &fresh.limits);
+    [
+        (
+            "global_max_clients",
+            old.global_max_clients != new.global_max_clients,
+        ),
+        (
+            "global_max_connections",
+            old.global_max_connections != new.global_max_connections,
+        ),
+        (
+            "max_inflight_messages",
+            old.max_inflight_messages != new.max_inflight_messages,
+        ),
+        (
+            "max_inflight_bytes",
+            old.max_inflight_bytes != new.max_inflight_bytes,
+        ),
+        (
+            "max_queued_messages",
+            old.max_queued_messages != new.max_queued_messages,
+        ),
+        (
+            "max_queued_bytes",
+            old.max_queued_bytes != new.max_queued_bytes,
+        ),
+        ("max_keepalive", old.max_keepalive != new.max_keepalive),
+        (
+            "max_packet_size",
+            old.max_packet_size != new.max_packet_size,
+        ),
+        (
+            "message_size_limit",
+            old.message_size_limit != new.message_size_limit,
+        ),
+        (
+            "persistent_client_expiration",
+            old.persistent_client_expiration != new.persistent_client_expiration,
+        ),
+        (
+            "retain_expiry_interval",
+            old.retain_expiry_interval != new.retain_expiry_interval,
+        ),
+        (
+            "queue_qos0_messages",
+            old.queue_qos0_messages != new.queue_qos0_messages,
+        ),
+        (
+            "retain_available",
+            old.retain_available != new.retain_available,
+        ),
+        (
+            "upgrade_outgoing_qos",
+            old.upgrade_outgoing_qos != new.upgrade_outgoing_qos,
+        ),
+        (
+            "allow_duplicate_messages",
+            old.allow_duplicate_messages != new.allow_duplicate_messages,
+        ),
+        (
+            "clientid_prefixes",
+            old.clientid_prefixes != new.clientid_prefixes,
+        ),
+        (
+            "set_tcp_nodelay",
+            running.set_tcp_nodelay != fresh.set_tcp_nodelay,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, changed)| changed.then_some(name))
+    .collect()
+}
+
 fn reload_config(
     path: &Path,
     cli: &Cli,
@@ -534,6 +611,13 @@ async fn run_broker(
                 if let Some(path) = &cli.file {
                     match reload_config(path, cli, &config) {
                         Ok(mut fresh) => {
+                            let unapplied = startup_only_changes(&config, &fresh);
+                            if !unapplied.is_empty() {
+                                tracing::warn!(
+                                    "Changing {} requires a restart; the running values are kept.",
+                                    unapplied.join(", ")
+                                );
+                            }
                             // signals.c: reload configuration before opening credential files.
                             certificates.refresh(Some(&fresh));
                             security.reload(&fresh)?;
