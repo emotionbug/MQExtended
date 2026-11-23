@@ -8,7 +8,7 @@ use ::openssl::{
         Ssl, SslContextBuilder, SslMethod, SslMode, SslOptions, SslRef, SslVerifyMode, SslVersion,
         StatusType,
     },
-    x509::{X509, X509VerifyResult, verify::X509CheckFlags},
+    x509::X509VerifyResult,
 };
 use mqx_bridge::TlsConfig;
 use rustls::pki_types::{PrivateKeyDer, ServerName, pem::PemObject};
@@ -43,17 +43,21 @@ pub(super) async fn connect(
             .set_max_proto_version(Some(SslVersion::TLS1_2))
             .map_err(io::Error::other)?;
     }
+    // Mosquitto lib/net_mosq.c: net__init_ssl_ctx keeps OpenSSL's default list
+    // for certificate bridges and selects "PSK" for PSK bridges.
     let cipher_list = match (tls.ciphers.as_deref(), tls.psk.is_some()) {
         (Some(ciphers), _) if ciphers.contains('\0') => {
             return Err(io::Error::other("bridge_ciphers contains a NUL"));
         }
-        (Some(ciphers), _) => Cow::Owned(format!("{ciphers}:!aNULL:!eNULL")),
-        (None, true) => Cow::Borrowed("PSK:!aNULL:!eNULL"),
-        (None, false) => Cow::Borrowed("ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!eNULL"),
+        (Some(ciphers), _) => Some(Cow::Owned(format!("{ciphers}:!aNULL:!eNULL"))),
+        (None, true) => Some(Cow::Borrowed("PSK:!aNULL:!eNULL")),
+        (None, false) => None,
     };
-    context
-        .set_cipher_list(&cipher_list)
-        .map_err(io::Error::other)?;
+    if let Some(cipher_list) = cipher_list {
+        context
+            .set_cipher_list(&cipher_list)
+            .map_err(io::Error::other)?;
+    }
     if let Some(ciphers) = &tls.ciphers_tls13 {
         if ciphers.contains('\0') {
             return Err(io::Error::other("bridge_ciphers_tls1.3 contains a NUL"));
@@ -102,15 +106,14 @@ pub(super) async fn connect(
             let name = name.as_ref();
             let name = name.strip_suffix('.').unwrap_or(name);
             ssl.set_hostname(name).map_err(io::Error::other)?;
-            if tls.require_ocsp && !tls.insecure {
-                let param = ssl.param_mut();
-                param.set_hostflags(
-                    X509CheckFlags::NO_PARTIAL_WILDCARDS | X509CheckFlags::NEVER_CHECK_SUBJECT,
-                );
-                param.set_host(name).map_err(io::Error::other)?;
+            if tls.psk.is_none() && !tls.insecure {
+                // lib/tls_mosq.c: tls__set_verify_hostname uses OpenSSL's
+                // default host flags: partial wildcards are allowed and the
+                // subject CN is checked when there are no DNS SANs.
+                ssl.param_mut().set_host(name).map_err(io::Error::other)?;
             }
         }
-        ServerName::IpAddress(ip) if tls.require_ocsp && !tls.insecure => {
+        ServerName::IpAddress(ip) if tls.psk.is_none() && !tls.insecure => {
             ssl.param_mut()
                 .set_ip(IpAddr::from(ip))
                 .map_err(io::Error::other)?;
@@ -128,7 +131,9 @@ pub(super) async fn connect(
         .map_err(io::Error::other)?;
     if tls.require_ocsp {
         verify_staple(stream.ssl())?;
-    } else if stream.ssl().psk_identity() != tls.identity.as_deref().map(str::as_bytes) {
+    } else if tls.psk.is_some()
+        && stream.ssl().psk_identity() != tls.identity.as_deref().map(str::as_bytes)
+    {
         return Err(io::Error::other("Peer did not negotiate bridge TLS-PSK"));
     }
     Ok(stream)
@@ -136,23 +141,9 @@ pub(super) async fn connect(
 
 fn certificate_context(context: &mut SslContextBuilder, tls: &TlsConfig) -> io::Result<()> {
     if tls.use_os_certs {
-        let native = rustls_native_certs::load_native_certs();
-        let mut loaded = false;
-        for cert in native.certs {
-            if let Ok(cert) = X509::from_der(cert.as_ref()) {
-                context
-                    .cert_store_mut()
-                    .add_cert(cert)
-                    .map_err(io::Error::other)?;
-                loaded = true;
-            }
-        }
-        if !loaded && tls.cafile.is_none() && tls.capath.is_none() && !native.errors.is_empty() {
-            return Err(io::Error::other(format!(
-                "Unable to load OS certificates: {:?}",
-                native.errors
-            )));
-        }
+        // lib/net_mosq.c: net__tls_load_ca ignores a failure to load OpenSSL's
+        // default trust locations; the handshake then fails verification.
+        let _ = context.set_default_verify_paths();
     }
     if tls.cafile.is_some() || tls.capath.is_some() {
         let cafile = checked_path(tls.cafile.as_deref(), "bridge_cafile")?;
@@ -160,6 +151,11 @@ fn certificate_context(context: &mut SslContextBuilder, tls: &TlsConfig) -> io::
         context
             .load_verify_locations(cafile, capath)
             .map_err(io::Error::other)?;
+    }
+    if tls.certfile.is_some() != tls.keyfile.is_some() {
+        return Err(io::Error::other(
+            "Both bridge_certfile and bridge_keyfile must be provided.",
+        ));
     }
     if let (Some(certfile), Some(keyfile)) = (&tls.certfile, &tls.keyfile) {
         checked_path(Some(certfile), "bridge_certfile")?;

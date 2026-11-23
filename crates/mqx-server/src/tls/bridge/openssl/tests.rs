@@ -5,6 +5,7 @@ use ::openssl::{
     pkey::Private,
     sign::Signer,
     ssl::{AlpnError, NameType, select_next_proto},
+    x509::X509,
 };
 use chrono::{TimeDelta, Utc};
 use mqx_bridge::Transport;
@@ -36,9 +37,17 @@ fn root(name: &str) -> CertifiedIssuer<'static, KeyPair> {
 
 impl Pki {
     fn new() -> Self {
+        Self::with_names(&["localhost", "127.0.0.1"], None)
+    }
+
+    fn with_names(sans: &[&str], common_name: Option<&str>) -> Self {
         let root = root("OCSP test root");
         let mut params =
-            CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+            CertificateParams::new(sans.iter().map(|&name| name.to_owned()).collect::<Vec<_>>())
+                .unwrap();
+        if let Some(name) = common_name {
+            params.distinguished_name.push(DnType::CommonName, name);
+        }
         params.serial_number = Some(1u64.into());
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let key = KeyPair::generate().unwrap();
@@ -367,4 +376,80 @@ async fn bridge_ocsp_preserves_tls_identity_and_bridge_settings() {
     fs::create_dir(tls.capath.as_ref().unwrap()).unwrap();
     let (result, _) = dial(pki.acceptor(Some(pki.staple(&[&good]))), "wrong.test", &tls).await;
     assert!(result.is_err());
+}
+
+// lib/net_mosq.c: net__init_ssl_ctx leaves OpenSSL's default cipher list in
+// place, and lib/tls_mosq.c: tls__set_verify_hostname checks the name with
+// OpenSSL's default X509_check_host flags, with or without OCSP.
+#[tokio::test]
+async fn certificate_bridge_uses_openssl_defaults_for_ciphers_and_names() {
+    let dir = tempfile::tempdir().unwrap();
+    for (case, sans, common_name, host, ocsp, server_ciphers) in [
+        (
+            "TLS 1.2 suite outside ECDHE AEAD",
+            &["localhost"][..],
+            None,
+            "localhost",
+            false,
+            Some("ECDHE-ECDSA-AES128-SHA256"),
+        ),
+        (
+            "partial wildcard",
+            &["b*.example.test"][..],
+            None,
+            "bridge.example.test",
+            false,
+            None,
+        ),
+        (
+            "subject CN without SAN",
+            &[][..],
+            Some("localhost"),
+            "localhost",
+            false,
+            None,
+        ),
+        (
+            "subject CN without SAN, with OCSP",
+            &[][..],
+            Some("localhost"),
+            "localhost",
+            true,
+            None,
+        ),
+    ] {
+        let pki = Pki::with_names(sans, common_name);
+        let ca = dir.path().join("root.pem");
+        fs::write(&ca, pki.root.pem()).unwrap();
+        let tls = TlsConfig {
+            cafile: Some(ca),
+            require_ocsp: ocsp,
+            ..TlsConfig::default()
+        };
+        let staple = ocsp.then(|| pki.staple(&[&pki.answer(1, 0, GOOD, (-1, Some(1)))]));
+        let mut acceptor = pki.acceptor(staple);
+        if let Some(ciphers) = server_ciphers {
+            acceptor
+                .set_max_proto_version(Some(SslVersion::TLS1_2))
+                .unwrap();
+            acceptor.set_cipher_list(ciphers).unwrap();
+        }
+        let (client, server) = dial(acceptor, host, &tls).await;
+        assert!(client.is_ok(), "{case}: {:?}", client.err());
+        if let Some(ciphers) = server_ciphers {
+            let server = server.unwrap();
+            assert_eq!(server.ssl().current_cipher().unwrap().name(), ciphers);
+        }
+    }
+    // The hostname is still checked against the SAN, and the CN is ignored
+    // when a DNS SAN is present.
+    let pki = Pki::with_names(&["other.test"], Some("localhost"));
+    let ca = dir.path().join("root.pem");
+    fs::write(&ca, pki.root.pem()).unwrap();
+    let tls = TlsConfig {
+        cafile: Some(ca),
+        ..TlsConfig::default()
+    };
+    let (client, _) = dial(pki.acceptor(None), "localhost", &tls).await;
+    assert!(client.is_err());
 }
