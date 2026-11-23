@@ -636,13 +636,17 @@ fn certificate_bridge_delivers(kind: BrokerKind, san: bool, options: &str) {
     let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
+    // `localhost` resolves to ::1 first on some hosts (GitHub's runners), and
+    // Mosquitto's non-blocking bridge connect stops at the first address
+    // (lib/net_mosq.c: net__try_connect_tcp). Serve the name on both loopbacks.
+    let tls = format!(
+        "certfile {}\nkeyfile {}\n",
+        certfile.display(),
+        keyfile.display()
+    );
     let core = start(
         BrokerKind::Mosquitto,
-        &format!(
-            "{ANONYMOUS}listener {port} 127.0.0.1\ncertfile {}\nkeyfile {}\n",
-            certfile.display(),
-            keyfile.display(),
-        ),
+        &format!("{ANONYMOUS}listener {port} 127.0.0.1\n{tls}listener {port} ::1\n{tls}"),
     );
     let edge = start(
         kind,
