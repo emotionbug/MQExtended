@@ -37,6 +37,6 @@ The policy is replicated state. Every `mosquitto_ctrl` change goes through the l
 
 ## Differences from the C plugin
 
-- JSON key order and whitespace in the saved file can differ; the content is the same.
+- JSON key order and whitespace in the saved file and in responses can differ; the content is the same. When a JSON object repeats a key, or uses the same key with different capitalisation, the first occurrence is used, as in Mosquitto.
 - `getClient` reports the connections of the node that answers.
 - The per-command audit log lines are not reproduced.

@@ -38,14 +38,15 @@ See [client interoperability](testing.md#client-sdk-interoperability) for the di
 - Every MQTT string goes through `mosquitto_validate_utf8`: besides malformed UTF-8 it rejects NUL, control characters U+0001–U+001F and U+007F–U+009F, and non-characters.
 - Zero-length strings and binary fields read as absent (`packet__read_binary`). An empty username is anonymous; an empty password is no password.
 - Reserved fixed-header flags are checked for MQTT 3.1.1 only; MQTT 3.1 (`MQIsdp`) clients get Mosquitto's leniency, e.g. a username flag without a username is ignored.
-- MQTT 5 (`mqx_codec::v5`) follows Mosquitto's separate rules for header and property variable-byte integers, property order and duplicates, and the per-packet allowed property sets (`property__read_all`, `mosquitto_property_check_all`).
+- MQTT 5 (`mqx_codec::v5`) follows Mosquitto's separate rules for header and property variable-byte integers, property order and duplicates, and the per-packet allowed property sets (`property__read_all`, `mosquitto_property_check_all`). A property that runs past the declared property length does not end the list: Mosquitto keeps reading properties from the rest of the packet, so the first failure in the packet decides the response.
+- A Remaining Length is rejected at its fifth byte; four continued bytes wait for more input (`packet__read_single`).
 
 ### Authentication (`mqx-auth` ← `plugins/password-file`, `libcommon/password_common.c`)
 
 - Hashes: `$6$` (SHA-512 of password + salt) and `$7$` (PBKDF2-HMAC-SHA512). Salts of 12 bytes (Mosquitto 2.0) and 64 bytes (2.1) load; hashes must be 64 bytes.
 - The password is compared up to its first NUL byte, as Mosquitto passes it with `strlen`.
 - No username: the password file abstains and `allow_anonymous` decides. Unknown user, wrong or missing password: refused.
-- File parsing keeps `strtok` behaviour: a leading `:` is skipped, a line without `:` is ignored, a duplicate user or undecodable hash rejects the whole file.
+- File parsing keeps `strtok` and `mosquitto_fgets` behaviour: a leading `:` is skipped; a line without `:` or with a NUL byte is ignored, and so is a final line without a newline that exactly fills the read buffer; a duplicate user or undecodable hash rejects the whole file. Base64 in hashes is decoded as OpenSSL does: blanks are skipped and unused trailing bits are ignored.
 
 ### Authorization (`mqx-auth` ← `plugins/acl-file`)
 
@@ -53,7 +54,7 @@ See [client interoperability](testing.md#client-sdk-interoperability) for the di
 - Topic lines before the first `user` line apply to clients without a username only. A username without a `user` section gets patterns only.
 - `deny` entries are checked before all others. The first matching entry that grants the requested access wins.
 - With any `pattern` line present, a client id or username containing `+` or `#` is denied everything.
-- Lines are split on spaces only; tabs are part of a token, and an indented `#` is not a comment.
+- Lines are split on spaces only; tabs are part of a token, and an indented `#` is not a comment. A line containing a NUL byte ends the file; later lines are ignored.
 
 ### Plugins
 
@@ -74,6 +75,10 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 
 - Taking over a client id sends the old connection's will when the old or the new session is clean; persistent-to-persistent takeover discards it (`connect__on_authorised`).
 - On a slow link, a large PUBLISH may take longer than 1.5 times the Keep Alive interval. Progress receiving its body resets the timer while more than 1000 bytes remain (`lib/packet_mosq.c`: `packet__read_single`); a stalled transfer still times out.
+- `mount_point` prefixes SUBSCRIBE filters, PUBLISH topics and Will topics, but not UNSUBSCRIBE filters (`handle__unsubscribe`): unsubscribe with the mounted filter. A Will topic is checked for `$CONTROL/` and topic syntax after the mount point is added (`will__read`); a refused Will closes the connection without CONNACK.
+- A denied SUBSCRIBE filter returns 0x80 to MQTT 3.1.1 and 0x87 to MQTT 5, but the requested QoS to MQTT 3.1 clients, without installing the subscription (`handle__subscribe`).
+- A PUBREC naming a packet id that is still queued gets its PUBREL and leaves the message queued (`handle__pubrec`, `db__message_update_outgoing`).
+- SUBSCRIBE and UNSUBSCRIBE filters are applied one at a time: filters before the first invalid one stay subscribed or unsubscribed when the broker closes the connection, without a SUBACK or UNSUBACK (`handle__subscribe`, `handle__unsubscribe`).
 - MQTT 3.1 has no 23-byte client id limit, and CONNACK `session_present` stays 0 for 3.1 clients.
 - Outgoing packet ids are consumed even when a message is then dropped as a duplicate or for a full queue (`mosquitto__mid_generate`), so packet ids on the wire match Mosquitto's.
 - `allow_duplicate_messages false` suppresses overlapping live copies only for pre-v5 recipients. MQTT 5 keeps separate deliveries from overlapping filters, each with its subscription's QoS and identifier if set (`src/database.c`: `db__message_insert_outgoing`).
@@ -100,6 +105,8 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 - As in `lib/send_publish.c`, the outgoing bridge size check drops oversized PUBLISH packets without blocking subscription setup or QoS control packets. Keep control packets within the remote broker's advertised MQTT 5 Maximum Packet Size.
 - In a cluster each bridge runs on exactly one node; see [data model](data-model.md#rules).
 - Use `bridge_identity` and `bridge_psk` together for outgoing TLS 1.2 PSK. Supply the key in hexadecimal without `0x`. Do not combine PSK with certificate settings or OCSP on the same bridge.
+- Bridge TLS uses OpenSSL with Mosquitto's settings (`net__init_ssl_ctx`, `tls__set_verify_hostname`): `bridge_ciphers` takes an OpenSSL cipher string and defaults to OpenSSL's default list, with `:!aNULL:!eNULL` appended; hostname checks use OpenSSL's defaults, so a certificate without DNS SANs is matched on its subject CN and partial wildcards are allowed. `bridge_tls_use_os_certs` loads OpenSSL's default trust locations.
+- A bridge accepts messages as soon as its connection to the remote opens and sends them after CONNACK, as `db__message_insert_outgoing` does; `local_cleansession true` discards only messages published while the bridge has no connection.
 - `bridge_require_ocsp true` requires certificate trust via `bridge_cafile`, `bridge_capath`, or `bridge_tls_use_os_certs`. The bridge accepts only an unambiguous `GOOD` status for the verified server leaf, signed by its issuer or a delegated responder, with a validity interval covering the current time. It never fetches OCSP responses. `bridge_insecure true` skips hostname verification only.
 
 ## Defaults
@@ -119,7 +126,7 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 | --- | --- |
 | `$argon2id$` hashes are rejected | Mosquitto 2.1.4 builds without `WITH_ARGON2` by default and rejects them too |
 | Non-UTF-8 entries in `password_file` / `acl_file` are kept or dropped instead of matched byte-wise | MQTT usernames and topics are validated UTF-8, so such entries can never match |
-| Base64 in hashes is decoded strictly | Every value Mosquitto writes is standard base64; malformed values fail Mosquitto's length checks as well |
+| Base64 in a hash field longer than 1024 bytes that is also malformed can decode differently | OpenSSL's base64 BIO reads in 1024-byte chunks; the values Mosquitto writes are never this long |
 | `$SYS/broker/heap/*` is not published | Mosquitto only publishes it in builds with memory tracking, so clients cannot rely on it |
 | Persistence is written to `<persistence_file>.mqx`, not `mosquitto.db` | Clients see the same state after a restart; the Mosquitto file is read once for [migration](migration.md#5-carry-state-over) and left untouched for rollback |
 | A Unix listener refuses a non-socket path or a socket still accepting connections | A typo cannot replace an existing file or disconnect clients from a running listener. A stale socket is still reclaimed. Use a service-owned directory and serialize starts; pathname checks are not a lock against concurrent directory changes. |
@@ -127,6 +134,7 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 | `log_dest dlt` logs nothing and `log_dest syslog` has no console fallback | Matches a stock Mosquitto build without DLT; syslog delivery goes to `/dev/log` as Mosquitto's does |
 | An invalid dynamic-security config file stops the broker | Mosquitto would run with an empty policy; refusing to start is the safe reading of the same file ([dynamic security](dynamic-security.md#differences-from-the-c-plugin)) |
 | Bridge reconnect delays follow `restart_timeout` without Mosquitto's event-loop jitter | The remote broker sees the same connect sequence; only the exact retry instants differ |
+| Bridge TLS appends `:!aNULL:!eNULL` to `bridge_ciphers`, and PSK bridges default to `PSK:!aNULL:!eNULL` | Unauthenticated cipher suites are never negotiated; only a remote that offers nothing else is refused |
 
 ## Unsupported directives
 
