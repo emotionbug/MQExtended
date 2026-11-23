@@ -24,10 +24,82 @@ pub(crate) fn trim_end(s: &[u8]) -> &[u8] {
     &s[..end]
 }
 
-/// Lines as returned by repeated `mosquitto_fgets()` calls: each line keeps
-/// its trailing `\n`; a final line without newline is still returned.
-pub(crate) fn lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
-    text.split_inclusive(|&b| b == b'\n')
+/// Successive `mosquitto_fgets()` calls (`libcommon/file_common.c`) over a
+/// file read with glibc `fgets()`, starting from the 256-byte buffer both
+/// file plugins allocate. The buffer grows by 1000 bytes whenever a line does
+/// not fit and stays grown for later lines.
+///
+/// `next()` returns `None` once the file is exhausted (`feof`). Otherwise
+/// `Some(None)` is a call that returned NULL: a line with an embedded NUL, or
+/// a final unterminated line that exactly filled the buffer. `Some(Some(line))`
+/// is the buffer as a C string, with the trailing `\n` if there was one.
+pub(crate) struct Fgets<'a> {
+    text: &'a [u8],
+    pos: usize,
+    eof: bool,
+    buflen: usize,
+}
+
+impl<'a> Fgets<'a> {
+    pub(crate) fn new(text: &'a [u8]) -> Self {
+        Self {
+            text,
+            pos: 0,
+            eof: false,
+            buflen: 256,
+        }
+    }
+
+    /// glibc `fgets(s, size, stream)`: at most `size - 1` bytes, stopping
+    /// after `\n`; sets end-of-file when it runs out of input first. `None`
+    /// when nothing was read.
+    fn fgets(&mut self, size: usize) -> Option<&'a [u8]> {
+        let rest = &self.text[self.pos..];
+        let limit = rest.len().min(size - 1);
+        let len = match rest[..limit].iter().position(|&b| b == b'\n') {
+            Some(newline) => newline + 1,
+            None => {
+                // Filling `size - 1` bytes exactly stops without reading on,
+                // so end-of-file is not seen yet.
+                if rest.len() < size - 1 {
+                    self.eof = true;
+                }
+                limit
+            }
+        };
+        self.pos += len;
+        (len > 0).then(|| &rest[..len])
+    }
+}
+
+impl<'a> Iterator for Fgets<'a> {
+    type Item = Option<&'a [u8]>;
+
+    fn next(&mut self) -> Option<Option<&'a [u8]>> {
+        if self.eof {
+            return None;
+        }
+        let start = self.pos;
+        let mut offset = 0;
+        loop {
+            let read = self.fgets(self.buflen - offset);
+            // The buffer holds every chunk read by this call.
+            let buf = &self.text[start..self.pos];
+            let c_str = &buf[..buf.iter().position(|&b| b == 0).unwrap_or(buf.len())];
+            if self.eof || read.is_none() {
+                return Some(read.map(|_| c_str));
+            }
+            if c_str.is_empty() || c_str.last() == Some(&b'\n') {
+                return Some(Some(c_str));
+            }
+            if c_str.len() + 1 < self.buflen {
+                // "Embedded nulls, invalid string"
+                return Some(None);
+            }
+            offset = self.buflen - 1;
+            self.buflen += 1000;
+        }
+    }
 }
 
 /// Emulates successive `strtok_r(.., delim, ..)` calls over one buffer:

@@ -7,13 +7,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use sha2::{Digest, Sha512};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
-use crate::ctext::{Strtok, atoi, lines, trim_blanks};
+use crate::ctext::{Fgets, Strtok, atoi, trim_blanks};
 
 /// SHA-512 digest length; Mosquitto's `HASH_LEN` (`EVP_MAX_MD_SIZE`).
 const HASH_LEN: usize = 64;
@@ -137,19 +135,97 @@ impl PasswordHash {
     }
 }
 
-// Mosquitto decodes with an OpenSSL base64 BIO; a strict standard decoder
-// accepts every value Mosquitto writes, and malformed input then fails the
-// length checks in Mosquitto anyway.
+/// `mosquitto_base64_decode`: an OpenSSL base64 BIO with
+/// `BIO_FLAGS_BASE64_NO_NL`, i.e. one `EVP_DecodeUpdate` over the whole
+/// input followed by `EVP_DecodeFinal` (`crypto/evp/encode.c`). Spaces, tabs,
+/// CR and LF are skipped, `-` ends the input, trailing bits are not checked,
+/// and a final incomplete group is dropped while earlier output is kept.
+/// Any other invalid byte, data after `=`, or more than two `=` is an error.
+/// `None` when nothing was decoded, which Mosquitto also treats as failure.
+/// Differentially tested against OpenSSL 3 for valid values padded with
+/// blanks to any length and for malformed values up to 1024 bytes; the BIO
+/// reads 1024-byte chunks, so longer malformed values can still differ.
+fn openssl_base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    enum Class {
+        Data(u8),
+        Skip,
+        End,
+    }
+    let class = |c: u8| match c {
+        b'A'..=b'Z' => Some(Class::Data(c - b'A')),
+        b'a'..=b'z' => Some(Class::Data(c - b'a' + 26)),
+        b'0'..=b'9' => Some(Class::Data(c - b'0' + 52)),
+        b'+' => Some(Class::Data(62)),
+        b'/' => Some(Class::Data(63)),
+        // Decodes as zero; the padding count is subtracted afterwards.
+        b'=' => Some(Class::Data(0)),
+        b' ' | b'\t' | b'\r' | b'\n' => Some(Class::Skip),
+        b'-' => Some(Class::End),
+        _ => None,
+    };
+    // evp_decodeblock_int: groups of four, minus the padding seen so far.
+    fn flush(group: &mut Vec<u8>, padding: usize, out: &mut Vec<u8>) -> Option<()> {
+        let start = out.len();
+        for chunk in group.chunks(4) {
+            let bits = chunk.iter().fold(0u32, |acc, &v| (acc << 6) | u32::from(v));
+            out.extend(&bits.to_be_bytes()[1..]);
+        }
+        group.clear();
+        let decoded = out.len() - start;
+        if padding > decoded {
+            return None;
+        }
+        out.truncate(out.len() - padding);
+        Some(())
+    }
+    let mut out = Vec::new();
+    let mut group = Vec::with_capacity(64);
+    let mut padding = 0;
+    let mut ended = false;
+    for &c in input {
+        let class = class(c)?;
+        if c == b'=' {
+            padding += 1;
+        } else if padding > 0 && matches!(class, Class::Data(_)) {
+            return None;
+        }
+        if padding > 2 {
+            return None;
+        }
+        match class {
+            Class::End => {
+                ended = true;
+                break;
+            }
+            Class::Data(v) => group.push(v),
+            Class::Skip => {}
+        }
+        if group.len() == 64 {
+            flush(&mut group, padding, &mut out)?;
+        }
+    }
+    if !group.is_empty() {
+        if group.len() % 4 == 0 {
+            flush(&mut group, padding, &mut out)?;
+        } else if ended {
+            return None;
+        }
+        // Otherwise EVP_DecodeFinal rejects the incomplete group, but the
+        // BIO still returns what was decoded before it.
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn decode_salt(field: Option<&[u8]>) -> Result<Vec<u8>, HashError> {
     field
-        .and_then(|f| BASE64.decode(f).ok())
+        .and_then(openssl_base64_decode)
         .filter(|s| SALT_LENS.contains(&s.len()))
         .ok_or(HashError::InvalidSalt)
 }
 
 fn decode_hash(field: Option<&[u8]>) -> Result<[u8; HASH_LEN], HashError> {
     field
-        .and_then(|f| BASE64.decode(f).ok())
+        .and_then(openssl_base64_decode)
         .and_then(|h| <[u8; HASH_LEN]>::try_from(h).ok())
         .ok_or(HashError::InvalidHash)
 }
@@ -211,8 +287,12 @@ impl PasswordFile {
     /// Port of `password_file__parse`.
     pub fn parse(text: &[u8]) -> Result<Self, PasswordFileError> {
         let mut users = HashMap::new();
-        for (index, line) in lines(text).enumerate() {
+        for (index, line) in Fgets::new(text).enumerate() {
             let line_no = index + 1;
+            // A NULL from mosquitto_fgets is skipped; the loop runs until feof.
+            let Some(line) = line else {
+                continue;
+            };
             if line.first() == Some(&b'#') || !line.contains(&b':') {
                 continue;
             }
@@ -349,6 +429,30 @@ mod tests {
         }
     }
 
+    // libcommon/base64_common.c: mosquitto_base64_decode goes through an
+    // OpenSSL BIO, which skips blanks and ignores the unused low bits of the
+    // last character. Mosquitto 2.1.4 loads this file and accepts "b0b".
+    #[test]
+    fn hashes_decode_like_openssl() {
+        let lenient = "$7$101$6b9p5DHy+HZ/s \td4YgiADThddgF4qwiTYS+RLK38MAtaSgo1LNYFEIFjSg4e4O+4qRCSqwd9aRQfND+t3A+q2cg==$PAsktMHF \r TboLeAy6kM+EAeasyKCAOKpO2hH6/IMzRw0OUEDkfjhI/RjDOfI26ZsmxHowJglZ7CmfGMp4M5ni5x==";
+        let pw = file(&[&format!("bob:{lenient}")]).unwrap();
+        assert_eq!(pw.check(Some("bob"), Some(b"b0b")), BasicAuth::Allow);
+
+        // Outputs of mosquitto_base64_decode, with OpenSSL 3.
+        let salt = |s: &str| decode_salt(Some(s.as_bytes()));
+        assert_eq!(salt("AA AA AA AA AA AA AA AA").unwrap(), [0; 12]);
+        // `-` ends the input.
+        assert_eq!(salt("AAAAAAAAAAAAAAAA-*").unwrap(), [0; 12]);
+        assert_eq!(openssl_base64_decode(b"AAAA===="), None);
+        assert_eq!(openssl_base64_decode(b"AAA=AAAA"), None);
+        assert_eq!(openssl_base64_decode(b"AA*A"), None);
+        // An incomplete final group is dropped: 86 characters decode to 48 bytes.
+        let unpadded = &BOB.as_bytes()[BOB.len() - 88..BOB.len() - 2];
+        assert_eq!(openssl_base64_decode(unpadded).map(|d| d.len()), Some(48));
+        let padded = &BOB.as_bytes()[BOB.len() - 88..];
+        assert_eq!(openssl_base64_decode(&[padded, b"AAAA"].concat()), None);
+    }
+
     fn file(lines: &[&str]) -> Result<PasswordFile, PasswordFileError> {
         PasswordFile::parse(
             lines
@@ -436,6 +540,51 @@ mod tests {
             PasswordFile::parse(b"bad:"),
             Err(PasswordFileError::MissingPassword { line: 1 })
         ));
+    }
+
+    // libcommon/file_common.c: mosquitto_fgets returns NULL for a line with
+    // an embedded NUL, which password_file__parse skips, and for a final
+    // unterminated line that exactly fills its 256-byte buffer. Both checked
+    // against Mosquitto 2.1.4 with these files.
+    #[test]
+    fn line_reading_follows_mosquitto_fgets() {
+        let pw = PasswordFile::parse(
+            format!("alice:{ALICE}\nbob:{ALICE}\0junk\ncarol:{ALICE}\n").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            pw.check(Some("alice"), Some(b"Secr3t!pass")),
+            BasicAuth::Allow
+        );
+        assert_eq!(pw.check(Some("bob"), Some(b"Secr3t!pass")), BasicAuth::Deny);
+        assert_eq!(
+            pw.check(Some("carol"), Some(b"Secr3t!pass")),
+            BasicAuth::Allow
+        );
+
+        let padded = |user: &str, len: usize| format!("{:len$}", format!("{user}:{ALICE}"));
+        for (len, loaded) in [(254, true), (255, false), (256, true)] {
+            let text = format!("{}\n{}", padded("alice", 100), padded("bob", len));
+            let pw = PasswordFile::parse(text.as_bytes()).unwrap();
+            let expected = if loaded {
+                BasicAuth::Allow
+            } else {
+                BasicAuth::Deny
+            };
+            assert_eq!(
+                pw.check(Some("bob"), Some(b"Secr3t!pass")),
+                expected,
+                "{len}"
+            );
+        }
+        // Once a long line has grown the buffer to 1256 bytes, the boundary moves.
+        let text = format!("{}\n{}", padded("alice", 300), padded("bob", 1255));
+        let pw = PasswordFile::parse(text.as_bytes()).unwrap();
+        assert_eq!(
+            pw.check(Some("alice"), Some(b"Secr3t!pass")),
+            BasicAuth::Allow
+        );
+        assert_eq!(pw.check(Some("bob"), Some(b"Secr3t!pass")), BasicAuth::Deny);
     }
 
     #[test]

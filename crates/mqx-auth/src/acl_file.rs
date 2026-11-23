@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use mqx_topic::{matches, matches_with_pattern, validate_topic_filter};
 use thiserror::Error;
 
-use crate::ctext::{Strtok, lines, trim_blanks, trim_end};
+use crate::ctext::{Fgets, Strtok, trim_blanks, trim_end};
 
 const ACL_READ: u8 = 0x01;
 const ACL_WRITE: u8 = 0x02;
@@ -100,7 +100,8 @@ impl AclFile {
         // `None` until the first `user` line: entries go to `anonymous`.
         let mut user: Option<Vec<u8>> = None;
 
-        for (index, raw) in lines(text).enumerate() {
+        // `while(mosquitto_fgets(..))`: a NULL ends the file, even before EOF.
+        for (index, raw) in Fgets::new(text).map_while(|line| line).enumerate() {
             let line_no = index + 1;
             let line = trim_end(raw);
             if line.first() == Some(&b'#') {
@@ -124,9 +125,15 @@ impl AclFile {
                         }
                         None => (ACL_READ | ACL_WRITE, access_word),
                     };
-                    // The C check runs on raw bytes; wildcard/separator bytes
-                    // are ASCII so a lossy view validates the same positions.
-                    validate_topic_filter(&String::from_utf8_lossy(topic))
+                    // The C check runs on raw bytes and only looks at the ASCII
+                    // `+`, `#` and `/`. Replacing every non-ASCII byte with one
+                    // ASCII byte keeps those positions and the byte length;
+                    // a lossy UTF-8 view would triple invalid bytes.
+                    let ascii: String = topic
+                        .iter()
+                        .map(|&b| if b.is_ascii() { char::from(b) } else { '?' })
+                        .collect();
+                    validate_topic_filter(&ascii)
                         .map_err(|_| AclFileError::InvalidTopic { line: line_no })?;
                     // A non-UTF-8 topic can never match a validated UTF-8 MQTT
                     // topic, so dropping it is observably identical.
@@ -392,6 +399,40 @@ mod tests {
                 topic: "fixed/topic".into()
             }]
         );
+    }
+
+    // libcommon/file_common.c: mosquitto_fgets returns NULL for a line with
+    // an embedded NUL, which ends acl_file__parse's read loop: Mosquitto 2.1.4
+    // starts with this file and ignores everything after the NUL. A NUL at the
+    // start of a line is an empty string instead, and parsing continues.
+    #[test]
+    fn embedded_nul_ends_the_file_like_mosquitto_fgets() {
+        let a =
+            AclFile::parse(b"user alice\ntopic read a/#\nfoo\0bar\ntopic write b/#\nnonsense\n")
+                .unwrap();
+        assert!(a.check("c", Some("alice"), "a/x", Read));
+        assert!(!a.check("c", Some("alice"), "b/x", Write));
+        assert!(matches!(
+            AclFile::parse(b"user alice\n\0foo\nnonsense\n"),
+            Err(AclFileError::InvalidLine { line: 3 })
+        ));
+    }
+
+    // mosquitto_sub_topic_check counts bytes: Mosquitto 2.1.4 loads a topic
+    // of 30000 non-UTF-8 bytes. It can never match, but the file is valid.
+    #[test]
+    fn non_utf8_topic_length_is_counted_in_bytes() {
+        let mut text = b"topic read ".to_vec();
+        text.extend([0xff; 30_000]);
+        text.extend(b"\ntopic read ok/#\n");
+        let a = AclFile::parse(&text).unwrap();
+        assert!(a.check("c", None, "ok/x", Read));
+        let mut text = b"topic read ".to_vec();
+        text.extend([0xff; 65_536]);
+        assert!(matches!(
+            AclFile::parse(&text),
+            Err(AclFileError::InvalidTopic { line: 1 })
+        ));
     }
 
     #[test]

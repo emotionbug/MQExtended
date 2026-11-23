@@ -336,7 +336,76 @@ fn parse_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     // cJSON_Parse(WithLength) accepts one value followed by extra bytes.
     let mut decoder =
         serde_json::Deserializer::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes));
-    Value::deserialize(&mut decoder)
+    serde::de::DeserializeSeed::deserialize(FirstKeyWins, &mut decoder)
+}
+
+/// Builds a `Value` keeping only the first member of each object whose name
+/// matches an earlier one case-insensitively. cJSON keeps every member and
+/// `cJSON_GetObjectItem` returns the first match, so later duplicates are
+/// never read; `serde_json` would otherwise keep the last one.
+struct FirstKeyWins;
+
+impl<'de> serde::de::DeserializeSeed<'de> for FirstKeyWins {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for FirstKeyWins {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(FirstKeyWins)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(FirstKeyWins)?;
+            if !object.keys().any(|name| name.eq_ignore_ascii_case(&key)) {
+                object.insert(key, value);
+            }
+        }
+        Ok(Value::Object(object))
+    }
 }
 
 fn memberships_json(memberships: &[Membership], key: &str) -> Value {

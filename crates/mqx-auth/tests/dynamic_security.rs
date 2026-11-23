@@ -122,3 +122,50 @@ fn prepared_password_is_hashed_before_replication() {
         Some(true)
     );
 }
+
+// cJSON_GetObjectItem returns the first member whose name matches
+// case-insensitively; later duplicates are never read. Expected values were
+// observed from Mosquitto 2.1.4 with the same control payloads.
+#[test]
+fn duplicate_json_keys_use_the_first_occurrence() {
+    let mut state = DynamicSecurity::default();
+    let request = DynsecRequest::prepare(
+        br#"{"commands":[
+        {"command":"createClient","username":"a","username":"b"},
+        {"command":"createClient","Username":"c","username":"d"},
+        {"command":"createClient","username":"e","Username":"f","password":"first","PASSWORD":"second"},
+        {"command":"createRole","rolename":"r"},
+        {"command":"addRoleACL","rolename":"r","acltype":"publishClientSend","topic":"x","allow":true,"allow":false},
+        {"command":"addClientRole","username":"a","rolename":"r"}
+    ]}"#,
+    )
+    .unwrap();
+    state.apply(request);
+    let list = state
+        .apply(DynsecRequest::prepare(br#"{"commands":[{"command":"listClients"}]}"#).unwrap());
+    let response: Value = serde_json::from_slice(&list.response).unwrap();
+    assert_eq!(
+        response["responses"][0]["data"]["clients"],
+        json!(["a", "c", "e"])
+    );
+    assert_eq!(
+        state.authorize("id", Some("a"), "x", Access::Write),
+        Some(true)
+    );
+    assert_eq!(
+        state.authenticate("id", Some("e"), Some(b"first")),
+        Some(true)
+    );
+
+    let loaded = DynamicSecurity::parse(
+        br#"{"clients":[{"username":"u","roles":[{"rolename":"r"}]}],
+        "roles":[{"rolename":"r","acls":[
+            {"acltype":"publishClientReceive","topic":"t","allow":true,"Allow":false}
+        ]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        loaded.authorize("id", Some("u"), "t", Access::Read),
+        Some(true)
+    );
+}
