@@ -21,6 +21,7 @@ pub struct DecodeContext {
     /// Limit advertised to the sender, if known. `Some(0)` disables aliases.
     pub topic_alias_maximum: Option<u16>,
     receiver: Receiver,
+    unmounted_will: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,6 +38,7 @@ impl DecodeContext {
             max_packet_size,
             topic_alias_maximum: None,
             receiver: Receiver::Broker,
+            unmounted_will: false,
         }
     }
 
@@ -58,6 +60,14 @@ impl DecodeContext {
 
     pub const fn with_topic_alias_maximum(mut self, maximum: u16) -> Self {
         self.topic_alias_maximum = Some(maximum);
+        self
+    }
+
+    /// Refuses a `$CONTROL/` Will topic, without a reply, before reading the
+    /// rest of CONNECT. Set this for a listener without `mount_point`; with
+    /// one, only the caller can check the mounted topic.
+    pub const fn with_unmounted_will(mut self) -> Self {
+        self.unmounted_will = true;
         self
     }
 
@@ -340,13 +350,8 @@ impl<'a> Cursor<'a> {
         pos..self.end
     }
 
-    pub(super) fn block(&mut self, size: usize, field: &'static str) -> Result<Self, Fault> {
-        let span = self.take(size, field)?;
-        Ok(Self {
-            bytes: self.bytes,
-            pos: span.start,
-            end: span.end,
-        })
+    pub(super) fn pos(&self) -> usize {
+        self.pos
     }
 
     pub(super) fn byte(&mut self, field: &'static str) -> Result<u8, Fault> {
@@ -496,7 +501,12 @@ pub fn decode(src: &mut BytesMut, ctx: DecodeContext) -> Result<Option<Packet>, 
     let mut cursor = Cursor::new(body);
     let mut binaries = Binaries::default();
     let mut packet = if kind == PacketType::Connect {
-        Packet::Connect(read_connect(&mut cursor, header.command, &mut binaries)?)
+        Packet::Connect(read_connect(
+            &mut cursor,
+            header.command,
+            ctx,
+            &mut binaries,
+        )?)
     } else {
         if kind != PacketType::Publish && header.command != kind.command() {
             return Err(Fault::InvalidFixedHeaderFlags(header.command).for_packet(kind, ctx));
@@ -515,6 +525,7 @@ pub fn decode(src: &mut BytesMut, ctx: DecodeContext) -> Result<Option<Packet>, 
 fn read_connect(
     cur: &mut Cursor<'_>,
     command: u8,
+    ctx: DecodeContext,
     binaries: &mut Binaries,
 ) -> Result<Connect, DecodeError> {
     // src/handle_connect.c: read_protocol_name and read_and_verify_protocol_version.
@@ -589,11 +600,12 @@ fn read_connect(
             .string("Will topic")
             .map_err(Fault::for_connect_properties)?;
         // src/handle_connect.c: will__read sends a protocol CONNACK for an
-        // empty topic, but closes silently for invalid syntax or $CONTROL.
+        // empty topic, but closes silently for invalid syntax. It refuses
+        // `$CONTROL/` after mounting and before reading the Will payload.
         if topic.is_empty() {
             return Err(Fault::InvalidTopic("Will topic").connack(R::PROTOCOL_ERROR));
         }
-        if !valid_topic(&topic, false) || topic.starts_with("$CONTROL/") {
+        if !valid_topic(&topic, false) || (ctx.unmounted_will && topic.starts_with("$CONTROL/")) {
             return Err(Fault::InvalidTopic("Will topic").without_reply());
         }
         let payload = cur

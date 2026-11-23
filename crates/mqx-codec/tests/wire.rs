@@ -228,11 +228,10 @@ fn remaining_length_and_configured_limit_from_header() {
         NEW,
         DecodeError::MalformedRemainingLength,
     );
-    rejected(
-        b"\x30\x80\x80\x80\x80",
-        NEW,
-        DecodeError::MalformedRemainingLength,
-    );
+    let prefix = b"\x30\x80\x80\x80\x80";
+    let mut input = BytesMut::from(prefix.as_slice());
+    assert_eq!(decode(&mut input, NEW), Ok(None));
+    assert_eq!(input, prefix.as_slice());
     rejected(
         b"\x30\x80\x01",
         DecodeContext::new(130, None),

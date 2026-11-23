@@ -366,11 +366,14 @@ impl PropertyBlock {
     pub(super) fn read(cur: &mut Cursor<'_>, scope: PropertyScope) -> Result<Self, Fault> {
         let mut block = Self::default();
         let length = cur.varint("property length")? as usize;
-        let mut properties = cur.block(length, "properties")?;
+        let start = cur.pos();
         // lib/property_mosq.c: property__read_all parses all encodings first,
         // then checks values, packet legality and duplicates in wire order.
-        while !properties.is_empty() {
-            let (property, span) = Property::read(&mut properties)?;
+        // Values are read against the remaining packet and the unsigned length
+        // counter wraps on overrun, so a property that crosses the declared
+        // length keeps the loop reading until the packet runs out.
+        while cur.pos() - start != length {
+            let (property, span) = Property::read(cur)?;
             if let Some(span) = span.filter(|span| !span.is_empty()) {
                 block.binary = Some(BinaryProperty {
                     index: block.values.len(),

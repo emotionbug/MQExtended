@@ -245,7 +245,8 @@ impl Layout {
         if let Some(will) = &packet.will {
             self.add_properties(&will.properties, PropertyScope::Will)?;
             self.add(string_len(&will.topic, "Will topic")?)?;
-            if !valid_topic(&will.topic, false) || will.topic.starts_with("$CONTROL/") {
+            // lib/will_mosq.c: will__set checks syntax but allows `$CONTROL/`.
+            if !valid_topic(&will.topic, false) {
                 return Err(Fault::InvalidTopic("Will topic").into());
             }
             self.add(binary_len(&will.payload, "Will payload")?)?;

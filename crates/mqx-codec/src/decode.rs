@@ -153,6 +153,11 @@ impl Frame {
                 }));
             }
         }
+        // lib/packet_mosq.c: packet__read_single rejects a continued length
+        // only when the fifth byte arrives, whatever its value.
+        if src.len() < 6 {
+            return Ok(None);
+        }
         Err(DecodeError::MalformedRemainingLength)
     }
 

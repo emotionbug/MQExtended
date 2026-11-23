@@ -388,18 +388,64 @@ fn framing_and_body_varints_have_different_minimality_rules() {
         E::InvalidVarInt("subscription identifier"),
         malformed,
     );
+    // lib/property_mosq.c: property__read_all keeps reading after a property
+    // overruns the declared length, so the packet end is the failure.
     reject(
         b"\x30\x06\0\x01t\x01\x01\x00",
         BROKER,
-        E::Truncated("payload format indicator"),
+        E::Truncated("property identifier"),
         malformed,
     );
     reject(
         b"\x30\x04\0\x01t\x01",
         BROKER,
-        E::Truncated("properties"),
+        E::Truncated("property identifier"),
         malformed,
     );
+}
+
+#[test]
+fn property_utf8_failure_precedes_property_length_mismatch() {
+    // lib/property_mosq.c: property__read_all reads property values against
+    // the remaining packet, not against the declared property length.
+    for property_length in [3, 5] {
+        let raw = [0x30, 8, 0, 1, b't', property_length, 0x03, 0, 1, 0];
+        reject(
+            &raw,
+            BROKER,
+            E::InvalidUtf8 {
+                field: "content type",
+                error: mqx_codec::Utf8Error::DisallowedCodePoint { character: '\0' },
+            },
+            None,
+        );
+    }
+}
+
+#[test]
+fn control_will_topic_remains_available_for_listener_mounting() {
+    // src/handle_connect.c: will__read applies the listener mount point
+    // before checking the $CONTROL/ prefix.
+    let raw = b"\x10\x1e\0\x04MQTT\x05\x06\0\0\0\0\x01i\0\0\x0b$CONTROL/op\0\0";
+    let packet = read(raw, BROKER);
+    assert!(matches!(
+        &packet,
+        Packet::Connect(c) if c.will.as_ref().is_some_and(|will| will.topic == "$CONTROL/op")
+    ));
+    assert_eq!(wire(&packet), raw.as_slice());
+
+    // Without a mount point the refusal precedes the Will payload, so a
+    // truncated payload closes silently instead of sending a CONNACK.
+    let truncated = b"\x10\x1e\0\x04MQTT\x05\x06\0\0\0\0\x01i\0\0\x0b$CONTROL/op\0\x05";
+    reject(
+        truncated,
+        BROKER,
+        E::Truncated("Will payload"),
+        Some(ErrorResponse::ConnAck(R::MALFORMED_PACKET)),
+    );
+    let unmounted = BROKER.with_unmounted_will();
+    reject(truncated, unmounted, E::InvalidTopic("Will topic"), None);
+    reject(raw, unmounted, E::InvalidTopic("Will topic"), None);
 }
 
 #[test]
