@@ -48,6 +48,8 @@ Give every node the same `password_file`, `acl_file` and broker limits. Send SIG
 
 Issue node certificates from a CA used only for the cluster, one per node, with Common Name `mqx-node-<id>` matching `cluster_node_id`. Every peer connection is mutually authenticated: a node only accepts a peer whose certificate chains to `cluster_cafile` and whose Common Name matches the node id it claims, and it checks the same when it dials out. Addresses play no part in authentication.
 
+To renew a certificate, replace the files in place (write a new file and rename it over the old one, or let your secret store swap them). A node checks `cluster_cafile`, `cluster_certfile` and `cluster_keyfile` before each new peer connection, at most once per second, and uses them once the CA, chain, key and Common Name are consistent; until then it keeps the previous set and logs a warning. Established peer connections are not interrupted. Renew certificates well before they expire: a connection opened after expiry is refused.
+
 ## Network
 
 - Keep `cluster_bind` on a private network even with TLS. With `cluster_insecure_plaintext true` peer traffic is neither authenticated nor encrypted, and anyone who can reach the port can rewrite broker state; use it only on an isolated network or for tests.
@@ -83,7 +85,18 @@ Use an IPv4 EKS cluster with Helm 3, [cert-manager](https://cert-manager.io/docs
    docker buildx build --platform linux/amd64 -t "$repo:$tag" --push .
    ```
 
-2. Create the client-facing secrets. Use a server certificate whose DNS SAN covers the name your MQTT clients use. For an existing installation, import its password and ACL files. For a first private test, `mosquitto_passwd -c password_file device` prompts for a password **and creates a new file**; an ACL containing `user device` and `topic readwrite devices/device/#` on separate lines restricts that account to its test topic tree.
+2. Choose the client listeners your devices already use, then create their secrets. Each enabled listener uses the same password and ACL files, as with `per_listener_settings true` in Mosquitto.
+
+   | Values | Listener |
+   | --- | --- |
+   | `listeners.mqtts` (default on, port 8883) | MQTT over TLS |
+   | `listeners.mqtt` (port 1883) | Plain MQTT |
+   | `listeners.ws` (port 8080), `listeners.wss` (port 8081) | MQTT over WebSocket, without and with TLS |
+   | `auth.passwordFile`, `auth.aclFile` (default on) | Keys `password_file` and `acl_file` of `auth.existingSecret` |
+   | `auth.allowAnonymous` (default off) | Mosquitto `allow_anonymous` |
+   | `mqttTLS.existingSecret` | `kubernetes.io/tls` Secret for `mqtts` and `wss` |
+
+   For an existing installation, import its password and ACL files and enable the listeners its clients connect to; for example `--set listeners.mqtt.enabled=true` keeps plain MQTT on 1883 working. Use a server certificate whose DNS SAN covers the name your MQTT clients use. For a first private test, `mosquitto_passwd -c password_file device` prompts for a password **and creates a new file**; an ACL containing `user device` and `topic readwrite devices/device/#` on separate lines restricts that account to its test topic tree.
 
    ```sh
    kubectl create namespace mqtt
@@ -101,7 +114,7 @@ Use an IPv4 EKS cluster with Helm 3, [cert-manager](https://cert-manager.io/docs
    kubectl -n mqtt get pods,pvc,certificates
    ```
 
-The default MQTT endpoint is the private Service `mqtt.mqtt.svc:8883`. Connect with TLS, the server CA and your MQTT credentials. To expose it through an **internal** NLB managed by EKS Auto Mode, include this values file with `-f` on install. Use `service.k8s.aws/nlb` instead of `eks.amazonaws.com/nlb` for the AWS Load Balancer Controller. Use private subnets tagged for internal load balancers and point your certificate's DNS name at the NLB. The NLB forwards TLS to the broker; port 7000 and the HTTP API are not exposed.
+The default MQTT endpoint is the private Service `mqtt.mqtt.svc`, with one port per enabled listener. To expose it through an **internal** NLB managed by EKS Auto Mode, include this values file with `-f` on install. Use `service.k8s.aws/nlb` instead of `eks.amazonaws.com/nlb` for the AWS Load Balancer Controller. Use private subnets tagged for internal load balancers and point your certificate's DNS name at the NLB. The NLB forwards TCP to the broker, which terminates TLS itself; port 7000 and the HTTP API are not exposed.
 
 ```yaml
 service:
@@ -120,7 +133,7 @@ Keep the namespace, release name, peer Services, CA and PVCs. Restart a Pod, **n
 
 Do not use an HPA, `kubectl scale`, or a change to Helm replica counts to resize an existing cluster. The chart manages fixed topologies and rejects ordinary topology-changing upgrades. To move an existing installation, plan a [membership change](#changing-membership) separately.
 
-StatefulSets use `OnDelete` so a chart upgrade cannot restart all voters together. Apply new chart values, then replace **one Pod at a time**, waiting for each new Pod to be Ready before touching another. Recreate Pods this way after peer certificate renewal or a password/ACL Secret change: Kubernetes does not update `subPath` mounts in place, so SIGHUP alone will not load a new policy. A one-voter or two-voter cluster necessarily has a maintenance interruption. For incompatible broker versions follow [Upgrades](#upgrades), not a rolling restart.
+StatefulSets use `OnDelete` so a chart upgrade cannot restart all voters together. Apply new chart values, then replace **one Pod at a time**, waiting for each new Pod to be Ready before touching another. Recreate Pods this way after a password/ACL Secret change: Kubernetes does not update `subPath` mounts in place, so SIGHUP alone will not load a new policy. Certificates need no restart. When the kubelet updates a renewed `mqttTLS` Secret in the Pod (typically within a minute), the Pod sends the broker SIGHUP within 10 seconds and new client connections get the new certificate. Nodes use renewed peer certificates for new peer connections without closing existing ones. A one-voter or two-voter cluster necessarily has a maintenance interruption. For incompatible broker versions follow [Upgrades](#upgrades), not a rolling restart.
 
 The disruption budget protects a majority from voluntary evictions. A worker drain can therefore block for a one- or two-voter topology; schedule downtime rather than lowering the broker's quorum. A disruption budget does not prevent physical node failures.
 

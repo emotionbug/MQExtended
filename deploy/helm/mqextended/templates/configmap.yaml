@@ -1,3 +1,5 @@
+{{- $listeners := include "mqextended.listeners" . | fromJsonArray -}}
+{{- $auth := .Values.auth -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -33,18 +35,30 @@ data:
       cat <<EOF
     per_listener_settings true
     log_dest stdout
+    EOF
+      {{- range $listeners }}
+      cat <<EOF
 
-    listener 8883 $MQX_MQTT_BIND
-    protocol mqtt
-    allow_anonymous false
+    listener {{ int .port }} $MQX_MQTT_BIND
+    protocol {{ .protocol }}
+    listener_allow_anonymous {{ $auth.allowAnonymous }}
+    {{- if $auth.passwordFile }}
     password_file /etc/mqextended/auth/password_file
+    {{- end }}
+    {{- if $auth.aclFile }}
     acl_file /etc/mqextended/auth/acl_file
+    {{- end }}
+    {{- if .tls }}
     certfile /etc/mqextended/mqtt/tls.crt
     keyfile /etc/mqextended/mqtt/tls.key
+    {{- end }}
+    EOF
+      {{- end }}
+      cat <<EOF
 
     listener 9883 127.0.0.1
     protocol http_api
-    allow_anonymous true
+    listener_allow_anonymous true
     acl_file /etc/mqextended/bootstrap/readiness.acl
 
     cluster_node_id $MQX_NODE_ID
@@ -59,4 +73,25 @@ data:
       peer {{ $id }} {{ include "mqextended.voterName" (list $.Release.Name $id) | quote }}
       {{- end }}
     } > "$config"
+    {{- if include "mqextended.clientTLS" . }}
+
+    # Kubernetes replaces the files of a Secret volume in place when the
+    # certificate is renewed. Like Mosquitto, the broker reloads listener
+    # certificates on SIGHUP. This process is a child of the broker, which
+    # keeps this shell's PID after exec.
+    tls_digest() { cat /etc/mqextended/mqtt/tls.crt /etc/mqextended/mqtt/tls.key | cksum; }
+    broker=$$
+    last=$(tls_digest)
+    (
+      trap - INT TERM
+      while sleep 10; do
+        now=$(tls_digest) || continue
+        if [ "$now" != "$last" ]; then
+          echo "Client listener certificate changed; reloading" >&2
+          kill -HUP "$broker" || exit 0
+          last=$now
+        fi
+      done
+    ) &
+    {{- end }}
     exec mqextended -c "$config"

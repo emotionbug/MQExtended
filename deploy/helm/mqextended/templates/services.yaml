@@ -2,6 +2,7 @@
 {{- $namespace := .Release.Namespace -}}
 {{- $voters := include "mqextended.voterCount" . | int -}}
 {{- $clients := int .Values.replicaCount -}}
+{{- $listeners := include "mqextended.listeners" . | fromJsonArray -}}
 {{- if not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" $release) -}}
 {{- fail "the Helm release name must be a DNS-1035 Service name (lowercase letters, digits and dashes, starting with a letter)" -}}
 {{- end -}}
@@ -57,9 +58,11 @@ spec:
     {{- include "mqextended.selectorLabels" . | nindent 4 }}
     mqextended.io/client-facing: "true"
   ports:
-    - name: mqtts
-      port: 8883
-      targetPort: mqtts
+    {{- range $listeners }}
+    - name: {{ .name }}
+      port: {{ int .port }}
+      targetPort: {{ .name }}
+    {{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["replicaCount", "additionalVoter", "image", "storage", "auth", "mqttTLS", "service", "resources"],
+  "required": ["replicaCount", "additionalVoter", "image", "storage", "listeners", "auth", "mqttTLS", "service", "resources"],
   "properties": {
     "replicaCount": { "type": "integer", "enum": [1, 2, 3] },
     "additionalVoter": {
@@ -29,8 +29,34 @@
         "size": { "type": "string", "minLength": 1 }
       }
     },
-    "auth": { "$ref": "#/definitions/existingSecret" },
-    "mqttTLS": { "$ref": "#/definitions/existingSecret" },
+    "listeners": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mqtt", "mqtts", "ws", "wss"],
+      "properties": {
+        "mqtt": { "$ref": "#/definitions/listener" },
+        "mqtts": { "$ref": "#/definitions/listener" },
+        "ws": { "$ref": "#/definitions/listener" },
+        "wss": { "$ref": "#/definitions/listener" }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowAnonymous", "existingSecret", "passwordFile", "aclFile"],
+      "properties": {
+        "allowAnonymous": { "type": "boolean" },
+        "existingSecret": { "$ref": "#/definitions/secretName" },
+        "passwordFile": { "type": "boolean" },
+        "aclFile": { "type": "boolean" }
+      }
+    },
+    "mqttTLS": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["existingSecret"],
+      "properties": { "existingSecret": { "$ref": "#/definitions/secretName" } }
+    },
     "service": {
       "type": "object",
       "additionalProperties": false,
@@ -55,17 +81,19 @@
     "resources": { "type": "object" }
   },
   "definitions": {
-    "existingSecret": {
+    "listener": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["existingSecret"],
+      "required": ["enabled", "port"],
       "properties": {
-        "existingSecret": {
-          "type": "string",
-          "maxLength": 253,
-          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
-        }
+        "enabled": { "type": "boolean" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
       }
+    },
+    "secretName": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
     }
   },
   "if": { "properties": { "additionalVoter": { "properties": { "enabled": { "const": true } } } } },

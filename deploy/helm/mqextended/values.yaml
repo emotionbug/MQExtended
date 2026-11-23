@@ -13,11 +13,34 @@ storage:
   storageClassName: null
   size: 10Gi
 
+# Client listeners, each on the client Service and every client-facing Pod.
+# Enable the ones your existing clients use. Ports 7000 and 9883 are reserved.
+listeners:
+  mqtt:
+    enabled: false
+    port: 1883
+  mqtts:
+    enabled: true
+    port: 8883
+  # MQTT over WebSocket, without and with TLS.
+  ws:
+    enabled: false
+    port: 8080
+  wss:
+    enabled: false
+    port: 8081
+
 auth:
-  # Secret keys: password_file, acl_file (Mosquitto format).
+  # Mosquitto allow_anonymous for every client listener.
+  allowAnonymous: false
+  # Secret with Mosquitto-format files under the keys password_file and acl_file.
   existingSecret: ""
+  passwordFile: true
+  aclFile: true
+
 mqttTLS:
-  # kubernetes.io/tls Secret with tls.crt and tls.key for the clients' hostname.
+  # kubernetes.io/tls Secret (tls.crt, tls.key) for the clients' hostname.
+  # Required by mqtts and wss. A renewed certificate is loaded without a restart.
   existingSecret: ""
 
 service:

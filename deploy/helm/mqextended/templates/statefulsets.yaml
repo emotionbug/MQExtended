@@ -1,4 +1,7 @@
 {{- $voters := include "mqextended.voterCount" . | int }}
+{{- $listeners := include "mqextended.listeners" . | fromJsonArray }}
+{{- $auth := .Values.auth }}
+{{- $clientTLS := include "mqextended.clientTLS" . }}
 {{- range $id := untilStep 1 (int (add1 $voters)) 1 }}
 {{- $name := include "mqextended.voterName" (list $.Release.Name $id) }}
 {{- $clientFacing := le $id (int $.Values.replicaCount) }}
@@ -61,8 +64,10 @@ spec:
               value: {{ ternary "0.0.0.0" "127.0.0.1" $clientFacing | quote }}
           ports:
             {{- if $clientFacing }}
-            - name: mqtts
-              containerPort: 8883
+            {{- range $listeners }}
+            - name: {{ .name }}
+              containerPort: {{ int .port }}
+            {{- end }}
             {{- end }}
             - name: peer
               containerPort: 7000
@@ -104,17 +109,20 @@ spec:
               mountPath: /etc/mqextended/bootstrap/readiness.acl
               subPath: readiness.acl
               readOnly: true
+            {{- range $file := list "password_file" "acl_file" }}
+            {{- if index $auth (ternary "passwordFile" "aclFile" (eq $file "password_file")) }}
             - name: auth
-              mountPath: /etc/mqextended/auth/password_file
-              subPath: password_file
+              mountPath: /etc/mqextended/auth/{{ $file }}
+              subPath: {{ $file }}
               readOnly: true
-            - name: auth
-              mountPath: /etc/mqextended/auth/acl_file
-              subPath: acl_file
-              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if $clientTLS }}
+            # A directory mount, so a renewed certificate appears in place.
             - name: mqtt-tls
               mountPath: /etc/mqextended/mqtt
               readOnly: true
+            {{- end }}
             - name: peer-tls
               mountPath: /etc/mqextended/peer
               readOnly: true
@@ -124,15 +132,22 @@ spec:
         - name: bootstrap
           configMap:
             name: {{ $.Release.Name }}-bootstrap
+        {{- if or $auth.passwordFile $auth.aclFile }}
         - name: auth
           secret:
-            secretName: {{ $.Values.auth.existingSecret | quote }}
+            secretName: {{ $auth.existingSecret | quote }}
             defaultMode: 0440
             items:
+              {{- if $auth.passwordFile }}
               - key: password_file
                 path: password_file
+              {{- end }}
+              {{- if $auth.aclFile }}
               - key: acl_file
                 path: acl_file
+              {{- end }}
+        {{- end }}
+        {{- if $clientTLS }}
         - name: mqtt-tls
           secret:
             secretName: {{ $.Values.mqttTLS.existingSecret | quote }}
@@ -142,6 +157,7 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
+        {{- end }}
         - name: peer-tls
           secret:
             secretName: {{ $name }}-tls
