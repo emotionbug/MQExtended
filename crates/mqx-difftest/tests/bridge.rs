@@ -2016,3 +2016,60 @@ fn sigkill_of_bridge_owner_resumes_inflight_and_queued_messages_on_one_survivor(
     peer.write_all(PING).unwrap();
     remote.expect(&mut peer, PONG);
 }
+
+// lib/handle_pubrec.c: handle__pubrec serves bridge contexts too. A PUBREC
+// naming a still-queued packet id gets PUBREL, and the queued message is sent
+// normally once the in-flight one completes.
+#[test]
+#[ignore = "requires Mosquitto 2.1.4 and mqextended"]
+fn remote_pubrec_for_a_queued_packet_id_does_not_stall_the_bridge() {
+    let version = Version::V311;
+    differential(|kind| {
+        let mut remote = Remote::bind();
+        let conf = bridge_config(
+            version,
+            remote.addr(),
+            "remote_clientid bridge-q-test\ncleansession true\ntry_private false\n\
+             notifications false\nbridge_max_topic_alias 0\nrestart_timeout 5\n",
+            "topic bridge/# out 2\n",
+        );
+        let mut h = start(kind, &format!("{ANONYMOUS}max_inflight_messages 1\n{conf}"));
+        let mut peer = remote.accept();
+        remote.expect(
+            &mut peer,
+            &connect_packet(version.level(), "bridge-q-test", 60, 2, &[], None),
+        );
+        peer.write_all(&connack(version, false, 0, &[])).unwrap();
+        let mut unsub = vec![0, 1];
+        field(&mut unsub, b"bridge/#");
+        remote.expect(&mut peer, &frame(0xa2, &unsub));
+        peer.write_all(&frame(0xb0, &[0, 1])).unwrap();
+        let local = client(&mut h, 1, version, "queued-helper", false, false, false);
+        for (mid, payload) in [(1, b"first"), (2, b"secnd")] {
+            publish_local(
+                &mut h,
+                local,
+                &publish(version, "bridge/queued", payload, 2, mid, 0),
+                2,
+                mid,
+            );
+        }
+        remote.expect(
+            &mut peer,
+            &publish(version, "bridge/queued", b"first", 2, 2, 0),
+        );
+        peer.write_all(&ack(0x50, 3)).unwrap();
+        remote.expect(&mut peer, &ack(0x62, 3));
+        peer.write_all(&ack(0x50, 2)).unwrap();
+        remote.expect(&mut peer, &ack(0x62, 2));
+        peer.write_all(&ack(0x70, 2)).unwrap();
+        remote.expect(
+            &mut peer,
+            &publish(version, "bridge/queued", b"secnd", 2, 3, 0),
+        );
+        peer.write_all(&ack(0x50, 3)).unwrap();
+        remote.expect(&mut peer, &ack(0x62, 3));
+        peer.write_all(&ack(0x70, 3)).unwrap();
+        (remote.transcript, h.into_transcript())
+    });
+}

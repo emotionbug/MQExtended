@@ -410,7 +410,14 @@ impl BridgeSession {
             BridgeAck::Reject => Ack::Rejected,
             BridgeAck::Drop => Ack::Dropped,
         };
-        self.apply(Operation::Ack(id, kind)).await?;
+        // lib/handle_pubrec.c: handle__pubrec treats bridge contexts like
+        // clients, so a PUBREC for a queued id must not mark it received.
+        let operation = if kind == Ack::Received {
+            self.broker.pubrec(&self.live, id)
+        } else {
+            Operation::Ack(id, kind)
+        };
+        self.apply(operation).await?;
         Ok(())
     }
 
