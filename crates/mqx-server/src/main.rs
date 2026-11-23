@@ -623,12 +623,14 @@ async fn run_broker(
                             security.reload(&fresh)?;
                             *reload_policies.write().unwrap_or_else(|e| e.into_inner()) =
                                 listener_policies(&fresh);
+                            // Publish the new inventory before revoking clients, so
+                            // a client that sees the revocation also sees it over HTTP.
+                            http_inventory.reload_access(&config, &fresh);
                             if membership.as_ref().is_none_or(|membership| membership.is_serving())
                                 && registered.load(Ordering::Acquire)
                             {
                                 security.register(&broker).await?;
                             }
-                            http_inventory.reload_access(&config, &fresh);
                             cli.override_log_types(&mut fresh.log);
                             broker.set_connection_messages(fresh.log.connection_messages);
                             logging.reload(&fresh.log);
