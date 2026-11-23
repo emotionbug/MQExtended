@@ -244,10 +244,16 @@ fn persistence_cluster_bootstrap_import_is_replicated_not_a_standalone_backup() 
 fn persistence_live_backups_survive_an_immediate_process_kill() {
     use std::os::unix::fs::PermissionsExt;
 
+    // src/loop.c: Mosquitto checks autosave only when its loop wakes, and an
+    // idle loop sleeps until the next $SYS tick. Tick every second so the
+    // reference saves within the deadline.
     for (autosave, signal) in [
         ("autosave_interval 0", true),
-        ("autosave_interval 1\nautosave_on_changes true", false),
-        ("autosave_interval 1", false),
+        (
+            "autosave_interval 1\nautosave_on_changes true\nsys_interval 1",
+            false,
+        ),
+        ("autosave_interval 1\nsys_interval 1", false),
     ] {
         let restart = |kind, filename| {
             let dir = tempfile::tempdir().unwrap();

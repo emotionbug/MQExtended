@@ -528,29 +528,87 @@ fn sighup_rotates_credentials_and_revokes_anonymous_sessions() {
     }
 }
 
+/// The `[mqtt, http, raft]` ports of a started cluster node.
+type NodePorts = [u16; 3];
+
+/// Start a three-node cluster with an HTTP API listener on each node.
+///
+/// Each node's ports stay reserved until that node spawns, and the next node
+/// starts only after this one has bound all three. A freed ephemeral port can
+/// still be taken by a running node's outbound peer dial or another test before
+/// the child binds it; the broker then exits (MQTT or cluster port) or skips
+/// the HTTP listener without a log line, as Mosquitto's `http_api__start` does.
+/// Those are test collisions, so retry them on fresh ports.
+fn start_http_cluster(root: &Path) -> (Vec<NodePorts>, Vec<(Process, PathBuf)>) {
+    const ATTEMPTS: usize = 5;
+    'attempt: for attempt in 0..ATTEMPTS {
+        let reserved: Vec<[TcpListener; 3]> = (0..3)
+            .map(|_| std::array::from_fn(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap()))
+            .collect();
+        let ports: Vec<NodePorts> = reserved
+            .iter()
+            .map(|node| {
+                node.each_ref()
+                    .map(|socket| socket.local_addr().unwrap().port())
+            })
+            .collect();
+        let mut processes = Vec::new();
+        for (index, sockets) in reserved.into_iter().enumerate() {
+            let [mqtt, http, local] = ports[index];
+            let dir = root.join(format!("{attempt}-{index}"));
+            fs::create_dir(&dir).unwrap();
+            let id = index + 1;
+            let mut config = format!(
+                "allow_anonymous true\nsys_interval 1\nlistener {mqtt} 127.0.0.1\nlistener {http} 127.0.0.1\nprotocol http_api\n\
+                 cluster_node_id {id}\ncluster_bind 127.0.0.1:{local}\ncluster_data_dir raft\ncluster_insecure_plaintext true\n",
+            );
+            for (peer, [.., port]) in ports.iter().enumerate() {
+                use std::fmt::Write as _;
+                writeln!(config, "cluster_peer {} 127.0.0.1:{port}", peer + 1).unwrap();
+            }
+            drop(sockets);
+            let mut process = start(BrokerKind::MqExtended, &dir, config);
+            let log_path = dir.join("broker.log");
+            let http_opened = format!("Opening http api listen socket on port {http}.");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let log = fs::read_to_string(&log_path).unwrap_or_default();
+                if let Some(status) = process.0.try_wait().unwrap() {
+                    if log.contains("Address already in use") {
+                        continue 'attempt;
+                    }
+                    panic!("node {id} exited during startup ({status}):\n{log}");
+                }
+                if log.contains(&http_opened) {
+                    // Cluster::start binds the peer listener after the MQTT ones.
+                    if TcpStream::connect(("127.0.0.1", local)).is_ok() {
+                        break;
+                    }
+                } else if log.contains("INSECURE cluster transport") {
+                    // The HTTP listener was skipped because its port was taken.
+                    continue 'attempt;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "node {id} did not bind its listeners:\n{log}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            processes.push((process, log_path));
+        }
+        return (ports, processes);
+    }
+    panic!("no free ports for the cluster after {ATTEMPTS} attempts");
+}
+
 #[test]
 #[ignore = "requires MQExtended"]
 fn cluster_http_reports_members_and_raft_progress() {
-    let [m1, m2, m3, h1, h2, h3, r1, r2, r3] = ports();
-    let raft = [r1, r2, r3];
-    let http = [h1, h2, h3];
     let temp = tempfile::tempdir().unwrap();
-    let mut processes = Vec::new();
-    for (index, (mqtt, http)) in [m1, m2, m3].into_iter().zip(http).enumerate() {
-        let dir = temp.path().join(index.to_string());
-        fs::create_dir(&dir).unwrap();
-        let local = raft[index];
-        let id = index + 1;
-        let mut config = format!(
-            "allow_anonymous true\nsys_interval 1\nlistener {mqtt} 127.0.0.1\nlistener {http} 127.0.0.1\nprotocol http_api\n\
-             cluster_node_id {id}\ncluster_bind 127.0.0.1:{local}\ncluster_data_dir raft\ncluster_insecure_plaintext true\n",
-        );
-        for (peer, port) in raft.into_iter().enumerate() {
-            use std::fmt::Write as _;
-            writeln!(config, "cluster_peer {} 127.0.0.1:{port}", peer + 1).unwrap();
-        }
-        processes.push(start(BrokerKind::MqExtended, &dir, config));
-    }
+    let (ports, mut processes) = start_http_cluster(temp.path());
+    let [m1, m2, m3] = std::array::from_fn(|index| ports[index][0]);
+    let http: [u16; 3] = std::array::from_fn(|index| ports[index][1]);
+    let raft: [u16; 3] = std::array::from_fn(|index| ports[index][2]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let snapshot = loop {
         let snapshots: Vec<_> = http
@@ -577,10 +635,16 @@ fn cluster_http_reports_members_and_raft_progress() {
         {
             break snapshots;
         }
-        assert!(
-            Instant::now() < deadline,
-            "cluster not ready: {snapshots:?}"
-        );
+        if Instant::now() >= deadline {
+            let nodes: Vec<_> = processes
+                .iter_mut()
+                .map(|(process, log)| {
+                    let exit = process.0.try_wait().ok().flatten();
+                    (exit, fs::read_to_string(log).unwrap_or_default())
+                })
+                .collect();
+            panic!("cluster not ready: {snapshots:?}\nnodes: {nodes:#?}");
+        }
         thread::sleep(Duration::from_millis(50));
     };
     for (offset, node) in snapshot.iter().enumerate() {
@@ -626,7 +690,7 @@ fn cluster_http_reports_members_and_raft_progress() {
     }));
     let readiness = || request(http[leader], "GET", "/api/v1/mqx/ready", None).unwrap();
     assert_eq!(readiness().status, 200);
-    for (i, process) in processes.iter_mut().enumerate() {
+    for (i, (process, _)) in processes.iter_mut().enumerate() {
         if i != leader {
             process.0.kill().unwrap();
             process.0.wait().unwrap();

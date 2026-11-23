@@ -71,17 +71,43 @@ impl StateMachine for Kv {
     }
 }
 
+/// A free loopback address below the kernel's ephemeral port range.
+///
+/// Nodes bind their address only once `Cluster::start` runs, and a restarted
+/// node binds it again. A port from `bind(0)` is free in between, so a peer's
+/// outbound dial (every test keeps redialing down members) can take it and the
+/// start fails with `AddrInUse`. Outbound connects never get ports outside the
+/// ephemeral range, and the per-process offset keeps parallel runs apart.
+fn peer_address() -> SocketAddr {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const FIRST: u32 = 10_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let ephemeral = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse::<u32>().ok())
+        .unwrap_or(32_768);
+    if ephemeral <= FIRST + 1_000 {
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        return socket.local_addr().unwrap();
+    }
+    let span = ephemeral - FIRST;
+    let offset = std::process::id().wrapping_mul(7_919) % span;
+    for _ in 0..span {
+        let port = FIRST + (offset + NEXT.fetch_add(1, Ordering::Relaxed)) % span;
+        let port = u16::try_from(port).unwrap();
+        if let Ok(socket) = TcpListener::bind(("127.0.0.1", port)) {
+            return socket.local_addr().unwrap();
+        }
+    }
+    panic!("no free port below the ephemeral range");
+}
+
 fn configs(
     root: &tempfile::TempDir,
     count: u64,
     policy: SnapshotPolicy,
 ) -> BTreeMap<u64, ClusterConfig> {
-    let sockets: Vec<_> = (0..count)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let peers: BTreeMap<_, SocketAddr> = (1..=count)
-        .zip(sockets.iter().map(|sock| sock.local_addr().unwrap()))
-        .collect();
+    let peers: BTreeMap<_, SocketAddr> = (1..=count).map(|id| (id, peer_address())).collect();
     peers
         .iter()
         .map(|(&id, &address)| {
@@ -151,6 +177,24 @@ async fn elected(nodes: &BTreeMap<u64, Node>) -> u64 {
             .then_some(leader)
     })
     .await
+}
+
+/// Knowing the leader is not enough to accept application RPCs: a follower
+/// learns the leader from its first append, before it has committed the
+/// membership that names its peers as voters. Production admits clients only
+/// once `wait_serving` returns, so tests that use the mesh wait for it too.
+async fn serving<'a>(nodes: impl IntoIterator<Item = &'a Node>) {
+    timeout(
+        WAIT,
+        try_join_all(
+            nodes
+                .into_iter()
+                .map(|node| async move { node.membership_control().wait_serving().await }),
+        ),
+    )
+    .await
+    .expect("every member must start serving")
+    .unwrap();
 }
 
 async fn put(node: &Node, key: &str, value: &str) -> Reply {
@@ -616,6 +660,7 @@ async fn peer_reconnect_survives_corrupt_credentials_and_expired_leaf_rotation()
     write_tls(&root, &mut configs, Some(expires));
     let mut nodes = start(&configs).await;
     elected(&nodes).await;
+    serving(nodes.values()).await;
 
     fn echo(node: &Node) {
         node.mesh()
@@ -655,6 +700,7 @@ async fn peer_reconnect_survives_corrupt_credentials_and_expired_leaf_rotation()
     let restarted = Cluster::start(configs[&3].clone(), Kv::default())
         .await
         .unwrap();
+    serving([&restarted]).await;
     echo(&restarted);
     check_mesh(&nodes[&1], &restarted).await;
     restarted.shutdown().await.unwrap();
@@ -669,6 +715,13 @@ async fn peer_reconnect_survives_corrupt_credentials_and_expired_leaf_rotation()
     let restarted = Cluster::start(configs[&3].clone(), Kv::default())
         .await
         .unwrap();
+    // Node 3 cannot reach node 2 now, so it cannot renew a lease while node 2
+    // leads. Mesh dispatch only needs node 1 in its applied membership.
+    until(|| {
+        let members = restarted.membership_control().status().members;
+        (members.get(&1)?.role == MemberRole::Voter).then_some(())
+    })
+    .await;
     echo(&restarted);
     check_mesh(&nodes[&1], &restarted).await;
     // Neither side could establish these sessions again: node 2 still has A.
