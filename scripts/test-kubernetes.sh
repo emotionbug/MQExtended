@@ -48,7 +48,10 @@ use_tls() { port=8883; transport=(-h 127.0.0.1 -p 29883 --cafile "$work/ca.crt")
 use_plain() { port=1883; transport=(-h 127.0.0.1 -p 29883); }
 connect_to() {
     stop_forward
-    "${k[@]}" port-forward --address 127.0.0.1 "$1" "29883:$port" >"$work/forward.log" 2>&1 & forward=$!
+    # Truncate before starting: the background job's own redirection runs
+    # later, and the previous forward's "Forwarding from" line would pass the wait.
+    : >"$work/forward.log"
+    "${k[@]}" port-forward --address 127.0.0.1 "$1" "29883:$port" >>"$work/forward.log" 2>&1 & forward=$!
     local end=$((SECONDS+20))
     until grep -q 'Forwarding from' "$work/forward.log"; do
         if ! kill -0 "$forward" || (( SECONDS >= end )); then cat "$work/forward.log" >&2; return 1; fi
