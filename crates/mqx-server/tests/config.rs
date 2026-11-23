@@ -1019,3 +1019,38 @@ fn snapshot_size_limit_matches_the_cluster_storage_bounds() {
         assert!(error.contains("cluster_max_snapshot_size"), "{error}");
     }
 }
+
+#[test]
+fn duplicate_tls_version_is_a_configuration_error_even_for_tls12_default() {
+    let error = ServerConfig::parse("listener 1888\ntls_version tlsv1.2\ntls_version tlsv1.3")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Duplicate 'tls_version' value in configuration."),
+        "{error}"
+    );
+}
+
+#[test]
+fn builtin_websockets_ignore_libwebsockets_log_level() {
+    ServerConfig::parse("websockets_log_level unused\nlistener 1888\nprotocol websockets").unwrap();
+}
+
+#[test]
+fn post_parse_tls_and_proxy_checks_apply_to_http_listeners() {
+    for (options, expected) in [
+        ("certfile server.pem", "Both certfile and keyfile"),
+        (
+            "cafile ca.pem",
+            "cafile specified without certfile and keyfile",
+        ),
+        (
+            "enable_proxy_protocol 2\nuse_subject_as_username true",
+            "use_subject_as_username cannot be used with `enable_proxy_protocol 2`",
+        ),
+    ] {
+        let config = format!("listener 1888\nprotocol http_api\n{options}");
+        let error = ServerConfig::parse(&config).unwrap_err().to_string();
+        assert!(error.contains(expected), "{config}: {error}");
+    }
+}

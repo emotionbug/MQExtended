@@ -455,6 +455,7 @@ impl ServerConfig {
 struct Parser {
     config: ServerConfig,
     default_listener: Option<usize>,
+    tls_version_seen: BTreeSet<usize>,
     security_seen: bool,
     plugins: Vec<plugin::Plugin>,
     reloading: bool,
@@ -489,6 +490,7 @@ impl Default for Parser {
                 notices: Vec::new(),
             },
             default_listener: None,
+            tls_version_seen: BTreeSet::new(),
             security_seen: false,
             plugins: Vec::new(),
             reloading: false,
@@ -513,11 +515,9 @@ impl Parser {
                 );
             }
         }
+        // Mosquitto src/conf.c: config__check_bridges validates TLS file pairs
+        // for every listener and config__check_proxy checks PROXY v2 separately.
         for listener in &self.config.listeners {
-            if listener.protocol == ListenerProtocol::HttpApi {
-                // http_api.c: http_api__start configures only HTTP's cert/key pair.
-                continue;
-            }
             let tls = &listener.tls;
             listener.proxy_options()?;
             let message = match (&tls.certfile, &tls.keyfile) {
@@ -828,7 +828,7 @@ impl Parser {
                     }
                     "cafile" => listener.tls.cafile = Some(v.path()?),
                     "tls_version" => {
-                        let version = v.string()?;
+                        let version = v.unique_string(!self.tls_version_seen.insert(index))?;
                         listener.tls.version = match version.as_str() {
                             "tlsv1.2" => TlsVersion::Tls12OrNewer,
                             "tlsv1.3" => TlsVersion::Tls13,
@@ -1038,9 +1038,9 @@ impl Parser {
             "autosave_interval" => {
                 self.config.persistence.autosave_interval = v.integer()?.max(0) as u32;
             }
-            "websockets_log_level" => {
-                v.integer()?;
-            }
+            // Mosquitto src/conf.c: config__read_file_core only parses this
+            // directive when built with libwebsockets.
+            "websockets_log_level" => {}
             "autosave_on_changes" => {
                 self.config.persistence.autosave_on_changes = v.boolean()?;
             }
