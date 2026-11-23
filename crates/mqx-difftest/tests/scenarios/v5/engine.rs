@@ -769,7 +769,9 @@ fn takeover_with_messages_in_flight(h: &mut Harness) {
 // src/database.c: db__expire_all_messages runs on reconnection for in-flight
 // and queued messages alike, so an unacknowledged message that expired while
 // the session was offline is not resent; a live one is resent with DUP and
-// its remaining interval.
+// its remaining interval. Expiry is counted in whole seconds, and a message
+// sent in its last second carries no interval (lib/send_publish.c), so the
+// short messages get 3 s to reach the subscriber on a loaded host.
 scenario!(inflight_message_expiry, config(ANONYMOUS), compare_expiry);
 fn inflight_message_expiry(h: &mut Harness) {
     let settings = Connect {
@@ -784,9 +786,9 @@ fn inflight_message_expiry(h: &mut Harness) {
     subscribe(h, receiver, 1, "inflight/expiry", Q1);
     let sender = client(h, "inflight-expiry-publisher");
     for (mid, seconds, payload) in [
-        (1, 1, b"short".as_slice()),
+        (1, 3, b"short".as_slice()),
         (2, 30, b"long".as_slice()),
-        (3, 1, b"queued short".as_slice()),
+        (3, 3, b"queued short".as_slice()),
         (4, 30, b"queued long".as_slice()),
     ] {
         publish_qos1(
@@ -803,7 +805,7 @@ fn inflight_message_expiry(h: &mut Harness) {
         expect_expiring(h, receiver, payload, mid, false);
     }
     disconnect(h, receiver, R::NORMAL_DISCONNECTION, vec![]);
-    std::thread::sleep(Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(4_500));
     let receiver = connect_with(h, settings, true);
     expect_expiring(h, receiver, b"long", 2, true);
     send(h, receiver, Packet::PubAck(ack(2, R::SUCCESS)));

@@ -141,10 +141,10 @@ fn dead_node_lease_publishes_will_once_to_each_survivor() {
             elapsed = killed_at.elapsed();
         }
     }
-    // The lease is 1000ms, renewed every 200ms. Use a conservative lower bound so
+    // The lease is 2000ms, renewed every 200ms. Use a conservative lower bound so
     // a stale heartbeat or election does not turn a timing assertion into a race.
     assert!(
-        elapsed >= Duration::from_millis(400),
+        elapsed >= Duration::from_millis(1000),
         "will fired before lease timeout: {elapsed:?}"
     );
     closed(h, dying);

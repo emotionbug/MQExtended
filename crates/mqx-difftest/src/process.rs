@@ -2,7 +2,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use mqx_codec::{Connect, ConnectReturnCode, Packet, ProtocolVersion, encode};
+use socket2::{Domain, Socket, Type};
 use tempfile::TempDir;
 
 use crate::{BrokerConfig, BrokerKind, Client, Connection, Error, Reading};
@@ -219,8 +220,8 @@ impl BrokerProcess {
                     format!("did not listen on {}", self.addr),
                 ));
             }
-            // The reserved port is an ephemeral one, so connecting to it before
-            // the broker binds can connect the socket to itself. That proves
+            // If the reserved port is ephemeral, connecting to it before the
+            // broker binds can connect the socket to itself. That proves
             // nothing and holds the port the broker is about to bind.
             if let Ok(stream) = TcpStream::connect_timeout(&self.addr, PROBE_TIMEOUT.min(remaining))
                 && stream.local_addr().ok() != stream.peer_addr().ok()
@@ -281,7 +282,22 @@ impl BrokerProcess {
 
 impl Drop for BrokerProcess {
     fn drop(&mut self) {
+        // The test runner shows this only for the failed test.
+        let report = thread::panicking().then(|| match self.child.as_mut().map(Child::try_wait) {
+            Some(Ok(None)) => "running".to_owned(),
+            Some(Ok(Some(status))) => status.to_string(),
+            Some(Err(error)) => error.to_string(),
+            None => "stopped".to_owned(),
+        });
         let _ = self.kill();
+        if let Some(state) = report {
+            eprintln!(
+                "----- broker {} on {}, {state}; log -----\n{}",
+                self.index,
+                self.addr,
+                self.log()
+            );
+        }
     }
 }
 
@@ -353,18 +369,15 @@ impl Brokers {
         let listeners = reserve_ports(size)?;
         let mesh = reserve_ports(cluster_ports)?;
         let mut readiness_listeners = reserve_ports(cluster_ports)?.into_iter();
-        let mesh_addrs = mesh
-            .iter()
-            .map(TcpListener::local_addr)
-            .collect::<io::Result<Vec<_>>>()?;
+        let mesh_addrs = mesh.iter().map(|port| port.addr).collect::<Vec<_>>();
         let mut nodes = Vec::with_capacity(size);
         for (offset, ((dir, prefix), listener)) in dirs.into_iter().zip(listeners).enumerate() {
-            let addr = listener.local_addr()?;
+            let addr = listener.addr;
             let readiness_listener = readiness_listeners.next();
             let readiness = readiness_listener
                 .as_ref()
                 .map(|listener| -> Result<_, Error> {
-                    Ok((listener.local_addr()?, probe_connect(offset + 1)?))
+                    Ok((listener.addr, probe_connect(offset + 1)?))
                 })
                 .transpose()?;
             if cluster.is_some() {
@@ -540,9 +553,67 @@ fn check_index(index: usize, nodes: usize) -> Result<usize, Error> {
     }
 }
 
-fn reserve_ports(count: usize) -> io::Result<Vec<TcpListener>> {
+/// A loopback port held by a bound socket that does not listen.
+///
+/// A listening placeholder would accept connections, and a child forked by
+/// another thread keeps a copy of it listening until its exec. The startup
+/// probe could then connect before the broker runs.
+struct Reservation {
+    _socket: Socket,
+    addr: SocketAddr,
+}
+
+impl Reservation {
+    fn bind(port: u16) -> io::Result<Self> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+        socket.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into())?;
+        let addr = socket
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| io::Error::other("reserved socket has no IP address"))?;
+        Ok(Self {
+            _socket: socket,
+            addr,
+        })
+    }
+}
+
+/// Reserve loopback ports below the kernel's ephemeral range.
+///
+/// A reserved port is released just before its broker binds it, and a node
+/// restart binds it again later. A port from `bind(0)` is ephemeral, so in
+/// between any outbound connect in this process (clients, or cluster nodes
+/// redialling a stopped peer) can take it and the broker fails with
+/// `AddrInUse`. Outbound connects never get ports outside the ephemeral range;
+/// the per-process offset keeps concurrent test binaries apart.
+fn reserve_ports(count: usize) -> io::Result<Vec<Reservation>> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const FIRST: u32 = 10_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let ephemeral = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse::<u32>().ok())
+        .unwrap_or(32_768);
+    if ephemeral <= FIRST + 1_000 {
+        return (0..count).map(|_| Reservation::bind(0)).collect();
+    }
+    let span = ephemeral - FIRST;
+    let offset = std::process::id().wrapping_mul(7_919) % span;
     (0..count)
-        .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+        .map(|_| {
+            for _ in 0..span {
+                let port = FIRST + (offset + NEXT.fetch_add(1, Ordering::Relaxed)) % span;
+                let port = u16::try_from(port).expect("below the ephemeral range");
+                if let Ok(reservation) = Reservation::bind(port) {
+                    return Ok(reservation);
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "no free port below the ephemeral range",
+            ))
+        })
         .collect()
 }
 
@@ -572,7 +643,7 @@ fn node_config(
         "cluster_heartbeat_interval 30\n",
         "cluster_election_timeout 150 300\n",
         "cluster_lease_interval 200\n",
-        "cluster_lease_timeout 1000\n",
+        "cluster_lease_timeout 2000\n",
     ));
     if let Some(addr) = readiness {
         // A successful CONNECT must commit a claim, even when the scenario listener
@@ -649,7 +720,7 @@ mod tests {
                         "cluster_heartbeat_interval 30\n",
                         "cluster_election_timeout 150 300\n",
                         "cluster_lease_interval 200\n",
-                        "cluster_lease_timeout 1000\n",
+                        "cluster_lease_timeout 2000\n",
                         "listener {} 127.0.0.1\n",
                         "listener_allow_anonymous true\n",
                     ),
