@@ -482,6 +482,8 @@ async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
         .map(|pair| pair.each_ref().map(|s| s.local_addr().unwrap()));
     let directory = tempfile::tempdir().unwrap();
     let tls = tls_configs::<2>(directory.path());
+    // Two voters commit only with both acknowledgements. On CI a 1 s lease
+    // expired while the leader's appends to the just-restarted node timed out.
     let configs = [0, 1].map(|index| {
         let id = index + 1;
         let path = directory.path().join(format!("node-{id}.conf"));
@@ -491,7 +493,7 @@ async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
                 "user root\nallow_anonymous true\nlistener {} 127.0.0.1\n\
                  listener {} 127.0.0.1\nprotocol http_api\n\
                  cluster_node_id {id}\ncluster_bind {}\ncluster_peer 1 {}\ncluster_peer 2 {}\n\
-                 cluster_data_dir {}\ncluster_lease_interval 100\ncluster_lease_timeout 1000\n{}",
+                 cluster_data_dir {}\ncluster_lease_interval 100\ncluster_lease_timeout 3000\n{}",
                 mqtt[index].port(),
                 http_addr[index].port(),
                 raft[index],
