@@ -1,6 +1,8 @@
-use std::fs::File;
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::verify_server_cert_signed_by_trust_anchor;
@@ -11,6 +13,8 @@ use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig,
     SignatureScheme,
 };
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::prelude::parse_x509_certificate;
 
@@ -18,10 +22,58 @@ use crate::transport::invalid_data;
 use crate::{ClusterError, ClusterSecurity};
 
 const NODE_PREFIX: &str = "mqx-node-";
+const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-pub(crate) struct Tls {
-    pub(crate) client: TlsConnector,
-    pub(crate) server: TlsAcceptor,
+pub(crate) struct Tls(Arc<Mutex<Current>>);
+
+struct Files {
+    node_id: u64,
+    ca: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
+}
+
+struct Current {
+    files: Files,
+    configs: Configs,
+    fingerprints: Fingerprints,
+    checked: Instant,
+}
+
+struct Configs {
+    client: TlsConnector,
+    server: TlsAcceptor,
+}
+
+type Fingerprints = [[u8; 32]; 3];
+
+fn fingerprints(pem: &[Vec<u8>; 3]) -> Fingerprints {
+    std::array::from_fn(|i| Sha256::digest(&pem[i]).into())
+}
+
+impl Files {
+    fn read(&self) -> io::Result<[Vec<u8>; 3]> {
+        Ok([
+            fs::read(&self.ca)?,
+            fs::read(&self.cert)?,
+            fs::read(&self.key)?,
+        ])
+    }
+}
+
+impl Current {
+    fn refresh(&mut self) -> Result<(), ClusterError> {
+        self.checked = Instant::now();
+        // Secret volume updates replace symlinks. Compare contents instead of
+        // holding open files or relying on timestamp precision.
+        let pem = self.files.read()?;
+        let next = fingerprints(&pem);
+        if next != self.fingerprints {
+            self.configs = Configs::parse(self.files.node_id, &pem)?;
+            self.fingerprints = next;
+        }
+        Ok(())
+    }
 }
 
 impl Tls {
@@ -41,27 +93,99 @@ impl Tls {
             );
             return Ok(None);
         };
+        let files = Files {
+            node_id,
+            ca: ca_file.clone(),
+            cert: cert_file.clone(),
+            key: key_file.clone(),
+        };
+        let pem = files.read()?;
+        let configs = Configs::parse(node_id, &pem)?;
+        Ok(Some(Self(Arc::new(Mutex::new(Current {
+            files,
+            configs,
+            fingerprints: fingerprints(&pem),
+            checked: Instant::now(),
+        })))))
+    }
+
+    pub(crate) async fn client(&self) -> TlsConnector {
+        self.refresh().await.configs.client.clone()
+    }
+
+    pub(crate) async fn server(&self) -> TlsAcceptor {
+        self.refresh().await.configs.server.clone()
+    }
+
+    async fn refresh(&self) -> OwnedMutexGuard<Current> {
+        let current = self.0.clone().lock_owned().await;
+        if current.checked.elapsed() < CHECK_INTERVAL {
+            return current;
+        }
+
+        // Keep the refresh serialized even if a handshake awaiting it times out.
+        let reload = tokio::task::spawn_blocking(move || {
+            let mut current = current;
+            if let Err(error) = current.refresh() {
+                tracing::warn!(
+                    node_id = current.files.node_id,
+                    %error,
+                    "cluster TLS reload rejected; keeping previous credentials"
+                );
+            }
+            current
+        })
+        .await;
+        match reload {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(%error, "cluster TLS reload task failed");
+                self.0.clone().lock_owned().await
+            }
+        }
+    }
+}
+
+impl Configs {
+    fn parse(node_id: u64, [ca, cert, key]: &[Vec<u8>; 3]) -> Result<Self, ClusterError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = RootCertStore::empty();
-        for cert in CertificateDer::pem_reader_iter(File::open(ca_file)?) {
+        for cert in CertificateDer::pem_slice_iter(ca) {
             roots
                 .add(cert.map_err(invalid_data)?)
                 .map_err(invalid_data)?;
         }
         let roots = Arc::new(roots);
-        let chain: Vec<_> = CertificateDer::pem_reader_iter(File::open(cert_file)?)
+        let chain: Vec<_> = CertificateDer::pem_slice_iter(cert)
             .collect::<Result<_, _>>()
             .map_err(invalid_data)?;
-        if chain.first().and_then(certificate_node) != Some(node_id) {
+        let Some((leaf, intermediates)) = chain
+            .split_first()
+            .filter(|(leaf, _)| certificate_node(leaf) == Some(node_id))
+        else {
             return Err(ClusterError::InvalidConfig(format!(
                 "cluster leaf certificate needs one Common Name: {NODE_PREFIX}{node_id}"
             )));
-        }
-        let key = PrivateKeyDer::from_pem_reader(File::open(key_file)?).map_err(invalid_data)?;
+        };
+        let key = PrivateKeyDer::from_pem_slice(key).map_err(invalid_data)?;
         let client_auth =
             WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
                 .build()
                 .map_err(invalid_data)?;
+        // A CA update and a leaf/key update need not reach disk together.
+        // Don't publish either config unless the whole bundle is usable.
+        let now = UnixTime::now();
+        client_auth
+            .verify_client_cert(leaf, intermediates, now)
+            .map_err(invalid_data)?;
+        verify_server_cert_signed_by_trust_anchor(
+            &ParsedCertificate::try_from(leaf).map_err(invalid_data)?,
+            &roots,
+            intermediates,
+            now,
+            provider.signature_verification_algorithms.all,
+        )
+        .map_err(invalid_data)?;
         let mut server = ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(invalid_data)?
@@ -83,10 +207,10 @@ impl Tls {
             .map_err(invalid_data)?;
         client.enable_sni = false;
         client.resumption = rustls::client::Resumption::disabled();
-        Ok(Some(Self {
+        Ok(Self {
             client: Arc::new(client).into(),
             server: Arc::new(server).into(),
-        }))
+        })
     }
 }
 

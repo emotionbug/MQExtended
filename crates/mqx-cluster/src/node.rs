@@ -29,8 +29,8 @@ use crate::membership::{Desired, MemberRole, MembershipControl, Serving, validat
 use crate::mtls::Tls;
 use crate::mux::{CallError, Response, write_responses};
 use crate::snapshot::{
-    RETIRED_FILE, Snapshot, SnapshotMeta, Store, TEMP_FILE_PREFIX, atomic_write, open_private_file,
-    prepare_dir,
+    RETIRED_FILE, SNAPSHOT_FILE, Snapshot, SnapshotMeta, Store, TEMP_FILE_PREFIX, atomic_write,
+    open_private_file, prepare_dir,
 };
 use crate::snapshot_file::SnapshotData;
 use crate::transport::{
@@ -196,13 +196,14 @@ impl<S: StateMachine> Cluster<S> {
                 }
             }
             let wal = Wal::open(&data_dir.join("wal"), max_append_size, state_format)?;
-            if new_join && wal.has_raft_state() {
-                return Err(ClusterError::InvalidConfig(
-                    "a new joining node cannot adopt a WAL without a node identity".into(),
-                ));
-            }
-            let (initial, digest, existing) =
-                load_identity(&data_dir, node_id, &peers, join, membership_generation)?;
+            let (initial, digest, existing) = load_identity(
+                &data_dir,
+                node_id,
+                &peers,
+                join,
+                membership_generation,
+                &wal,
+            )?;
             let store = Store::open(state_machine, data_dir.clone(), state_format)?;
             if store.status.borrow().retired.contains(&node_id) {
                 return Err(ClusterError::Removed(node_id));
@@ -756,13 +757,19 @@ impl<S: StateMachine> Core<S> {
             .rpc(leader, Op::Lease, Bytes::new(), deadline)
             .await
             .is_ok_and(|body| matches!(decode::<Route<Option<Bytes>>>(&body), Ok(Route::Value(_))));
-        if !renewed || *self.serving.borrow() != Serving::Waiting {
+        if !renewed
+            || (*self.serving.borrow() == Serving::Active
+                && self
+                    .safe_until
+                    .borrow()
+                    .is_some_and(|until| until > Instant::now()))
+        {
             return renewed;
         }
 
-        // A leader can renew our lease while this replica is still reading
-        // its pre-restart state. Fence admission on a fresh quorum read and
-        // apply through that index locally before first serving again.
+        // Admission may already have closed on the local deadline even if
+        // the renewal loop has not changed the serving flag. Reopen only
+        // after applying through a fresh quorum-confirmed read index.
         let Ok(Route::Value(index)) = self.read_remote(leader, deadline).await else {
             return false;
         };
@@ -1483,6 +1490,7 @@ fn load_identity(
     peers: &Peers,
     join: bool,
     generation: u64,
+    wal: &Wal,
 ) -> Result<NodeIdentity, ClusterError> {
     let path = dir.join(IDENTITY_FILE);
     let read = |path: &Path| {
@@ -1523,6 +1531,16 @@ fn load_identity(
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let has_snapshot = match dir.join(SNAPSHOT_FILE).symlink_metadata() {
+                Ok(_) => true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if has_snapshot || wal.has_raft_state() {
+                return Err(ClusterError::InvalidConfig(
+                    "cluster data directory contains Raft state without a node identity".into(),
+                ));
+            }
             if !peers.contains_key(&node_id)
                 || (join && peers.len() < 2)
                 || (!join && generation != 0)
@@ -1781,6 +1799,88 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(isolated.metrics().applied_index.unwrap() >= index);
+        assert_eq!(isolated.read(|counter| counter.0), 1);
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_requires_catchup_even_before_the_serving_flag_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let reserves: Vec<_> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let peers: BTreeMap<_, _> = (1..=3)
+            .zip(reserves.iter().map(|socket| socket.local_addr().unwrap()))
+            .collect();
+        drop(reserves);
+        let nodes = futures_util::future::try_join_all(peers.iter().map(|(&id, &addr)| {
+            Cluster::start(
+                ClusterConfig::new(
+                    id,
+                    addr,
+                    peers.clone(),
+                    root.path().join(id.to_string()),
+                    ClusterSecurity::InsecurePlaintext,
+                ),
+                Counter::default(),
+            )
+        }))
+        .await
+        .unwrap();
+        let wait = Duration::from_secs(5);
+        for node in &nodes {
+            timeout(wait, node.membership_control().wait_serving())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let leader_id = nodes[0].leader().unwrap();
+        let leader = nodes
+            .iter()
+            .find(|node| node.node_id() == leader_id)
+            .unwrap();
+        let isolated = nodes
+            .iter()
+            .find(|node| node.node_id() != leader_id)
+            .unwrap();
+        let core = &isolated.0.core;
+        core.filter_lease_renewals
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let (paused, sm_paused) = tokio::sync::oneshot::channel();
+        let (resume, sm_resume) = tokio::sync::oneshot::channel();
+        core.raft
+            .external_state_machine_request(move |_| {
+                Box::pin(async move {
+                    let _ = paused.send(());
+                    let _ = sm_resume.await;
+                })
+            })
+            .await
+            .unwrap();
+        timeout(wait, sm_paused).await.unwrap().unwrap();
+        leader.submit(1).await.unwrap();
+        assert_eq!(isolated.read(|counter| counter.0), 0);
+
+        // A renewal can be in flight when the readiness deadline passes, but
+        // the periodic renewal loop has not changed its serving flag yet.
+        core.safe_until.send_replace(Some(Instant::now()));
+        assert_eq!(*core.serving.borrow(), Serving::Active);
+        assert!(isolated.membership_control().lease_valid_until().is_none());
+        let renewal = core.renew_lease(leader_id, Instant::now() + wait);
+        assert!(
+            timeout(Duration::from_millis(500), renewal).await.is_err(),
+            "the follower renewed admission without applying the missed write"
+        );
+
+        resume.send(()).unwrap();
+        assert!(
+            timeout(wait, core.renew_lease(leader_id, Instant::now() + wait))
+                .await
+                .unwrap()
+        );
         assert_eq!(isolated.read(|counter| counter.0), 1);
         for node in &nodes {
             node.shutdown().await.unwrap();

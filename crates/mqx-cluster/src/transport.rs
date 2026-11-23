@@ -303,9 +303,13 @@ impl Endpoint {
             let stream = TcpStream::connect(address).await?;
             stream.set_nodelay(true)?;
             Ok(match &self.tls {
-                Some(tls) => {
-                    Connection::Tls(tls.client.connect(node_name(target)?, stream).await?.into())
-                }
+                Some(tls) => Connection::Tls(
+                    tls.client()
+                        .await
+                        .connect(node_name(target)?, stream)
+                        .await?
+                        .into(),
+                ),
                 None => Connection::Plain(stream),
             })
         })
@@ -316,7 +320,7 @@ impl Endpoint {
     pub(crate) async fn accept(&self, stream: TcpStream) -> io::Result<(Connection, u64, Op)> {
         stream.set_nodelay(true)?;
         let (mut stream, authenticated) = if let Some(tls) = &self.tls {
-            let stream = tls.server.accept(stream).await?;
+            let stream = tls.server().await.accept(stream).await?;
             let node_id = stream
                 .get_ref()
                 .1

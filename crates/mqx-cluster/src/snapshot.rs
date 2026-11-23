@@ -22,7 +22,7 @@ use crate::snapshot_file::SnapshotData;
 use crate::transport::{decode, encode, invalid_data};
 use crate::{NodeEvent, StateMachine, version};
 
-const SNAPSHOT_FILE: &str = "snapshot.mpk";
+pub(crate) const SNAPSHOT_FILE: &str = "snapshot.mpk";
 pub(crate) const RETIRED_FILE: &str = "removed";
 pub(crate) const TEMP_FILE_PREFIX: &str = ".mqx-";
 

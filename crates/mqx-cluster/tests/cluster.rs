@@ -253,6 +253,56 @@ async fn versioned_reader_restores_legacy_snapshot_and_versioned_wal_tail() {
     rebuilt.shutdown().await.unwrap();
 }
 
+async fn refuse_foreign_state_without_node_identity(only_snapshot: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let policy = if only_snapshot {
+        SnapshotPolicy::LogsSinceLast(2)
+    } else {
+        SnapshotPolicy::Never
+    };
+    let mut cfg = configs(&root, 1, policy).remove(&1).unwrap();
+    let original = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
+    let reply = put(&original, "key", "owned by node 1").await;
+    if only_snapshot {
+        until(|| {
+            original
+                .metrics()
+                .snapshot_index
+                .filter(|index| *index >= reply.index)
+        })
+        .await;
+    }
+    original.shutdown().await.unwrap();
+
+    // An incomplete restore copied durable state but not the node identity.
+    let identity = cfg.data_dir.join("node.mpk");
+    std::fs::rename(&identity, root.path().join("original-node.mpk")).unwrap();
+    if only_snapshot {
+        std::fs::rename(cfg.data_dir.join("wal"), root.path().join("original-wal")).unwrap();
+    }
+    cfg.node_id = 2;
+    cfg.peers = BTreeMap::from([(2, cfg.raft_addr)]);
+    let result = Cluster::start(cfg, Kv::default()).await;
+    if let Ok(node) = &result {
+        node.shutdown().await.unwrap();
+    }
+    assert!(
+        !identity.exists(),
+        "assigned foreign state a new node identity"
+    );
+    assert!(matches!(result, Err(ClusterError::InvalidConfig(_))));
+}
+
+#[tokio::test]
+async fn bootstrap_refuses_foreign_wal_without_node_identity() {
+    refuse_foreign_state_without_node_identity(false).await;
+}
+
+#[tokio::test]
+async fn bootstrap_refuses_foreign_snapshot_without_node_identity() {
+    refuse_foreign_state_without_node_identity(true).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_bootstrap_forwarding_failover_and_rejoining() {
     let root = tempfile::tempdir().unwrap();
@@ -460,6 +510,14 @@ async fn follower_installs_snapshot_when_its_missing_prefix_has_been_purged() {
 }
 
 fn with_tls(root: &tempfile::TempDir, configs: &mut BTreeMap<u64, ClusterConfig>) {
+    write_tls(root, configs, None);
+}
+
+fn write_tls(
+    root: &tempfile::TempDir,
+    configs: &mut BTreeMap<u64, ClusterConfig>,
+    expires: Option<Duration>,
+) {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     };
@@ -480,6 +538,9 @@ fn with_tls(root: &tempfile::TempDir, configs: &mut BTreeMap<u64, ClusterConfig>
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
+        if let Some(expires) = expires {
+            params.not_after = rcgen::date_time_ymd(1970, 1, 1) + expires;
+        }
         let key = KeyPair::generate().unwrap();
         let leaf = params.signed_by(&key, &issuer).unwrap();
         let cert_file = root.path().join(format!("{id}-cert.pem"));
@@ -541,6 +602,78 @@ async fn mutually_authenticated_cluster_replicates_and_serves_mesh() {
     assert!(plaintext.mesh().request(leader, greeting).await.is_err());
     assert_eq!(handled.load(std::sync::atomic::Ordering::Relaxed), 1);
     plaintext.shutdown().await.unwrap();
+    stop(nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_reconnect_survives_corrupt_credentials_and_expired_leaf_rotation() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut configs = configs(&root, 3, SnapshotPolicy::Never);
+    let unix_time = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let expires = unix_time() + Duration::from_secs(10);
+    write_tls(&root, &mut configs, Some(expires));
+    let mut nodes = start(&configs).await;
+    elected(&nodes).await;
+
+    fn echo(node: &Node) {
+        node.mesh()
+            .register_handler(|_, bytes| async move { Ok(bytes) })
+            .unwrap();
+    }
+    async fn check_mesh(left: &Node, right: &Node) {
+        let probe = Bytes::from_static(b"new peer session");
+        for (client, server) in [(left, right), (right, left)] {
+            let reply = client
+                .mesh()
+                .request(server.node_id(), probe.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "mesh {} -> {} failed: {error}",
+                        client.node_id(),
+                        server.node_id()
+                    )
+                });
+            assert_eq!(reply, probe);
+        }
+    }
+    echo(&nodes[&1]);
+    echo(&nodes[&2]);
+    echo(&nodes[&3]);
+    check_mesh(&nodes[&1], &nodes[&2]).await;
+    check_mesh(&nodes[&1], &nodes[&3]).await;
+
+    nodes.remove(&3).unwrap().shutdown().await.unwrap();
+    let ClusterSecurity::Tls { key_file, .. } = &configs[&1].security else {
+        unreachable!()
+    };
+    std::fs::write(key_file, b"incomplete private key").unwrap();
+    // Let the live node's credential check come due before forcing a full handshake.
+    sleep(Duration::from_millis(1100)).await;
+    let restarted = Cluster::start(configs[&3].clone(), Kv::default())
+        .await
+        .unwrap();
+    echo(&restarted);
+    check_mesh(&nodes[&1], &restarted).await;
+    restarted.shutdown().await.unwrap();
+
+    // A different CA means neither end can pass by still using the old config.
+    write_tls(&root, &mut configs, None);
+    let ClusterSecurity::Tls { key_file, .. } = &configs[&2].security else {
+        unreachable!()
+    };
+    std::fs::write(key_file, b"incomplete private key").unwrap();
+    sleep(expires.saturating_sub(unix_time()) + Duration::from_secs(1)).await;
+    let restarted = Cluster::start(configs[&3].clone(), Kv::default())
+        .await
+        .unwrap();
+    echo(&restarted);
+    check_mesh(&nodes[&1], &restarted).await;
+    // Neither side could establish these sessions again: node 2 still has A.
+    check_mesh(&nodes[&1], &nodes[&2]).await;
+    nodes.insert(3, restarted);
     stop(nodes).await;
 }
 
