@@ -699,7 +699,15 @@ impl Parser {
                 }));
             }
             "port" | "bind_address" => {
-                self.deprecated(name, "Please use 'listener' instead.");
+                // src/conf.c: config__read_file_core gives only `port` an alternative.
+                self.deprecated(
+                    name,
+                    if name == "port" {
+                        "Please use 'listener' instead."
+                    } else {
+                        ""
+                    },
+                );
                 let mut default = None;
                 let index = self.implicit_listener(&mut default, name);
                 *current = Some(index);
@@ -716,7 +724,10 @@ impl Parser {
                 }
             }
             "per_listener_settings" => {
-                self.deprecated(name, "Use listener-specific security settings instead.");
+                self.deprecated(
+                    name,
+                    "Please see the documentation for how to achieve the same effect.",
+                );
                 if !self.config.per_listener_settings {
                     let enable = v.boolean()?;
                     if enable && self.security_seen {
@@ -958,7 +969,7 @@ impl Parser {
             "max_queued_messages" => self.config.limits.max_queued_messages = v.nonnegative()?,
             "message_size_limit" => {
                 self.config.notices.push(
-                    "It is recommended to replace `message_size_limit` with `max_packet_size`."
+                    "Note: It is recommended to replace `message_size_limit` with `max_packet_size`."
                         .into(),
                 );
                 let value = v.integer()? as u32;
@@ -1109,7 +1120,10 @@ impl Parser {
     }
 
     fn deprecated(&mut self, name: &str, alternative: &str) {
-        self.config.notices.push(format!("The '{name}' option is now deprecated and will be removed in version 3.0. {alternative}").trim_end().into());
+        // src/conf.c: OPTION_DEPRECATED keeps the space before an empty alternative.
+        self.config.notices.push(format!(
+            "The '{name}' option is now deprecated and will be removed in version 3.0. {alternative}"
+        ));
     }
 
     fn log_dest(&mut self, v: Value<'_>) -> ParseResult<()> {

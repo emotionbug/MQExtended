@@ -33,6 +33,12 @@ use runtime::Live;
 pub use runtime::{BridgeAck, BridgeIdentity, BridgeSession, Broker, SocketObservation};
 pub use sys::{BrokerMetrics, MOSQUITTO_VERSION, ProposalHistogram, SysTree};
 
+/// An IP address as Mosquitto prints it: lib/net_mosq.c uses inet_ntop, so
+/// IPv4-compatible and IPv4-mapped IPv6 addresses keep a dotted suffix.
+pub fn inet_ntop(ip: std::net::IpAddr) -> String {
+    connection::ntop(ip)
+}
+
 /// Broker-wide options. Zero-valued limits are disabled.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -356,6 +362,20 @@ pub enum CertIdentity {
     /// Username asserted by PROXY v2; it does not satisfy basic authentication.
     ForwardedUsername(String),
     MissingOrInvalid,
+}
+
+/// What the transport knows about a peer beyond [`ConnectionInfo`], as
+/// Mosquitto keeps it on the client context.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerTransport<'a> {
+    /// `context->address`: a Unix socket path, or a PROXY v1 source address
+    /// exactly as sent. Without it the IP of `peer_addr` is formatted as
+    /// inet_ntop does.
+    pub address: Option<&'a str>,
+    /// The negotiated TLS version and OpenSSL cipher name, e.g. `TLSv1.3`
+    /// and `TLS_AES_256_GCM_SHA384`, for a TLS connection the listener
+    /// terminated itself.
+    pub tls: Option<(&'a str, &'a str)>,
 }
 
 #[derive(Debug, Clone, Default)]

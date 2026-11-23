@@ -277,7 +277,7 @@ impl Runtime {
                 (
                     username.to_owned(),
                     live.lease.id.to_string(),
-                    live.peer_ip.map(|ip| ip.to_string()),
+                    live.peer_address.as_deref().map(str::to_owned),
                 )
             })
             .collect()

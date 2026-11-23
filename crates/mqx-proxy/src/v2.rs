@@ -108,10 +108,12 @@ fn addresses(family: Family, body: &[u8]) -> ProxyAddresses {
                 Ipv4Addr::new(body[4], body[5], body[6], body[7]),
                 port(body, 10),
             )),
+            source_text: None,
         },
         Family::Ipv6 => ProxyAddresses::Ip {
             source: SocketAddr::from((ipv6(&body[..16]), port(body, 32))),
             destination: SocketAddr::from((ipv6(&body[16..32]), port(body, 34))),
+            source_text: None,
         },
         Family::Unix => {
             let (source, remaining) = body.split_at(body.len().min(UNIX_PATH_LEN));

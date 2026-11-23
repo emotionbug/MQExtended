@@ -68,6 +68,12 @@ pub struct Connection {
     /// The shared initial keepalive begins at socket accept, before any upgrade.
     pub accepted_at: Instant,
     pub cert_identity: CertIdentity,
+    /// Mosquitto's `context->address` where it is not the inet_ntop form of
+    /// `peer_addr`: a Unix socket path or a PROXY v1 source token as sent.
+    pub peer_text: Option<String>,
+    /// The negotiated TLS version and OpenSSL cipher name, when this listener
+    /// terminated TLS itself.
+    pub tls: Option<(String, String)>,
 }
 
 pub struct Server {
@@ -702,7 +708,7 @@ impl SocketWorker {
                     ) else {
                         if observed_broker.as_ref().map_or(connection_messages, mqx_broker::Broker::connection_messages) {
                             match peer_addr {
-                                Some(peer_addr) => tracing::info!(target: "mqx::notice", "Client connection from {} denied: max_connections exceeded.", peer_addr.ip()),
+                                Some(peer_addr) => tracing::info!(target: "mqx::notice", "Client connection from {} denied: max_connections exceeded.", mqx_broker::inet_ntop(peer_addr.ip())),
                                 None => {
                                     if let Some(path) = &options.config.unix_socket_path {
                                         tracing::info!(target: "mqx::notice", "Client connection from {} denied: max_connections exceeded.", path.display());
@@ -728,7 +734,7 @@ impl SocketWorker {
                         );
                         let LiveTls { acceptor, tls, proxy } = options.live.borrow().clone();
                         let mut peer = match peer_addr {
-                            Some(address) => PeerAddress::Ip(address),
+                            Some(address) => PeerAddress::Ip(address, None),
                             None => PeerAddress::LocalUnix(
                                 options.config.unix_socket_path.as_deref()
                                     .expect("Unix listener has a socket path"),
@@ -740,7 +746,7 @@ impl SocketWorker {
                         if connection_messages() && proxy.is_none() {
                             tracing::info!(target: "mqx::notice", "New connection from {peer} on port {}.", listener.port);
                         }
-                        let (stream, cert_identity) = if proxy.is_some()
+                        let (stream, cert_identity, tls_session) = if proxy.is_some()
                             || acceptor.is_some() || options.websockets.is_some()
                         {
                             // Mosquitto src/context.c: context__init and src/keepalive.c:
@@ -769,7 +775,7 @@ impl SocketWorker {
                                 }
                             }
                         } else {
-                            (ConnectionStream::plain(stream), transport::plain_identity(&tls))
+                            (ConnectionStream::plain(stream), transport::plain_identity(&tls), None)
                         };
                         handler(Connection {
                             stream,
@@ -778,6 +784,8 @@ impl SocketWorker {
                             peer_addr: peer.ip(),
                             accepted_at,
                             cert_identity,
+                            peer_text: peer.text(),
+                            tls: tls_session,
                         }).await;
                     });
                 }

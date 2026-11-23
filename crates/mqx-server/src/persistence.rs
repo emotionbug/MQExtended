@@ -11,6 +11,11 @@ use tokio::{
     time::{self, Instant},
 };
 
+// src/database.c: db__open fails when persist__restore does, and
+// src/mosquitto.c: main then exits with status 1.
+pub(super) const RESTORE_FAILED: &str = "Unable to restore persistent database";
+pub(super) const IMPORT_FAILED: &str = "Unable to import Mosquitto persistence database";
+
 const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(super) struct Persistence {
@@ -40,11 +45,9 @@ impl Persistence {
         }
         let native = snapshot_path(&config.persistence);
         let path = native.clone();
-        let image = file_job(
-            "Unable to restore persistent database",
-            path.clone(),
-            move || PersistentState::read_snapshot(&path),
-        )
+        let image = file_job(RESTORE_FAILED, path.clone(), move || {
+            PersistentState::read_snapshot(&path)
+        })
         .await?;
         if let Some(image) = image {
             let counts = image.counts();
@@ -196,19 +199,15 @@ async fn read_mosquitto(config: &ServerConfig) -> Result<Option<PersistentState>
             .map(|(index, listener)| (listener.port, index as u64 + 1))
             .collect::<Vec<_>>()
     });
-    file_job(
-        "Unable to import Mosquitto persistence database",
-        path.clone(),
-        move || {
-            PersistentState::read_mosquitto(&path, |port| match &listeners {
-                Some(listeners) => listeners
-                    .iter()
-                    .find(|(candidate, _)| *candidate == port)
-                    .map_or(0, |(_, id)| *id),
-                None => 1,
-            })
-        },
-    )
+    file_job(IMPORT_FAILED, path.clone(), move || {
+        PersistentState::read_mosquitto(&path, |port| match &listeners {
+            Some(listeners) => listeners
+                .iter()
+                .find(|(candidate, _)| *candidate == port)
+                .map_or(0, |(_, id)| *id),
+            None => 1,
+        })
+    })
     .await
 }
 

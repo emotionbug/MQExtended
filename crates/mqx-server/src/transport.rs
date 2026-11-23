@@ -166,7 +166,8 @@ impl AsyncWrite for ConnectionStream {
 }
 
 pub(crate) enum PeerAddress<'a> {
-    Ip(SocketAddr),
+    /// With the PROXY v1 source token as sent, if any.
+    Ip(SocketAddr, Option<Box<str>>),
     Unix(Box<[u8]>),
     LocalUnix(&'a Path),
 }
@@ -174,8 +175,18 @@ pub(crate) enum PeerAddress<'a> {
 impl PeerAddress<'_> {
     pub(crate) fn ip(&self) -> Option<SocketAddr> {
         match self {
-            Self::Ip(addr) => Some(*addr),
+            Self::Ip(addr, _) => Some(*addr),
             Self::Unix(_) | Self::LocalUnix(_) => None,
+        }
+    }
+
+    /// Mosquitto's `context->address` when it is not the inet_ntop form of
+    /// [`Self::ip`]: a PROXY v1 source token or a Unix socket path.
+    pub(crate) fn text(&self) -> Option<String> {
+        match self {
+            Self::Ip(_, text) => text.as_deref().map(str::to_owned),
+            Self::Unix(path) => Some(String::from_utf8_lossy(path).into_owned()),
+            Self::LocalUnix(path) => Some(path.display().to_string()),
         }
     }
 }
@@ -183,7 +194,12 @@ impl PeerAddress<'_> {
 impl fmt::Display for PeerAddress<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ip(addr) => write!(f, "{}:{}", addr.ip(), addr.port()),
+            // Mosquitto src/proxy_v1.c keeps the v1 source token; lib/net_mosq.c
+            // and src/proxy_v2.c format binary addresses with inet_ntop.
+            Self::Ip(addr, Some(text)) => write!(f, "{text}:{}", addr.port()),
+            Self::Ip(addr, None) => {
+                write!(f, "{}:{}", mqx_broker::inet_ntop(addr.ip()), addr.port())
+            }
             // Mosquitto src/proxy_v2.c: proxy_v2__read stores a proxied Unix
             // source with remote_port 0, and logs print "%s:%d".
             Self::Unix(path) => write!(f, "{}:0", String::from_utf8_lossy(path)),
@@ -226,7 +242,11 @@ fn log_proxy_rejection(options: ProxyOptions, error: &mqx_proxy::ProxyError) {
         // Mosquitto src/proxy_v2.c: proxy_v2__read.
         (ProxyVersion::V2, ProxyError::Rejected { addresses, reason }) => {
             let peer = match addresses {
-                ProxyAddresses::Ip { source, .. } => PeerAddress::Ip(*source),
+                ProxyAddresses::Ip {
+                    source,
+                    source_text,
+                    ..
+                } => PeerAddress::Ip(*source, source_text.clone()),
                 ProxyAddresses::Unix { source, .. } => PeerAddress::Unix(source.clone()),
             };
             let why = match **reason {
@@ -240,6 +260,10 @@ fn log_proxy_rejection(options: ProxyOptions, error: &mqx_proxy::ProxyError) {
     }
 }
 
+/// A negotiated transport. `tls` is the version and OpenSSL cipher name of a
+/// TLS session this listener terminated itself.
+pub(crate) type Negotiated = (ConnectionStream, CertIdentity, Option<(String, String)>);
+
 pub(crate) async fn negotiate(
     stream: SocketStream,
     peer: &mut PeerAddress<'_>,
@@ -247,7 +271,7 @@ pub(crate) async fn negotiate(
     acceptor: Option<ListenerAcceptor>,
     tls: &TlsConfig,
     ws: Option<&WsOptions>,
-) -> Result<Option<(ConnectionStream, CertIdentity)>, NegotiationError> {
+) -> Result<Option<Negotiated>, NegotiationError> {
     match stream {
         SocketStream::Tcp(stream) => {
             negotiate_stream(
@@ -285,7 +309,7 @@ async fn negotiate_stream<S: TransportIo + 'static>(
     acceptor: Option<ListenerAcceptor>,
     tls: &TlsConfig,
     ws: Option<&WsOptions>,
-) -> Result<Option<(ConnectionStream, CertIdentity)>, NegotiationError> {
+) -> Result<Option<Negotiated>, NegotiationError> {
     let mut identity = plain_identity(tls);
     let prefix = if let Some(options) = proxy {
         let (info, prefix) = read_proxy_header(&mut stream, options)
@@ -298,7 +322,11 @@ async fn negotiate_stream<S: TransportIo + 'static>(
             ProxyInfo::Unknown => (),
             ProxyInfo::Proxied { addresses, tls } => {
                 *peer = match addresses {
-                    ProxyAddresses::Ip { source, .. } => PeerAddress::Ip(source),
+                    ProxyAddresses::Ip {
+                        source,
+                        source_text,
+                        ..
+                    } => PeerAddress::Ip(source, source_text),
                     ProxyAddresses::Unix { source, .. } => PeerAddress::Unix(source),
                 };
                 if let Some(tls) = tls {
@@ -321,15 +349,16 @@ async fn negotiate_stream<S: TransportIo + 'static>(
         Bytes::new()
     };
 
+    let mut session = None;
     let stream = if acceptor.is_none() && ws.is_none() && prefix.is_empty() {
         plain(stream)
     } else if prefix.is_empty() {
-        upgrade(stream, acceptor, tls, ws, &mut identity).await?
+        upgrade(stream, acceptor, tls, ws, &mut identity, &mut session).await?
     } else {
         let stream = Replay { stream, prefix };
-        upgrade(stream, acceptor, tls, ws, &mut identity).await?
+        upgrade(stream, acceptor, tls, ws, &mut identity, &mut session).await?
     };
-    Ok(Some((stream, identity)))
+    Ok(Some((stream, identity, session)))
 }
 
 async fn upgrade<S: TransportIo + 'static>(
@@ -338,6 +367,7 @@ async fn upgrade<S: TransportIo + 'static>(
     tls: &TlsConfig,
     ws: Option<&WsOptions>,
     identity: &mut CertIdentity,
+    session: &mut Option<(String, String)>,
 ) -> Result<ConnectionStream, NegotiationError> {
     match acceptor {
         Some(ListenerAcceptor::Rustls(acceptor)) => {
@@ -351,6 +381,11 @@ async fn upgrade<S: TransportIo + 'static>(
                 .peer_certificates()
                 .and_then(|chain| chain.first());
             *identity = tls::identity(tls, certificate.map(AsRef::as_ref));
+            *session = stream
+                .get_ref()
+                .1
+                .negotiated_cipher_suite()
+                .and_then(tls::rustls_session);
             upgrade_websocket(stream, ws).await
         }
         Some(ListenerAcceptor::OpenSsl(context)) => {
@@ -372,6 +407,11 @@ async fn upgrade<S: TransportIo + 'static>(
                 None
             };
             *identity = tls::identity(tls, certificate.as_deref());
+            // src/handle_connect.c: SSL_get_cipher_version and SSL_get_cipher_name.
+            *session = stream
+                .ssl()
+                .current_cipher()
+                .map(|cipher| (cipher.version().to_owned(), cipher.name().to_owned()));
             upgrade_websocket(stream, ws).await
         }
         None => upgrade_websocket(stream, ws).await,

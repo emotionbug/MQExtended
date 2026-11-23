@@ -848,6 +848,214 @@ async fn startup_reload_and_shutdown_logs_match_the_reference() {
     }
 }
 
+// A raw CONNECT: protocol level 3 (MQIsdp) or 4, clean session, keepalive 60.
+fn raw_connect(level: u8, id: &str, will: Option<&[u8]>, login: Option<(&str, &str)>) -> Vec<u8> {
+    let field = |out: &mut Vec<u8>, bytes: &[u8]| {
+        out.extend_from_slice(&u16::try_from(bytes.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(bytes);
+    };
+    let mut body = Vec::new();
+    field(&mut body, if level == 3 { b"MQIsdp" } else { b"MQTT" });
+    let mut flags = 0x02;
+    if will.is_some() {
+        flags |= 0x04;
+    }
+    if login.is_some() {
+        flags |= 0xc0;
+    }
+    body.extend_from_slice(&[level, flags, 0, 60]);
+    field(&mut body, id.as_bytes());
+    if let Some(payload) = will {
+        field(&mut body, b"will/topic");
+        field(&mut body, payload);
+    }
+    if let Some((username, password)) = login {
+        field(&mut body, username.as_bytes());
+        field(&mut body, password.as_bytes());
+    }
+    let mut packet = vec![0x10, u8::try_from(body.len()).unwrap()];
+    packet.extend(body);
+    packet
+}
+
+// Replace each client's ephemeral port after `127.0.0.1:` with `PORT`.
+fn mask_client_ports(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut rest = log;
+    while let Some(at) = rest.find("127.0.0.1:") {
+        let (head, tail) = rest.split_at(at + "127.0.0.1:".len());
+        out.push_str(head);
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            out.push_str("PORT");
+        }
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
+// src/handle_connect.c and src/loop.c: do_disconnect. A refused CONNECT is
+// logged with its reason, naming the client by address until its id is set.
+#[tokio::test]
+#[ignore = "requires the Mosquitto 2.1.4 reference broker"]
+async fn refused_connect_logs_match_the_reference() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let reference = reference("MOSQUITTO_BUILD_DIR");
+    let passwd = reference
+        .parent()
+        .unwrap()
+        .join("../apps/mosquitto_passwd/mosquitto_passwd");
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(passwd)
+        .args(["-c", "-b", "passwords", "pfx-user", "secret"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let address = listen_address();
+    fs::write(
+        dir.path().join("broker.conf"),
+        format!(
+            "listener {} 127.0.0.1\nallow_anonymous false\npassword_file passwords\n\
+             clientid_prefixes pfx-\nallow_zero_length_clientid false\nmessage_size_limit 10\n",
+            address.port()
+        ),
+    )
+    .unwrap();
+    let login = Some(("pfx-user", "secret"));
+    let cases = [
+        raw_connect(4, "pfx-badpw", None, Some(("pfx-user", "wrong"))),
+        raw_connect(4, "pfx-anon", None, None),
+        raw_connect(3, "pfx-anon31", None, None),
+        raw_connect(4, "", None, login),
+        raw_connect(3, "", None, login),
+        raw_connect(4, "other", None, login),
+        raw_connect(4, "pfx-will", Some(&[b'x'; 11]), login),
+    ];
+    let mut transcripts = Vec::new();
+    for binary in [reference.as_path(), Path::new(BIN)] {
+        let log_path = dir.path().join("refusals.log");
+        let mut child = command(binary, dir.path())
+            .args(["-c", "broker.conf"])
+            .stderr(Stdio::from(fs::File::create(&log_path).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| fs::read_to_string(&log_path).unwrap().contains(RUNNING)).await;
+        for packet in &cases {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(packet).await.unwrap();
+            let mut rest = Vec::new();
+            timeout(WAIT, stream.read_to_end(&mut rest))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        stop(&mut child).await;
+        let log = mask_client_ports(&fs::read_to_string(&log_path).unwrap());
+        transcripts.push(
+            log.lines()
+                .filter_map(|line| line.split_once(": ").map(|(_, message)| message))
+                .filter(|message| {
+                    ["New connection", "disconnected:", "Protocol error", "Note:"]
+                        .iter()
+                        .any(|marker| message.contains(marker))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(transcripts[1], transcripts[0]);
+    assert!(
+        transcripts[0]
+            .iter()
+            .any(|line| line.ends_with("disconnected: oversize payload.")),
+        "{:?}",
+        transcripts[0]
+    );
+}
+
+// src/handle_connect.c: connect__on_authorised logs the TLS version and the
+// OpenSSL cipher name of every TLS client, whatever connection_messages says.
+#[tokio::test]
+#[ignore = "requires the Mosquitto 2.1.4 reference broker and clients, and openssl"]
+async fn tls_client_negotiation_logs_match_the_reference() {
+    let reference = reference("MOSQUITTO_BUILD_DIR");
+    let publisher = reference.parent().unwrap().join("../client/mosquitto_pub");
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            "server.key",
+            "-out",
+            "server.crt",
+        ])
+        .current_dir(dir.path())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let address = listen_address();
+    fs::write(
+        dir.path().join("broker.conf"),
+        format!(
+            "listener {} 127.0.0.1\ncertfile server.crt\nkeyfile server.key\n\
+             allow_anonymous true\nconnection_messages false\n",
+            address.port()
+        ),
+    )
+    .unwrap();
+    let mut transcripts = Vec::new();
+    for binary in [reference.as_path(), Path::new(BIN)] {
+        let log_path = dir.path().join("tls.log");
+        let mut child = command(binary, dir.path())
+            .args(["-c", "broker.conf"])
+            .stderr(Stdio::from(fs::File::create(&log_path).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| fs::read_to_string(&log_path).unwrap().contains(RUNNING)).await;
+        for (id, version) in [("tls13", "tlsv1.3"), ("tls12", "tlsv1.2")] {
+            let status = Command::new(&publisher)
+                .args(["-h", "127.0.0.1", "-p", &address.port().to_string()])
+                .args([
+                    "--cafile",
+                    "server.crt",
+                    "--insecure",
+                    "--tls-version",
+                    version,
+                ])
+                .args(["-i", id, "-t", "tls/check", "-m", "x"])
+                .current_dir(dir.path())
+                .status()
+                .await
+                .unwrap();
+            assert!(status.success(), "{binary:?} {version}");
+        }
+        stop(&mut child).await;
+        transcripts.push(
+            fs::read_to_string(&log_path)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_once(": ").map(|(_, message)| message))
+                .filter(|message| message.contains(" negotiated "))
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(transcripts[0].len(), 2, "{:?}", transcripts[0]);
+    assert_eq!(transcripts[1], transcripts[0]);
+}
+
 #[tokio::test]
 #[ignore = "requires the Mosquitto 2.1.4 reference with built-in websockets"]
 async fn built_in_websockets_use_reference_listener_log() {
@@ -1078,6 +1286,96 @@ async fn rejected_proxy_headers_log_the_reference_notices() {
         "Connection rejected, corrupt PROXY header.",
         "Connection from 192.0.2.7:47568 rejected, client did not connect using TLS.",
         "Connection from 192.0.2.7:47568 rejected, corrupt PROXY header.",
+    ];
+    eventually(|| {
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        expected.iter().all(|line| text.contains(line))
+    })
+    .await;
+    stop(&mut child).await;
+}
+
+// src/persist_read.c: persist__restore rejects an unrecognised file, then
+// src/database.c: db__open fails and src/mosquitto.c: main exits with 1.
+#[tokio::test]
+async fn corrupt_persistence_database_exits_with_the_reference_status() {
+    for file in ["mosquitto.db", "mosquitto.db.mqx"] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(file), b"garbage-not-a-db").unwrap();
+        let output = timeout(
+            WAIT,
+            persistence_command(dir.path(), listen_address(), "")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{file}");
+        let log = fs::read_to_string(dir.path().join("broker.log")).unwrap();
+        assert!(!log.contains(RUNNING), "{file}: {log}");
+        // The unreadable file is left for recovery, unlike Mosquitto's final save.
+        assert_eq!(
+            fs::read(dir.path().join(file)).unwrap(),
+            b"garbage-not-a-db"
+        );
+    }
+}
+
+// src/proxy_v1.c: proxy_v1__decode keeps the source token as sent;
+// src/proxy_v2.c: proxy_v2__read formats binary addresses with inet_ntop.
+#[tokio::test]
+async fn proxied_peers_are_logged_with_the_reference_address_text() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let v1 = listen_address();
+    let v2 = listen_address();
+    fs::write(
+        dir.path().join("broker.conf"),
+        format!(
+            "{}enable_proxy_protocol 1\nlistener {} 127.0.0.1\nenable_proxy_protocol 2\n\
+            log_dest file broker.log\n",
+            config(v1),
+            v2.port()
+        ),
+    )
+    .unwrap();
+    let mut child = command(BIN, dir.path())
+        .args(["-c", "broker.conf"])
+        .env("NOTIFY_SOCKET", &notify_path)
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+
+    const CONNECT: &[u8] = b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev";
+    let connected = async |address, header: &[u8]| {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(&[header, CONNECT].concat()).await.unwrap();
+        let mut connack = [0; 4];
+        timeout(WAIT, stream.read_exact(&mut connack))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&connack, b"\x20\x02\x00\x00");
+        stream.write_all(b"\xe0\x00").await.unwrap();
+    };
+    connected(v1, b"PROXY TCP6 2001:DB8:0:0:0:0:0:1 ::1 6275 1234\r\n").await;
+    // IPv6 ::1.2.3.4 port 6278 -> ::1 port 1234.
+    let mut v2_header = b"\r\n\r\n\0\r\nQUIT\n\x21\x21\x00\x24".to_vec();
+    v2_header.extend_from_slice(&[0; 12]);
+    v2_header.extend_from_slice(&[1, 2, 3, 4]);
+    v2_header.extend_from_slice(&[0; 15]);
+    v2_header.extend_from_slice(&[1, 0x18, 0x86, 0x04, 0xd2]);
+    connected(v2, &v2_header).await;
+
+    let log = dir.path().join("broker.log");
+    let expected = [
+        "New client connected from 2001:DB8:0:0:0:0:0:1:6275 as dev (p4, c1, k60).",
+        "New client connected from ::1.2.3.4:6278 as dev (p4, c1, k60).",
     ];
     eventually(|| {
         let text = fs::read_to_string(&log).unwrap_or_default();

@@ -201,6 +201,11 @@ fn start() -> Result<ExitCode, StartupError> {
     Ok(match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(ServerError::Listen(_)) => ExitCode::FAILURE,
+        Err(ServerError::File { operation, .. })
+            if [persistence::RESTORE_FAILED, persistence::IMPORT_FAILED].contains(&operation) =>
+        {
+            ExitCode::FAILURE
+        }
         Err(_) => ExitCode::from(3),
     })
 }
@@ -503,7 +508,18 @@ async fn run_broker(
                         cert_identity: connection.cert_identity.into(),
                     };
                     if let Err(error) = broker
-                        .serve_accepted(connection.stream, info, connection.accepted_at)
+                        .serve_accepted_with(
+                            connection.stream,
+                            info,
+                            connection.accepted_at,
+                            mqx_broker::PeerTransport {
+                                address: connection.peer_text.as_deref(),
+                                tls: connection
+                                    .tls
+                                    .as_ref()
+                                    .map(|(version, cipher)| (version.as_str(), cipher.as_str())),
+                            },
+                        )
                         .await
                         && broker.connection_messages()
                     {

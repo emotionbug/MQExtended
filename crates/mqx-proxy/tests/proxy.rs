@@ -51,17 +51,45 @@ fn ip(source: &str, destination: &str) -> ProxyInfo {
         addresses: ProxyAddresses::Ip {
             source: source.parse().unwrap(),
             destination: destination.parse().unwrap(),
+            source_text: None,
         },
         tls: None,
     }
+}
+
+// Mosquitto src/proxy_v1.c: proxy_v1__decode keeps the source token itself.
+fn v1_ip(text: &str, source: &str, destination: &str) -> ProxyInfo {
+    let mut info = ip(source, destination);
+    if let ProxyInfo::Proxied {
+        addresses: ProxyAddresses::Ip { source_text, .. },
+        ..
+    } = &mut info
+    {
+        *source_text = Some(text.into());
+    }
+    info
 }
 
 #[test]
 fn v1_reports_addresses_and_keeps_mqtt_bytes() {
     // Mosquitto test/broker/21-proxy-v1-success.py; src/proxy_v1.c:proxy_v1__decode.
     for (header, expected) in [
-        (V1_IPV4, ip("192.0.2.5:6275", "127.0.0.1:1234")),
-        (V1_IPV6, ip("[2001:db8:506:708:900::1]:6275", "[::1]:1234")),
+        (
+            V1_IPV4,
+            v1_ip("192.0.2.5", "192.0.2.5:6275", "127.0.0.1:1234"),
+        ),
+        (
+            V1_IPV6,
+            v1_ip(
+                "2001:db8:506:708:900::1",
+                "[2001:db8:506:708:900::1]:6275",
+                "[::1]:1234",
+            ),
+        ),
+        (
+            b"PROXY TCP6 2001:DB8:0:0:0:0:0:1 ::1 6275 1234\r\n",
+            v1_ip("2001:DB8:0:0:0:0:0:1", "[2001:db8::1]:6275", "[::1]:1234"),
+        ),
         (b"PROXY UNKNOWN \r\n", ProxyInfo::Unknown),
         (b"PROXY UNKNOWN ignored\xff\0\r\n", ProxyInfo::Unknown),
     ] {
@@ -76,7 +104,7 @@ fn v1_reports_addresses_and_keeps_mqtt_bytes() {
 #[test]
 fn v1_uses_c_tokens_and_decimal_port_prefixes() {
     // Mosquitto src/proxy_v1.c:proxy_v1__decode uses strtok_r and atoi.
-    let expected = ip("192.0.2.5:6275", "127.0.0.1:1234");
+    let expected = v1_ip("192.0.2.5", "192.0.2.5:6275", "127.0.0.1:1234");
     for header in [
         &b"PROXY TCP4  192.0.2.5 127.0.0.1  \t+06275junk 1234 \r\n"[..],
         &b"PROXY TCP4 192.0.2.5 127.0.0.1 6275 1234\0 ignored\r\n"[..],
@@ -489,7 +517,7 @@ async fn async_helper_preserves_both_buffered_and_unread_bytes() {
     let (info, leftover) = read_proxy_header(&mut input.as_slice(), ProxyVersion::V1)
         .await
         .unwrap();
-    assert_eq!(info, ip("192.0.2.5:6275", "127.0.0.1:1234"));
+    assert_eq!(info, v1_ip("192.0.2.5", "192.0.2.5:6275", "127.0.0.1:1234"));
     assert_eq!(leftover.as_ref(), CONNECT);
 
     let header = v2(0x21, 0x11, V2_IPV4);

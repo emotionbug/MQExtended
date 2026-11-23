@@ -109,6 +109,10 @@ pub enum ProxyAddresses {
     Ip {
         source: SocketAddr,
         destination: SocketAddr,
+        /// The v1 source address token exactly as sent. Mosquitto
+        /// src/proxy_v1.c: proxy_v1__decode keeps it as `context->address`;
+        /// v2 carries binary addresses and has none.
+        source_text: Option<Box<str>>,
     },
     Unix {
         source: Box<[u8]>,

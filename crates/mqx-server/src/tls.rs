@@ -501,6 +501,19 @@ fn cipher_strength(suite: SupportedCipherSuite) -> u16 {
     }
 }
 
+/// SSL_get_cipher_version and SSL_get_cipher_name for a rustls session, as
+/// src/handle_connect.c: connect__on_authorised logs them. OpenSSL reports a
+/// cipher's minimum protocol version, which for every suite rustls offers is
+/// the version of its family.
+pub(crate) fn rustls_session(suite: SupportedCipherSuite) -> Option<(String, String)> {
+    let version = match suite {
+        SupportedCipherSuite::Tls12(_) => "TLSv1.2",
+        SupportedCipherSuite::Tls13(_) => "TLSv1.3",
+    };
+    let (name, _) = cipher_names(suite)?;
+    Some((version.to_owned(), name.to_owned()))
+}
+
 fn cipher_names(suite: SupportedCipherSuite) -> Option<(&'static str, &'static str)> {
     use rustls::CipherSuite::*;
     Some(match suite.suite() {

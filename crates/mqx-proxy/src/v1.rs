@@ -52,12 +52,14 @@ fn decode(line: &[u8]) -> Result<ProxyInfo, ProxyError> {
             text.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
         }
     };
+    let source_text = std::str::from_utf8(source).ok().map(Box::from);
     let source = parse_ip(source).ok_or(ProxyError::MalformedHeader)?;
     let destination = parse_ip(destination).ok_or(ProxyError::MalformedHeader)?;
     Ok(ProxyInfo::Proxied {
         addresses: ProxyAddresses::Ip {
             source: SocketAddr::new(source, source_port),
             destination: SocketAddr::new(destination, destination_port),
+            source_text,
         },
         tls: None,
     })

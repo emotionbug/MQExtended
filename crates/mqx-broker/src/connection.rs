@@ -38,6 +38,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     info: ConnectionInfo,
     accepted_at: Instant,
+    peer: Address,
+    tls: Option<(&str, &str)>,
 ) -> Result<(), BrokerError> {
     let config = &broker.0.config;
     let mut wire = Wire::new(stream, broker.clone());
@@ -112,7 +114,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut security = listener.security.0.snapshots.subscribe();
     let identity = match prepare(config, &info, &mut connect, options.as_ref())? {
         Preparation::Accepted(identity) => identity,
-        Preparation::Refused(code, reason) => {
+        Preparation::Refused(code, reason, refusal) => {
+            log_refusal(broker, &peer, &connect.client_id, refusal);
             if options.is_some() {
                 return refuse_v5(&mut wire, &mut shutdown, config, &info, reason).await;
             }
@@ -149,6 +152,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await
     {
+        log_refusal(
+            broker,
+            &peer,
+            &client_id,
+            Refusal::NotAuthorised { named: true },
+        );
         if options.is_some() {
             return refuse_v5(&mut wire, &mut shutdown, config, &info, R::NOT_AUTHORIZED).await;
         }
@@ -163,6 +172,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         .as_ref()
         .filter(|options| options.assigned_id)
         .map(|_| Property::AssignedClientIdentifier(client_id.to_string()));
+    let publisher_id = client_id.clone();
     let publisher = Publisher {
         id: client_id,
         username: identity.username.clone(),
@@ -183,7 +193,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 internal_bridge: None,
                 dynamic_security_revision,
             },
-            info.peer_addr.map(|peer| peer.ip()),
+            peer.host.clone(),
         )
         .await?
     {
@@ -192,6 +202,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             return refuse_v5(&mut wire, &mut shutdown, config, &info, R::SERVER_BUSY).await;
         }
         ClaimResult::Unauthorized => {
+            log_refusal(
+                broker,
+                &peer,
+                &publisher_id,
+                Refusal::NotAuthorised { named: true },
+            );
             if options.is_some() {
                 return refuse_v5(&mut wire, &mut shutdown, config, &info, R::NOT_AUTHORIZED).await;
             }
@@ -210,7 +226,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     };
     if broker.connection_messages() {
         log_connected(
-            info.peer_addr,
+            &peer,
             &session.live.lease.id,
             if options.is_some() {
                 5
@@ -223,6 +239,15 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             connect.keep_alive,
             &identity,
             connect.is_bridge,
+        );
+    }
+    // handle_connect.c: connect__on_authorised logs the TLS session even
+    // without connection_messages.
+    if let Some((version, cipher)) = tls {
+        tracing::info!(
+            target: "mqx::notice",
+            "Client {} negotiated {version} cipher {cipher}",
+            session.live.lease.id
         );
     }
 
@@ -465,7 +490,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         wire.flush_ready().await;
     }
     if broker.connection_messages() {
-        log_disconnected(info.peer_addr, &session.live.lease.id, &result);
+        log_disconnected(&peer, &session.live.lease.id, &result);
     }
     let detached = broker
         .detach(
@@ -550,7 +575,7 @@ async fn wait_security(receiver: &mut watch::Receiver<Arc<Security>>) -> Arc<Sec
 
 enum Preparation {
     Accepted(Identity),
-    Refused(Code, R),
+    Refused(Code, R, Refusal),
     Close,
 }
 
@@ -569,6 +594,7 @@ fn prepare(
         return Ok(Preparation::Refused(
             Code::UnacceptableProtocolVersion,
             R::UNSUPPORTED_PROTOCOL_VERSION,
+            Refusal::Silent,
         ));
     }
     if let Some(will) = &connect.will {
@@ -581,7 +607,7 @@ fn prepare(
         };
         if let Some(reason) = reason {
             return Ok(if v5.is_some() {
-                Preparation::Refused(Code::NotAuthorized, reason)
+                Preparation::Refused(Code::NotAuthorized, reason, Refusal::Silent)
             } else {
                 Preparation::Close
             });
@@ -598,6 +624,9 @@ fn prepare(
             return Ok(Preparation::Refused(
                 Code::IdentifierRejected,
                 R::UNSPECIFIED_ERROR,
+                Refusal::ZeroLengthId {
+                    v31: v5.is_none() && connect.protocol == ProtocolVersion::V31,
+                },
             ));
         }
         connect.client_id = generate_id(
@@ -612,7 +641,11 @@ fn prepare(
         .as_ref()
         .is_some_and(|prefix| !connect.client_id.starts_with(prefix))
     {
-        return Ok(Preparation::Refused(Code::NotAuthorized, R::NOT_AUTHORIZED));
+        return Ok(Preparation::Refused(
+            Code::NotAuthorized,
+            R::NOT_AUTHORIZED,
+            Refusal::NotAuthorised { named: false },
+        ));
     }
     if let Some(will) = &mut connect.will {
         // handle_connect.c: will__read mounts the topic, then refuses a
@@ -630,6 +663,7 @@ fn prepare(
             return Ok(Preparation::Refused(
                 Code::NotAuthorized,
                 R::PACKET_TOO_LARGE,
+                Refusal::OversizePayload,
             ));
         }
     }
@@ -651,6 +685,7 @@ fn prepare(
             return Ok(Preparation::Refused(
                 Code::BadUserNameOrPassword,
                 R::BAD_USERNAME_OR_PASSWORD,
+                Refusal::NotAuthorised { named: true },
             ));
         }
         CertIdentity::None => (
@@ -662,7 +697,11 @@ fn prepare(
     if listener.use_username_as_clientid {
         // handle_connect.c: handle_username_as_clientid_option.
         let Some(username) = &username else {
-            return Ok(Preparation::Refused(Code::NotAuthorized, R::NOT_AUTHORIZED));
+            return Ok(Preparation::Refused(
+                Code::NotAuthorized,
+                R::NOT_AUTHORIZED,
+                Refusal::NotAuthorised { named: true },
+            ));
         };
         connect.client_id.clone_from(username);
     }
@@ -1532,21 +1571,123 @@ fn frame_size(input: &[u8]) -> Option<usize> {
     None
 }
 
-pub(super) struct Address(pub(super) Option<SocketAddr>);
+/// A peer as Mosquitto's `context->address` and `remote_port` show it.
+#[derive(Clone)]
+pub(super) struct Address {
+    pub(super) host: Option<Arc<str>>,
+    port: u16,
+}
 
-impl fmt::Display for Address {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(address) = self.0 {
-            // Mosquitto prints the address and port separately, with no IPv6 brackets.
-            write!(formatter, "{}:{}", address.ip(), address.port())
-        } else {
-            formatter.write_str("unknown:0")
+impl Address {
+    /// `text` is the transport's own address text, e.g. a Unix socket path or
+    /// a PROXY v1 source as sent; otherwise the IP is formatted like inet_ntop.
+    pub(super) fn new(peer: Option<SocketAddr>, text: Option<&str>) -> Self {
+        Self {
+            host: text
+                .map(Arc::from)
+                .or_else(|| peer.map(|peer| Arc::from(ntop(peer.ip())))),
+            port: peer.map_or(0, |peer| peer.port()),
         }
     }
 }
 
+impl fmt::Display for Address {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Mosquitto prints the address and port separately, with no IPv6 brackets.
+        let host = self.host.as_deref().unwrap_or("unknown");
+        write!(formatter, "{host}:{}", self.port)
+    }
+}
+
+// lib/net_mosq.c: net__socket_get_address uses inet_ntop, which writes an
+// IPv4-compatible or IPv4-mapped IPv6 address with a dotted suffix
+// (`::1.2.3.4`, `::ffff:1.2.3.4`) and compresses the first longest zero run.
+pub(super) fn ntop(ip: std::net::IpAddr) -> String {
+    use std::fmt::Write;
+    let ip = match ip {
+        std::net::IpAddr::V4(ip) => return ip.to_string(),
+        std::net::IpAddr::V6(ip) => ip,
+    };
+    let words = ip.segments();
+    let (mut best, mut run) = ((0, 0), (0, 0));
+    for (index, word) in words.iter().enumerate() {
+        if *word == 0 {
+            if run.1 == 0 {
+                run.0 = index;
+            }
+            run.1 += 1;
+            if run.1 > best.1 {
+                best = run;
+            }
+        } else {
+            run.1 = 0;
+        }
+    }
+    if best.1 < 2 {
+        best = (usize::MAX, 0);
+    }
+    let mut text = String::with_capacity(46);
+    for (index, word) in words.iter().enumerate() {
+        if (best.0..best.0.saturating_add(best.1)).contains(&index) {
+            if index == best.0 {
+                text.push(':');
+            }
+            continue;
+        }
+        if index != 0 {
+            text.push(':');
+        }
+        if index == 6 && best.0 == 0 && (best.1 == 6 || (best.1 == 5 && words[5] == 0xffff)) {
+            let [.., a, b, c, d] = ip.octets();
+            let _ = write!(text, "{a}.{b}.{c}.{d}");
+            return text;
+        }
+        let _ = write!(text, "{word:x}");
+    }
+    if best.0.saturating_add(best.1) == 8 {
+        text.push(':');
+    }
+    text
+}
+
+// How Mosquitto logs a refused CONNECT: handle_connect.c logs a zero-length
+// client id itself; loop.c: do_disconnect then names the reason. Before
+// handle__connect sets context->id, the line names the client by address.
+#[derive(Clone, Copy)]
+enum Refusal {
+    Silent,
+    ZeroLengthId { v31: bool },
+    NotAuthorised { named: bool },
+    OversizePayload,
+}
+
+fn log_refusal(broker: &Broker, addr: &Address, id: &str, refusal: Refusal) {
+    let host = addr.host.as_deref().unwrap_or("unknown");
+    let (id, reason) = match refusal {
+        Refusal::Silent => return,
+        Refusal::ZeroLengthId { v31 } => {
+            // handle_connect.c: handle_zero_length_clientid.
+            if v31 {
+                tracing::info!(
+                    "Protocol error from {addr}: v3.1 CONNECT with zero length clientid."
+                );
+            } else {
+                tracing::info!(
+                    "Protocol error from {addr}: CONNECT with zero length clientid when forbidden."
+                );
+            }
+            (host, "protocol error")
+        }
+        Refusal::NotAuthorised { named } => (if named { id } else { host }, "not authorised"),
+        Refusal::OversizePayload => (host, "oversize payload"),
+    };
+    if broker.connection_messages() {
+        tracing::info!(target: "mqx::notice", "Client {id} [{addr}] disconnected: {reason}.");
+    }
+}
+
 fn log_connected(
-    addr: Option<SocketAddr>,
+    addr: &Address,
     id: &str,
     protocol: u8,
     clean: bool,
@@ -1557,7 +1698,6 @@ fn log_connected(
     // handle_connect.c: connect__on_authorised logs the wire protocol version.
     let kind = if bridge { "bridge" } else { "client" };
     let clean = u8::from(clean);
-    let addr = Address(addr);
     if let Some(username) = &identity.username {
         tracing::info!(
             target: "mqx::notice",
@@ -1571,8 +1711,7 @@ fn log_connected(
     }
 }
 
-fn log_disconnected(addr: Option<SocketAddr>, id: &str, result: &Result<End, BrokerError>) {
-    let addr = Address(addr);
+fn log_disconnected(addr: &Address, id: &str, result: &Result<End, BrokerError>) {
     // loop.c: do_disconnect distinguishes an MQTT DISCONNECT from EOF/failure.
     let reason = match result {
         Ok(End::Disconnect | End::DisconnectWithWill | End::Security | End::Shutdown) => {
@@ -1596,4 +1735,40 @@ fn log_disconnected(addr: Option<SocketAddr>, id: &str, result: &Result<End, Bro
         Err(_) => "protocol error",
     };
     tracing::info!(target: "mqx::notice", "Client {id} [{addr}] disconnected: {reason}.");
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    // Expected strings come from glibc inet_ntop via Python's socket.inet_ntop.
+    #[test]
+    fn ipv6_text_matches_inet_ntop() {
+        for (input, expected) in [
+            ("::1", "::1"),
+            ("::", "::"),
+            ("::1.2.3.4", "::1.2.3.4"),
+            ("::ffff:1.2.3.4", "::ffff:1.2.3.4"),
+            ("1::", "1::"),
+            ("1:0:0:1:0:0:0:1", "1:0:0:1::1"),
+            ("1:0:0:1:0:0:1:1", "1::1:0:0:1:1"),
+            ("2001:db8::ff00:42:8329", "2001:db8::ff00:42:8329"),
+            ("::ffff:0:1.2.3.4", "::ffff:0:102:304"),
+            ("0:0:0:0:0:1:0:0", "::1:0:0"),
+            ("::0.0.0.2", "::2"),
+            ("fe80::1:0:0:0", "fe80::1:0:0:0"),
+            ("1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8"),
+            ("0:1:0:1:0:1:0:1", "0:1:0:1:0:1:0:1"),
+            ("::fffe:1.2.3.4", "::fffe:102:304"),
+        ] {
+            let ip: std::net::IpAddr = input.parse().unwrap();
+            assert_eq!(ntop(ip), expected, "{input}");
+        }
+        let peer = Some("[::1.2.3.4]:1883".parse().unwrap());
+        assert_eq!(Address::new(peer, None).to_string(), "::1.2.3.4:1883");
+        assert_eq!(
+            Address::new(None, Some("/run/mqtt.sock")).to_string(),
+            "/run/mqtt.sock:0"
+        );
+    }
 }

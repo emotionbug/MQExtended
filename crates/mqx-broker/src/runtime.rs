@@ -8,7 +8,6 @@ pub use telemetry::SocketObservation;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    net::IpAddr,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -28,8 +27,8 @@ use tokio::{
 };
 
 use crate::{
-    BrokerConfig, BrokerError, ConnectionInfo, SECURITY_REVISION, Security, SecurityHandle,
-    connection, fast,
+    BrokerConfig, BrokerError, ConnectionInfo, PeerTransport, SECURITY_REVISION, Security,
+    SecurityHandle, connection, fast,
     inbox::{Delivery, Inbox, Offer, Outbound},
     persistence::PersistentState,
     state::{
@@ -104,7 +103,7 @@ struct Runtime {
 struct Pending {
     transient: bool,
     receive_maximum: Option<u16>,
-    peer_ip: Option<IpAddr>,
+    peer_address: Option<Arc<str>>,
     live: Option<Arc<Live>>,
 }
 
@@ -115,7 +114,7 @@ pub(super) struct Live {
     pub(super) kicked: AtomicBool,
     pub(super) ready: Notify,
     bridge_queue_peak: AtomicUsize,
-    peer_ip: Option<IpAddr>,
+    peer_address: Option<Arc<str>>,
     sequence: AtomicU64,
     outbox: Mutex<Outbox>,
 }
@@ -138,7 +137,7 @@ impl Live {
         lease: Lease,
         transient: bool,
         receive_maximum: Option<u16>,
-        peer_ip: Option<IpAddr>,
+        peer_address: Option<Arc<str>>,
     ) -> Self {
         Self {
             lease,
@@ -151,7 +150,7 @@ impl Live {
             kicked: AtomicBool::new(false),
             ready: Notify::new(),
             bridge_queue_peak: AtomicUsize::new(0),
-            peer_ip,
+            peer_address,
             sequence: AtomicU64::new(0),
             outbox: Mutex::new(Outbox::default()),
         }
@@ -328,13 +327,26 @@ impl Broker {
     /// pre-CONNECT budget. `accepted_at` is the original socket accept time.
     pub async fn serve_accepted<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &self,
-        mut stream: S,
+        stream: S,
         info: ConnectionInfo,
         accepted_at: Instant,
     ) -> Result<(), BrokerError> {
-        let permit = self.admit(&info);
+        self.serve_accepted_with(stream, info, accepted_at, PeerTransport::default())
+            .await
+    }
+
+    /// As [`Self::serve_accepted`], with transport details Mosquitto logs.
+    pub async fn serve_accepted_with<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        &self,
+        mut stream: S,
+        info: ConnectionInfo,
+        accepted_at: Instant,
+        transport: PeerTransport<'_>,
+    ) -> Result<(), BrokerError> {
+        let peer = connection::Address::new(info.peer_addr, transport.address);
+        let permit = self.admit(&info, &peer);
         let result = if permit.is_some() {
-            connection::serve(self, &mut stream, info, accepted_at).await
+            connection::serve(self, &mut stream, info, accepted_at, peer, transport.tls).await
         } else {
             Ok(())
         };
@@ -458,7 +470,7 @@ impl Broker {
     }
 
     // net.c: net__socket_accept checks accepted sockets, before MQTT CONNECT.
-    fn admit(&self, info: &ConnectionInfo) -> Option<Permit<'_>> {
+    fn admit(&self, info: &ConnectionInfo, peer: &connection::Address) -> Option<Permit<'_>> {
         if *self.0.shutdown.borrow() {
             return None;
         }
@@ -471,9 +483,11 @@ impl Broker {
                 && runtime.listeners.get(&key).copied().unwrap_or(0) >= listener_limit)
         {
             if self.connection_messages() {
+                // net.c: net__socket_accept logs the address only, as a notice.
                 tracing::info!(
+                    target: "mqx::notice",
                     "Client connection from {} denied: max_connections exceeded.",
-                    connection::Address(info.peer_addr)
+                    peer.host.as_deref().unwrap_or("unknown")
                 );
             }
             return None;
@@ -493,7 +507,7 @@ impl Broker {
         &self,
         security: &SecurityHandle,
         mut claim: Claim,
-        peer_ip: Option<IpAddr>,
+        peer_address: Option<Arc<str>>,
     ) -> Result<ClaimResult, BrokerError> {
         let transient = claim.local_inbox();
         let receive_maximum = claim
@@ -531,7 +545,12 @@ impl Broker {
                     Reply::DynamicSecurityChanged => return Ok(ClaimResult::Unauthorized),
                     _ => unreachable!(),
                 };
-                let live = Arc::new(Live::new(lease, transient, receive_maximum, peer_ip));
+                let live = Arc::new(Live::new(
+                    lease,
+                    transient,
+                    receive_maximum,
+                    peer_address.clone(),
+                ));
                 runtime.live.insert(live.lease.epoch, live.clone());
                 self.schedule_local_expiry(&mut runtime);
                 Ok(ClaimResult::Accepted(live, present))
@@ -548,7 +567,7 @@ impl Broker {
                         Pending {
                             transient,
                             receive_maximum,
-                            peer_ip,
+                            peer_address: peer_address.clone(),
                             live: None,
                         },
                     );
@@ -618,7 +637,12 @@ impl Broker {
                         if !machine.state.owns(log.owner, &lease) {
                             return None;
                         }
-                        let live = Arc::new(Live::new(lease, transient, receive_maximum, peer_ip));
+                        let live = Arc::new(Live::new(
+                            lease,
+                            transient,
+                            receive_maximum,
+                            peer_address.clone(),
+                        ));
                         if machine.state.has_reserved_outbound(&live.lease) {
                             live.interrupt_outbound();
                         }
@@ -1447,7 +1471,7 @@ impl Runtime {
                             lease,
                             pending.transient,
                             pending.receive_maximum,
-                            pending.peer_ip,
+                            pending.peer_address.clone(),
                         ));
                         self.live.insert(live.lease.epoch, live.clone());
                         pending.live = Some(live);
