@@ -416,6 +416,15 @@ pub(crate) enum Connection {
     Tls(TlsStream<TcpStream>),
 }
 
+impl Connection {
+    pub(crate) fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => stream.get_ref().0,
+        }
+    }
+}
+
 impl AsyncRead for Connection {
     fn poll_read(
         self: Pin<&mut Self>,

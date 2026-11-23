@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
+#[cfg(unix)]
+use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -59,11 +61,22 @@ impl Client {
     pub(crate) fn start(stream: Connection, limits: Limits) -> Arc<Self> {
         let (calls, rx) = mpsc::channel(IN_FLIGHT);
         let permits = Arc::new(Semaphore::new(IN_FLIGHT));
+        // A second descriptor for the same socket, only to look for the
+        // peer's FIN without disturbing the TLS reader.
+        #[cfg(unix)]
+        let probe = stream
+            .tcp()
+            .as_fd()
+            .try_clone_to_owned()
+            .ok()
+            .map(std::net::TcpStream::from);
+        #[cfg(not(unix))]
+        let probe = None;
         let task = tokio::spawn(async move {
             let (rx_socket, tx_socket) = tokio::io::split(stream);
             let pending = Pending::default();
             tokio::select! {
-                result = Self::write_calls(tx_socket, rx, &pending) => {
+                result = Self::write_calls(tx_socket, rx, &pending, probe.as_ref()) => {
                     if let Err(error) = result { tracing::trace!(%error, "cluster session writer closed"); }
                 },
                 result = Self::read_replies(rx_socket, limits, &pending) => {
@@ -115,6 +128,7 @@ impl Client {
         mut writer: impl AsyncWriteExt + Unpin,
         mut calls: mpsc::Receiver<Call>,
         pending: &Pending,
+        probe: Option<&std::net::TcpStream>,
     ) -> io::Result<()> {
         let mut sequence = 0u64;
         while let Some(mut call) = calls.recv().await {
@@ -125,6 +139,16 @@ impl Client {
             if Instant::now() >= call.deadline {
                 let _ = reply.send(Err(CallError::Unsent(io::ErrorKind::TimedOut.into())));
                 continue;
+            }
+            // Peers never half-close a session, so once their FIN has arrived
+            // nothing written afterwards can be read. A leader killed just
+            // before this call is then a definite failure the caller may
+            // retry on the next leader, not an uncertain write.
+            if probe.is_some_and(peer_closed) {
+                let _ = reply.send(Err(CallError::Unsent(
+                    io::ErrorKind::ConnectionReset.into(),
+                )));
+                return Err(io::ErrorKind::ConnectionReset.into());
             }
             sequence = sequence
                 .checked_add(1)
@@ -195,6 +219,18 @@ impl Drop for Client {
     }
 }
 
+// The socket is non-blocking. A FIN with nothing left to read peeks as 0
+// bytes, and an RST as an error; unread replies hide a later FIN.
+fn peer_closed(socket: &std::net::TcpStream) -> bool {
+    match socket.peek(&mut [0]) {
+        Ok(read) => read == 0,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
+    }
+}
+
 pub(crate) struct Response {
     pub(crate) id: u64,
     pub(crate) body: io::Result<Bytes>,
@@ -226,4 +262,40 @@ pub(crate) async fn write_responses(
         .map_err(|_| io::ErrorKind::TimedOut)??;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    // A leader that died before the request was written never read it. On a
+    // single-threaded runtime the writer and reader of a new session race to
+    // notice the closed socket; either way the call must be retryable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_call_after_the_peer_closed_is_unsent() {
+        let limits = Limits {
+            command: 1024,
+            append: 1024,
+            mesh: 1024,
+        };
+        for _ in 0..32 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            drop(listener.accept().unwrap());
+            // Loopback delivers the FIN before this returns.
+            let mut probe = [0];
+            assert_eq!(stream.peek(&mut probe).unwrap(), 0);
+            stream.set_nonblocking(true).unwrap();
+            let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+            let client = Client::start(Connection::Plain(stream), limits);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = client
+                .call(Op::Write, Bytes::from_static(b"command"), deadline)
+                .await;
+            assert!(
+                matches!(result, Err(CallError::Unsent(_))),
+                "a write was reported uncertain"
+            );
+        }
+    }
 }

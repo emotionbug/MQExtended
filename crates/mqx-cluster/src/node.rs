@@ -681,6 +681,7 @@ impl<S: StateMachine> Core<S> {
         let mut next = Instant::now();
         let mut last_renewal = next;
         let mut next_probe = next;
+        let mut lapsed = false;
         loop {
             tokio::select! {
                 retired = async { applied.wait_for(|status| status.retired.contains(&node_id)).await.is_ok() } => {
@@ -707,6 +708,19 @@ impl<S: StateMachine> Core<S> {
             } else {
                 false
             };
+            // Admission closes at the local deadline even while a renewal is
+            // in flight; report each gap, however short.
+            if !lapsed
+                && self
+                    .safe_until
+                    .borrow()
+                    .is_some_and(|until| until <= Instant::now())
+            {
+                lapsed = true;
+                tracing::warn!(
+                    "Cluster lease expired; refusing new MQTT clients until a quorum renews it."
+                );
+            }
             if renewed && self.is_voter(node_id) {
                 last_renewal = Instant::now();
                 // The leader's expiry clock cannot start before we issue this
@@ -721,6 +735,9 @@ impl<S: StateMachine> Core<S> {
                     }
                     changed
                 });
+                if std::mem::take(&mut lapsed) {
+                    tracing::info!("Cluster lease renewed; admitting MQTT clients again.");
+                }
             } else {
                 if last_renewal.elapsed() >= self.lease_timeout {
                     self.serving.send_if_modified(|state| {
