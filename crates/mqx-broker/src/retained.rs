@@ -45,22 +45,65 @@ impl Retained {
         filter: &str,
         now: Duration,
         dollar_root: bool,
-        mut visit: impl FnMut(&Arc<Message>),
-    ) {
-        let mut levels = filter.split('/');
-        if dollar_root && filter.starts_with('$') {
-            // retain.c: retain__search starts a dollar topic at level zero,
-            // where `/#` includes the parent only if it has children.
-            if let Some(branch) = self.dollar.children.get_mut(levels.next().unwrap()) {
-                branch.search(levels, false, now, &mut visit);
+        mut visit: impl FnMut(&Arc<Message>) -> bool,
+    ) -> bool {
+        let mut expired = Vec::new();
+        let complete = self.search(filter, dollar_root, |message| {
+            if message.expires.is_some_and(|at| at <= now) {
+                expired.push(message.clone());
+                true
+            } else {
+                visit(message)
             }
-        } else {
-            let root = if filter.starts_with('$') {
+        });
+        // retain.c: retain__delete_expired_msg removes the message, not the branch.
+        for message in expired {
+            let mut root = if message.topic.starts_with('$') {
                 &mut self.dollar
             } else {
                 &mut self.ordinary
             };
-            root.search(levels, true, now, &mut visit);
+            for level in message.topic.split('/') {
+                root = root.children.get_mut(level).unwrap();
+            }
+            root.message = None;
+        }
+        complete
+    }
+
+    pub(crate) fn inspect(
+        &self,
+        filter: &str,
+        now: Duration,
+        dollar_root: bool,
+        mut visit: impl FnMut(&Arc<Message>) -> bool,
+    ) -> bool {
+        self.search(filter, dollar_root, |message| {
+            message.expires.is_some_and(|at| at <= now) || visit(message)
+        })
+    }
+
+    fn search(
+        &self,
+        filter: &str,
+        dollar_root: bool,
+        mut visit: impl FnMut(&Arc<Message>) -> bool,
+    ) -> bool {
+        let mut levels = filter.split('/');
+        if dollar_root && filter.starts_with('$') {
+            // retain.c: retain__search starts a dollar topic at level zero,
+            // where `/#` includes the parent only if it has children.
+            self.dollar
+                .children
+                .get(levels.next().unwrap())
+                .is_none_or(|branch| branch.search(levels, false, &mut visit))
+        } else {
+            let root = if filter.starts_with('$') {
+                &self.dollar
+            } else {
+                &self.ordinary
+            };
+            root.search(levels, true, &mut visit)
         }
     }
 
@@ -102,48 +145,32 @@ impl Branch {
     // retain.c: retain__search visits children in insertion order, and `#`
     // visits descendants before the parent that matched without a suffix.
     fn search(
-        &mut self,
+        &self,
         mut levels: Split<'_, char>,
         include_leaf_for_hash: bool,
-        now: Duration,
-        visit: &mut impl FnMut(&Arc<Message>),
-    ) {
+        visit: &mut impl FnMut(&Arc<Message>) -> bool,
+    ) -> bool {
         match levels.next() {
-            None => self.visit_message(now, visit),
+            None => self.message.as_ref().is_none_or(visit),
             Some("#") => {
-                for child in self.children.values_mut() {
-                    child.visit_tree(now, visit);
-                }
-                if include_leaf_for_hash || !self.children.is_empty() {
-                    self.visit_message(now, visit);
-                }
+                self.children.values().all(|child| child.visit_tree(visit))
+                    && ((!include_leaf_for_hash && self.children.is_empty())
+                        || self.message.as_ref().is_none_or(visit))
             }
-            Some("+") => {
-                for child in self.children.values_mut() {
-                    child.search(levels.clone(), true, now, visit);
-                }
-            }
-            Some(level) => {
-                if let Some(child) = self.children.get_mut(level) {
-                    child.search(levels, true, now, visit);
-                }
-            }
+            Some("+") => self
+                .children
+                .values()
+                .all(|child| child.search(levels.clone(), true, visit)),
+            Some(level) => self
+                .children
+                .get(level)
+                .is_none_or(|child| child.search(levels, true, visit)),
         }
     }
 
-    fn visit_tree(&mut self, now: Duration, visit: &mut impl FnMut(&Arc<Message>)) {
-        self.visit_message(now, visit);
-        for child in self.children.values_mut() {
-            child.visit_tree(now, visit);
-        }
-    }
-
-    fn visit_message(&mut self, now: Duration, visit: &mut impl FnMut(&Arc<Message>)) {
-        // retain.c: retain__delete_expired_msg uses >=, unlike the inbox.
-        self.delete_expired(now);
-        if let Some(message) = &self.message {
-            visit(message);
-        }
+    fn visit_tree(&self, visit: &mut impl FnMut(&Arc<Message>) -> bool) -> bool {
+        self.message.as_ref().is_none_or(&mut *visit)
+            && self.children.values().all(|child| child.visit_tree(visit))
     }
 
     fn delete_expired(&mut self, now: Duration) -> bool {

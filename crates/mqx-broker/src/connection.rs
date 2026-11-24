@@ -11,8 +11,11 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
-use mqx_auth::DynamicSecurity;
+use bytes::{Buf, Bytes, BytesMut};
+use mqx_auth::{
+    DynamicSecurity,
+    external::{Binding, Verdict},
+};
 use mqx_codec::v5::{self as codec5, Packet as Packet5, Property, ReasonCode as R};
 use mqx_codec::{
     ConnAck, Connect, ConnectReturnCode as Code, DecodeContext, DecodeError, Packet,
@@ -149,15 +152,20 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let dynamic_security_revision = dynamic.as_ref().map(|(revision, _)| *revision);
     let dynamic = listener.security.1.zip(dynamic.map(|(_, policy)| policy));
     let security_snapshot = security.borrow_and_update().clone();
-    if !identity
-        .authorized(
+    let (verdict, credentials) = identity
+        .authenticate(
             &listener.security,
             &client_id,
             security_snapshot,
             dynamic.as_ref(),
         )
-        .await
-    {
+        .await;
+    // handle_connect.c: handle__connect sends CONNACK Not Authorized only
+    // for an auth refusal, not a backend error.
+    if verdict == Verdict::Error {
+        return Ok(());
+    }
+    if verdict != Verdict::Allow {
         log_refusal(
             broker,
             &peer,
@@ -184,6 +192,16 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         username: identity.username.clone(),
         security: 0, // Filled by the log backend before claiming the session.
         dynamic_security: listener.security.1,
+        external: listener.security.3.as_ref().map(|(id, _)| {
+            (
+                *id,
+                Binding {
+                    credentials,
+                    certificate: identity.certificate,
+                    synthetic: false,
+                },
+            )
+        }),
     };
     let (live, present) = match broker
         .claim(
@@ -198,6 +216,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 now: Duration::ZERO, // Filled by the log backend when proposing.
                 internal_bridge: None,
                 dynamic_security_revision,
+                verdicts: Vec::new(),
             },
             peer.host.clone(),
         )
@@ -292,6 +311,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut prefer_input = false;
     let mut deferred = None;
     let clustered = broker.is_clustered();
+    // External WRITE errors must stop the stream at the rejected packet.
+    let pipeline_enabled = clustered && listener.security.3.is_none();
     let result = 'active: loop {
         if session.live.taken.load(Ordering::Acquire) {
             break Ok(if session.live.kicked.load(Ordering::Relaxed) {
@@ -355,7 +376,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     partial_bytes = 0;
                     deadline = self::deadline(connect.keep_alive);
                     let packet_bytes = input_bytes - wire.input.len();
-                    let step = if clustered
+                    let step = if pipeline_enabled
                         && packet_bytes < pipeline::PREFETCH_BYTES
                         && wire.input.first().is_some_and(|byte| byte >> 4 == 3)
                         && pipeline::eligible(&packet, listener, config)
@@ -435,15 +456,15 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    // handle_subscribe.c and handle_unsubscribe.c: filters before
-                    // the invalid one already took effect; no SUBACK is sent.
-                    match wire.filter_prefix.take() {
+                    // Earlier filters are still processed. Their ACL error can
+                    // stop the handler before it reaches the malformed filter.
+                    let step = match wire.filter_prefix.take() {
                         Some(Frame::Legacy(packet)) => {
-                            let _ = session.process(packet, &info, connect.protocol).await;
+                            session.process(packet, &info, connect.protocol).await
                         }
                         Some(Frame::V5(packet)) => {
                             let mut aliases = wire.v5.take().unwrap();
-                            let _ = session
+                            let step = session
                                 .process_v5(
                                     packet,
                                     &info,
@@ -452,8 +473,22 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                                 )
                                 .await;
                             wire.v5 = Some(aliases);
+                            step
                         }
-                        None => {}
+                        None => break Err(error),
+                    };
+                    match step {
+                        Ok(Step::End(End::ExternalAcl)) => break Ok(End::ExternalAcl),
+                        Ok(Step::Continue) => {
+                            let size = frame_size(&wire.input).expect("complete filter packet");
+                            wire.input.advance(size);
+                            deadline = self::deadline(connect.keep_alive);
+                            partial_bytes = 0;
+                            delivering = true;
+                            prefer_input = false;
+                            continue;
+                        }
+                        _ => {}
                     }
                     break Err(error);
                 }
@@ -530,28 +565,32 @@ struct Identity {
     username: Option<Arc<str>>,
     password: Option<Bytes>,
     certificate: bool,
+    certificate_username: bool,
     allow_anonymous: bool,
 }
 
 impl Identity {
-    async fn authorized(
+    async fn authenticate(
         &self,
         security: &SecurityHandle,
         client_id: &Arc<str>,
         snapshot: Arc<Security>,
         dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
-    ) -> bool {
+    ) -> (Verdict, bool) {
+        if self.certificate_username {
+            return (Verdict::Allow, false);
+        }
         let anonymous = security.anonymous(&snapshot, self.allow_anonymous);
-        self.certificate
-            || snapshot
-                .authenticate(
-                    client_id,
-                    self.username.as_ref(),
-                    self.password.as_ref(),
-                    anonymous,
-                    dynamic,
-                )
-                .await
+        snapshot
+            .authenticate(
+                client_id,
+                self.username.as_ref(),
+                self.password.as_ref(),
+                anonymous,
+                dynamic,
+                security.3.as_ref().map(|(_, plugin)| plugin.as_ref()),
+            )
+            .await
     }
 
     async fn reauthenticate(
@@ -561,13 +600,20 @@ impl Identity {
         client_id: &Arc<str>,
         snapshot: Arc<Security>,
     ) -> bool {
+        // security_default.c: reload disconnects anonymous contexts before
+        // consulting callbacks when anonymous access has been disabled.
+        if self.username.is_none() && !security.anonymous(&snapshot, self.allow_anonymous) {
+            return false;
+        }
         let dynamic = security.1.zip(
             broker
                 .dynamic_policy_snapshot(security)
                 .map(|(_, policy)| policy),
         );
-        self.authorized(security, client_id, snapshot, dynamic.as_ref())
-            .await
+        let (verdict, _) = self
+            .authenticate(security, client_id, snapshot, dynamic.as_ref())
+            .await;
+        verdict == Verdict::Allow
     }
 }
 
@@ -676,7 +722,7 @@ fn prepare(
     // proxy_v2.c and handle_connect.c: handle_username_from_cert_options
     // discard MQTT credentials for both certificate sources, but only a
     // locally verified TLS identity bypasses mosquitto_basic_auth.
-    let (username, password, certificate) = match &info.cert_identity {
+    let (username, password, certificate_username) = match &info.cert_identity {
         CertIdentity::Username(username) if !username.contains('\0') => {
             (Some(username.clone()), None, true)
         }
@@ -694,7 +740,7 @@ fn prepare(
                 Refusal::NotAuthorised { named: true },
             ));
         }
-        CertIdentity::None => (
+        CertIdentity::None | CertIdentity::Presented => (
             connect.username.take().filter(|value| !value.is_empty()),
             connect.password.take().filter(|value| !value.is_empty()),
             false,
@@ -714,7 +760,8 @@ fn prepare(
     Ok(Preparation::Accepted(Identity {
         username: username.map(Arc::from),
         password,
-        certificate,
+        certificate: certificate_username || matches!(info.cert_identity, CertIdentity::Presented),
+        certificate_username,
         allow_anonymous: listener.allow_anonymous.unwrap_or(config.allow_anonymous),
     }))
 }
@@ -1047,6 +1094,12 @@ fn action_result(reply: Reply) -> Result<Step, BrokerError> {
         | Reply::ControlAccepted { .. }
         | Reply::PublishReason(_)
         | Reply::Unsubscribed(_) => Ok(Step::Continue),
+        // handle_subscribe.c: retain__queue failure aborts the packet without
+        // a SUBACK, but the caller keeps the connection and queued deliveries.
+        Reply::RetainedAclError => Ok(Step::Continue),
+        // handle_publish.c and handle_subscribe.c return the callback error
+        // without an ACK, and read_handle.c sends no MQTT 5 DISCONNECT for it.
+        Reply::ExternalAclError => Ok(Step::End(End::ExternalAcl)),
         Reply::Stale => Ok(Step::End(End::Takeover)),
         Reply::ProtocolError => Err(BrokerError::Protocol),
         _ => unreachable!(),
@@ -1077,6 +1130,7 @@ enum End {
     Eof,
     Timeout,
     Security,
+    ExternalAcl,
     Shutdown,
     Takeover,
     Kicked,
@@ -1731,6 +1785,7 @@ fn log_disconnected(addr: &Address, id: &str, result: &Result<End, BrokerError>)
         Ok(End::Timeout) => "exceeded timeout",
         Ok(End::Takeover) => "session taken over",
         Ok(End::Kicked) => "administrative action",
+        Ok(End::ExternalAcl) => "external ACL error",
         Ok(End::Unsupported) => {
             "used disallowed feature (QoS too high, retain not supported, or bad AUTH method)"
         }

@@ -17,6 +17,8 @@ pub(crate) struct DynamicControl {
     pub(crate) payload_len: usize,
     pub(crate) qos: QoS,
     pub(crate) now: Duration,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verdicts: Vec<ResolvedVerdict>,
 }
 
 impl State {
@@ -44,8 +46,17 @@ impl State {
         origin: Owner,
         lease: &Lease,
         payload_len: usize,
+        now: Duration,
+        verdicts: &[ResolvedVerdict],
     ) -> Result<(), Reply> {
-        self.check_control(origin, lease, DYNSEC_CONTROL_TOPIC, payload_len)?;
+        self.check_control(
+            origin,
+            lease,
+            DYNSEC_CONTROL_TOPIC,
+            payload_len,
+            now,
+            verdicts,
+        )?;
         if self.dynamic_security.is_none() {
             Err(Reply::PublishReason(R::IMPLEMENTATION_SPECIFIC_ERROR.0))
         } else {
@@ -66,10 +77,16 @@ impl State {
             payload_len,
             qos,
             now,
+            mut verdicts,
         } = control;
-        let checked = self.check_dynamic_control(origin, &lease, payload_len);
+        ResolvedVerdict::sort(&mut verdicts);
+        let checked = self.check_dynamic_control(origin, &lease, payload_len, now, &verdicts);
         if checked == Err(Reply::Stale) {
             return Reply::Stale;
+        }
+        self.verdicts.insert(&verdicts, now);
+        if checked == Err(Reply::ExternalAclError) {
+            return Reply::ExternalAclError;
         }
         let accepted = checked.is_ok() && request.is_some();
         let session = self.sessions.get_mut(&lease.id).unwrap();
@@ -100,13 +117,14 @@ impl State {
         // non-retained QoS 0 broker publication. Route it in this same entry:
         // each replica delivers only its own transport effects, and a lost
         // proposal reply cannot cause the origin to publish it a second time.
-        self.publish(
+        self.publish_with_verdicts(
             Arc::new(Message {
                 source: Publisher {
                     id: Arc::from(""),
                     username: None,
                     security: 0,
                     dynamic_security: None,
+                    external: None,
                 },
                 topic: DYNSEC_RESPONSE_TOPIC.into(),
                 payload: Bytes::from(result.response),
@@ -115,7 +133,7 @@ impl State {
                 properties: Vec::new(),
                 expires: None,
             }),
-            now,
+            VerdictContext::new(now),
             effects,
         );
         if !result.kicks.is_empty() {
@@ -134,7 +152,13 @@ impl State {
     ) {
         let usernames: Vec<_> = usernames.iter().map(Option::as_deref).collect();
         let mut kicked = Vec::new();
-        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
+        let acl = Acls::new(
+            &self.acls,
+            self.dynamic_security.as_ref(),
+            &self.external_plugins,
+            &self.verdicts,
+            VerdictContext::new(now),
+        );
         for (id, session) in &mut self.sessions {
             if session.owner.is_none()
                 || session.internal_bridge.is_some()
@@ -148,7 +172,9 @@ impl State {
             // from persistent sessions using the new policy, then discards the will.
             if session.inbox.is_some() {
                 session.filters.retain(|filter, _| {
-                    if acl.allowed(&session.publisher, filter, Access::Subscribe) {
+                    if acl.check(&session.publisher, filter, Access::Subscribe, false, None)
+                        == AclDecision::Allow
+                    {
                         return true;
                     }
                     remove_filter(

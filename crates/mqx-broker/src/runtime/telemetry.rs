@@ -90,7 +90,7 @@ impl Broker {
         SocketObservation(self.clone())
     }
 
-    fn read_state<R>(&self, read: impl FnOnce(&State) -> R) -> R {
+    pub(super) fn read_state<R>(&self, read: impl FnOnce(&State) -> R) -> R {
         match &self.0.log {
             Log::Local { .. } => {
                 read(&self.0.runtime.lock().unwrap().local.as_ref().unwrap().state)

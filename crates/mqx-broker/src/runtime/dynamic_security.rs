@@ -4,10 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mqx_auth::{Access, DynamicSecurity, DynsecRequest};
+use mqx_auth::{
+    Access, DynamicSecurity, DynsecRequest,
+    external::{AclAccess, Binding, Subject, Verdict},
+};
 
 use super::*;
-use crate::{security_callbacks, state::DynamicControl};
+use crate::{external_acl_precheck, security_callbacks, state::DynamicControl};
 
 impl Broker {
     /// Installs this node's JSON destination and uses `initial` only if no
@@ -153,7 +156,8 @@ impl Broker {
             self.dynamic_policy_snapshot(security)
                 .map(|(_, policy)| policy),
         );
-        if !file
+        let plugin = security.3.as_ref().map(|(_, plugin)| plugin.as_ref());
+        let (verdict, credentials) = file
             .clone()
             .authenticate(
                 &client_id,
@@ -161,12 +165,38 @@ impl Broker {
                 password.as_ref(),
                 allow_anonymous,
                 dynamic.as_ref(),
+                plugin,
             )
-            .await
-        {
+            .await;
+        if verdict != Verdict::Allow {
             return false;
         }
         let user = username.as_deref();
+        if let Some(plugin) = plugin {
+            // plugin_acl_check.c: URL READ uses the same reserved-topic rules.
+            if url.starts_with("$share") || !external_acl_precheck(plugin, &client_id, user) {
+                return false;
+            }
+            let subject = Subject {
+                client_id: &client_id,
+                username: user,
+                binding: Binding {
+                    credentials,
+                    ..Binding::default()
+                },
+            };
+            if let Some(identity) = plugin.acl_identity(subject) {
+                match plugin
+                    .authorize(&identity, url, AclAccess::Read)
+                    .await
+                    .verdict
+                {
+                    Verdict::Allow => return true,
+                    Verdict::Deny | Verdict::Error => return false,
+                    Verdict::Defer => {}
+                }
+            }
+        }
         security_callbacks(
             security.1,
             || {
@@ -180,7 +210,7 @@ impl Broker {
                     .and_then(|(_, policy)| policy.authorize(&client_id, user, url, Access::Read))
             },
         )
-        .unwrap_or(security.1.is_none())
+        .unwrap_or(security.1.is_none() && plugin.is_none())
     }
 
     pub(super) async fn receive_dynamic_control(
@@ -188,6 +218,8 @@ impl Broker {
         live: &Live,
         publication: Publication,
     ) -> Result<Reply, BrokerError> {
+        let verdicts = self.resolve_write(&live.lease, &publication).await;
+        let now = publication.now;
         let payload = publication.packet.payload;
         let payload_len = payload.len();
         let (origin, admission) = match &self.0.log {
@@ -197,26 +229,36 @@ impl Broker {
                 local.update_security(None);
                 (
                     Owner::LOCAL,
-                    local
-                        .state
-                        .check_dynamic_control(Owner::LOCAL, &live.lease, payload_len),
+                    local.state.check_dynamic_control(
+                        Owner::LOCAL,
+                        &live.lease,
+                        payload_len,
+                        now,
+                        &verdicts,
+                    ),
                 )
             }
             Log::Replicated(log) => (
                 log.owner,
                 log.cluster.read(|machine| {
-                    machine
-                        .state
-                        .check_dynamic_control(log.owner, &live.lease, payload_len)
+                    machine.state.check_dynamic_control(
+                        log.owner,
+                        &live.lease,
+                        payload_len,
+                        now,
+                        &verdicts,
+                    )
                 }),
             ),
         };
-        if admission == Err(Reply::Stale) {
-            return Ok(Reply::Stale);
-        }
+        let allowed = match admission {
+            Ok(()) => true,
+            Err(reply @ (Reply::Stale | Reply::ExternalAclError)) => return Ok(reply),
+            Err(_) => false,
+        };
         // Never hash passwords from publications that fail the local WRITE ACL,
         // and never replicate the unprepared payload, including on rejection.
-        let request = if admission.is_ok() {
+        let request = if allowed {
             let request = tokio::task::spawn_blocking(move || DynsecRequest::prepare(&payload))
                 .await
                 .map_err(io::Error::other)?
@@ -251,7 +293,8 @@ impl Broker {
                 request,
                 payload_len,
                 qos,
-                now: publication.now,
+                now,
+                verdicts,
             }))
             .await?;
         live.credit_control(qos, &reply);

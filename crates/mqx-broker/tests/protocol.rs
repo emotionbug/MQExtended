@@ -25,6 +25,7 @@ use tokio::{
 };
 
 mod cluster;
+mod external;
 
 const Q0: QoS = QoS::AtMostOnce;
 const Q1: QoS = QoS::AtLeastOnce;

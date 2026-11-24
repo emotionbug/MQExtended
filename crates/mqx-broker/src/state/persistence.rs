@@ -195,6 +195,7 @@ impl State {
                     will_at: None,
                     internal_bridge: entry.bridge,
                     clean_start: false,
+                    pending: VecDeque::new(),
                 },
             );
         }

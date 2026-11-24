@@ -162,6 +162,7 @@ impl State {
                     username: None,
                     security: 0,
                     dynamic_security: None,
+                    external: None,
                 },
                 topic: topic.into(),
                 payload,

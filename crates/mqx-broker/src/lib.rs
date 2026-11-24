@@ -21,7 +21,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use mqx_auth::{AclFile, AclFileError, BasicAuth, DynamicSecurity, PasswordFile};
+use mqx_auth::{
+    AclFile, AclFileError, BasicAuth, DynamicSecurity, PasswordFile,
+    external::{ExternalSecurity, Verdict},
+};
 use mqx_cluster::ClusterError;
 use mqx_codec::{DecodeError, EncodeError, QoS};
 use serde::{Deserialize, Serialize};
@@ -210,8 +213,26 @@ impl Security {
         password: Option<&Bytes>,
         allow_anonymous: bool,
         dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
-    ) -> bool {
-        if username.is_some()
+        external: Option<&dyn ExternalSecurity>,
+    ) -> (Verdict, bool) {
+        // plugin_basic_auth.c: the first callback that doesn't defer wins.
+        let credentials = if let Some(plugin) = external {
+            let username = username.map(Arc::as_ref);
+            let password = password.map(|bytes| &bytes[..]);
+            let credentials = username.is_some_and(|name| !name.is_empty())
+                && password
+                    .and_then(|bytes| bytes.first())
+                    .is_some_and(|&byte| byte != 0);
+            let verdict = plugin.authenticate(client_id, username, password).await;
+            if verdict != Verdict::Defer {
+                return (verdict, credentials);
+            }
+            credentials
+        } else {
+            false
+        };
+        let deferred = external.is_some();
+        let allowed = if username.is_some()
             && password.is_some()
             && (self.password.is_some() || dynamic.is_some())
         {
@@ -226,6 +247,7 @@ impl Security {
                     password.as_deref(),
                     allow_anonymous,
                     dynamic.as_ref(),
+                    deferred,
                 )
             })
             .await
@@ -237,8 +259,15 @@ impl Security {
                 password.map(AsRef::as_ref),
                 allow_anonymous,
                 dynamic,
+                deferred,
             )
-        }
+        };
+        let verdict = if allowed {
+            Verdict::Allow
+        } else {
+            Verdict::Deny
+        };
+        (verdict, credentials)
     }
 
     fn basic_auth(
@@ -248,6 +277,7 @@ impl Security {
         password: Option<&[u8]>,
         allow_anonymous: bool,
         dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
+        deferred: bool,
     ) -> bool {
         let file = || match self.password.as_ref()?.check(username, password) {
             BasicAuth::Allow => Some(true),
@@ -258,7 +288,7 @@ impl Security {
         // plugin_basic_auth.c: unlike an ignored password-file callback, a
         // deferred callback can fall back to allow_anonymous only for no user.
         security_callbacks(dynamic.map(|(order, _)| *order), file, policy)
-            .unwrap_or(allow_anonymous && (dynamic.is_none() || username.is_none()))
+            .unwrap_or(allow_anonymous && ((!deferred && dynamic.is_none()) || username.is_none()))
     }
 }
 
@@ -274,6 +304,17 @@ fn security_callbacks(
     }
 }
 
+// plugin_acl_check.c: acl__pre_check precedes the v4 ACL callback.
+pub(crate) fn external_acl_precheck(
+    plugin: &dyn ExternalSecurity,
+    client_id: &str,
+    username: Option<&str>,
+) -> bool {
+    !plugin.deny_special_chars()
+        || (!client_id.contains(['+', '#', '/'])
+            && !username.is_some_and(|user| user.contains(['+', '#', '/'])))
+}
+
 struct SharedSecurity {
     id: u64,
     stable_id: Option<u64>,
@@ -286,7 +327,12 @@ static SECURITY_REVISION: AtomicU64 = AtomicU64::new(0);
 /// Reloadable security callbacks. Listeners sharing password/ACL files share a
 /// handle; dynamic security state is owned by the broker, not by the handle.
 #[derive(Clone)]
-pub struct SecurityHandle(Arc<SharedSecurity>, Option<bool>, usize);
+pub struct SecurityHandle(
+    Arc<SharedSecurity>,
+    Option<bool>,
+    usize,
+    Option<(u32, Arc<dyn ExternalSecurity>)>,
+);
 
 impl std::fmt::Debug for SecurityHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -294,6 +340,7 @@ impl std::fmt::Debug for SecurityHandle {
             .debug_struct("SecurityHandle")
             .field("cluster_id", &self.0.stable_id)
             .field("dynamic_security_before_file", &self.1)
+            .field("external_plugin_id", &self.3.as_ref().map(|(id, _)| id))
             .finish_non_exhaustive()
     }
 }
@@ -340,6 +387,7 @@ impl SecurityHandle {
             }),
             None,
             0,
+            None,
         )
     }
 
@@ -347,6 +395,13 @@ impl SecurityHandle {
     /// `before_file` places them before password/ACL file callbacks.
     pub fn with_dynamic_security(mut self, before_file: bool) -> Self {
         self.1 = Some(before_file);
+        self
+    }
+
+    /// Runs this listener's external security plugin before the file callbacks.
+    /// Use the same plugin ID for this configuration on every cluster node.
+    pub fn with_external(mut self, id: u32, plugin: Arc<dyn ExternalSecurity>) -> Self {
+        self.3 = Some((id, plugin));
         self
     }
 
@@ -412,6 +467,8 @@ pub enum CertIdentity {
     None,
     /// Username from a locally verified TLS client certificate.
     Username(String),
+    /// A local TLS client certificate with no username mapping.
+    Presented,
     /// Username asserted by PROXY v2; it does not satisfy basic authentication.
     ForwardedUsername(String),
     MissingOrInvalid,

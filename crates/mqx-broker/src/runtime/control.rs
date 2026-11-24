@@ -33,6 +33,7 @@ impl Broker {
         {
             return self.receive_dynamic_control(live, publication).await;
         }
+        let verdicts = self.resolve_write(&live.lease, &publication).await;
         let inventory = self.0.control_inventory.get().filter(|_| topic == TOPIC);
         let packet = publication.packet;
         let origin = match &self.0.log {
@@ -42,7 +43,14 @@ impl Broker {
         let payload_len = packet.payload.len();
         let response = if let Some(inventory) = inventory {
             let check = |state: &State| {
-                state.admit_broker_control(origin, &live.lease, &packet.topic, payload_len)
+                state.admit_broker_control(
+                    origin,
+                    &live.lease,
+                    &packet.topic,
+                    payload_len,
+                    publication.now,
+                    &verdicts,
+                )
             };
             let admission = match &self.0.log {
                 Log::Local { .. } => {
@@ -74,6 +82,7 @@ impl Broker {
                 qos: packet.qos,
                 now: publication.now,
                 response,
+                verdicts,
             }))
             .await?;
         live.credit_control(packet.qos, &reply);

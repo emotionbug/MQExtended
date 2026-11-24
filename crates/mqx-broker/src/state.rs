@@ -3,11 +3,18 @@
 
 mod control;
 mod dynamic_security;
+mod external;
 mod persistence;
 mod telemetry;
 pub(crate) use control::{BrokerControl, ControlResponse};
 pub(crate) use dynamic_security::DynamicControl;
 use dynamic_security::DynamicPolicy;
+use external::{
+    AclDecision, PendingCheck, PendingDelivery, PinnedVerdicts, VerdictCache, VerdictContext,
+};
+pub(crate) use external::{
+    ExternalPlugins, ResolvedVerdict, VerdictKey, VerdictRequest, VerdictTarget,
+};
 pub(crate) use telemetry::Store;
 
 use std::{
@@ -33,7 +40,7 @@ use crate::{
 pub(crate) type Epoch = u64;
 pub(crate) type ClaimToken = [u8; 16];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct Owner {
     pub(crate) node: u64,
     pub(crate) incarnation: [u8; 16],
@@ -89,6 +96,12 @@ pub(crate) enum Command {
     DynamicSecurityControl(DynamicControl),
     BrokerControl(BrokerControl),
     ReloadLimits(ReloadableLimits),
+    // Commits external callback results, without changing existing WAL operations.
+    ResolveVerdicts {
+        now: Duration,
+        target: VerdictTarget,
+        verdicts: Vec<ResolvedVerdict>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +109,8 @@ pub(crate) enum BatchEntry {
     Claim {
         owner: Owner,
         token: ClaimToken,
-        request: Claim,
+        // Keep data-plane batches compact. Box is transparent in the WAL.
+        request: Box<Claim>,
     },
     Act(Mutations),
 }
@@ -130,6 +144,8 @@ pub(crate) struct Claim {
     pub(crate) internal_bridge: Option<Box<BridgeState>>,
     #[serde(default)]
     pub(crate) dynamic_security_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verdicts: Vec<ResolvedVerdict>,
 }
 
 impl Claim {
@@ -283,6 +299,7 @@ pub(crate) enum Operation {
     // replay, it updates only in-flight messages (handle_pubrec.c). Old
     // binaries cannot decode this command.
     ReceivedInFlight(PacketId),
+    Authorize(Vec<ResolvedVerdict>),
 }
 
 impl Operation {
@@ -323,6 +340,24 @@ impl Operation {
                 | Self::BridgeRemove
         )
     }
+
+    fn verdict_time(&self) -> Option<Duration> {
+        match self {
+            Self::Receive(publication)
+            | Self::ReceiveAdmitted(publication)
+            | Self::ReceiveBirth { publication, .. }
+            | Self::BridgeNotify(publication) => Some(publication.now),
+            Self::Disconnect { now, .. }
+            | Self::Subscribe(_, now)
+            | Self::SubscribeDollarRoot(_, now)
+            | Self::Forward(_, now)
+            | Self::ForwardBirth { now, .. }
+            | Self::Release(_, now)
+            | Self::BridgePrepare { now, .. }
+            | Self::BridgeOffline { now, .. } => Some(*now),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +383,8 @@ pub(crate) enum Reply {
     DynamicSecurityInitialized,
     DynamicSecurityChanged,
     ControlAccepted { changed: bool },
+    ExternalAclError,
+    RetainedAclError,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,6 +411,10 @@ pub(crate) enum Effect {
     BridgeQueued {
         owner: Epoch,
         pending: usize,
+    },
+    NeedVerdicts {
+        target: VerdictTarget,
+        keys: Vec<VerdictKey>,
     },
 }
 
@@ -423,10 +464,17 @@ pub(crate) struct State {
     pending_import: Option<PendingImport>,
     #[serde(default)]
     dynamic_security: Option<DynamicPolicy>,
-    // Snapshots are array-encoded: omitting this keeps the old snapshot shape
-    // until a reload is committed. Keep it last, or later fields would shift.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // MessagePack arrays cannot omit a field before an appended field.
+    #[serde(default)]
     limits: Option<ReloadableLimits>,
+    #[serde(default)]
+    verdicts: VerdictCache,
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pending_wills: VecDeque<PendingWill>,
+    #[serde(skip)]
+    pending_sessions: BTreeSet<Arc<str>>,
+    #[serde(skip)]
+    external_plugins: ExternalPlugins,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,10 +492,20 @@ struct Session {
     v5: Option<SessionSettings>,
     #[serde(default)]
     will_at: Option<Duration>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     internal_bridge: Option<BridgeState>,
     #[serde(skip)]
     clean_start: bool,
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pending: VecDeque<PendingDelivery>,
+}
+
+impl Session {
+    fn persistent(&self) -> bool {
+        self.v5
+            .as_ref()
+            .map_or(self.inbox.is_some(), |v5| v5.session_expiry != 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,6 +665,7 @@ impl State {
             self.next_session_expiry(),
             self.wills.first_key_value().map(|(&(time, _), _)| time),
             self.retain_sweep,
+            self.verdicts.next_expiry(),
         ]
         .into_iter()
         .flatten()
@@ -704,11 +763,12 @@ impl State {
         lease: &Lease,
         publish: &Publish,
         admitted_local: bool,
+        now: Duration,
     ) -> Option<crate::fast::Route> {
         if publish.retain || publish.qos == QoS::ExactlyOnce || !self.owns(owner, lease) {
             return None;
         }
-        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
+        let acl = self.acl_at(VerdictContext::new(now));
         let source = &self.sessions[&lease.id];
         if publish.qos == QoS::AtLeastOnce
             && !admitted_local
@@ -742,8 +802,20 @@ impl State {
                     return;
                 }
                 let session = &self.sessions[id];
-                if !can_deliver(acl, session, *sub, &lease.id, &publish.topic, false) {
+                if !matches_delivery(session, *sub, &lease.id, false) {
                     return;
+                }
+                if !session.pending.is_empty() {
+                    durable = true;
+                    return;
+                }
+                match acl.session_check(session, &publish.topic, Access::Read) {
+                    AclDecision::Allow => {}
+                    AclDecision::Deny | AclDecision::Error => return,
+                    AclDecision::Missing(_) => {
+                        durable = true;
+                        return;
+                    }
                 }
                 if session.inbox.is_some() {
                     durable = true;
@@ -842,6 +914,14 @@ impl State {
         }
         let mut restored: Self = rmp_serde::from_slice(bytes).map_err(invalid)?;
         restored.startup_config = self.startup_config.clone();
+        restored.external_plugins = self.external_plugins.clone();
+        restored.verdicts.rebuild_deadlines();
+        restored.pending_sessions = restored
+            .sessions
+            .iter()
+            .filter(|(_, session)| !session.pending.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
         if let Some(limits) = restored.limits.take() {
             restored.set_limits(limits);
         } else {
@@ -976,7 +1056,16 @@ impl State {
                 self.expire(now, &mut effects);
                 Reply::NoChange
             }
-            Command::Act(lease, action) => self.act(lease, action, &mut effects),
+            Command::ResolveVerdicts {
+                now,
+                target,
+                mut verdicts,
+            } => {
+                ResolvedVerdict::sort(&mut verdicts);
+                self.resolve_verdicts(now, target, &verdicts, &mut effects);
+                Reply::NoChange
+            }
+            Command::Act(lease, action) => self.act(lease, action, None, &mut effects),
             Command::Batch(batch) | Command::EagerBatch(batch) => Reply::Batched(
                 batch
                     .into_iter()
@@ -985,16 +1074,46 @@ impl State {
                             owner,
                             token,
                             request,
-                        } => vec![self.claim(owner, token, request, &mut effects)],
+                        } => vec![self.claim(owner, token, *request, &mut effects)],
                         BatchEntry::Act(entry) => {
-                            let mut replies = Vec::with_capacity(entry.operations.len());
-                            for operation in entry.operations {
+                            let mut operations = entry.operations.into_iter().peekable();
+                            let mut pinned = Vec::new();
+                            while let Some(Operation::Authorize(_)) = operations.peek() {
+                                let Some(Operation::Authorize(mut verdicts)) = operations.next()
+                                else {
+                                    unreachable!();
+                                };
+                                if pinned.is_empty() {
+                                    pinned = verdicts;
+                                } else {
+                                    pinned.append(&mut verdicts);
+                                }
+                            }
+                            if !pinned.is_empty() && self.claimed_session(&entry.lease).is_some() {
+                                ResolvedVerdict::sort(&mut pinned);
+                                let now = operations
+                                    .peek()
+                                    .and_then(Operation::verdict_time)
+                                    .unwrap_or_default();
+                                self.verdicts.insert(&pinned, now);
+                            }
+                            let pins = (!pinned.is_empty()).then(|| PinnedVerdicts::new(&pinned));
+                            let mut replies = Vec::with_capacity(operations.len());
+                            for operation in operations {
                                 let first_effect = effects.len();
-                                let reply = self.act(entry.lease.clone(), operation, &mut effects);
+                                let reply = self.act(
+                                    entry.lease.clone(),
+                                    operation,
+                                    pins.as_ref(),
+                                    &mut effects,
+                                );
                                 if eager {
                                     self.reserve_ready(&mut effects[first_effect..]);
                                 }
-                                let stop = matches!(reply, Reply::Stale | Reply::ProtocolError);
+                                let stop = matches!(
+                                    reply,
+                                    Reply::Stale | Reply::ProtocolError | Reply::ExternalAclError
+                                );
                                 replies.push(reply);
                                 if stop {
                                     break;
@@ -1059,6 +1178,7 @@ impl State {
     }
 
     fn expire(&mut self, now: Duration, effects: &mut Vec<Effect>) {
+        self.verdicts.expire(now);
         // will_delay.c: will_delay__check publishes even when the session
         // itself does not expire. Session expiry cancels a later Will timer.
         while let Some((&(at, _), id)) = self.expirations.first_key_value() {
@@ -1147,6 +1267,7 @@ impl State {
         let requested = expiry
             .filter(|&ttl| ttl != u32::MAX)
             .map(|ttl| Duration::from_secs(u64::from(ttl)));
+        let pending_id = (!session.pending.is_empty()).then(|| id.clone());
         if let Some(ttl) = [requested, cap].into_iter().flatten().min() {
             let at = if expiry.is_some() {
                 Duration::from_secs(now.as_secs())
@@ -1157,6 +1278,9 @@ impl State {
             };
             session.expires = Some(at);
             self.expirations.insert((at, session.epoch), id);
+        }
+        if let Some(id) = pending_id {
+            self.request_pending(&id, now, effects);
         }
     }
 
@@ -1225,10 +1349,7 @@ impl State {
         if let Some(previous) = self.sessions.get(&id) {
             let expired = previous.expires.is_some_and(|at| at <= claim.now);
             let due_will = previous.will_at.is_some_and(|at| at <= claim.now);
-            let persistent = previous
-                .v5
-                .as_ref()
-                .map_or(previous.inbox.is_some(), |v5| v5.session_expiry != 0);
+            let persistent = previous.persistent();
             let active = previous.owner.is_some();
             if active {
                 effects.push(Effect::Takeover(previous.epoch));
@@ -1249,6 +1370,8 @@ impl State {
                 effects.push(Effect::Expired(id.clone()));
             }
         }
+        ResolvedVerdict::sort(&mut claim.verdicts);
+        self.verdicts.insert(&claim.verdicts, claim.now);
         // handle_connect.c: connect__on_authorised counts non-clean CONNECTs.
         self.persistence_changes += u64::from(!claim.clean_start);
         self.last_epoch += 1;
@@ -1267,6 +1390,7 @@ impl State {
             will_at: None,
             internal_bridge: None,
             clean_start: claim.clean_start,
+            pending: VecDeque::new(),
         });
         session.publisher = claim.publisher;
         session.epoch = epoch;
@@ -1294,14 +1418,28 @@ impl State {
         if present {
             let publisher = &session.publisher;
             let internal_bridge = session.internal_bridge.is_some();
-            let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
+            let pinned = PinnedVerdicts::new(&claim.verdicts);
+            let acl = Acls::new(
+                &self.acls,
+                self.dynamic_security.as_ref(),
+                &self.external_plugins,
+                &self.verdicts,
+                VerdictContext::new(claim.now).with_pins(&pinned, true),
+            );
             session.inbox.as_mut().unwrap().resume(
                 |topic, writing| {
+                    // A replica may see a queued publication the claiming node
+                    // could not precheck. It already passed ACL when queued.
                     internal_bridge
-                        || acl.allowed(
-                            publisher,
-                            topic,
-                            if writing { Access::Write } else { Access::Read },
+                        || matches!(
+                            acl.check(
+                                publisher,
+                                topic,
+                                external::inbox_access(writing),
+                                false,
+                                None
+                            ),
+                            AclDecision::Allow | AclDecision::Missing(_)
                         )
                 },
                 &self.config,
@@ -1316,11 +1454,30 @@ impl State {
                 lease: lease.clone(),
             });
         }
+        if present && !self.sessions[&lease.id].pending.is_empty() {
+            self.request_pending(&lease.id, claim.now, effects);
+        }
         Reply::Claimed { lease, present }
     }
 
-    fn act(&mut self, lease: Lease, operation: Operation, effects: &mut Vec<Effect>) -> Reply {
-        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
+    fn act(
+        &mut self,
+        lease: Lease,
+        operation: Operation,
+        pinned: Option<&PinnedVerdicts<'_>>,
+        effects: &mut Vec<Effect>,
+    ) -> Reply {
+        let mut context = VerdictContext::new(operation.verdict_time().unwrap_or_default());
+        if let Some(pinned) = pinned {
+            context = context.with_pins(pinned, true);
+        }
+        let acl = Acls::new(
+            &self.acls,
+            self.dynamic_security.as_ref(),
+            &self.external_plugins,
+            &self.verdicts,
+            context,
+        );
         let Some(session) = self
             .sessions
             .get_mut(&lease.id)
@@ -1356,7 +1513,7 @@ impl State {
                 max_qos,
                 clean_incoming,
                 receive_maximum,
-                now,
+                now: _,
             } => {
                 let bridge = session
                     .internal_bridge
@@ -1383,7 +1540,7 @@ impl State {
                         filter,
                     );
                 }
-                self.subscribe(&lease.id, filters, now, false, effects)
+                self.subscribe(&lease.id, filters, context, false, effects)
             }
             Operation::BridgeOnline {
                 max_qos,
@@ -1442,8 +1599,8 @@ impl State {
                 self.remove_session(&lease.id);
                 Reply::NoChange
             }
-            Operation::Subscribe(filters, now) | Operation::SubscribeDollarRoot(filters, now) => {
-                let reply = self.subscribe(&lease.id, filters, now, check_root_leaf, effects);
+            Operation::Subscribe(filters, _) | Operation::SubscribeDollarRoot(filters, _) => {
+                let reply = self.subscribe(&lease.id, filters, context, check_root_leaf, effects);
                 // handle_subscribe.c: handle__subscribe counts once per packet.
                 self.persistence_changes += u64::from(matches!(reply, Reply::Subscribed(_)));
                 reply
@@ -1456,7 +1613,13 @@ impl State {
                     Vec::new()
                 };
                 for filter in filters {
-                    let acl_allowed = acl.allowed(&session.publisher, &filter, Access::Unsubscribe);
+                    let acl_allowed = acl.check(
+                        &session.publisher,
+                        &filter,
+                        Access::Unsubscribe,
+                        false,
+                        None,
+                    ) == AclDecision::Allow;
                     // handle_unsubscribe.c: handle__unsubscribe validates each
                     // filter in turn; earlier filters stay removed.
                     let Some((group, path)) = split_filter(&filter)
@@ -1500,18 +1663,20 @@ impl State {
                 let rejection = publish_rejection(&self.config, acl, session, publish);
                 let qos = publish.qos;
                 let id = publish.packet_id;
-                if let Some(reason) = rejection {
+                if matches!(rejection, Some(Reply::ExternalAclError)) {
+                    return Reply::ExternalAclError;
+                }
+                if let Some(Reply::PublishReason(reason)) = rejection {
                     if qos == QoS::AtLeastOnce || (qos == QoS::ExactlyOnce && session.v5.is_some())
                     {
                         if let Some(inbox) = &mut session.inbox {
                             inbox.credit_incoming();
                         } else if !admitted_local {
-                            return Reply::ReceiveLocal(None, reason.0);
+                            return Reply::ReceiveLocal(None, reason);
                         }
                     }
-                    return Reply::PublishReason(reason.0);
+                    return Reply::PublishReason(reason);
                 }
-                let now = publication.now;
                 let message = publication.into_message(session.publisher.clone());
                 // handle__accepted_publish: the message-in callback runs after
                 // ACL checks but before quota, duplicate handling and PUBREL.
@@ -1542,35 +1707,37 @@ impl State {
                             break 'publish Reply::PublishReason(R::QUOTA_EXCEEDED.0);
                         }
                     }
-                    self.forward(message, now, effects)
+                    self.forward(message, context, effects)
                 };
                 if let Some(copy) = copy {
-                    self.publish(copy, now, effects);
+                    self.publish_with_verdicts(copy, context, effects);
                 }
                 reply
             }
-            Operation::Release(id, now) => {
+            Operation::Release(id, _) => {
                 let Some(inbox) = &mut session.inbox else {
                     return Reply::LocalInbox;
                 };
                 if let Some(message) = inbox.release(id) {
-                    self.publish(message, now, effects);
+                    self.publish_with_verdicts(message, context, effects);
                 }
                 Reply::NoChange
             }
-            Operation::Forward(message, now) => self.forward(message, now, effects),
+            // handle_publish.c: handle__publish checks WRITE once. A local
+            // inbox forwards an admitted PUBLISH, like db__message_release_incoming.
+            Operation::Forward(message, _) => self.forward(message, context, effects),
             Operation::ForwardBirth {
                 message,
-                now,
+                now: _,
                 admitted,
             } => {
                 let copy = message.sparkplug_certificate(self.config.retain_available);
                 let reply = if admitted {
-                    self.forward(message, now, effects)
+                    self.forward(message, context, effects)
                 } else {
                     Reply::PublishReason(R::QUOTA_EXCEEDED.0)
                 };
-                self.publish(copy, now, effects);
+                self.publish_with_verdicts(copy, context, effects);
                 reply
             }
             Operation::Ack(..) | Operation::ReceivedInFlight(_) => {
@@ -1620,16 +1787,17 @@ impl State {
                     Reply::NoChange
                 }
             }
+            Operation::Authorize(_) => Reply::NoChange,
         }
     }
 
     fn forward(
         &mut self,
         message: Arc<Message>,
-        now: Duration,
+        context: VerdictContext<'_>,
         effects: &mut Vec<Effect>,
     ) -> Reply {
-        Reply::PublishReason(if self.publish(message, now, effects) {
+        Reply::PublishReason(if self.publish_with_verdicts(message, context, effects) {
             R::SUCCESS.0
         } else {
             R::NO_MATCHING_SUBSCRIBERS.0
@@ -1638,6 +1806,9 @@ impl State {
 
     fn remove_session(&mut self, id: &Arc<str>) {
         let session = self.sessions.remove(id).unwrap();
+        if !session.pending.is_empty() {
+            self.pending_sessions.remove(id);
+        }
         if let Some(bridge) = &session.internal_bridge {
             self.bridges.remove(&bridge.name);
         }
@@ -1662,11 +1833,24 @@ impl State {
         &mut self,
         id: &Arc<str>,
         filters: Vec<SubscriptionRequest>,
-        now: Duration,
+        context: VerdictContext<'_>,
         check_root_leaf: bool,
         effects: &mut Vec<Effect>,
     ) -> Reply {
-        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
+        let acl = Acls::new(
+            &self.acls,
+            self.dynamic_security.as_ref(),
+            &self.external_plugins,
+            &self.verdicts,
+            context,
+        );
+        let mut deliveries = DeliverySink {
+            config: &self.config,
+            pending_sessions: &mut self.pending_sessions,
+            effects,
+            counters: &mut self.sys_counters,
+            persistence_changes: &mut self.persistence_changes,
+        };
         let session = self.sessions.get_mut(id).unwrap();
         let mut codes = Vec::with_capacity(filters.len());
         for request in filters {
@@ -1684,9 +1868,13 @@ impl State {
             if validate_topic_filter(path).is_err() {
                 return Reply::ProtocolError;
             }
-            if !acl.session_allowed(session, &filter, Access::Subscribe) {
-                codes.push(SubscribeReturnCode::Failure);
-                continue;
+            match acl.session_check(session, &filter, Access::Subscribe) {
+                AclDecision::Allow => {}
+                AclDecision::Deny => {
+                    codes.push(SubscribeReturnCode::Failure);
+                    continue;
+                }
+                AclDecision::Error | AclDecision::Missing(_) => return Reply::ExternalAclError,
             }
             let subscription = Subscription {
                 qos,
@@ -1695,6 +1883,7 @@ impl State {
                 retain_as_published,
                 identifier,
             };
+            let mut retained_complete = true;
             if let Some(group) = group {
                 // src/topic_tok.c: sub__topic_tokenise always puts shared
                 // filters under the ordinary root, even for a '$' filter.
@@ -1732,29 +1921,37 @@ impl State {
                 if retain_handling == 0
                     || retain_handling == 1 && !session.filters.contains_key(filter.as_str())
                 {
-                    self.retained.visit(path, now, check_root_leaf, |message| {
-                        if acl.session_allowed(session, &message.topic, Access::Read)
-                            && (!self.config.check_retain_source
-                                || message.source.id.is_empty()
-                                || acl.allowed(&message.source, &message.topic, Access::Write))
-                        {
-                            let qos = outgoing_qos(message.qos, qos, &self.config);
-                            deliver(
-                                session,
-                                Delivery {
-                                    message: message.clone(),
-                                    qos,
-                                    retain: true,
-                                    dedup_id: None,
-                                    subscription_identifier: identifier,
-                                },
-                                &self.config,
-                                effects,
-                                &mut self.sys_counters,
-                                &mut self.persistence_changes,
-                            );
-                        }
-                    });
+                    retained_complete =
+                        self.retained
+                            .visit(path, context.now, check_root_leaf, |message| {
+                                let read = acl.session_check(session, &message.topic, Access::Read);
+                                let (decision, check) = if read == AclDecision::Allow {
+                                    (
+                                        acl.retained_source(&self.config, message, None),
+                                        PendingCheck::RetainedSource,
+                                    )
+                                } else {
+                                    (read, PendingCheck::RetainedRead)
+                                };
+                                match decision {
+                                    AclDecision::Error => return false,
+                                    AclDecision::Deny => return true,
+                                    _ => {}
+                                }
+                                deliveries.send(
+                                    session,
+                                    Delivery {
+                                        message: message.clone(),
+                                        qos: outgoing_qos(message.qos, qos, &self.config),
+                                        retain: true,
+                                        dedup_id: None,
+                                        subscription_identifier: identifier,
+                                    },
+                                    decision,
+                                    check,
+                                );
+                                true
+                            });
                 }
             }
             if let Some(entry) = session.filters.get_mut(filter.as_str()) {
@@ -1769,6 +1966,11 @@ impl State {
                     },
                 );
             }
+            // handle_subscribe.c: if retained replay errors, the filter is
+            // installed, earlier replay stays queued, and no SUBACK is sent.
+            if !retained_complete {
+                return Reply::RetainedAclError;
+            }
             codes.push(SubscribeReturnCode::Success(qos));
         }
         Reply::Subscribed(codes)
@@ -1776,44 +1978,55 @@ impl State {
 
     // context.c: context__send_will checks ACL write at publication time.
     fn publish_will(&mut self, will: PendingWill, now: Duration, effects: &mut Vec<Effect>) {
-        let PendingWill {
-            source,
-            packet: will,
-            properties,
-            expiry,
-            internal_bridge,
-        } = will;
-        let acl = Acls::new(&self.acls, self.dynamic_security.as_ref());
-        if internal_bridge || acl.allowed(&source, &will.topic, Access::Write) {
-            self.publish(
-                Arc::new(Message {
-                    source,
-                    topic: will.topic.into_boxed_str(),
-                    payload: will.payload,
-                    qos: will.qos,
-                    retain: will.retain,
-                    properties,
-                    expires: Message::expiry(Duration::from_secs(now.as_secs()), expiry),
-                }),
-                now,
-                effects,
-            );
+        let decision = will.check(self.acl_at(VerdictContext::new(now)));
+        match decision {
+            AclDecision::Allow => {
+                self.publish(will.into_message(now), now, effects);
+            }
+            AclDecision::Missing(key) => {
+                if self.pending_wills.is_empty() {
+                    effects.push(Effect::NeedVerdicts {
+                        target: VerdictTarget::Will,
+                        keys: vec![key],
+                    });
+                }
+                self.pending_wills.push_back(will);
+            }
+            AclDecision::Deny | AclDecision::Error => {}
         }
     }
 
     fn publish(&mut self, message: Arc<Message>, now: Duration, effects: &mut Vec<Effect>) -> bool {
+        self.publish_with_verdicts(message, VerdictContext::new(now), effects)
+    }
+
+    fn publish_with_verdicts(
+        &mut self,
+        message: Arc<Message>,
+        context: VerdictContext<'_>,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
         let topic = &message.topic;
         self.last_message += 1;
         let mut router = Router {
             sessions: &mut self.sessions,
-            config: &self.config,
-            acl: Acls::new(&self.acls, self.dynamic_security.as_ref()),
+            acl: Acls::new(
+                &self.acls,
+                self.dynamic_security.as_ref(),
+                &self.external_plugins,
+                &self.verdicts,
+                context,
+            ),
             message: &message,
             id: self.last_message,
             matched: false,
-            effects,
-            counters: &mut self.sys_counters,
-            persistence_changes: &mut self.persistence_changes,
+            deliveries: DeliverySink {
+                config: &self.config,
+                pending_sessions: &mut self.pending_sessions,
+                effects,
+                counters: &mut self.sys_counters,
+                persistence_changes: &mut self.persistence_changes,
+            },
         };
         // subs.c: sub__messages_queue searches the normal tree before shared.
         let _ = self
@@ -1838,7 +2051,7 @@ impl State {
                 && self.retain_sweep.is_none()
                 && let Some(interval) = self.config.retain_expiry_interval
             {
-                self.retain_sweep = Some(now.saturating_add(interval));
+                self.retain_sweep = Some(context.now.saturating_add(interval));
             }
             self.retained.store(topic, message.clone());
         }
@@ -1846,6 +2059,7 @@ impl State {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 struct PendingWill {
     source: Publisher,
     packet: LastWill,
@@ -1854,20 +2068,39 @@ struct PendingWill {
     internal_bridge: bool,
 }
 
+impl PendingWill {
+    fn check(&self, acl: Acls<'_>) -> AclDecision {
+        if self.internal_bridge {
+            AclDecision::Allow
+        } else {
+            acl.check(&self.source, &self.packet.topic, Access::Write, false, None)
+        }
+    }
+
+    fn into_message(self, now: Duration) -> Arc<Message> {
+        Arc::new(Message {
+            source: self.source,
+            topic: self.packet.topic.into_boxed_str(),
+            payload: self.packet.payload,
+            qos: self.packet.qos,
+            retain: self.packet.retain,
+            properties: self.properties,
+            expires: Message::expiry(Duration::from_secs(now.as_secs()), self.expiry),
+        })
+    }
+}
+
 fn dollar_root(filter: &str) -> &str {
     filter.split('/').next().unwrap()
 }
 
 struct Router<'a> {
     sessions: &'a mut BTreeMap<Arc<str>, Session>,
-    config: &'a BrokerConfig,
     acl: Acls<'a>,
     message: &'a Arc<Message>,
     id: u64,
     matched: bool,
-    effects: &'a mut Vec<Effect>,
-    counters: &'a mut Values,
-    persistence_changes: &'a mut u64,
+    deliveries: DeliverySink<'a>,
 }
 
 impl Router<'_> {
@@ -1875,35 +2108,78 @@ impl Router<'_> {
         self.matched = true;
         let session = self.sessions.get_mut(id).unwrap();
         let message = self.message;
-        if !can_deliver(
-            self.acl,
-            session,
-            sub,
-            &message.source.id,
-            &message.topic,
-            shared,
-        ) {
+        if !matches_delivery(session, sub, &message.source.id, shared) {
+            return;
+        }
+        let decision = self
+            .acl
+            .session_check(session, &message.topic, Access::Read);
+        if matches!(decision, AclDecision::Deny | AclDecision::Error) {
             return;
         }
         let retain = (sub.bridge || sub.retain_as_published) && message.retain;
-        let qos = outgoing_qos(message.qos, sub.qos, self.config);
+        let qos = outgoing_qos(message.qos, sub.qos, self.deliveries.config);
         let delivery = Delivery {
             message: message.clone(),
             qos,
             retain,
             // database.c: db__message_insert_outgoing does not suppress v5 copies.
-            dedup_id: (!self.config.allow_duplicate_messages && session.v5.is_none() && !retain)
+            dedup_id: (!self.deliveries.config.allow_duplicate_messages
+                && session.v5.is_none()
+                && !retain)
                 .then_some(crate::inbox::DedupId::Log(self.id)),
             subscription_identifier: sub.identifier,
         };
-        deliver(
-            session,
-            delivery,
-            self.config,
-            self.effects,
-            self.counters,
-            self.persistence_changes,
-        );
+        self.deliveries
+            .send(session, delivery, decision, PendingCheck::Read);
+    }
+}
+
+struct DeliverySink<'a> {
+    config: &'a BrokerConfig,
+    pending_sessions: &'a mut BTreeSet<Arc<str>>,
+    effects: &'a mut Vec<Effect>,
+    counters: &'a mut Values,
+    persistence_changes: &'a mut u64,
+}
+
+impl DeliverySink<'_> {
+    fn send(
+        &mut self,
+        session: &mut Session,
+        packet: Delivery,
+        decision: AclDecision,
+        check: PendingCheck,
+    ) {
+        match decision {
+            AclDecision::Allow if session.pending.is_empty() => {
+                deliver(
+                    session,
+                    packet,
+                    self.config,
+                    self.effects,
+                    self.counters,
+                    self.persistence_changes,
+                );
+            }
+            AclDecision::Allow => {
+                session.pending.push_back(PendingDelivery {
+                    packet,
+                    check: PendingCheck::Allowed,
+                });
+            }
+            AclDecision::Missing(key) => {
+                if session.pending.is_empty() {
+                    self.pending_sessions.insert(session.publisher.id.clone());
+                    self.effects.push(Effect::NeedVerdicts {
+                        target: VerdictTarget::Session(session.owner),
+                        keys: vec![key],
+                    });
+                }
+                session.pending.push_back(PendingDelivery { packet, check });
+            }
+            AclDecision::Deny | AclDecision::Error => {}
+        }
     }
 }
 
@@ -1964,16 +2240,8 @@ fn deliver(
     }
 }
 
-fn can_deliver(
-    acl: Acls<'_>,
-    session: &Session,
-    sub: Subscription,
-    source: &str,
-    topic: &str,
-    shared: bool,
-) -> bool {
-    (shared || !(sub.bridge || sub.no_local) || session.publisher.id.as_ref() != source)
-        && acl.session_allowed(session, topic, Access::Read)
+fn matches_delivery(session: &Session, sub: Subscription, source: &str, shared: bool) -> bool {
+    shared || !(sub.bridge || sub.no_local) || session.publisher.id.as_ref() != source
 }
 
 fn publish_rejection(
@@ -1981,12 +2249,12 @@ fn publish_rejection(
     acl: Acls<'_>,
     source: &Session,
     publish: &Publish,
-) -> Option<R> {
+) -> Option<Reply> {
     check_publish(config, acl, source, &publish.topic, publish.payload.len()).or_else(|| {
         publish
             .topic
             .starts_with(crate::control::PREFIX)
-            .then_some(R::IMPLEMENTATION_SPECIFIC_ERROR)
+            .then_some(Reply::PublishReason(R::IMPLEMENTATION_SPECIFIC_ERROR.0))
     })
 }
 
@@ -1996,46 +2264,54 @@ fn check_publish(
     source: &Session,
     topic: &str,
     payload_len: usize,
-) -> Option<R> {
+) -> Option<Reply> {
     // handle_publish.c: handle__publish checks size before write ACL.
-    if config.message_size_limit != 0 && payload_len > config.message_size_limit {
-        Some(R::PACKET_TOO_LARGE)
-    } else if !acl.session_allowed(source, topic, Access::Write) {
-        Some(R::NOT_AUTHORIZED)
+    if publish_oversize(config, payload_len) {
+        Some(Reply::PublishReason(R::PACKET_TOO_LARGE.0))
     } else {
-        None
+        write_rejection(acl.session_check(source, topic, Access::Write))
     }
+}
+
+fn write_rejection(decision: AclDecision) -> Option<Reply> {
+    match decision {
+        AclDecision::Allow => None,
+        AclDecision::Deny => Some(Reply::PublishReason(R::NOT_AUTHORIZED.0)),
+        AclDecision::Error | AclDecision::Missing(_) => Some(Reply::ExternalAclError),
+    }
+}
+
+fn publish_oversize(config: &BrokerConfig, payload_len: usize) -> bool {
+    config.message_size_limit != 0 && payload_len > config.message_size_limit
 }
 
 #[derive(Clone, Copy)]
 struct Acls<'a> {
     files: &'a BTreeMap<u64, Arc<AclFile>>,
     dynamic: Option<&'a DynamicSecurity>,
+    plugins: &'a ExternalPlugins,
+    cache: &'a VerdictCache,
+    context: VerdictContext<'a>,
 }
 
 impl<'a> Acls<'a> {
-    fn new(files: &'a BTreeMap<u64, Arc<AclFile>>, dynamic: Option<&'a DynamicPolicy>) -> Self {
+    fn new(
+        files: &'a BTreeMap<u64, Arc<AclFile>>,
+        dynamic: Option<&'a DynamicPolicy>,
+        plugins: &'a ExternalPlugins,
+        cache: &'a VerdictCache,
+        context: VerdictContext<'a>,
+    ) -> Self {
         Self {
             files,
             dynamic: dynamic.map(|policy| policy.data.as_ref()),
+            plugins,
+            cache,
+            context,
         }
     }
 
-    // plugin_acl_check.c: mosquitto_acl_check exempts local bridge contexts,
-    // not incoming private-protocol connections or synthetic retained sources.
-    fn session_allowed(self, session: &Session, topic: &str, access: Access) -> bool {
-        session.internal_bridge.is_some() || self.allowed(&session.publisher, topic, access)
-    }
-
-    fn allowed(self, publisher: &Publisher, topic: &str, access: Access) -> bool {
-        // plugin_acl_check.c: acl__check_dollar runs before the ACL callbacks.
-        if (topic.starts_with("$share") && matches!(access, Access::Read | Access::Write))
-            || (topic.starts_with("$SYS")
-                && access == Access::Write
-                && !mqx_topic::matches("$SYS/broker/connection/+/state", topic).unwrap_or(false))
-        {
-            return false;
-        }
+    fn file_or_dynamic_allows(self, publisher: &Publisher, topic: &str, access: Access) -> bool {
         let id = &publisher.id;
         let username = publisher.username.as_deref();
         let file = || {
@@ -2049,7 +2325,8 @@ impl<'a> Acls<'a> {
                 .and_then(|policy| policy.authorize(id, username, topic, access))
         };
         // All configured callbacks deferring means denial.
-        crate::security_callbacks(order, file, dynamic).unwrap_or(order.is_none())
+        crate::security_callbacks(order, file, dynamic)
+            .unwrap_or(order.is_none() && publisher.external.is_none())
     }
 }
 
@@ -2126,6 +2403,7 @@ mod tests {
                     username: None,
                     security: 1,
                     dynamic_security: None,
+                    external: None,
                 },
                 clean_start: transient,
                 bridge: false,
@@ -2135,6 +2413,7 @@ mod tests {
                 now: Duration::ZERO,
                 internal_bridge: None,
                 dynamic_security_revision: None,
+                verdicts: Vec::new(),
             },
         }
     }
@@ -2257,6 +2536,7 @@ mod tests {
                 username: None,
                 security: 1,
                 dynamic_security: None,
+                external: None,
             },
             topic: "topic".into(),
             payload: Bytes::from_static(b"payload"),
@@ -2401,7 +2681,11 @@ mod tests {
             payload: Bytes::from_static(b"ab"),
         };
         let old_snapshot = state.snapshot();
-        assert!(state.fast_route(owner, &lease, &packet, false).is_some());
+        assert!(
+            state
+                .fast_route(owner, &lease, &packet, false, Duration::ZERO)
+                .is_some()
+        );
 
         let limits = ReloadableLimits {
             message_size_limit: 1,
@@ -2418,7 +2702,11 @@ mod tests {
         for replica in [&mut state, &mut restored] {
             assert_eq!(replica.config().reloadable_limits(), limits);
             assert_eq!(replica.config().max_packet_size, 1024);
-            assert!(replica.fast_route(owner, &lease, &packet, false).is_none());
+            assert!(
+                replica
+                    .fast_route(owner, &lease, &packet, false, Duration::ZERO)
+                    .is_none()
+            );
             assert_eq!(
                 replica
                     .apply(Command::Act(
@@ -2436,7 +2724,11 @@ mod tests {
         }
 
         restored.restore(&old_snapshot).unwrap();
-        assert!(restored.fast_route(owner, &lease, &packet, false).is_some());
+        assert!(
+            restored
+                .fast_route(owner, &lease, &packet, false, Duration::ZERO)
+                .is_some()
+        );
         assert_eq!(
             restored.config().clientid_prefixes.as_deref(),
             Some("startup-")

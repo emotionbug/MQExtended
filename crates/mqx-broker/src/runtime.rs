@@ -1,6 +1,7 @@
 mod bridge;
 mod control;
 mod dynamic_security;
+mod external;
 mod proposals;
 mod telemetry;
 pub use bridge::{BridgeAck, BridgeIdentity, BridgeSession};
@@ -33,7 +34,7 @@ use crate::{
     persistence::PersistentState,
     state::{
         BatchEntry, Claim, ClaimToken, Command, Effect, Epoch, Lease, Mutations, Operation, Owner,
-        Publication, Reply, State,
+        Publication, Reply, ResolvedVerdict, State, VerdictKey, VerdictTarget,
     },
     sys::{Metric, ProposalLatency, Traffic},
 };
@@ -52,6 +53,7 @@ pub(super) struct Inner {
     runtime: Arc<Mutex<Runtime>>,
     log: Log,
     dynamic_security_registration: tokio::sync::Mutex<()>,
+    external_enabled: AtomicBool,
 }
 
 pub(super) struct ConfigCell {
@@ -127,6 +129,7 @@ struct Runtime {
     listeners: HashMap<usize, usize>,
     transient_drops: i64,
     dynamic_security_path: Option<std::path::PathBuf>,
+    verdict_resolver: Option<external::Resolver>,
 }
 
 struct Pending {
@@ -226,6 +229,7 @@ impl Broker {
             traffic: Traffic::default(),
             sys_interval: watch::Sender::new(None),
             dynamic_security_registration: tokio::sync::Mutex::new(()),
+            external_enabled: AtomicBool::new(false),
             log: Log::Local {
                 started: Instant::now(),
                 wall_origin: wall_now(),
@@ -250,6 +254,20 @@ impl Broker {
         config: BrokerConfig,
         cluster: ClusterConfig,
     ) -> Result<Self, BrokerError> {
+        Self::clustered_with_security(config, cluster, &[]).await
+    }
+
+    /// Starts a Raft-backed broker with external plugins installed before
+    /// recovering the log and snapshots. Pass all external listener handles
+    /// on every node, with identical plugin IDs and configuration.
+    ///
+    /// Call [`Self::register_security`] afterwards to install the listener ACL
+    /// files. Standalone brokers only need registration before serving.
+    pub async fn clustered_with_security(
+        config: BrokerConfig,
+        cluster: ClusterConfig,
+        security: &[SecurityHandle],
+    ) -> Result<Self, BrokerError> {
         let owner = Owner {
             node: cluster.node_id,
             incarnation: new_token()?,
@@ -266,10 +284,16 @@ impl Broker {
         let max_command_size = cluster.max_command_size;
         let batch_limits =
             proposals::Limits::new(cluster.max_command_size, cluster.max_append_size);
+        let state = State::new(config.clone());
+        for handle in security {
+            if let Some((id, plugin)) = &handle.3 {
+                state.external_plugins().insert(*id, plugin.clone());
+            }
+        }
         let cluster = Cluster::start(
             cluster,
             Machine {
-                state: State::new(config.clone()),
+                state,
                 config: config_cell.clone(),
                 owner,
                 runtime: runtime.clone(),
@@ -287,6 +311,7 @@ impl Broker {
             traffic: Traffic::default(),
             sys_interval: watch::Sender::new(None),
             dynamic_security_registration: tokio::sync::Mutex::new(()),
+            external_enabled: AtomicBool::new(false),
             log: Log::Replicated(ReplicatedLog {
                 cluster,
                 owner,
@@ -312,6 +337,9 @@ impl Broker {
                 Broker(inner).receive_mesh(from, body).await
             }
         })?;
+        if security.iter().any(|handle| handle.3.is_some()) {
+            broker.start_verdict_resolver();
+        }
         tokio::spawn(proposals::run(Arc::downgrade(&broker.0), proposal_rx));
         tokio::spawn(cluster_maintenance(
             Arc::downgrade(&broker.0),
@@ -346,7 +374,11 @@ impl Broker {
 
     /// Install a listener's initial ACL, or commit changed bytes after a reload.
     /// Initial registration never overwrites a policy already committed by a peer.
+    /// Register each external handle on every node that applies the log. For a
+    /// Raft restart pass those handles to [`Self::clustered_with_security`] as
+    /// well, so the plugins are available during replay.
     pub async fn register_security(&self, handle: &SecurityHandle) -> Result<(), BrokerError> {
+        self.install_external(handle);
         match &self.0.log {
             Log::Local { .. } => {
                 self.0
@@ -561,6 +593,7 @@ impl Broker {
         mut claim: Claim,
         peer_address: Option<Arc<str>>,
     ) -> Result<ClaimResult, BrokerError> {
+        self.install_external(security);
         let transient = claim.local_inbox();
         let receive_maximum = claim
             .v5
@@ -568,6 +601,8 @@ impl Broker {
             .map(|v5| v5.outgoing_maximum(self.0.config.startup()));
         match &self.0.log {
             Log::Local { .. } => {
+                claim.publisher.security = security.0.id;
+                claim.verdicts = self.resolve_claim(&claim).await;
                 let mut runtime = self.0.runtime.lock().unwrap();
                 claim.now = self.now();
                 if runtime
@@ -580,7 +615,6 @@ impl Broker {
                 {
                     runtime.apply_local(Command::Expire(claim.now), &self.0.config, None);
                 }
-                claim.publisher.security = security.0.id;
                 let reply = runtime.apply_local(
                     Command::Claim {
                         owner: Owner::LOCAL,
@@ -610,6 +644,7 @@ impl Broker {
             Log::Replicated(log) => {
                 log.ensure_boot().await?;
                 claim.publisher.security = log.security(security, false).await?;
+                claim.verdicts = self.resolve_claim(&claim).await;
                 claim.now = self.now();
                 let token = new_token()?;
                 {
@@ -635,7 +670,7 @@ impl Broker {
                 let proposal = |request| BatchEntry::Claim {
                     owner: log.owner,
                     token,
-                    request,
+                    request: Box::new(request),
                 };
                 let mut reply = log.propose_one(proposal(claim)).await?;
                 if reply == Reply::Full
@@ -659,6 +694,7 @@ impl Broker {
                         if expiry_due {
                             log.submit(Command::Expire(now)).await?;
                         }
+                        request.verdicts = self.resolve_claim(&request).await;
                         request.now = self.now();
                         reply = log.propose_one(proposal(request)).await?;
                     }
@@ -730,8 +766,26 @@ impl Broker {
         live: &Live,
         operation: Operation,
     ) -> Result<Reply, BrokerError> {
-        self.submit(Command::Act(live.lease.clone(), operation))
-            .await
+        let verdicts = self.resolve_operation(&live.lease, &operation).await;
+        if verdicts.is_empty() {
+            return self
+                .submit(Command::Act(live.lease.clone(), operation))
+                .await;
+        }
+        let entry = BatchEntry::Act(Mutations {
+            lease: live.lease.clone(),
+            operations: vec![Operation::Authorize(verdicts), operation],
+        });
+        match &self.0.log {
+            Log::Local { .. } => {
+                let Reply::Batched(mut entries) = self.submit(Command::Batch(vec![entry])).await?
+                else {
+                    unreachable!("authorized batch did not return its replies")
+                };
+                Ok(entries.pop().unwrap().pop().unwrap())
+            }
+            Log::Replicated(log) => log.propose_one(entry).await,
+        }
     }
 
     // A standalone log is never replayed, so it can always use the newer
@@ -1167,7 +1221,13 @@ impl ReplicatedLog {
         self.cluster.read(|machine| {
             machine
                 .state
-                .fast_route(self.owner, &live.lease, &publication.packet, admitted_local)
+                .fast_route(
+                    self.owner,
+                    &live.lease,
+                    &publication.packet,
+                    admitted_local,
+                    publication.now,
+                )
                 .map(|route| (machine.state.applied, route))
         })
     }
@@ -1489,6 +1549,11 @@ impl StateMachine for Machine {
                 false
             }
         });
+        if runtime.verdict_resolver.is_some() {
+            for (target, keys) in self.state.pending_verdicts(wall_now()) {
+                runtime.request_verdicts(self.owner, target, keys);
+            }
+        }
         self.applied.send_replace(self.state.applied);
         Ok(())
     }
@@ -1594,6 +1659,9 @@ impl Runtime {
                 }
                 Effect::Expired(id) => tracing::info!("Expiring client {id} due to timeout."),
                 Effect::QueueFull(id) => report_drop(&id),
+                Effect::NeedVerdicts { target, keys } => {
+                    self.request_verdicts(here, target, keys);
+                }
             }
         }
     }
@@ -1826,6 +1894,9 @@ async fn cluster_maintenance(
                         tracing::debug!(%error, "session-expiry tick did not complete");
                     }
                 }
+                if inner.external_enabled.load(Ordering::Acquire) {
+                    Broker(inner).redrive_verdicts();
+                }
             }
         }
     }
@@ -1865,6 +1936,7 @@ mod tests {
                 username: None,
                 security: 0,
                 dynamic_security: None,
+                external: None,
             },
             clean_start: true,
             bridge: false,
@@ -1880,6 +1952,7 @@ mod tests {
             now: Duration::ZERO,
             internal_bridge: None,
             dynamic_security_revision: None,
+            verdicts: Vec::new(),
         };
         let ClaimResult::Accepted(old, false) = broker
             .claim(&security, claim("offline"), None)

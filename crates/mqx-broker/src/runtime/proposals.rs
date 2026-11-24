@@ -8,7 +8,7 @@ use tokio::{
 
 use crate::{
     inbox::PublishProperty,
-    state::{BatchEntry, Command, Operation, Reply},
+    state::{BatchEntry, Command, Operation, Reply, ResolvedVerdict},
 };
 
 use super::{Inner, Log};
@@ -57,6 +57,17 @@ fn publication_cost(payload_len: usize, topic_len: usize, properties: &[PublishP
             .sum::<usize>()
 }
 
+fn verdict_cost(verdicts: &[ResolvedVerdict]) -> usize {
+    verdicts
+        .iter()
+        .map(|entry| {
+            64 + entry.key.topic.len()
+                + entry.key.identity.client_id.as_deref().map_or(0, str::len)
+                + entry.key.identity.username.as_deref().map_or(0, str::len)
+        })
+        .sum()
+}
+
 impl Proposal {
     fn can_pipeline(&self) -> bool {
         matches!(&self.entry, BatchEntry::Act(entry) if entry.operations.iter().all(|operation| {
@@ -70,6 +81,7 @@ impl Proposal {
                     | Operation::ReceivedInFlight(_)
                     | Operation::ReserveOutbound(_)
                     | Operation::ReserveOutboundWithQos0Expiry(_)
+                    | Operation::Authorize(_)
             )
         }))
     }
@@ -91,7 +103,10 @@ impl Proposal {
                         .map_or(&[][..], |v5| v5.will_properties.as_slice());
                     publication_cost(will.payload.len(), will.topic.len(), properties)
                 });
-                return (512 + id + username + will, 256 + id);
+                return (
+                    512 + id + username + will + verdict_cost(&request.verdicts),
+                    256 + id,
+                );
             }
         };
         let base = 512 + entry.lease.id.len();
@@ -130,6 +145,7 @@ impl Proposal {
                         filters.iter().map(|filter| 8 + filter.len()).sum(),
                         8 * filters.len(),
                     ),
+                    Operation::Authorize(verdicts) => (verdict_cost(verdicts), 0),
                     _ => (0, 0),
                 };
                 (input + body + 256, reply + result + 256)
@@ -220,7 +236,7 @@ async fn submit(inner: Arc<Inner>, mut group: Vec<Proposal>, eager: bool) {
             } => Command::Claim {
                 owner,
                 token,
-                request,
+                request: *request,
             },
             BatchEntry::Act(entry) => {
                 Command::Act(entry.lease, entry.operations.into_iter().next().unwrap())

@@ -21,6 +21,8 @@ pub(crate) struct Publisher {
     pub(crate) security: u64,
     #[serde(default)]
     pub(crate) dynamic_security: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external: Option<(u32, mqx_auth::external::Binding)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +51,7 @@ impl Message {
                 username: None,
                 security: 0,
                 dynamic_security: None,
+                external: None,
             },
             topic: topic.into_boxed_str(),
             payload: self.payload.clone(),
@@ -333,6 +336,20 @@ impl Inbox {
         }
         for entry in self.incoming.values() {
             visit(&entry.message);
+        }
+    }
+
+    pub(crate) fn visit_acl_topics(&self, now: Duration, mut visit: impl FnMut(&str, bool)) {
+        for entry in self.in_flight.iter().chain(&self.queued) {
+            let message = &entry.delivery.message;
+            if !message.expired(now) {
+                visit(&message.topic, false);
+            }
+        }
+        for entry in self.incoming.values() {
+            if !entry.message.expired(now) {
+                visit(&entry.message.topic, true);
+            }
         }
     }
 
@@ -859,6 +876,7 @@ mod tests {
                     username: None,
                     security: 0,
                     dynamic_security: None,
+                    external: None,
                 },
                 topic: "topic".into(),
                 payload: Bytes::from_static(bytes),

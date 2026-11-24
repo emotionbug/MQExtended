@@ -4,6 +4,8 @@ use mqx_cluster::ClusterConfig;
 
 use super::*;
 
+mod external_security;
+
 // A fixture drops its reservations before Raft takes ownership of the ports.
 // Do not let another fixture reserve those same ports during the handoff.
 static STARTUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -122,7 +124,16 @@ async fn ordered_mesh_routes_qos0_and_qos1_and_raft_routes_retained_qos2() {
     let [a, b, c] = &cluster.brokers;
     let mut source = connected(a, "source", true, false).await;
     let mut sink = connected(b, "sink", true, false).await;
+    let mut third = connected(c, "third", false, false).await;
     sink.subscribe(&[("samples/#", Q2)], &[Q2]).await;
+    let proposal_count = || {
+        cluster
+            .brokers
+            .iter()
+            .map(|broker| broker.metrics().proposal_latency.count)
+            .sum::<u64>()
+    };
+    let before_mesh = proposal_count();
 
     source
         .send(Packet::Publish(publish("samples/temp", b"q0", Q0, 0)))
@@ -133,6 +144,11 @@ async fn ordered_mesh_routes_qos0_and_qos1_and_raft_routes_retained_qos2() {
         .send(Packet::Publish(publish("samples/temp", b"q1", Q1, 31)))
         .await;
     source.expect(Packet::PubAck(mid(31))).await;
+    assert_eq!(
+        proposal_count(),
+        before_mesh,
+        "plain live publishers must not write to Raft"
+    );
     sink.expect(Packet::Publish(publish("samples/temp", b"q1", Q1, 1)))
         .await;
     sink.send(Packet::PubAck(mid(1))).await;
@@ -156,7 +172,6 @@ async fn ordered_mesh_routes_qos0_and_qos1_and_raft_routes_retained_qos2() {
     sink.expect(Packet::PubRel(mid(2))).await;
     sink.send(Packet::PubComp(mid(2))).await;
 
-    let mut third = connected(c, "third", false, false).await;
     third.subscribe(&[("samples/#", Q1)], &[Q1]).await;
     third
         .expect(Packet::Publish(Publish {

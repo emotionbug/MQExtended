@@ -75,6 +75,7 @@ impl Broker {
                         username: id.username.map(Arc::from),
                         security: 0,
                         dynamic_security: None,
+                        external: None,
                     },
                     clean_start: false,
                     bridge: true,
@@ -98,6 +99,7 @@ impl Broker {
                         online: false,
                     })),
                     dynamic_security_revision: None,
+                    verdicts: Vec::new(),
                 },
                 None,
             )
