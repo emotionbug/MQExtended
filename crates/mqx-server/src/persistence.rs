@@ -1,7 +1,6 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -21,16 +20,15 @@ const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(super) struct Persistence {
     config: watch::Sender<PersistenceConfig>,
-    writer: Mutex<()>,
-    writes_blocked: AtomicBool,
+    // Serialize backups and remember a native path we couldn't safely clear.
+    writer: Mutex<Option<PathBuf>>,
 }
 
 impl Persistence {
     pub(super) fn new(config: PersistenceConfig) -> Self {
         Self {
             config: watch::Sender::new(config),
-            writer: Mutex::new(()),
-            writes_blocked: AtomicBool::new(false),
+            writer: Mutex::new(None),
         }
     }
 
@@ -64,13 +62,26 @@ impl Persistence {
                 log_restored(counts);
                 return Ok(());
             }
-            Load::Missing => read_mosquitto(config, config.auto_recover).await?,
-            // A broken native image may be newer than the original import.
-            // Starting empty avoids restoring messages already consumed.
+            Load::Missing => {
+                // A crash after discard but before the next save must not
+                // revive data consumed since the original import.
+                let discarded = discarded_path(&native);
+                if file_job(RESTORE_FAILED, discarded.clone(), move || {
+                    Ok(database_metadata(&discarded)?.is_some())
+                })
+                .await?
+                {
+                    return Ok(());
+                }
+                read_mosquitto(config, config.auto_recover).await?
+            }
             Load::Discarded => return Ok(()),
             Load::Unusable => {
-                // Keep saves off even if SIGHUP changes the path to an alias.
-                self.writes_blocked.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "Persistence writes disabled for '{}' until it can be safely recovered",
+                    native.display()
+                );
+                *self.writer.lock().await = Some(native);
                 return Ok(());
             }
         };
@@ -96,14 +107,38 @@ impl Persistence {
         broker: &Broker,
         shutdown: bool,
     ) -> Result<Option<u64>, ServerError> {
-        let _write = self.writer.lock().await;
+        let mut writer = self.writer.lock().await;
         let path = {
             let config = self.config.borrow();
-            if !self.writes_enabled(&config) {
+            if !config.enabled {
                 return Ok(None);
             }
             snapshot_path(&config)
         };
+        if let Some(blocked) = writer.as_ref() {
+            // Check the original path, even if reload selects an alias.
+            let blocked = blocked.clone();
+            let destination = path.clone();
+            let cleared = file_job(RESTORE_FAILED, blocked.clone(), move || {
+                let recovered = match read_for_recovery(&blocked, PersistentState::read_snapshot) {
+                    // A valid replacement belongs to the operator. We never
+                    // loaded it and cannot safely overwrite it with live state.
+                    Ok(image) => image.is_none(),
+                    Err(error) if is_corruption(&error) => discard_database(&blocked).is_ok(),
+                    Err(error) => return Err(error),
+                };
+                Ok(
+                    recovered
+                        && (destination == blocked || database_metadata(&destination).is_ok()),
+                )
+            })
+            .await
+            .inspect_err(|error| tracing::error!("{error}"))?;
+            if !cleared {
+                return Ok(None);
+            }
+            *writer = None;
+        }
         let Some((changes, state)) = broker.persistence_snapshot(shutdown) else {
             return Ok(None);
         };
@@ -111,10 +146,6 @@ impl Persistence {
             .await
             .inspect_err(|error| tracing::error!("{error}"))?;
         Ok(Some(changes))
-    }
-
-    fn writes_enabled(&self, config: &PersistenceConfig) -> bool {
-        config.enabled && !self.writes_blocked.load(Ordering::Relaxed)
     }
 
     pub(super) async fn autosave(&self, broker: &Broker, mut stop: watch::Receiver<bool>) {
@@ -129,7 +160,7 @@ impl Persistence {
                 (
                     config.autosave_interval,
                     config.autosave_on_changes,
-                    self.writes_enabled(&config),
+                    config.enabled,
                 )
             };
             if *stop.borrow() {
@@ -167,7 +198,7 @@ impl Persistence {
                             last_changes = count;
                             retry_at = None;
                         }
-                        Err(_) if by_changes => {
+                        Ok(None) | Err(_) if by_changes => {
                             // The threshold is still met. Back off without waiting
                             // for new MQTT traffic or blocking reload/shutdown.
                             retry_at = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
@@ -248,24 +279,14 @@ async fn load_database(
 ) -> Result<Load, ServerError> {
     file_job(operation, path.clone(), move || {
         let result = if auto_recover {
-            // The legacy reader accepts empty files and can optionally
-            // follow symlinks. Neither is usable for auto-recovery.
-            match database_metadata(&path) {
-                Ok(Some(metadata)) if metadata.len() == 0 => Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "persistence database is empty",
-                )),
-                Ok(Some(_)) => read(&path),
-                Ok(None) => Ok(None),
-                Err(error) => Err(error),
-            }
+            read_for_recovery(&path, read)
         } else {
             read(&path)
         };
         match result {
             Ok(Some(image)) => Ok(Load::Restored(image)),
             Ok(None) => Ok(Load::Missing),
-            Err(error) if auto_recover => {
+            Err(error) if auto_recover && is_corruption(&error) => {
                 tracing::warn!(
                     "{operation} '{}': {error}; starting with empty state",
                     path.display()
@@ -274,7 +295,7 @@ async fn load_database(
                     Ok(()) => Ok(Load::Discarded),
                     Err(error) => {
                         tracing::warn!(
-                            "Persistence writes disabled for '{}' for this run: {error}",
+                            "Could not discard persistence database '{}': {error}",
                             path.display()
                         );
                         Ok(Load::Unusable)
@@ -287,11 +308,65 @@ async fn load_database(
     .await
 }
 
+fn read_for_recovery(
+    path: &Path,
+    read: impl FnOnce(&Path) -> io::Result<Option<PersistentState>>,
+) -> io::Result<Option<PersistentState>> {
+    // The legacy reader accepts empty files and can optionally follow
+    // symlinks. Neither is usable for auto-recovery.
+    match database_metadata(path)? {
+        Some(metadata) if metadata.len() == 0 => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "persistence database is empty",
+        )),
+        Some(_) => read(path),
+        None => Ok(None),
+    }
+}
+
+fn is_corruption(error: &io::Error) -> bool {
+    let corrupt = |error: &io::Error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+        )
+    };
+    if !corrupt(error) {
+        return false;
+    }
+    // The native decoder can wrap I/O failures in an InvalidData error.
+    let mut source = error.get_ref().map(|error| error as &dyn std::error::Error);
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| !corrupt(error))
+        {
+            return false;
+        }
+        source = cause.source();
+    }
+    true
+}
+
+fn discarded_path(path: &Path) -> PathBuf {
+    let mut discarded = path.as_os_str().to_owned();
+    discarded.push(".discarded");
+    discarded.into()
+}
+
 fn discard_database(path: &Path) -> io::Result<()> {
     if database_metadata(path)?.is_some() {
-        let mut discarded = path.as_os_str().to_owned();
-        discarded.push(".discarded");
-        fs::rename(path, Path::new(&discarded))?;
+        let discarded = discarded_path(path);
+        database_metadata(&discarded)?;
+        #[cfg(unix)]
+        let directory = fs::File::open(
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?;
+        fs::rename(path, discarded)?;
+        #[cfg(unix)]
+        directory.sync_all()?;
     }
     Ok(())
 }

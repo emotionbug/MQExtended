@@ -679,23 +679,46 @@ fn persistence_command(dir: &Path, address: SocketAddr, extra: &str) -> Command 
     command
 }
 
-#[tokio::test]
-async fn persistence_retries_failed_change_save_without_more_client_traffic() {
+async fn persistence_exchange<const N: usize>(
+    stream: &mut TcpStream,
+    request: &[u8],
+    response: &[u8; N],
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn exchange<const N: usize>(stream: &mut TcpStream, request: &[u8], response: &[u8; N]) {
-        timeout(WAIT, async {
-            stream.write_all(request).await.unwrap();
-            let mut received = [0; N];
-            stream.read_exact(&mut received).await.unwrap();
-            assert_eq!(&received, response);
-        })
-        .await
-        .unwrap();
-    }
+    timeout(WAIT, async {
+        stream.write_all(request).await.unwrap();
+        let mut received = [0; N];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, response);
+    })
+    .await
+    .unwrap();
+}
 
-    const CONNECT: &[u8] = b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev";
-    const CONNACK: &[u8; 4] = b"\x20\x02\x00\x00";
+async fn persistence_connect(address: SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    persistence_exchange(
+        &mut stream,
+        b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev",
+        b"\x20\x02\x00\x00",
+    )
+    .await;
+    stream
+}
+
+async fn publish_retained_for_persistence(address: SocketAddr) {
+    let mut publisher = persistence_connect(address).await;
+    persistence_exchange(
+        &mut publisher,
+        b"\x33\x0d\x00\x04keep\x00\x01value",
+        b"\x40\x02\x00\x01",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn persistence_retries_failed_change_save_without_more_client_traffic() {
     let dir = tempfile::tempdir().unwrap();
     let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
     let address = listen_address();
@@ -710,14 +733,7 @@ async fn persistence_retries_failed_change_save_without_more_client_traffic() {
     let log = dir.path().join("broker.log");
     // A directory blocks atomic replacement even if the test runs as root.
     fs::create_dir(&snapshot).unwrap();
-    let mut publisher = TcpStream::connect(address).await.unwrap();
-    exchange(&mut publisher, CONNECT, CONNACK).await;
-    exchange(
-        &mut publisher,
-        b"\x33\x0d\x00\x04keep\x00\x01value",
-        b"\x40\x02\x00\x01",
-    )
-    .await;
+    publish_retained_for_persistence(address).await;
     eventually(|| fs::read_to_string(&log).unwrap().contains(SAVE_ERROR)).await;
     fs::remove_dir(&snapshot).unwrap();
     eventually(|| snapshot.is_file()).await;
@@ -726,9 +742,8 @@ async fn persistence_retries_failed_change_save_without_more_client_traffic() {
     child.kill().await.unwrap();
     let mut child = command.spawn().unwrap();
     ready(&notify).await;
-    let mut subscriber = TcpStream::connect(address).await.unwrap();
-    exchange(&mut subscriber, CONNECT, CONNACK).await;
-    exchange(
+    let mut subscriber = persistence_connect(address).await;
+    persistence_exchange(
         &mut subscriber,
         b"\x82\x09\x00\x01\x00\x04keep\x01",
         b"\x90\x03\x00\x01\x01\x33\x0d\x00\x04keep\x00\x01value",
@@ -1324,6 +1339,170 @@ async fn corrupt_persistence_database_exits_with_the_reference_status() {
 }
 
 #[tokio::test]
+async fn auto_recover_does_not_reimport_stale_state_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("mosquitto.db");
+    let native = dir.path().join("mosquitto.db.mqx");
+    let discarded = dir.path().join("mosquitto.db.mqx.discarded");
+
+    // A Mosquitto v2 database with one retained message.
+    let mut original = b"\0\xb5\0mosquitto db\0\0\0\0\0\0\0\x02".to_vec();
+    let id = 1u64.to_ne_bytes();
+    let message = [
+        &id[..],
+        &b"\0\x01s\0\x01\0\0\0\x01t\x01\x01\0\0\0\x03msg"[..],
+    ]
+    .concat();
+    for (chunk, contents) in [(2u16, message.as_slice()), (4, id.as_slice())] {
+        original.extend(chunk.to_be_bytes());
+        original.extend(u32::try_from(contents.len()).unwrap().to_be_bytes());
+        original.extend_from_slice(contents);
+    }
+    fs::write(&legacy, &original).unwrap();
+    assert_eq!(
+        mqx_broker::PersistentState::read_mosquitto(&legacy, |_| 1)
+            .unwrap()
+            .unwrap()
+            .counts()
+            .retained,
+        1
+    );
+
+    let invalid = b"corrupt native snapshot";
+    fs::write(&native, invalid).unwrap();
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let address = listen_address();
+    let mut child = persistence_command(
+        dir.path(),
+        address,
+        "auto_recover true\nautosave_interval 0",
+    )
+    .spawn()
+    .unwrap();
+    ready(&notify).await;
+    assert_eq!(fs::read(&discarded).unwrap(), invalid);
+    assert!(!native.exists());
+    child.kill().await.unwrap();
+
+    // The restart must stay empty even without auto_recover and before any
+    // successful save has written a native snapshot.
+    let mut child = persistence_command(dir.path(), address, "autosave_interval 0")
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+    stop(&mut child).await;
+    let fresh = mqx_broker::PersistentState::read_snapshot(&native)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.counts().retained, 0);
+    assert_eq!(fs::read(legacy).unwrap(), original);
+}
+
+#[tokio::test]
+async fn auto_recover_retries_a_blocked_discard_and_saves_pending_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = dir.path().join("mosquitto.db.mqx");
+    let discarded = dir.path().join("mosquitto.db.mqx.discarded");
+    let invalid = b"corrupt native snapshot";
+    fs::write(&native, invalid).unwrap();
+    // A directory blocks the discard even when run as root.
+    fs::create_dir(&discarded).unwrap();
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let address = listen_address();
+    let mut child = persistence_command(
+        dir.path(),
+        address,
+        "auto_recover true\nautosave_interval 1\nautosave_on_changes true",
+    )
+    .spawn()
+    .unwrap();
+    ready(&notify).await;
+    publish_retained_for_persistence(address).await;
+    assert_eq!(fs::read(&native).unwrap(), invalid);
+    fs::remove_dir(&discarded).unwrap();
+
+    // No more client traffic, reload, manual backup or shutdown.
+    eventually(|| {
+        mqx_broker::PersistentState::read_snapshot(&native)
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.counts().retained == 1)
+    })
+    .await;
+    assert_eq!(fs::read(&discarded).unwrap(), invalid);
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn auto_recover_does_not_discard_a_valid_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = dir.path().join("mosquitto.db.mqx");
+    let discarded = dir.path().join("mosquitto.db.mqx.discarded");
+    fs::write(&native, b"corrupt native snapshot").unwrap();
+    fs::create_dir(&discarded).unwrap();
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let address = listen_address();
+    let mut child = persistence_command(
+        dir.path(),
+        address,
+        "auto_recover true\nautosave_interval 0",
+    )
+    .spawn()
+    .unwrap();
+    ready(&notify).await;
+    publish_retained_for_persistence(address).await;
+
+    mqx_broker::PersistentState::default()
+        .write_snapshot(&native)
+        .unwrap();
+    let replacement = fs::read(&native).unwrap();
+    fs::remove_dir(&discarded).unwrap();
+    stop(&mut child).await;
+    assert_eq!(fs::read(&native).unwrap(), replacement);
+    assert!(!discarded.exists());
+}
+
+#[tokio::test]
+async fn auto_recover_rejects_an_invalid_persistence_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let location = dir.path().join("not-a-directory");
+    fs::write(&location, b"keep me").unwrap();
+    let address = listen_address();
+    let status = timeout(
+        WAIT,
+        persistence_command(
+            dir.path(),
+            address,
+            "auto_recover true\npersistence_location not-a-directory",
+        )
+        .status(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(fs::read(&location).unwrap(), b"keep me");
+    let log = fs::read_to_string(dir.path().join("broker.log")).unwrap();
+    assert!(
+        log.contains("Unable to restore persistent database"),
+        "{log}"
+    );
+    assert!(!log.contains(RUNNING), "{log}");
+
+    // With persistence explicitly disabled, that location is irrelevant.
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let mut child = persistence_command(
+        dir.path(),
+        address,
+        "auto_recover true\npersistence false\npersistence_location not-a-directory",
+    )
+    .spawn()
+    .unwrap();
+    ready(&notify).await;
+    stop(&mut child).await;
+}
+
+#[tokio::test]
 async fn auto_recover_discards_bad_persistence_and_saves_a_fresh_snapshot() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1436,8 +1615,14 @@ async fn auto_recover_leaves_non_regular_persistence_paths_in_place() {
             }
             let log = fs::read_to_string(dir.path().join("broker.log")).unwrap();
             assert_eq!(
-                log.matches("Persistence writes disabled for").count(),
+                log.matches("Could not discard persistence database")
+                    .count(),
                 1,
+                "{log}"
+            );
+            assert_eq!(
+                log.matches("Persistence writes disabled for").count(),
+                usize::from(file == "mosquitto.db.mqx"),
                 "{log}"
             );
         }
