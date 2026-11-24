@@ -622,12 +622,14 @@ impl Server {
                 biased;
                 () = &mut stop => break Ok(()),
                 Some(result) = serving.join_next() => {
-                    if let Err(error) = result {
-                        tracing::error!("Listener task failed: {error}");
-                    }
-                    if serving.is_empty() {
-                        break Ok(());
-                    }
+                    // A worker only returns on cancellation. One that ended
+                    // otherwise left its socket unserved; exit non-zero so the
+                    // service manager restarts the broker with every listener.
+                    let error = match result {
+                        Err(error) => error.to_string(),
+                        Ok(()) => "accept loop ended".into(),
+                    };
+                    break Err(ServerError::ListenerTask(error));
                 }
                 event = signals() => {
                     if !matches!(event, BrokerSignal::Reload) {

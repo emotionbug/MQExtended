@@ -71,4 +71,7 @@ pub enum ServerError {
     /// auth-plug's `log.c: _fatal` does before `exit(1)`.
     #[error("auth plugin initialization aborted")]
     PluginAbort,
+    /// A listener stopped accepting connections without a shutdown request.
+    #[error("Listener task stopped: {0}")]
+    ListenerTask(String),
 }
