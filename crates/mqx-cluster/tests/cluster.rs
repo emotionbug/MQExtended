@@ -517,10 +517,9 @@ async fn follower_installs_snapshot_when_its_missing_prefix_has_been_purged() {
     let leader = nodes[&leader_id].clone();
     // A follower may not have received any entry yet right after the election;
     // wait for one so the lag below is measured from a real log position.
-    until(|| nodes[&follower_id].metrics().last_log_index).await;
+    let lagged_at = until(|| nodes[&follower_id].metrics().last_log_index).await;
     let stopped = nodes.remove(&follower_id).unwrap();
     stopped.shutdown().await.unwrap();
-    let lagged_at = stopped.metrics().last_log_index.unwrap();
 
     let large = "a".repeat(80 * 1024);
     let important = put(&leader, "large", &large).await;

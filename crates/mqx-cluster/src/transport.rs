@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
 use std::net::SocketAddr;
 use std::ops::Deref;
@@ -33,6 +33,7 @@ use crate::mux::{CallError, Client};
 use crate::node::Types;
 use crate::snapshot::{Snapshot, atomic_write};
 use crate::snapshot_file::SnapshotData;
+use crate::survivor::{Incarnation, Probe, ProbeRequest, Record};
 
 const MAGIC: &[u8; 4] = b"MQX3";
 pub(crate) const CLUSTER_ID_FILE: &str = "cluster.id";
@@ -82,6 +83,7 @@ pub(crate) enum Op {
     MeshSend,
     Session,
     Retired,
+    Incarnation,
 }
 
 impl TryFrom<u8> for Op {
@@ -101,6 +103,7 @@ impl TryFrom<u8> for Op {
             10 => Ok(Self::MeshSend),
             11 => Ok(Self::Session),
             12 => Ok(Self::Retired),
+            13 => Ok(Self::Incarnation),
             _ => Err(invalid_data("unknown cluster RPC")),
         }
     }
@@ -149,6 +152,9 @@ pub(crate) struct Endpoint {
     pub(crate) max_snapshot_size: u64,
     pub(crate) limits: Limits,
     slots: SyncMutex<BTreeMap<u64, Arc<PeerSlot>>>,
+    recovery_timeout: Option<Duration>,
+    incarnation: Option<Record>,
+    mismatch_warned: SyncMutex<BTreeSet<u64>>,
 }
 
 impl Endpoint {
@@ -176,7 +182,75 @@ impl Endpoint {
             max_snapshot_size,
             limits,
             slots: SyncMutex::default(),
+            recovery_timeout: None,
+            incarnation: None,
+            mismatch_warned: SyncMutex::default(),
         }
+    }
+
+    pub(crate) fn set_recovery(&mut self, timeout: Option<Duration>, record: Option<Record>) {
+        self.recovery_timeout = timeout;
+        self.incarnation = record;
+    }
+
+    pub(crate) fn digest(&self) -> Option<[u8; 32]> {
+        self.digest.get().copied()
+    }
+
+    pub(crate) fn identity(&self) -> Option<Incarnation> {
+        self.incarnation
+            .as_ref()
+            .and_then(|record| record.identity.clone())
+            .or_else(|| self.digest().map(Incarnation::original))
+    }
+
+    pub(crate) fn record(&self) -> Option<&Record> {
+        self.incarnation.as_ref()
+    }
+
+    pub(crate) fn recovery_timeout(&self) -> Option<Duration> {
+        self.recovery_timeout
+    }
+
+    pub(crate) fn observe_recovery_timeout(&self, from: u64, timeout: Option<Duration>) {
+        if !self.seeds.contains_key(&from) {
+            return;
+        }
+        let mut warned = self.mismatch_warned.lock().unwrap();
+        if self.recovery_timeout == timeout {
+            warned.remove(&from);
+        } else if warned.insert(from) {
+            tracing::warn!(peer = from, local = ?self.recovery_timeout, remote = ?timeout,
+                "Cluster peer has different auto_recover or auto_recover_timeout settings");
+        }
+    }
+
+    pub(crate) async fn query_incarnation(
+        &self,
+        id: u64,
+        address: SocketAddr,
+        repair: bool,
+        deadline: Instant,
+    ) -> io::Result<Probe> {
+        timeout_at(deadline, async {
+            let mut stream = self.connect(id, address, deadline).await?;
+            self.header(&mut stream, id, Op::Incarnation).await?;
+            write_control(
+                &mut stream,
+                &ProbeRequest {
+                    timeout: self.recovery_timeout,
+                    digest: self.digest(),
+                    repair,
+                },
+            )
+            .await?;
+            stream.flush().await?;
+            let info: Probe = self.limits.read_control(&mut stream).await?;
+            self.observe_recovery_timeout(id, info.timeout);
+            Ok(info)
+        })
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut)?
     }
 
     fn slot(&self, id: u64) -> Arc<PeerSlot> {
@@ -336,7 +410,21 @@ impl Endpoint {
         let mut header = [0; HEADER_LEN];
         stream.read_exact(&mut header).await?;
         let (from, op, digest) = self.check_header(&header, authenticated)?;
+        if matches!(op, Op::Incarnation) {
+            if authenticated.is_none() && (!self.seeds.contains_key(&from) || from == self.node_id)
+            {
+                return Err(invalid_data(
+                    "incarnation probe requires a configured plaintext peer",
+                ));
+            }
+            return Ok((stream, from, op));
+        }
         if self.digest.get().is_none() {
+            if self.incarnation.is_some() || self.recovery_timeout.is_some() {
+                return Err(invalid_data(
+                    "recovery must establish the cluster identity before replication",
+                ));
+            }
             // Only a configured seed can establish a joining node's identity.
             let _pin = self.pin.lock().await;
             if self.digest.get().is_none() {
@@ -375,11 +463,13 @@ impl Endpoint {
     fn rpc_header(&self, target: u64, op: Op) -> io::Result<[u8; HEADER_LEN]> {
         let mut header = [0; HEADER_LEN];
         header[..4].copy_from_slice(MAGIC);
-        header[4..36].copy_from_slice(
-            self.digest
-                .get()
-                .ok_or_else(|| invalid_data("cluster identity is not established"))?,
-        );
+        if !matches!(op, Op::Incarnation) {
+            header[4..36].copy_from_slice(
+                self.digest
+                    .get()
+                    .ok_or_else(|| invalid_data("cluster identity is not established"))?,
+            );
+        }
         header[36..44].copy_from_slice(&self.node_id.to_be_bytes());
         header[44..52].copy_from_slice(&target.to_be_bytes());
         header[52] = op as u8;
@@ -397,15 +487,17 @@ impl Endpoint {
                 "cluster header does not match the TLS peer identity",
             ));
         }
+        let op = Op::try_from(header[52])?;
         let digest = header[4..36].try_into().unwrap();
         if &header[..4] != MAGIC
-            || self.digest.get().is_some_and(|known| *known != digest)
+            || (!matches!(op, Op::Incarnation)
+                && self.digest.get().is_some_and(|known| *known != digest))
             || header[44..52] != self.node_id.to_be_bytes()
             || from == 0
         {
             return Err(invalid_data("wrong protocol or cluster identity"));
         }
-        Ok((from, Op::try_from(header[52])?, digest))
+        Ok((from, op, digest))
     }
 }
 
@@ -864,6 +956,49 @@ impl Mesh {
 mod tests {
     use super::*;
     use crate::node::{Leadership, LogId};
+
+    #[test]
+    fn a_fork_rejects_old_raft_and_mesh_headers_but_accepts_the_probe() {
+        let peers = BTreeMap::from([
+            (1, "127.0.0.1:1234".parse().unwrap()),
+            (2, "127.0.0.1:1235".parse().unwrap()),
+        ]);
+        let endpoint = |node, digest| {
+            Endpoint::new(
+                node,
+                peers.clone(),
+                (PathBuf::new(), Some(digest)),
+                watch::channel(MembershipStatus::default()).1,
+                None,
+                1,
+                Limits {
+                    command: 1024,
+                    append: 128 * 1024,
+                    mesh: 1024,
+                },
+            )
+        };
+        let original = Incarnation::original([42; 32]);
+        let fork = original.clone().fork(2, Some(10)).unwrap();
+        let old = endpoint(1, original.digest);
+        let new = endpoint(2, fork.digest);
+        for op in [
+            Op::Session,
+            Op::Append,
+            Op::Vote,
+            Op::Snapshot,
+            Op::MeshSend,
+            Op::Retired,
+        ] {
+            assert!(
+                new.check_header(&old.rpc_header(2, op).unwrap(), Some(1))
+                    .is_err()
+            );
+        }
+        let probe = old.rpc_header(2, Op::Incarnation).unwrap();
+        assert!(new.check_header(&probe, Some(1)).is_ok());
+        assert!(new.check_header(&probe, Some(2)).is_err());
+    }
 
     #[tokio::test]
     async fn append_stream_waits_for_a_delayed_empty_commit_update() {

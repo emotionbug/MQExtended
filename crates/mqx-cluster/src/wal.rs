@@ -64,6 +64,7 @@ pub(crate) struct Wal {
     inner: Arc<RwLock<Option<Inner>>>,
     append_budget: usize,
     format: u16,
+    term_floor: Option<u64>,
 }
 
 impl Wal {
@@ -92,6 +93,7 @@ impl Wal {
             }))),
             append_budget: max_append_size - crate::transport::MAX_CONTROL_FRAME,
             format,
+            term_floor: None,
         })
     }
 
@@ -101,6 +103,11 @@ impl Wal {
             let state = inner.log.log_state();
             state.vote().is_some() || state.last().is_some() || state.committed().is_some()
         })
+    }
+
+    pub(crate) fn with_term_floor(mut self, term: Option<u64>) -> Self {
+        self.term_floor = term;
+        self
     }
 
     pub(crate) async fn metrics(&self) -> io::Result<WalMetrics> {
@@ -184,7 +191,10 @@ impl RaftLogReader<Types> for Wal {
     }
 
     async fn read_vote(&mut self) -> io::Result<Option<Vote>> {
-        Ok(self.read().await?.log.log_state().vote().map(|vote| vote.0))
+        let vote = self.read().await?.log.log_state().vote().map(|vote| vote.0);
+        // A fork has no saved vote. Seed the first election above its snapshot
+        // term without granting a vote to any real member (node IDs are positive).
+        Ok(vote.or_else(|| self.term_floor.map(|term| Vote::new(term, 0))))
     }
 }
 

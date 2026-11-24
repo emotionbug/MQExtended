@@ -9,6 +9,7 @@ WatchdogSec=3min
 ExecStart=/opt/mqextended/current/bin/mqextended -c /etc/mqextended/mqextended.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
+RestartSec=5s
 
 DynamicUser=yes
 User=mqextended

@@ -11,6 +11,7 @@ mod mux;
 mod node;
 mod snapshot;
 mod snapshot_file;
+mod survivor;
 mod transport;
 mod version;
 mod wal;
@@ -30,6 +31,7 @@ pub use lease::{NodeEvent, NodeStatus};
 pub use membership::{MemberRole, MemberStatus, MembershipControl, MembershipStatus};
 pub use node::{Cluster, ClusterMetrics};
 pub use openraft::SnapshotPolicy;
+pub use survivor::{SurvivorEvent, SurvivorReason};
 pub use transport::Mesh;
 pub use wal::WalMetrics;
 
@@ -116,6 +118,10 @@ pub struct ClusterConfig {
     /// Write legacy format 1 for a rolling upgrade from static membership, or
     /// format 2 for tagged payloads and dynamic membership.
     pub state_format: u16,
+    /// Opt in to recovering without a quorum, discarding divergent state if needed.
+    pub auto_recover: bool,
+    /// Defaults to the lease timeout; only valid with automatic recovery enabled.
+    pub auto_recover_timeout: Option<Duration>,
     pub data_dir: PathBuf,
     pub security: ClusterSecurity,
     pub heartbeat_interval: Duration,
@@ -154,6 +160,8 @@ impl ClusterConfig {
             join: false,
             membership_generation: 0,
             state_format: 2,
+            auto_recover: false,
+            auto_recover_timeout: None,
             data_dir,
             security,
             heartbeat_interval: Duration::from_millis(100),
@@ -202,6 +210,36 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Validate the recovery directives before opening the data directory.
+    pub fn validate_auto_recover(&self) -> Result<(), ClusterError> {
+        let invalid = |message: &str| ClusterError::InvalidConfig(message.into());
+        if self.auto_recover {
+            if self.state_format != 2 {
+                return Err(invalid(
+                    "'auto_recover true' requires 'cluster_state_format 2'",
+                ));
+            }
+            if !self.peers.contains_key(&self.node_id) {
+                return Err(invalid(
+                    "'auto_recover true' requires a 'cluster_peer' entry for this node",
+                ));
+            }
+            if self
+                .auto_recover_timeout
+                .is_some_and(|timeout| timeout.as_millis() == 0)
+            {
+                return Err(invalid(
+                    "'auto_recover_timeout' must be a positive number of milliseconds",
+                ));
+            }
+        } else if self.auto_recover_timeout.is_some() {
+            return Err(invalid(
+                "'auto_recover_timeout' requires 'auto_recover true'",
+            ));
+        }
+        Ok(())
+    }
+
     fn raft_config(&self) -> Result<openraft::Config, ClusterError> {
         self.check_frame_limits()?;
         let invalid = ClusterError::InvalidConfig;
@@ -212,6 +250,7 @@ impl ClusterConfig {
                 version: self.state_format,
             });
         }
+        self.validate_auto_recover()?;
         if self.state_format == 1 && (self.join || self.membership_generation != 0) {
             return Err(invalid("dynamic membership requires state format 2".into()));
         }
@@ -263,6 +302,8 @@ impl ClusterConfig {
 pub enum ClusterError {
     #[error("invalid cluster configuration: {0}")]
     InvalidConfig(String),
+    #[error("invalid cluster configuration: {0}")]
+    UnusableIdentity(String),
     #[error("cluster IO: {0}")]
     Io(#[from] io::Error),
     #[error("Raft node failed: {0}")]
@@ -275,6 +316,8 @@ pub enum ClusterError {
     WriteRejected,
     #[error("cluster node is shut down")]
     Shutdown,
+    #[error("cluster incarnation changed; restart the process")]
+    Restart,
     #[error("no cluster member with ID {0}")]
     UnknownNode(u64),
     #[error("node {0} has been permanently removed from the cluster")]

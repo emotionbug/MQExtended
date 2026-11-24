@@ -663,11 +663,11 @@ async fn root_only_identity_mapping_and_privilege_drop_order() {
 
 const SAVE_ERROR: &str = "Error during saving in-memory database";
 
-fn persistence_command(dir: &Path, address: SocketAddr, autosave: &str) -> Command {
+fn persistence_command(dir: &Path, address: SocketAddr, extra: &str) -> Command {
     fs::write(
         dir.join("broker.conf"),
         format!(
-            "{}persistence true\nlog_dest file broker.log\nlog_type all\n{autosave}\n",
+            "{}persistence true\nlog_dest file broker.log\nlog_type all\n{extra}\n",
             config(address)
         ),
     )
@@ -1321,6 +1321,144 @@ async fn corrupt_persistence_database_exits_with_the_reference_status() {
             b"garbage-not-a-db"
         );
     }
+}
+
+#[tokio::test]
+async fn auto_recover_discards_bad_persistence_and_saves_a_fresh_snapshot() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (file, data, reason) in [
+        (
+            "mosquitto.db.mqx",
+            &b"garbage-not-a-db"[..],
+            "unrecognised MQExtended persistence header",
+        ),
+        (
+            "mosquitto.db.mqx",
+            &b""[..],
+            "persistence database is empty",
+        ),
+        (
+            "mosquitto.db",
+            &b"\0\xb5\0mosquitto db\0"[..],
+            "failed to fill whole buffer",
+        ),
+        ("mosquitto.db", &b""[..], "persistence database is empty"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let discarded = dir.path().join(format!("{file}.discarded"));
+        let native = dir.path().join("mosquitto.db.mqx");
+        let legacy = dir.path().join("mosquitto.db");
+        fs::write(&path, data).unwrap();
+        fs::write(&discarded, b"previous discarded database").unwrap();
+        if path == native {
+            // A failed native restore must not fall back to an older source.
+            fs::write(&legacy, b"old import").unwrap();
+        }
+        let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+        let address = listen_address();
+        let mut child = persistence_command(
+            dir.path(),
+            address,
+            "autosave_interval 0\nauto_recover true",
+        )
+        .spawn()
+        .unwrap();
+        ready(&notify).await;
+        assert!(!path.exists(), "{file}");
+        assert_eq!(fs::read(&discarded).unwrap(), data, "{file}");
+        if path == native {
+            assert_eq!(fs::read(&legacy).unwrap(), b"old import");
+        }
+        timeout(WAIT, async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(b"\x10\x0f\x00\x04MQTT\x04\x02\x00\x3c\x00\x03dev")
+                .await
+                .unwrap();
+            let mut response = [0; 4];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"\x20\x02\x00\x00");
+        })
+        .await
+        .expect("the recovered broker did not answer MQTT CONNECT");
+        stop(&mut child).await;
+        assert!(
+            mqx_broker::PersistentState::read_snapshot(&native)
+                .unwrap()
+                .is_some()
+        );
+        let log = fs::read_to_string(dir.path().join("broker.log")).unwrap();
+        assert!(
+            log.lines()
+                .any(|line| line.contains(file) && line.contains(reason)),
+            "{log}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_recover_leaves_non_regular_persistence_paths_in_place() {
+    use std::os::unix::fs::symlink;
+
+    for file in ["mosquitto.db", "mosquitto.db.mqx"] {
+        for is_symlink in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(file);
+            let target = dir.path().join("symlink-target");
+            if is_symlink {
+                fs::write(&target, b"original target").unwrap();
+                symlink(&target, &path).unwrap();
+            } else {
+                fs::create_dir(&path).unwrap();
+            }
+            let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+            let mut child = persistence_command(
+                dir.path(),
+                listen_address(),
+                "autosave_interval 0\nauto_recover true",
+            )
+            .env("MOSQUITTO_UNSAFE_ALLOW_SYMLINKS", "1")
+            .spawn()
+            .unwrap();
+            ready(&notify).await;
+            stop(&mut child).await;
+            if is_symlink {
+                assert_eq!(fs::read_link(&path).unwrap(), target);
+                assert_eq!(fs::read(&target).unwrap(), b"original target");
+            } else {
+                assert!(path.is_dir());
+            }
+            assert!(!dir.path().join(format!("{file}.discarded")).exists());
+            if file == "mosquitto.db" {
+                assert!(dir.path().join("mosquitto.db.mqx").is_file());
+            }
+            let log = fs::read_to_string(dir.path().join("broker.log")).unwrap();
+            assert_eq!(
+                log.matches("Persistence writes disabled for").count(),
+                1,
+                "{log}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn occupied_listener_exits_nonzero_and_a_restart_can_bind_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    let mut command = persistence_command(dir.path(), address, "auto_recover true");
+    let status = timeout(WAIT, command.status()).await.unwrap().unwrap();
+    assert_eq!(status.code(), Some(1));
+
+    drop(reserved);
+    let mut child = command.spawn().unwrap();
+    ready(&notify).await;
+    drop(TcpStream::connect(address).await.unwrap());
+    stop(&mut child).await;
 }
 
 // src/proxy_v1.c: proxy_v1__decode keeps the source token as sent;

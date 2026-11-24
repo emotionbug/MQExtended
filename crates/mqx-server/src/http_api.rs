@@ -234,6 +234,9 @@ fn cluster_status(broker: &Broker) -> serde_json::Value {
         "mode": "cluster",
         "mqx_version": env!("CARGO_PKG_VERSION"),
         "membership": membership,
+        "auto_recover": metrics.auto_recover,
+        "incarnation": metrics.incarnation,
+        "last_survivor_event": metrics.last_survivor_event,
         "raft": {
             "node_id": metrics.node_id,
             "term": metrics.current_term,
@@ -269,6 +272,22 @@ async fn prometheus(broker: &Broker) -> String {
         writeln!(body, "# TYPE mqx_{metric} {kind}\nmqx_{metric} {value}").unwrap();
     }
     if let Some(metrics) = broker.raft_metrics() {
+        for (name, value) in [
+            ("mqx_cluster_auto_recover", u64::from(metrics.auto_recover)),
+            ("mqx_cluster_incarnation", metrics.incarnation),
+        ] {
+            writeln!(body, "# TYPE {name} gauge\n{name} {value}").unwrap();
+        }
+        if let Some(event) = metrics.last_survivor_event {
+            let name = "mqx_cluster_last_recovery_timestamp_seconds";
+            writeln!(
+                body,
+                "# TYPE {name} gauge\n{name}{{reason=\"{}\"}} {}",
+                event.reason.as_str(),
+                event.timestamp_seconds
+            )
+            .unwrap();
+        }
         for (metric, value) in [
             ("commit", metrics.committed_index),
             ("apply", metrics.applied_index),

@@ -820,6 +820,47 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
 }
 
 #[test]
+fn automatic_recovery_is_opt_in_and_validates_its_timeout_and_state_format() {
+    assert!(!ServerConfig::default().auto_recover);
+    let standalone = ServerConfig::parse("auto_recover true\nauto_recover_timeout 700\n").unwrap();
+    assert!(standalone.auto_recover);
+    assert_eq!(
+        standalone.auto_recover_timeout,
+        Some(Duration::from_millis(700))
+    );
+    for extra_peer in ["", "cluster_peer 3 192.0.2.3:9003\n"] {
+        let cfg = ServerConfig::parse(&format!(
+            "{CLUSTER}{CLUSTER_TLS}{extra_peer}auto_recover true\nauto_recover_timeout 1200\n"
+        ))
+        .unwrap();
+        let cluster = cfg.cluster.unwrap();
+        assert!(cluster.auto_recover);
+        assert_eq!(
+            cluster.auto_recover_timeout,
+            Some(Duration::from_millis(1200))
+        );
+    }
+    let invalid = [
+        (
+            "auto_recover_timeout 700\n".to_owned(),
+            "'auto_recover_timeout' requires 'auto_recover true'",
+        ),
+        (
+            format!("{CLUSTER}{CLUSTER_TLS}auto_recover true\ncluster_state_format 1\n"),
+            "'auto_recover true' requires 'cluster_state_format 2'",
+        ),
+    ];
+    for (input, reason) in invalid {
+        assert!(
+            ServerConfig::parse(&input)
+                .unwrap_err()
+                .to_string()
+                .contains(reason)
+        );
+    }
+}
+
+#[test]
 fn membership_generation_can_exclude_the_local_node_but_bootstrap_cannot() {
     let config = ServerConfig::parse(&format!(
         "cluster_node_id 1\ncluster_bind 127.0.0.1:7001\ncluster_data_dir node1\n\

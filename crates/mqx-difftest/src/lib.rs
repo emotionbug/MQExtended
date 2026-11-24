@@ -71,6 +71,8 @@ pub enum Error {
     NodeStopped(usize),
     #[error("node {0} is already running")]
     NodeRunning(usize),
+    #[error("node {0} does not have an HTTP status listener")]
+    NoHttpStatusListener(usize),
     #[error("node {index} did not exit within {timeout:?} of SIGTERM:\n{log}")]
     StopTimeout {
         index: usize,
@@ -328,6 +330,18 @@ impl Harness {
         self.brokers.kill(index)
     }
 
+    /// Pauses a node with SIGSTOP without closing its sockets.
+    #[cfg(unix)]
+    pub fn suspend_node(&self, index: usize) -> Result<(), Error> {
+        self.brokers.signal(index, "STOP")
+    }
+
+    /// Sends SIGCONT to a node paused with `suspend_node`.
+    #[cfg(unix)]
+    pub fn resume_node(&self, index: usize) -> Result<(), Error> {
+        self.brokers.signal(index, "CONT")
+    }
+
     /// Starts a stopped node with the same configuration, ports and data directory.
     pub fn restart_node(&mut self, index: usize) -> Result<(), Error> {
         self.brokers.restart(index)
@@ -342,7 +356,7 @@ impl Harness {
     /// Sends SIGUSR1, requesting an immediate persistence backup.
     #[cfg(unix)]
     pub fn backup_node(&self, index: usize) -> Result<(), Error> {
-        self.brokers.backup(index)
+        self.brokers.signal(index, "USR1")
     }
 
     /// Replaces the scenario's directives in a node's configuration with `conf`
@@ -362,9 +376,30 @@ impl Harness {
         self.brokers.log(index)
     }
 
+    /// The Raft storage directory, accessible even while the node is stopped.
+    pub fn node_cluster_data_dir(&self, index: usize) -> Result<PathBuf, Error> {
+        self.brokers.cluster_data_dir(index)
+    }
+
     /// Waits for all running nodes to report the same live leader.
     pub fn wait_for_leader(&mut self, timeout: Duration) -> Result<usize, Error> {
         self.brokers.wait_for_leader(timeout)
+    }
+
+    /// Fetches the cluster status from a node started with `ClusterReadiness::HttpStatus`.
+    /// `None` means the probe did not get a cluster status response within `timeout`.
+    pub fn node_cluster_status(
+        &self,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        self.brokers.cluster_status(index, timeout)
+    }
+
+    /// Probes MQTT admission on a node started with `ClusterReadiness::HttpStatus`.
+    /// `None` means the HTTP probe did not report readiness within `timeout`.
+    pub fn node_mqtt_ready(&self, index: usize, timeout: Duration) -> Result<Option<bool>, Error> {
+        self.brokers.mqtt_ready(index, timeout)
     }
 
     pub fn send(&mut self, connection: Connection, packet: &Packet) -> Result<(), Error> {

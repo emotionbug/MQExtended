@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -14,6 +16,7 @@ use openraft::errors::{ClientWriteError, InitializeError, LinearizableReadError,
 use openraft::raft::{
     AppendEntriesRequest, Precondition, StreamAppendResult, TransferLeaderRequest, VoteRequest,
 };
+use openraft::storage::{RaftLogReader, RaftLogStorage};
 use openraft::{BasicNode, ChangeMembers, Raft, ReadPolicy, ServerState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,6 +36,10 @@ use crate::snapshot::{
     open_private_file, prepare_dir,
 };
 use crate::snapshot_file::SnapshotData;
+use crate::survivor::{
+    self, IDENTITY_FILE, IDENTITY_VERSION, Incarnation, JOINED, Probe, ProbeRequest, Record,
+    SurvivorEvent, SurvivorReason, Switch,
+};
 use crate::transport::{
     APPEND_WINDOW, CLUSTER_ID_FILE, Connection, Endpoint, Frame, Limits, Network, Op, decode,
     encode, invalid_data, write_control,
@@ -40,7 +47,6 @@ use crate::transport::{
 use crate::wal::{Wal, WalMetrics};
 use crate::{ClusterConfig, ClusterError, Mesh, NodeEvent, NodeStatus, StateMachine, version};
 
-const IDENTITY_FILE: &str = "node.mpk";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_WINDOW: usize = 256;
 pub(crate) type Leadership = LeaderIdOf<Types>;
@@ -86,6 +92,9 @@ pub struct ClusterMetrics {
     pub snapshot_index: Option<u64>,
     pub purged_index: Option<u64>,
     pub running: bool,
+    pub auto_recover: bool,
+    pub incarnation: u64,
+    pub last_survivor_event: Option<SurvivorEvent>,
 }
 
 /// A Raft member. Clones share the same local node, transport and state machine.
@@ -116,6 +125,9 @@ struct Core<S: StateMachine> {
     requested: watch::Sender<Option<Desired>>,
     serving: watch::Sender<Serving>,
     safe_until: watch::Sender<Option<Instant>>,
+    restart: Option<watch::Sender<bool>>,
+    repair: AtomicBool,
+    replication_source: AtomicU64,
     #[cfg(test)]
     filter_lease_renewals: std::sync::atomic::AtomicBool,
     heartbeat_interval: Duration,
@@ -124,6 +136,18 @@ struct Core<S: StateMachine> {
     lease_interval: Duration,
     lease_timeout: Duration,
     clock_origin: Instant,
+    bootstrap_identity: Option<Incarnation>,
+}
+
+enum IncarnationChange {
+    Fork {
+        unreachable: Duration,
+        parent: Incarnation,
+    },
+    Rejoin {
+        peer: u64,
+        identity: Incarnation,
+    },
 }
 
 impl<S: StateMachine> Cluster<S> {
@@ -146,6 +170,8 @@ impl<S: StateMachine> Cluster<S> {
             join,
             membership_generation,
             state_format,
+            auto_recover,
+            auto_recover_timeout,
             heartbeat_interval,
             request_timeout,
             snapshot_timeout,
@@ -157,71 +183,116 @@ impl<S: StateMachine> Cluster<S> {
             lease_timeout,
             ..
         } = config;
+        let recovery_timeout = auto_recover.then(|| auto_recover_timeout.unwrap_or(lease_timeout));
+        let bootstrap_identity = if auto_recover {
+            Some(Incarnation::original(
+                Sha256::digest(encode(&peers)?).into(),
+            ))
+        } else {
+            None
+        };
         let requested = (membership_generation != 0).then(|| Desired {
             generation: membership_generation,
             peers: peers.clone(),
         });
-        let (endpoint, wal, store, initial, existing) = tokio::task::spawn_blocking(move || {
-            let tls = Tls::load(&security, node_id)?;
-            let limits = Limits {
-                command: max_command_size,
-                append: max_append_size,
-                mesh: max_mesh_size,
-            };
-            prepare_dir(&data_dir, false)?;
-            match open_private_file(&data_dir.join(RETIRED_FILE)) {
-                Ok(_) => return Err(ClusterError::Removed(node_id)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            let new_join = join && !data_dir.join(IDENTITY_FILE).exists();
-            if new_join {
-                for entry in data_dir.read_dir()? {
-                    let entry = entry?;
-                    let name = entry.file_name();
-                    let kind = entry.file_type()?;
-                    // A crash before the node identity's rename can leave its
-                    // temporary file and a WAL without any Raft state.
-                    if (name == "wal" && kind.is_dir())
-                        || (name
-                            .as_encoded_bytes()
-                            .starts_with(TEMP_FILE_PREFIX.as_bytes())
-                            && kind.is_file())
-                    {
-                        continue;
-                    }
-                    return Err(ClusterError::InvalidConfig(
-                        "a new joining node needs an empty data directory".into(),
-                    ));
+        let (endpoint, wal, store, initial, existing, lock) =
+            tokio::task::spawn_blocking(move || {
+                let tls = Tls::load(&security, node_id)?;
+                let limits = Limits {
+                    command: max_command_size,
+                    append: max_append_size,
+                    mesh: max_mesh_size,
+                };
+                prepare_dir(&data_dir, false)?;
+                let lock = survivor::lock(&data_dir, auto_recover)?;
+                if lock.is_some() {
+                    Switch::recover(&data_dir)?;
                 }
-            }
-            let wal = Wal::open(&data_dir.join("wal"), max_append_size, state_format)?;
-            let (initial, digest, existing) = load_identity(
-                &data_dir,
-                node_id,
-                &peers,
-                join,
-                membership_generation,
-                &wal,
-            )?;
-            let store = Store::open(state_machine, data_dir.clone(), state_format)?;
-            if store.status.borrow().retired.contains(&node_id) {
-                return Err(ClusterError::Removed(node_id));
-            }
-            let endpoint = Arc::new(Endpoint::new(
-                node_id,
-                peers,
-                (data_dir, digest),
-                store.status.subscribe(),
-                tls,
-                max_snapshot_size,
-                limits,
-            ));
-            Ok((endpoint, wal, store, initial, existing))
-        })
-        .await
-        .map_err(io::Error::other)??;
-        let raft = Raft::build(
+                match open_private_file(&data_dir.join(RETIRED_FILE)) {
+                    Ok(_) => return Err(ClusterError::Removed(node_id)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let new_join = join && !data_dir.join(IDENTITY_FILE).exists();
+                if new_join {
+                    for entry in data_dir.read_dir()? {
+                        let entry = entry?;
+                        let name = entry.file_name();
+                        let kind = entry.file_type()?;
+                        // A crash before the node identity's rename can leave its
+                        // temporary file and a WAL without any Raft state.
+                        if (name == "wal" && kind.is_dir())
+                            || (name
+                                .as_encoded_bytes()
+                                .starts_with(TEMP_FILE_PREFIX.as_bytes())
+                                && kind.is_file())
+                            || (lock.is_some() && name == survivor::DISCARDED && kind.is_dir())
+                        {
+                            continue;
+                        }
+                        return Err(ClusterError::InvalidConfig(
+                            "a new joining node needs an empty data directory".into(),
+                        ));
+                    }
+                }
+                let recover = |error| unusable_state(&data_dir, node_id, auto_recover, error);
+                let wal = Wal::open(&data_dir.join("wal"), max_append_size, state_format)
+                    .map_err(|error| recover(error.into()))?;
+                let loaded = (|| {
+                    let (initial, digest, existing, record) = load_identity(
+                        &data_dir,
+                        node_id,
+                        &peers,
+                        join,
+                        membership_generation,
+                        &wal,
+                        auto_recover,
+                    )?;
+                    if record.is_some() && state_format != 2 {
+                        return Err(ClusterError::InvalidConfig(
+                            "a recovery incarnation requires 'cluster_state_format 2'".into(),
+                        ));
+                    }
+                    Ok((
+                        initial,
+                        digest,
+                        existing,
+                        record,
+                        Store::open(state_machine, data_dir.clone(), state_format)?,
+                    ))
+                })();
+                let (initial, digest, existing, record, store) = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        drop(wal);
+                        return Err(recover(error));
+                    }
+                };
+                if store.status.borrow().retired.contains(&node_id) {
+                    return Err(ClusterError::Removed(node_id));
+                }
+                let mut endpoint = Endpoint::new(
+                    node_id,
+                    peers,
+                    (data_dir, digest),
+                    store.status.subscribe(),
+                    tls,
+                    max_snapshot_size,
+                    limits,
+                );
+                endpoint.set_recovery(recovery_timeout, record);
+                let wal = wal.with_term_floor(
+                    endpoint
+                        .record()
+                        .filter(|record| record.event.reason == SurvivorReason::PeerUnreachable)
+                        .and_then(|_| store.last_applied().map(|id| id.leader_id.term)),
+                );
+                Ok((Arc::new(endpoint), wal, store, initial, existing, lock))
+            })
+            .await
+            .map_err(io::Error::other)??;
+        let mut wal = wal;
+        let raft = match Raft::build(
             node_id,
             raft_config,
             Network {
@@ -232,10 +303,36 @@ impl<S: StateMachine> Cluster<S> {
             store.clone(),
         )
         .await
-        .map_err(|error| ClusterError::Raft(error.to_string()))?;
+        {
+            Ok(raft) => raft,
+            Err(error) => {
+                if auto_recover {
+                    let _ = store.close().await;
+                    let _ = wal.close().await;
+                    let dir = store.dir().to_path_buf();
+                    return Err(tokio::task::spawn_blocking(move || {
+                        unusable_state(
+                            &dir,
+                            node_id,
+                            auto_recover,
+                            ClusterError::Raft(error.to_string()),
+                        )
+                    })
+                    .await
+                    .map_err(io::Error::other)?);
+                }
+                return Err(ClusterError::Raft(error.to_string()));
+            }
+        };
         if store.status.borrow().retired.contains(&node_id) {
             return Err(ClusterError::Removed(node_id));
         }
+        let repair = if let Some(record) = endpoint.record() {
+            record.event.reason != SurvivorReason::PeerUnreachable
+                && !survivor::join_complete(store.dir(), store.last_applied().map(|id| id.index))?
+        } else {
+            false
+        };
         let core = Arc::new(Core {
             raft,
             store,
@@ -243,6 +340,9 @@ impl<S: StateMachine> Cluster<S> {
             requested: watch::channel(requested).0,
             serving: watch::channel(Serving::Waiting).0,
             safe_until: watch::channel(None).0,
+            restart: auto_recover.then(|| watch::channel(false).0),
+            repair: AtomicBool::new(repair),
+            replication_source: AtomicU64::new(0),
             #[cfg(test)]
             filter_lease_renewals: std::sync::atomic::AtomicBool::new(false),
             heartbeat_interval,
@@ -251,14 +351,98 @@ impl<S: StateMachine> Cluster<S> {
             lease_interval,
             lease_timeout,
             clock_origin: Instant::now(),
+            bootstrap_identity,
         });
+        if repair {
+            core.raft.runtime_config().elect(false);
+        }
+        if auto_recover {
+            let wait = recovery_timeout.expect("automatic recovery timeout");
+            let replies = core
+                .probe_incarnations(wait.min(request_timeout).min(Duration::from_millis(250)))
+                .await;
+            let mut local = core.incarnation_probe(None);
+            local.committed = local
+                .committed
+                .max(wal.read_committed().await?.map(|id| id.index))
+                .max(core.store.last_applied().map(|id| id.index));
+            if Core::<S>::reported_retired(&local, &replies) {
+                core.retire().await?;
+                wal.close().await?;
+                return Err(ClusterError::Removed(node_id));
+            }
+            let rejoin = core.rejoin_choice(&local, &replies).or_else(|| {
+                // An empty volume has no proof that its ID is not already a
+                // voter. Let an existing replica identify the incarnation first.
+                (!repair && local.committed.is_none())
+                    .then(|| {
+                        replies.iter().find_map(|(&peer, probe)| {
+                            let identity = probe.identity.as_ref()?;
+                            (!probe.repair
+                                && probe.committed.is_some_and(|index| index > 0)
+                                && Some(identity.digest) == core.mesh.endpoint.digest())
+                            .then(|| IncarnationChange::Rejoin {
+                                peer,
+                                identity: identity.clone(),
+                            })
+                        })
+                    })
+                    .flatten()
+            });
+            if let Some(change) = rejoin {
+                let switch = core.prepare_switch(change, &mut wal).await?;
+                wal.close().await?;
+                tokio::task::spawn_blocking(move || switch.commit())
+                    .await
+                    .map_err(io::Error::other)??;
+                return Err(ClusterError::Restart);
+            }
+        }
+        let start_single_voter = auto_recover
+            && !repair
+            && core
+                .mesh
+                .endpoint
+                .record()
+                .is_some_and(|record| record.event.reason == SurvivorReason::PeerUnreachable)
+            && wal
+                .read_vote()
+                .await?
+                .is_some_and(|vote| vote.leader_id.node_id == 0)
+            && {
+                let state = core.store.status.borrow();
+                !state.joint
+                    && state
+                        .members
+                        .values()
+                        .filter(|m| m.role == MemberRole::Voter)
+                        .count()
+                        == 1
+                    && state
+                        .members
+                        .get(&node_id)
+                        .is_some_and(|m| m.role == MemberRole::Voter)
+            };
+        if start_single_voter {
+            // The snapshot has no granted vote. Start the uncontested election
+            // without waiting for a randomized follower deadline.
+            core.raft.runtime_config().elect(false);
+        }
         core.raft.run();
-        let driver = tokio::spawn(core.clone().run(listener, wal.clone()));
+        let driver = tokio::spawn(core.clone().run(listener, wal.clone(), lock));
         let cluster = Self(Arc::new(Node {
             core,
             wal,
             driver: Mutex::new(Some(driver)),
         }));
+        if start_single_voter {
+            let raft = &cluster.0.core.raft;
+            if let Err(error) = raft.trigger().elect(false).await {
+                let _ = cluster.shutdown().await;
+                return Err(ClusterError::Raft(error.to_string()));
+            }
+            raft.runtime_config().elect(true);
+        }
         if let Some(peers) = initial {
             let membership = MembershipOf::<Types>::from(
                 peers
@@ -474,6 +658,7 @@ impl<S: StateMachine> Cluster<S> {
             serving: core.serving.subscribe(),
             safe_until: core.safe_until.subscribe(),
             stop: core.mesh.stop.subscribe(),
+            restart: core.restart.as_ref().map(watch::Sender::subscribe),
             leader: Arc::new(move || weak.upgrade().and_then(|core| core.current_leader())),
             dynamic: core.store.format == 2,
         }
@@ -487,6 +672,7 @@ impl<S: StateMachine> Cluster<S> {
     pub fn metrics(&self) -> ClusterMetrics {
         let receiver = self.0.core.raft.metrics();
         let m = receiver.borrow_watched();
+        let endpoint = &self.0.core.mesh.endpoint;
         ClusterMetrics {
             node_id: m.id,
             current_term: m.current_term,
@@ -497,6 +683,12 @@ impl<S: StateMachine> Cluster<S> {
             snapshot_index: m.snapshot.map(|id| id.index),
             purged_index: m.purged.map(|id| id.index),
             running: !*self.0.core.mesh.stop.borrow() && m.running_state.is_ok(),
+            auto_recover: endpoint.recovery_timeout().is_some(),
+            incarnation: endpoint
+                .record()
+                .and_then(|record| record.identity.as_ref())
+                .map_or(0, |id| id.number),
+            last_survivor_event: endpoint.record().map(|record| record.event),
         }
     }
 
@@ -675,7 +867,7 @@ impl<S: StateMachine> Core<S> {
             .await
     }
 
-    async fn renew_leases(&self) -> Result<(), ClusterError> {
+    async fn renew_leases(&self) -> Result<Option<IncarnationChange>, ClusterError> {
         let mut applied = self.store.status.subscribe();
         let node_id = self.mesh.endpoint.node_id;
         let mut next = Instant::now();
@@ -686,15 +878,17 @@ impl<S: StateMachine> Core<S> {
             tokio::select! {
                 retired = async { applied.wait_for(|status| status.retired.contains(&node_id)).await.is_ok() } => {
                     if retired {
-                        return self.retire().await;
+                        self.retire().await?;
                     }
-                    return Ok(());
+                    return Ok(None);
                 },
                 _ = tokio::time::sleep_until(next) => {},
             }
             let started = Instant::now();
             let deadline = started + self.lease_interval;
-            let leader = self.current_leader();
+            let leader = self
+                .current_leader()
+                .filter(|_| !self.repair.load(Ordering::Acquire));
             #[cfg(test)]
             let leader = leader.filter(|_| {
                 !self
@@ -725,9 +919,8 @@ impl<S: StateMachine> Core<S> {
                 last_renewal = Instant::now();
                 // The leader's expiry clock cannot start before we issue this
                 // renewal. Don't extend local ownership by RPC or apply latency.
-                let margin = (self.lease_timeout / 4).min(Duration::from_millis(100));
                 self.safe_until
-                    .send_replace(Some(started + (self.lease_timeout - margin)));
+                    .send_replace(Some(started + self.lease_window()));
                 self.serving.send_if_modified(|state| {
                     let changed = *state == Serving::Waiting;
                     if changed {
@@ -748,21 +941,291 @@ impl<S: StateMachine> Core<S> {
                         changed
                     });
                 }
-                if self.store.format == 2 && Instant::now() >= next_probe {
+                if self.store.format == 2
+                    && self.mesh.endpoint.recovery_timeout().is_none()
+                    && Instant::now() >= next_probe
+                {
                     next_probe =
                         Instant::now() + self.lease_interval.max(Duration::from_millis(200));
                     if self.probe_retired().await {
-                        return self.retire().await;
+                        self.retire().await?;
+                        return Ok(None);
                     }
                 }
             }
-            next = Instant::now()
-                + if *self.serving.borrow() == Serving::Waiting {
-                    self.heartbeat_interval.min(self.lease_interval)
-                } else {
-                    self.lease_interval
-                };
+            let period = if *self.serving.borrow() == Serving::Waiting {
+                self.heartbeat_interval.min(self.lease_interval)
+            } else {
+                self.lease_interval
+            };
+            let period = self
+                .mesh
+                .endpoint
+                .recovery_timeout()
+                .map_or(period, |wait| {
+                    period.min((wait / 3).max(Duration::from_millis(1)))
+                });
+            next = Instant::now() + period;
         }
+    }
+
+    fn lease_window(&self) -> Duration {
+        self.lease_timeout - (self.lease_timeout / 4).min(Duration::from_millis(100))
+    }
+
+    async fn recover_incarnation(
+        &self,
+        wait: Duration,
+    ) -> Result<Option<IncarnationChange>, ClusterError> {
+        let mut last_viable = Instant::now();
+        let period = self
+            .lease_interval
+            .max(Duration::from_millis(200))
+            .min(wait);
+        let mut ticks = tokio::time::interval(period);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            if let Some(change) = self.check_recovery(wait, &mut last_viable).await? {
+                return Ok(Some(change));
+            }
+        }
+    }
+
+    fn incarnation_probe(&self, asking: Option<u64>) -> Probe {
+        let endpoint = &self.mesh.endpoint;
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow_watched();
+        let membership = &metrics.committed_membership_config;
+        let repair = self.repair.load(Ordering::Acquire);
+        let safe_until = (!repair && !*self.mesh.stop.borrow() && self.is_voter(endpoint.node_id))
+            .then_some(*self.safe_until.borrow())
+            .flatten();
+        let now = Instant::now();
+        let quorum = safe_until.is_some_and(|until| until > now);
+        let renewal_age =
+            safe_until.map(|until| now.saturating_duration_since(until - self.lease_window()));
+        let learner_at = if quorum
+            && metrics.current_leader == Some(endpoint.node_id)
+            && membership.membership().get_joint_config().len() == 1
+        {
+            asking
+                .filter(|asking| {
+                    membership
+                        .membership()
+                        .non_write_voter_ids()
+                        .any(|id| id == *asking)
+                })
+                .and_then(|_| membership.log_id().map(|id| id.index))
+        } else {
+            None
+        };
+        let voters = membership.voter_ids().count();
+        let voters = if voters == 0 {
+            self.store
+                .status
+                .borrow()
+                .members
+                .values()
+                .filter(|m| m.role == MemberRole::Voter)
+                .count()
+        } else {
+            voters
+        };
+        Probe {
+            timeout: endpoint.recovery_timeout(),
+            identity: endpoint.identity(),
+            quorum,
+            renewal_age,
+            voters,
+            committed: metrics
+                .local_committed
+                .map(|id| id.index)
+                .max(self.store.last_applied().map(|id| id.index)),
+            repair,
+            retired: asking.is_some_and(|id| self.store.status.borrow().retired.contains(&id)),
+            learner_at,
+        }
+    }
+
+    async fn probe_incarnations(&self, wait: Duration) -> BTreeMap<u64, Probe> {
+        let endpoint = &self.mesh.endpoint;
+        let repair = self.repair.load(Ordering::Acquire);
+        let deadline = Instant::now() + wait;
+        let mut pending: FuturesUnordered<_> = endpoint
+            .seeds
+            .iter()
+            .filter(|(id, _)| **id != endpoint.node_id)
+            .map(|(&id, &address)| async move {
+                endpoint
+                    .query_incarnation(id, address, repair, deadline)
+                    .await
+                    .map(|probe| (id, probe))
+            })
+            .collect();
+        let mut replies = BTreeMap::new();
+        while let Some(result) = pending.next().await {
+            if let Ok((id, probe)) = result {
+                replies.insert(id, probe);
+            }
+        }
+        replies
+    }
+
+    fn reported_retired(local: &Probe, replies: &BTreeMap<u64, Probe>) -> bool {
+        replies.values().any(|reply| {
+            reply.retired
+                && reply.identity.as_ref().is_some_and(|remote| {
+                    local
+                        .identity
+                        .as_ref()
+                        .is_none_or(|local| local.related(remote))
+                })
+        })
+    }
+
+    fn rejoin_choice(
+        &self,
+        local: &Probe,
+        replies: &BTreeMap<u64, Probe>,
+    ) -> Option<IncarnationChange> {
+        let mut winner: Option<(u64, &Probe)> = None;
+        for (&peer, probe) in replies {
+            if probe.repair
+                || probe.identity.is_none()
+                || !(probe.wins_over(local) || (local.identity.is_none() && probe.quorum))
+            {
+                continue;
+            }
+            if winner.is_none_or(|(_, best)| {
+                probe.wins_over(best)
+                    || (probe.identity == best.identity && probe.committed > best.committed)
+            }) {
+                winner = Some((peer, probe));
+            }
+        }
+        let (peer, probe) = winner?;
+        Some(IncarnationChange::Rejoin {
+            peer,
+            identity: probe.identity.clone()?,
+        })
+    }
+
+    async fn check_recovery(
+        &self,
+        wait: Duration,
+        last_viable: &mut Instant,
+    ) -> Result<Option<IncarnationChange>, ClusterError> {
+        let started = Instant::now();
+        let replies = self
+            .probe_incarnations(
+                wait.min(self.request_timeout)
+                    .min(Duration::from_millis(200)),
+            )
+            .await;
+        let local_sampled_at = Instant::now();
+        let local = self.incarnation_probe(None);
+        if Self::reported_retired(&local, &replies) {
+            self.retire().await?;
+            return Ok(None);
+        }
+        if let Some(change) = self.rejoin_choice(&local, &replies) {
+            return Ok(Some(change));
+        }
+        if local.repair {
+            let source = replies.iter().find_map(|(&id, peer)| {
+                (peer.identity.is_some() && peer.identity == local.identity)
+                    .then_some(peer.learner_at)
+                    .flatten()
+                    .map(|index| (id, index))
+            });
+            if let Some((_, index)) = source
+                && self
+                    .store
+                    .last_applied()
+                    .is_some_and(|id| id.index >= index)
+            {
+                let dir = self.store.dir().to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    let bytes = encode(&index)?;
+                    atomic_write(&dir, JOINED, |file| file.write_all(&bytes))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                self.repair.store(false, Ordering::Release);
+                self.raft.runtime_config().elect(true);
+            }
+            self.replication_source
+                .store(source.map_or(0, |(id, _)| id), Ordering::Release);
+        }
+        let own_renewal = local
+            .renewal_age
+            .and_then(|age| local_sampled_at.checked_sub(age));
+        let peer_renewals = replies
+            .values()
+            .filter(|peer| peer.identity.is_some() && peer.identity == local.identity)
+            .filter_map(|peer| started.checked_sub(peer.renewal_age?));
+        // Repeated observations of a cached admission lease must not push the
+        // recovery deadline forward. Subtract from the send time so network
+        // delays cannot make the peer's last renewal look newer.
+        for renewed_at in own_renewal.into_iter().chain(peer_renewals) {
+            *last_viable = (*last_viable).max(renewed_at);
+        }
+        let (single_voter, reachable_quorum) = {
+            let receiver = self.raft.metrics();
+            let metrics = receiver.borrow_watched();
+            let configs = metrics.membership_config.membership().get_joint_config();
+            let node = self.mesh.endpoint.node_id;
+            let single_voter = matches!(configs.as_slice(), [voters] if voters.len() == 1 && voters.contains(&node));
+            let reachable_quorum = !configs.is_empty()
+                && configs.iter().all(|voters| {
+                    voters
+                        .iter()
+                        .filter(|&&id| {
+                            (id == node && !local.repair)
+                                || replies.get(&id).is_some_and(|peer| {
+                                    !peer.repair
+                                        && peer.identity.is_some()
+                                        && peer.identity == local.identity
+                                })
+                        })
+                        .count()
+                        > voters.len() / 2
+                });
+            (single_voter, reachable_quorum)
+        };
+        // Replacing a sole voter with itself cannot restore an unavailable disk.
+        // Still probe for a winning branch, and let the supervisor handle a
+        // fatal Raft error. A joint promotion is not a sole-voter configuration.
+        if single_voter {
+            return Ok(None);
+        }
+        let wait = if self.store.last_applied().is_some() {
+            wait
+        } else {
+            wait.saturating_mul(6)
+        };
+        // Replicas that answer a real protocol probe can still be waiting for
+        // a durable vote or append. Allow one request deadline for Raft to
+        // recover with a reachable quorum. An unresponsive TCP listener alone
+        // contributes nothing, and the grace ends if the quorum disappears.
+        let wait = if reachable_quorum {
+            wait.max(self.request_timeout)
+        } else {
+            wait
+        };
+        let unreachable = last_viable.elapsed();
+        if unreachable < wait {
+            return Ok(None);
+        }
+        let parent = local
+            .identity
+            .or_else(|| self.bootstrap_identity.clone())
+            .expect("automatic recovery has a bootstrap identity");
+        Ok(Some(IncarnationChange::Fork {
+            unreachable,
+            parent,
+        }))
     }
 
     async fn renew_lease(&self, leader: u64, deadline: Instant) -> bool {
@@ -876,6 +1339,9 @@ impl<S: StateMachine> Core<S> {
     }
 
     async fn reconcile(&self) -> Result<(), ClusterError> {
+        if self.mesh.endpoint.recovery_timeout().is_some() && self.reconcile_recovery().await? {
+            return Ok(());
+        }
         let (local, committed) = {
             let requested = self.requested.borrow();
             let state = self.store.state.read().unwrap();
@@ -1053,6 +1519,163 @@ impl<S: StateMachine> Core<S> {
         Ok(())
     }
 
+    // Recovery changes one node at a time. An absent configured peer does
+    // not prevent another peer from rejoining and serving.
+    async fn reconcile_recovery(&self) -> Result<bool, ClusterError> {
+        let (stored, leader) = {
+            let receiver = self.raft.metrics();
+            let metrics = receiver.borrow_watched();
+            if metrics.state != ServerState::Leader
+                || metrics.membership_config != metrics.committed_membership_config
+                || metrics.last_applied.as_ref() < metrics.membership_config.log_id().as_ref()
+            {
+                return Ok(true);
+            }
+            (
+                metrics.committed_membership_config.clone(),
+                metrics.vote.leader_id,
+            )
+        };
+        let endpoint = &self.mesh.endpoint;
+        let (desired, candidates) = {
+            let requested = self.requested.borrow();
+            let state = self.store.state.read().unwrap();
+            if requested.as_ref().is_some_and(|requested| {
+                requested.generation >= state.desired.generation && *requested != state.desired
+            }) {
+                return Ok(false);
+            }
+            let status = self.store.status.borrow();
+            let desired = if state.desired.peers.is_empty() {
+                &endpoint.seeds
+            } else {
+                &state.desired.peers
+            };
+            let candidates = desired
+                .iter()
+                .filter(|&(id, _)| *id != endpoint.node_id && !status.retired.contains(id))
+                .filter(|&(id, _)| {
+                    status.members.get(id).is_none_or(|member| {
+                        member.role == MemberRole::Learner || member.liveness == NodeStatus::Down
+                    })
+                })
+                .map(|(&id, &address)| (id, address))
+                .collect::<Vec<_>>();
+            let normal_change = stored
+                .membership()
+                .nodes()
+                .any(|(id, _)| !desired.contains_key(id));
+            (!normal_change, candidates)
+        };
+        if !desired {
+            return Ok(false);
+        }
+        let membership = stored.membership();
+        let joint = membership.get_joint_config();
+        let mut voters: BTreeSet<_> = membership.voter_ids().collect();
+        let preconditions = || {
+            [
+                Precondition::CommittedLeaderId {
+                    committed_leader_id: leader,
+                },
+                Precondition::LastMembershipLogId {
+                    last_membership_log_id: *stored.log_id(),
+                },
+            ]
+        };
+        if joint.len() > 1 {
+            if matches!(self.read_index().await, Route::Value(_)) {
+                self.raft
+                    .change_membership_if(
+                        ChangeMembers::ReplaceAllVoters(
+                            joint.last().expect("joint voters").clone(),
+                        ),
+                        true,
+                        preconditions(),
+                    )
+                    .await
+                    .map_err(|error| ClusterError::Membership(error.to_string()))?;
+            }
+            return Ok(true);
+        }
+        let deadline = Instant::now() + self.request_timeout.min(Duration::from_millis(200));
+        let mut probes: FuturesUnordered<_> = candidates
+            .into_iter()
+            .map(|(id, address)| async move {
+                (
+                    id,
+                    address,
+                    endpoint
+                        .query_incarnation(id, address, false, deadline)
+                        .await,
+                )
+            })
+            .collect();
+        while let Some((id, address, reply)) = probes.next().await {
+            let Ok(probe) = reply else {
+                continue;
+            };
+            if probe.identity.as_ref().map(|identity| identity.digest) != endpoint.digest() {
+                continue;
+            }
+            if voters.contains(&id) {
+                if !probe.repair || !matches!(self.read_index().await, Route::Value(_)) {
+                    continue;
+                }
+                // Retain the ID as a learner, not as a retired member. The
+                // returning process will not accept a vote or any replication
+                // until this voter change commits.
+                voters.remove(&id);
+            } else if membership.get_node(&id).is_none() {
+                if self.store.state.read().unwrap().leases.status(id) == NodeStatus::Alive {
+                    // Commit the peer's Down event and its wills before it can
+                    // renew a lease under the same node ID.
+                    continue;
+                }
+                self.raft
+                    .add_learner(
+                        id,
+                        BasicNode {
+                            addr: address.to_string(),
+                        },
+                        false,
+                    )
+                    .await
+                    .map_err(|error| ClusterError::Membership(error.to_string()))?;
+                return Ok(true);
+            } else {
+                if probe.repair {
+                    continue;
+                }
+                let Route::Value(barrier) = self.read_index().await else {
+                    continue;
+                };
+                let caught_up = self
+                    .raft
+                    .metrics()
+                    .borrow_watched()
+                    .replication
+                    .as_ref()
+                    .and_then(|matches| matches.get(&id).copied().flatten())
+                    .is_some_and(|log| log.index >= barrier);
+                if !caught_up {
+                    continue;
+                }
+                voters.insert(id);
+            }
+            self.raft
+                .change_membership_if(
+                    ChangeMembers::ReplaceAllVoters(voters),
+                    true,
+                    preconditions(),
+                )
+                .await
+                .map_err(|error| ClusterError::Membership(error.to_string()))?;
+            return Ok(true);
+        }
+        Ok(true)
+    }
+
     async fn expire_leases(&self) {
         let mut ticks = tokio::time::interval(self.lease_interval);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1081,24 +1704,189 @@ impl<S: StateMachine> Core<S> {
         }
     }
 
-    async fn run(self: Arc<Self>, listener: TcpListener, wal: Wal) -> Result<(), ClusterError> {
+    async fn run(
+        self: Arc<Self>,
+        listener: TcpListener,
+        mut wal: Wal,
+        _lock: Option<File>,
+    ) -> Result<(), ClusterError> {
         let mut stop = self.mesh.stop.subscribe();
-        let (_, membership) = tokio::join!(self.serve(listener), async {
+        let recover = self.mesh.endpoint.recovery_timeout().is_some();
+        let recovery_timeout = self.mesh.endpoint.recovery_timeout();
+        let (_, change) = tokio::join!(self.serve(listener), async {
             let result = tokio::select! {
-                _ = stop.wait_for(|stopped| *stopped) => Ok(()),
+                _ = stop.wait_for(|stopped| *stopped) => Ok(None),
                 result = self.renew_leases() => result,
-                _ = self.expire_leases() => Ok(()),
-                _ = self.reconcile_loop() => Ok(()),
+                result = async { self.recover_incarnation(recovery_timeout.expect("recovery enabled")).await }, if recover => result,
+                result = self.raft_failure(), if recover => Err(result),
+                _ = self.expire_leases() => Ok(None),
+                _ = self.reconcile_loop() => Ok(None),
             };
             self.mesh.stop.send_replace(true);
             result
         });
-        let result = self.raft.try_shutdown().await;
+        let raft_result = self.raft.try_shutdown().await;
         self.mesh.endpoint.close().await;
-        self.store.close().await?;
-        wal.close().await?;
-        membership?;
-        result.map_err(|error| ClusterError::Raft(error.to_string()))
+        let cleanup = async {
+            if recover {
+                self.store.seal();
+            }
+            self.store.close().await?;
+            let switch = match change {
+                Ok(Some(change)) => Some(self.prepare_switch(change, &mut wal).await?),
+                Ok(None) => None,
+                Err(error) => {
+                    wal.close().await?;
+                    return Err(error);
+                }
+            };
+            wal.close().await?;
+            if let Some(switch) = switch {
+                tokio::task::spawn_blocking(move || switch.commit())
+                    .await
+                    .map_err(io::Error::other)??;
+                return Err(ClusterError::Restart);
+            }
+            raft_result.map_err(|error| ClusterError::Raft(error.to_string()))
+        }
+        .await;
+        if cleanup.is_err()
+            && let Some(restart) = &self.restart
+        {
+            restart.send_replace(true);
+        }
+        cleanup
+    }
+
+    async fn raft_failure(&self) -> ClusterError {
+        let mut metrics = self.raft.metrics();
+        loop {
+            if let Err(error) = &metrics.borrow_and_update().running_state {
+                return ClusterError::Raft(error.to_string());
+            }
+            if metrics.changed().await.is_err() {
+                return ClusterError::Raft("Raft metrics channel closed".into());
+            }
+        }
+    }
+
+    async fn prepare_switch(
+        &self,
+        change: IncarnationChange,
+        wal: &mut Wal,
+    ) -> Result<Switch, ClusterError> {
+        let endpoint = &self.mesh.endpoint;
+        let node = endpoint.node_id;
+        let preserve_archive = endpoint
+            .record()
+            .is_some_and(|record| record.identity.is_none());
+        let (record, fork) = match change {
+            IncarnationChange::Fork {
+                unreachable,
+                parent,
+            } => {
+                // RaftCore stopped advancing the commit frontier. The apply
+                // worker may still be behind; replay the locally committed tail.
+                let metrics_commit = self.raft.metrics().borrow_watched().local_committed;
+                let committed = metrics_commit.max(wal.read_committed().await?);
+                if let Some(committed) =
+                    committed.filter(|id| Some(*id) > self.store.last_applied())
+                {
+                    let mut start = self.store.last_applied().map_or(0, |id| id.index + 1);
+                    while start <= committed.index {
+                        let end = committed.index.min(start.saturating_add(127));
+                        let entries = wal.try_get_log_entries(start..=end).await?;
+                        if entries.len() as u64 != end - start + 1
+                            || entries
+                                .iter()
+                                .zip(start..=end)
+                                .any(|(entry, index)| entry.log_id.index != index)
+                            || (end == committed.index
+                                && entries.last().map(|entry| entry.log_id) != Some(committed))
+                        {
+                            return Err(invalid_data(
+                                "missing locally committed entries during cluster recovery",
+                            )
+                            .into());
+                        }
+                        self.store.replay_for_fork(entries)?;
+                        if end == committed.index {
+                            break;
+                        }
+                        start = end + 1;
+                    }
+                }
+                if self.store.status.borrow().retired.contains(&node) {
+                    self.retire().await?;
+                    return Err(ClusterError::Removed(node));
+                }
+                let identity = parent.fork(node, self.store.last_applied().map(|id| id.index))?;
+                let metrics_term = self.raft.metrics().borrow_watched().current_term;
+                let last_log_term = wal
+                    .get_log_state()
+                    .await?
+                    .last_log_id
+                    .map_or(0, |id| id.leader_id.term);
+                let vote_term = wal.read_vote().await?.map_or(0, |vote| vote.leader_id.term);
+                let peers = endpoint.seeds.clone();
+                let peer = peers.keys().copied().find(|id| *id != node);
+                (
+                    Record::new(Some(identity), SurvivorReason::PeerUnreachable, peer),
+                    Some((
+                        unreachable,
+                        metrics_term.max(last_log_term).max(vote_term),
+                        peers,
+                    )),
+                )
+            }
+            IncarnationChange::Rejoin { peer, identity } => (
+                Record::new(
+                    Some(identity),
+                    if preserve_archive {
+                        SurvivorReason::UnusableState
+                    } else {
+                        SurvivorReason::PeerWon
+                    },
+                    Some(peer),
+                ),
+                None,
+            ),
+        };
+        let number = record
+            .identity
+            .as_ref()
+            .expect("incarnation assigned")
+            .number;
+        let peer = record.event.peer;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let switch = Switch::prepare(store.dir(), node, record)?;
+            if preserve_archive {
+                switch.keep_archive()?;
+            }
+            if let Some((unreachable, term, peers)) = fork {
+                tracing::warn!(
+                    "Cluster quorum unreachable for {unreachable:?}; continuing alone as a new single-voter cluster (incarnation {number}). Clients reconnect; state not committed here can be lost.",
+                );
+                store.fork_snapshot(&switch.fresh(), node, peers, term)?;
+            } else if let Some(peer) = peer {
+                tracing::warn!(
+                    "Cluster peer {peer} continued without this node (incarnation {number}); discarding local cluster state and rejoining.",
+                );
+            }
+            Ok::<_, io::Error>(switch)
+        }).await.map_err(io::Error::other)?.map_err(Into::into)
+    }
+
+    fn check_repair_source(&self, from: u64) -> io::Result<()> {
+        if self.repair.load(Ordering::Acquire)
+            && self.replication_source.load(Ordering::Acquire) != from
+        {
+            return Err(invalid_data(
+                "replication is fenced until the leader installs this node as a learner",
+            ));
+        }
+        Ok(())
     }
 
     async fn serve(self: &Arc<Self>, listener: TcpListener) {
@@ -1180,6 +1968,31 @@ impl<S: StateMachine> Core<S> {
                 .await
                 .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
             }
+            Op::Incarnation => timeout_at(deadline, async {
+                let endpoint = &self.mesh.endpoint;
+                let request: ProbeRequest = endpoint.limits.read_control(&mut stream).await?;
+                endpoint.observe_recovery_timeout(from, request.timeout);
+                let mut probe = self.incarnation_probe(Some(from));
+                if request.repair && probe.learner_at.is_some() {
+                    // Demotion retains the node ID and thus Raft's previous
+                    // matching index. Authorize a one-time rewind for this
+                    // learner before letting it receive replication again.
+                    if endpoint.recovery_timeout().is_none()
+                        || request.timeout.is_none()
+                        || request.digest != endpoint.digest()
+                        || !matches!(
+                            self.raft.trigger().allow_next_revert(&from, true).await,
+                            Ok(Ok(()))
+                        )
+                    {
+                        probe.learner_at = None;
+                    }
+                }
+                write_control(&mut stream, &probe).await?;
+                stream.flush().await
+            })
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
             _ => Err(invalid_data("RPC requires an established cluster session")),
         }
     }
@@ -1234,7 +2047,7 @@ impl<S: StateMachine> Core<S> {
                 reader.read_exact(&mut id[1..]).await?;
                 let id = u64::from_be_bytes(id);
                 let op = Op::try_from(reader.read_u8().await?)?;
-                if id <= latest || matches!(op, Op::Session | Op::Snapshot) {
+                if id <= latest || matches!(op, Op::Session | Op::Snapshot | Op::Incarnation) {
                     return Err(invalid_data("invalid cluster session request"));
                 }
                 let frame = limits
@@ -1332,6 +2145,11 @@ impl<S: StateMachine> Core<S> {
     }
 
     async fn dispatch(&self, from: u64, op: Op, frame: &Frame) -> io::Result<Bytes> {
+        if matches!(op, Op::Append) {
+            self.check_repair_source(from)?;
+        } else if self.repair.load(Ordering::Acquire) {
+            return Err(invalid_data("cluster node is recovering as a learner"));
+        }
         let (retired, established) = {
             let status = self.store.status.borrow();
             (status.retired.contains(&from), !status.members.is_empty())
@@ -1419,13 +2237,14 @@ impl<S: StateMachine> Core<S> {
                 .handle(from, frame.bytes.clone())
                 .await
                 .map_err(io::Error::other),
-            Op::Session | Op::Snapshot | Op::Retired => {
+            Op::Session | Op::Snapshot | Op::Retired | Op::Incarnation => {
                 Err(invalid_data("invalid cluster session request"))
             }
         }
     }
 
     async fn receive_snapshot(&self, stream: &mut Connection, from: u64) -> io::Result<()> {
+        self.check_repair_source(from)?;
         let endpoint = &self.mesh.endpoint;
         if self.store.status.borrow().retired.contains(&from) {
             return Err(invalid_data("retired node cannot send a snapshot"));
@@ -1499,7 +2318,29 @@ impl<S: StateMachine> Core<S> {
 }
 
 type Peers = BTreeMap<u64, SocketAddr>;
-type NodeIdentity = (Option<Peers>, Option<[u8; 32]>, bool);
+type NodeIdentity = (Option<Peers>, Option<[u8; 32]>, bool, Option<Record>);
+
+fn unusable_state(dir: &Path, node: u64, enabled: bool, error: ClusterError) -> ClusterError {
+    let recoverable = match &error {
+        ClusterError::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::Other
+        ),
+        ClusterError::UnusableIdentity(_)
+        | ClusterError::UnsupportedVersion { .. }
+        | ClusterError::Raft(_) => true,
+        _ => false,
+    };
+    if !enabled || !recoverable {
+        return error;
+    }
+    tracing::warn!(node, %error, "Unusable local cluster state; discarding it and rejoining with empty state");
+    let record = Record::new(None, SurvivorReason::UnusableState, None);
+    match Switch::prepare(dir, node, record).and_then(Switch::commit) {
+        Ok(()) => ClusterError::Restart,
+        Err(error) => error.into(),
+    }
+}
 
 fn load_identity(
     dir: &Path,
@@ -1508,6 +2349,7 @@ fn load_identity(
     join: bool,
     generation: u64,
     wal: &Wal,
+    auto_recover: bool,
 ) -> Result<NodeIdentity, ClusterError> {
     let path = dir.join(IDENTITY_FILE);
     let read = |path: &Path| {
@@ -1515,21 +2357,25 @@ fn load_identity(
         open_private_file(path)?.read_to_end(&mut bytes)?;
         Ok::<_, io::Error>(bytes)
     };
+    let unusable = if auto_recover {
+        ClusterError::UnusableIdentity
+    } else {
+        ClusterError::InvalidConfig
+    };
     match read(&path) {
         Ok(identity) => {
             let (version, prior_id, bootstrap): (u8, u64, Bytes) = decode(&identity)?;
             if prior_id != node_id {
-                return Err(ClusterError::InvalidConfig(
-                    "data directory belongs to another node ID".into(),
-                ));
+                return Err(unusable("data directory belongs to another node ID".into()));
             }
             match version {
                 1 => Ok((
                     Some(decode(&bootstrap)?),
                     Some(Sha256::digest(&bootstrap).into()),
                     true,
+                    None,
                 )),
-                2 => {
+                2 | IDENTITY_VERSION => {
                     let digest = match read(&dir.join(CLUSTER_ID_FILE)) {
                         Ok(bytes) => Some(
                             bytes
@@ -1539,7 +2385,12 @@ fn load_identity(
                         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                         Err(error) => return Err(error.into()),
                     };
-                    Ok((None, digest, true))
+                    let record = if version == IDENTITY_VERSION {
+                        Some(Record::read(dir, digest)?)
+                    } else {
+                        None
+                    };
+                    Ok((None, digest, true, record))
                 }
                 version => Err(ClusterError::UnsupportedVersion {
                     kind: "node identity",
@@ -1554,7 +2405,7 @@ fn load_identity(
                 Err(error) => return Err(error.into()),
             };
             if has_snapshot || wal.has_raft_state() {
-                return Err(ClusterError::InvalidConfig(
+                return Err(unusable(
                     "cluster data directory contains Raft state without a node identity".into(),
                 ));
             }
@@ -1572,7 +2423,7 @@ fn load_identity(
             let digest = (!join).then(|| Sha256::digest(&bootstrap).into());
             let identity = encode(&(if join { 2u8 } else { 1u8 }, node_id, bootstrap))?;
             atomic_write(dir, IDENTITY_FILE, |file| file.write_all(&identity))?;
-            Ok(((!join).then(|| peers.clone()), digest, false))
+            Ok(((!join).then(|| peers.clone()), digest, false, None))
         }
         Err(error) => Err(error.into()),
     }
@@ -1642,6 +2493,221 @@ mod tests {
         fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
             self.0 = decode(bytes)?;
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_dropped_by_a_fork_is_not_retired() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        let new = root.path().join("new");
+        prepare_dir(&old, false).unwrap();
+        prepare_dir(&new, false).unwrap();
+        let peers = BTreeMap::from([
+            (1, "127.0.0.1:1234".parse::<SocketAddr>().unwrap()),
+            (2, "127.0.0.1:1235".parse::<SocketAddr>().unwrap()),
+        ]);
+        let mut store = Store::open(Counter::default(), old, 2).unwrap();
+        let log_id = LogId::new(
+            Leadership {
+                term: 1,
+                node_id: 1,
+            },
+            8,
+        );
+        let membership = MembershipOf::<Types>::from(
+            peers
+                .iter()
+                .map(|(&id, address)| {
+                    (
+                        id,
+                        BasicNode {
+                            addr: address.to_string(),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        );
+        store
+            .apply(futures_util::stream::iter([Ok((
+                EntryOf::<Types> {
+                    log_id,
+                    payload: EntryPayloadOf::<Types>::Membership(membership),
+                },
+                None,
+            ))]))
+            .await
+            .unwrap();
+        store.fork_snapshot(&new, 1, peers.clone(), 2).unwrap();
+        let forked = Store::open(Counter::default(), new, 2).unwrap();
+        let s = forked.status.borrow();
+        assert!(s.retired.is_empty());
+        assert_eq!(s.members.keys().copied().collect::<Vec<_>>(), [1]);
+        assert_eq!(s.desired, peers);
+        validate_change(
+            &s,
+            &Desired {
+                generation: 0,
+                peers,
+            },
+        )
+        .unwrap();
+        assert_eq!(forked.last_applied().unwrap().index, 9);
+        assert_eq!(forked.last_applied().unwrap().leader_id.term, 3);
+    }
+
+    #[tokio::test]
+    async fn cached_admission_lease_does_not_extend_the_recovery_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let reserves: Vec<_> = (0..2)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let peers: Peers = (1..=2)
+            .zip(reserves.iter().map(|socket| socket.local_addr().unwrap()))
+            .collect();
+        drop(reserves);
+        let nodes = futures_util::future::try_join_all(peers.iter().map(|(&id, &addr)| {
+            let mut config = ClusterConfig::new(
+                id,
+                addr,
+                peers.clone(),
+                root.path().join(id.to_string()),
+                ClusterSecurity::InsecurePlaintext,
+            );
+            config.lease_timeout = Duration::from_secs(5);
+            Cluster::start(config, Counter::default())
+        }))
+        .await
+        .unwrap();
+        let [node, stopped] = nodes.as_slice() else {
+            unreachable!()
+        };
+        for node in &nodes {
+            timeout(
+                Duration::from_secs(5),
+                node.membership_control().wait_serving(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        stopped.shutdown().await.unwrap();
+        let core = &node.0.core;
+        core.filter_lease_renewals.store(true, Ordering::Release);
+        let renewal = Instant::now() - Duration::from_secs(2);
+        core.safe_until
+            .send_replace(Some(renewal + core.lease_window()));
+        assert!(core.incarnation_probe(None).quorum);
+        let mut last_viable = renewal - Duration::from_secs(1);
+        assert!(matches!(
+            core.check_recovery(Duration::from_secs(1), &mut last_viable)
+                .await
+                .unwrap(),
+            Some(IncarnationChange::Fork { .. })
+        ));
+        assert!(last_viable <= renewal);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_minority_incarnation_rejoins_the_majority_that_kept_committing() {
+        let root = tempfile::tempdir().unwrap();
+        let reserves: Vec<_> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let peers: Peers = (1..=3)
+            .zip(reserves.iter().map(|socket| socket.local_addr().unwrap()))
+            .collect();
+        drop(reserves);
+        let configs: Vec<_> = peers
+            .iter()
+            .map(|(&id, &addr)| {
+                let mut config = ClusterConfig::new(
+                    id,
+                    addr,
+                    peers.clone(),
+                    root.path().join(id.to_string()),
+                    ClusterSecurity::InsecurePlaintext,
+                );
+                config.auto_recover = true;
+                config.auto_recover_timeout = Some(Duration::from_secs(6));
+                config.heartbeat_interval = Duration::from_millis(40);
+                config.lease_interval = Duration::from_millis(120);
+                config.lease_timeout = Duration::from_secs(1);
+                config
+            })
+            .collect();
+        let mut nodes = futures_util::future::try_join_all(
+            configs
+                .iter()
+                .cloned()
+                .map(|config| Cluster::start(config, Counter::default())),
+        )
+        .await
+        .unwrap();
+        for node in &nodes {
+            timeout(
+                Duration::from_secs(5),
+                node.membership_control().wait_serving(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let isolated = nodes.pop().unwrap();
+        nodes[0].submit(1).await.unwrap();
+        assert_eq!(
+            isolated
+                .linearizable_read(|counter| counter.0)
+                .await
+                .unwrap(),
+            1
+        );
+        isolated.shutdown().await.unwrap();
+        let core = &isolated.0.core;
+        let parent = core.mesh.endpoint.identity().unwrap();
+        let applied = core.store.last_applied().unwrap();
+        let fork = parent.fork(3, Some(applied.index)).unwrap();
+        let switch = Switch::prepare(
+            core.store.dir(),
+            3,
+            Record::new(Some(fork), SurvivorReason::PeerUnreachable, None),
+        )
+        .unwrap();
+        core.store
+            .fork_snapshot(&switch.fresh(), 3, peers, applied.leader_id.term)
+            .unwrap();
+        switch.commit().unwrap();
+
+        // Let the original branch establish progress beyond the archived fork
+        // point before bringing the divergent replica back.
+        nodes[0].submit(41).await.unwrap();
+        let config = configs[2].clone();
+        assert!(matches!(
+            Cluster::start(config.clone(), Counter::default()).await,
+            Err(ClusterError::Restart)
+        ));
+        assert!(config.data_dir.join("discarded/snapshot.mpk").is_file());
+        let recovered = Cluster::start(config, Counter::default()).await.unwrap();
+        timeout(
+            Duration::from_secs(8),
+            recovered.membership_control().wait_serving(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.metrics().incarnation, 0);
+        assert_eq!(recovered.voter_ids(), [1, 2, 3]);
+        assert_eq!(
+            recovered
+                .linearizable_read(|counter| counter.0)
+                .await
+                .unwrap(),
+            42
+        );
+        recovered.shutdown().await.unwrap();
+        for node in nodes {
+            node.shutdown().await.unwrap();
         }
     }
 
@@ -1921,6 +2987,15 @@ mod tests {
         config.lease_interval = Duration::from_secs(60);
         config.lease_timeout = Duration::from_secs(120);
         let node = Cluster::start(config, Counter::default()).await.unwrap();
+        // The initial lease renewal also writes a log entry. Wait for it
+        // before checking that the rejected proposal leaves no gap.
+        timeout(
+            Duration::from_secs(5),
+            node.membership_control().wait_serving(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let (index, total) = node.submit(1).await.unwrap();
         assert_eq!(total, 1);
         let core = &node.0.core;

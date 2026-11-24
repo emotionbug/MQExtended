@@ -20,7 +20,7 @@ use mqx_bridge::Bridges;
 use mqx_broker::{
     Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, ReloadableLimits, SecurityHandle,
 };
-use mqx_cluster::ClusterError;
+use mqx_cluster::{ClusterError, SurvivorReason};
 use mqx_codec::QoS;
 use mqx_server::{
     BrokerSignal, CertificateReloader, HttpApi, ListenerConfig, ListenerProtocol, LogConfig,
@@ -168,7 +168,7 @@ fn start() -> Result<ExitCode, StartupError> {
     let run = || {
         process::drop_privileges(&config.user, &config.log)?;
         process::set_umask()?;
-        if cli.daemon {
+        if cli.daemon && (!config.auto_recover || !already_daemonised()) {
             process::daemonise(&config.log)?;
         }
         config.pid_file.as_deref().map(PidFile::write).transpose()
@@ -200,6 +200,17 @@ fn start() -> Result<ExitCode, StartupError> {
         log_topics,
         &mut shutdown,
     ));
+    if matches!(
+        &result,
+        Err(ServerError::Cluster(mqx_broker::BrokerError::Cluster(
+            ClusterError::Restart
+        )))
+    ) {
+        drop(runtime);
+        tracing::error!(error = %reexec(), "Unable to re-exec MQExtended after cluster recovery");
+        shutdown.finish(&result);
+        return Ok(ExitCode::FAILURE);
+    }
     shutdown.finish(&result);
     Ok(match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -211,6 +222,36 @@ fn start() -> Result<ExitCode, StartupError> {
         }
         Err(_) => ExitCode::from(3),
     })
+}
+
+#[cfg(unix)]
+fn already_daemonised() -> bool {
+    use nix::unistd::{getpid, getsid};
+    getsid(None).is_ok_and(|id| id == getpid())
+}
+
+#[cfg(not(unix))]
+fn already_daemonised() -> bool {
+    false
+}
+
+fn reexec() -> std::io::Error {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let program = match std::env::current_exe() {
+            Ok(program) => program,
+            Err(error) => return error,
+        };
+        let mut argv = std::env::args_os();
+        let mut command = std::process::Command::new(program);
+        if let Some(arg0) = argv.next() {
+            command.arg0(arg0);
+        }
+        command.args(argv).exec()
+    }
+    #[cfg(not(unix))]
+    std::io::Error::new(std::io::ErrorKind::Unsupported, "re-exec requires Unix")
 }
 
 #[derive(Default)]
@@ -356,6 +397,11 @@ fn startup_only_changes(running: &ServerConfig, fresh: &ServerConfig) -> Vec<&'s
             "set_tcp_nodelay",
             running.set_tcp_nodelay != fresh.set_tcp_nodelay,
         ),
+        ("auto_recover", running.auto_recover != fresh.auto_recover),
+        (
+            "auto_recover_timeout",
+            running.auto_recover_timeout != fresh.auto_recover_timeout,
+        ),
     ]
     .into_iter()
     .filter_map(|(name, changed)| changed.then_some(name))
@@ -497,6 +543,18 @@ async fn serve_broker(
         .as_ref()
         .map(|cluster| (cluster.node_id, cluster.state_format));
     let joining = cluster.as_ref().is_some_and(|cluster| cluster.join);
+    let deferred = joining || cluster.as_ref().is_some_and(|cluster| cluster.auto_recover);
+    let bootstrap_node = !joining
+        && cluster.as_ref().is_some_and(|cluster| {
+            cluster
+                .peers
+                .first_key_value()
+                .is_some_and(|(&id, _)| id == cluster.node_id)
+        });
+    let migration_node = bootstrap_node
+        && cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.membership_generation == 0);
     let persistence = cluster
         .is_none()
         .then(|| Arc::new(Persistence::new(config.persistence.clone())));
@@ -515,14 +573,6 @@ async fn serve_broker(
             .map_err(mqx_broker::BrokerError::from)
             .map_err(ServerError::Cluster)?;
         let request_timeout = cluster.request_timeout;
-        // One deterministic bootstrap candidate, even if several empty
-        // voters race to initialize the same Raft membership.
-        let bootstrap_node = !joining
-            && cluster
-                .peers
-                .first_key_value()
-                .is_some_and(|(&id, _)| id == cluster.node_id);
-        let migration_node = bootstrap_node && cluster.membership_generation == 0;
         let broker =
             Broker::clustered_with_security(broker_config(&config), cluster, &security.handles())
                 .await
@@ -530,7 +580,7 @@ async fn serve_broker(
         let membership = broker
             .cluster_membership()
             .expect("the clustered broker owns membership control");
-        if !joining {
+        if !deferred {
             let ready = async {
                 tokio::time::timeout(request_timeout, membership.wait_serving())
                     .await
@@ -572,7 +622,7 @@ async fn serve_broker(
         let (persistence, broker) = (persistence.clone(), broker.clone());
         tokio::spawn(async move { persistence.autosave(&broker, stop).await })
     });
-    let registered = Arc::new(AtomicBool::new(!joining));
+    let registered = Arc::new(AtomicBool::new(!deferred));
     let membership_watch = membership.as_ref().map(|membership| {
         let membership = membership.clone();
         let broker = broker.clone();
@@ -580,12 +630,28 @@ async fn serve_broker(
         let dynamic_security = config.dynamic_security.clone();
         let file_limits = broker_config(&config).reloadable_limits();
         let registered = registered.clone();
+        let migration =
+            (deferred && migration_node && config.persistence.enabled).then(|| config.clone());
         tokio::spawn(async move {
-            if joining {
+            if deferred {
                 while membership.wait_serving().await.is_ok() {
                     let result = async {
                         security.register(&broker).await?;
-                        dynsec_config::register(&broker, dynamic_security.as_ref(), false).await
+                        let event = broker
+                            .raft_metrics()
+                            .and_then(|metrics| metrics.last_survivor_event);
+                        let bootstrap = match event {
+                            None => bootstrap_node,
+                            Some(event) => event.reason == SurvivorReason::PeerUnreachable,
+                        };
+                        dynsec_config::register(&broker, dynamic_security.as_ref(), bootstrap)
+                            .await?;
+                        if event.is_none()
+                            && let Some(config) = &migration
+                        {
+                            persistence::migrate_cluster(&broker, config).await?;
+                        }
+                        Ok::<_, ServerError>(())
                     }
                     .await;
                     match result {
@@ -640,7 +706,7 @@ async fn serve_broker(
     let http = Arc::new(HttpApi::new(&config, &server));
     let http_inventory = http.clone();
     let reload_policies = policies.clone();
-    let result = server
+    let serve = server
         .with_broker_observation(broker.clone())
         .with_watchdog(process::watchdog())
         .run_with_signals(
@@ -794,7 +860,16 @@ async fn serve_broker(
             },
             || broker.shutdown(),
         )
-        .await;
+        ;
+    let result = tokio::select! {
+        result = serve => result,
+        () = async {
+            match &membership {
+                Some(membership) => membership.wait_restart().await,
+                None => std::future::pending().await,
+            }
+        }, if deferred => Ok(()),
+    };
     shutdown.finish(&result);
     stop_autosave.send_replace(true);
     if let Some(task) = autosave {

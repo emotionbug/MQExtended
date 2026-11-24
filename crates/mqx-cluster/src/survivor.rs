@@ -1,0 +1,472 @@
+use std::cmp::Reverse;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::snapshot::{SNAPSHOT_FILE, atomic_write, open_private_file, prepare_dir};
+use crate::transport::{CLUSTER_ID_FILE, decode, encode, invalid_data};
+
+pub(crate) const IDENTITY_FILE: &str = "node.mpk";
+pub(crate) const IDENTITY_VERSION: u8 = 3;
+pub(crate) const RECORD_FILE: &str = "incarnation.mpk";
+pub(crate) const LOCK_FILE: &str = ".mqx-survivor-lock";
+pub(crate) const DISCARDED: &str = "discarded";
+const STAGING: &str = ".mqx-survivor-stage";
+const PENDING: &str = ".mqx-survivor-switch";
+const INSTALL: &str = "install";
+const KEEP_ARCHIVE: &str = "keep_archive";
+pub(crate) const JOINED: &str = "recovery.joined";
+const ACTIVE: [&str; 6] = [
+    IDENTITY_FILE,
+    CLUSTER_ID_FILE,
+    RECORD_FILE,
+    SNAPSHOT_FILE,
+    "wal",
+    JOINED,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurvivorReason {
+    #[serde(rename = "peer_unreachable")]
+    PeerUnreachable,
+    #[serde(rename = "peer_won")]
+    PeerWon,
+    #[serde(rename = "unusable_state")]
+    UnusableState,
+}
+
+impl SurvivorReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerUnreachable => "peer_unreachable",
+            Self::PeerWon => "peer_won",
+            Self::UnusableState => "unusable_state",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurvivorEvent {
+    pub reason: SurvivorReason,
+    pub peer: Option<u64>,
+    pub timestamp_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ForkPoint {
+    parent: [u8; 32],
+    applied: Option<u64>,
+    founder: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Incarnation {
+    pub(crate) number: u64,
+    pub(crate) founder: u64,
+    pub(crate) digest: [u8; 32],
+    lineage: Vec<ForkPoint>,
+}
+
+impl Incarnation {
+    pub(crate) fn original(digest: [u8; 32]) -> Self {
+        Self {
+            number: 0,
+            founder: 0,
+            digest,
+            lineage: Vec::new(),
+        }
+    }
+
+    pub(crate) fn fork(mut self, node_id: u64, applied: Option<u64>) -> io::Result<Self> {
+        self.number = self
+            .number
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("cluster incarnation overflow"))?;
+        let mut hash = Sha256::new();
+        hash.update(b"MQExtended recovery incarnation\0");
+        hash.update(self.digest);
+        hash.update(self.number.to_be_bytes());
+        hash.update(node_id.to_be_bytes());
+        let mut nonce = [0; 32];
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut nonce)
+            .map_err(|_| io::Error::other("unable to generate a cluster identity"))?;
+        hash.update(nonce);
+        self.lineage.push(ForkPoint {
+            parent: self.digest,
+            applied,
+            founder: node_id,
+        });
+        self.digest = hash.finalize().into();
+        self.founder = node_id;
+        Ok(self)
+    }
+
+    fn root(&self) -> [u8; 32] {
+        self.lineage.first().map_or(self.digest, |fork| fork.parent)
+    }
+
+    pub(crate) fn related(&self, other: &Self) -> bool {
+        self.root() == other.root() && self.is_valid() && other.is_valid()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.number == self.lineage.len() as u64
+            && self.lineage.last().map_or(self.founder == 0, |fork| {
+                self.founder != 0 && fork.founder == self.founder
+            })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ProbeRequest {
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) digest: Option<[u8; 32]>,
+    pub(crate) repair: bool,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Probe {
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) identity: Option<Incarnation>,
+    pub(crate) quorum: bool,
+    // Age of the last successful renewal, not of this probe response.
+    pub(crate) renewal_age: Option<Duration>,
+    pub(crate) voters: usize,
+    pub(crate) committed: Option<u64>,
+    pub(crate) repair: bool,
+    pub(crate) retired: bool,
+    pub(crate) learner_at: Option<u64>,
+}
+
+impl Probe {
+    pub(crate) fn wins_over(&self, other: &Self) -> bool {
+        let (Some(a), Some(b)) = (&self.identity, &other.identity) else {
+            return false;
+        };
+        if a.digest == b.digest || a.root() != b.root() || !a.is_valid() || !b.is_valid() {
+            return false;
+        }
+        if let Some(fork) = b.lineage.iter().find(|fork| fork.parent == a.digest) {
+            return self.committed > fork.applied;
+        }
+        if let Some(fork) = a.lineage.iter().find(|fork| fork.parent == b.digest) {
+            return other.committed <= fork.applied;
+        }
+        (self.voters, a.number, Reverse(a.founder), Reverse(a.digest))
+            > (
+                other.voters,
+                b.number,
+                Reverse(b.founder),
+                Reverse(b.digest),
+            )
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Record {
+    pub(crate) identity: Option<Incarnation>,
+    pub(crate) event: SurvivorEvent,
+}
+
+impl Record {
+    pub(crate) fn new(
+        identity: Option<Incarnation>,
+        reason: SurvivorReason,
+        peer: Option<u64>,
+    ) -> Self {
+        Self {
+            identity,
+            event: SurvivorEvent {
+                reason,
+                peer,
+                timestamp_seconds: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            },
+        }
+    }
+
+    pub(crate) fn read(dir: &Path, digest: Option<[u8; 32]>) -> io::Result<Self> {
+        let mut body = Vec::new();
+        open_private_file(&dir.join(RECORD_FILE))
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    invalid_data("missing recovery incarnation record")
+                } else {
+                    error
+                }
+            })?
+            .read_to_end(&mut body)?;
+        let record: Self = decode(&body)?;
+        if let Some(identity) = &record.identity {
+            if Some(identity.digest) != digest || !identity.is_valid() {
+                return Err(invalid_data("invalid recovery incarnation record"));
+            }
+        } else if digest.is_some() || record.event.reason != SurvivorReason::UnusableState {
+            return Err(invalid_data("missing recovery incarnation identity"));
+        }
+        Ok(record)
+    }
+}
+
+pub(crate) fn join_complete(dir: &Path, applied: Option<u64>) -> io::Result<bool> {
+    let mut body = Vec::new();
+    match open_private_file(&dir.join(JOINED)) {
+        Ok(mut file) => file.read_to_end(&mut body)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(applied >= Some(decode(&body)?))
+}
+
+// The WAL lock lives inside the directory that gets renamed. Keep a separate
+// lock across recovery and the switch so another process cannot open a half-install.
+pub(crate) fn lock(dir: &Path, enabled: bool) -> io::Result<Option<File>> {
+    let path = dir.join(LOCK_FILE);
+    if !enabled && !path.try_exists()? {
+        return Ok(None);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    file.try_lock().map_err(io::Error::from)?;
+    File::open(dir)?.sync_all()?;
+    Ok(Some(file))
+}
+
+pub(crate) struct Switch {
+    root: PathBuf,
+    stage: PathBuf,
+}
+
+impl Switch {
+    pub(crate) fn prepare(root: &Path, node_id: u64, record: Record) -> io::Result<Self> {
+        let stage = root.join(STAGING);
+        if stage.try_exists()? {
+            fs::remove_dir_all(&stage)?;
+        }
+        let fresh = stage.join("fresh");
+        prepare_dir(&fresh, false)?;
+        prepare_dir(&stage.join("archive"), false)?;
+        for (name, body) in [
+            (
+                IDENTITY_FILE,
+                encode(&(IDENTITY_VERSION, node_id, bytes::Bytes::new()))?,
+            ),
+            (RECORD_FILE, encode(&record)?),
+        ] {
+            write_staged(&fresh.join(name), &body)?;
+        }
+        if let Some(identity) = record.identity {
+            write_staged(&fresh.join(CLUSTER_ID_FILE), &identity.digest)?;
+        }
+        File::open(&fresh)?.sync_all()?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            stage,
+        })
+    }
+
+    pub(crate) fn fresh(&self) -> PathBuf {
+        self.stage.join("fresh")
+    }
+
+    pub(crate) fn keep_archive(&self) -> io::Result<()> {
+        atomic_write(&self.stage, KEEP_ARCHIVE, |_| Ok(()))
+    }
+
+    fn publish(&self) -> io::Result<()> {
+        fs::rename(&self.stage, self.root.join(PENDING))?;
+        File::open(&self.root)?.sync_all()
+    }
+
+    pub(crate) fn commit(self) -> io::Result<()> {
+        self.publish()?;
+        Self::recover(&self.root)
+    }
+
+    pub(crate) fn recover(root: &Path) -> io::Result<()> {
+        let pending = root.join(PENDING);
+        if !pending.try_exists()? {
+            let stage = root.join(STAGING);
+            if stage.try_exists()? {
+                fs::remove_dir_all(stage)?;
+                File::open(root)?.sync_all()?;
+            }
+            return Ok(());
+        }
+        let archive = pending.join("archive");
+        let discarded = root.join(DISCARDED);
+        if !pending.join(INSTALL).try_exists()? {
+            if archive.try_exists()? {
+                move_active(root, &archive)?;
+                if !pending.join(KEEP_ARCHIVE).try_exists()? {
+                    // The new archive is complete before replacing the previous one.
+                    match fs::symlink_metadata(&discarded) {
+                        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&discarded)?,
+                        Ok(_) => fs::remove_file(&discarded)?,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    fs::rename(&archive, &discarded)?;
+                }
+            }
+            File::open(root)?.sync_all()?;
+            atomic_write(&pending, INSTALL, |_| Ok(()))?;
+        }
+        let fresh = pending.join("fresh");
+        move_active(&fresh, root)?;
+        // Removing the journal via rename, rather than recursively, keeps it
+        // recoverable until the new root and its discarded predecessor are durable.
+        let stage = root.join(STAGING);
+        fs::rename(&pending, &stage)?;
+        File::open(root)?.sync_all()?;
+        fs::remove_dir_all(stage)?;
+        File::open(root)?.sync_all()
+    }
+}
+
+fn write_staged(path: &Path, body: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(body)?;
+    file.sync_all()
+}
+
+fn move_active(from: &Path, to: &Path) -> io::Result<()> {
+    // The durable phase marker makes partial moves replayable. Flush the two
+    // directories once after the batch, before publishing the next phase.
+    for name in ACTIVE {
+        move_if_present(from, to, name)?;
+    }
+    File::open(to)?.sync_all()?;
+    File::open(from)?.sync_all()
+}
+
+fn move_if_present(from: &Path, to: &Path, name: &str) -> io::Result<()> {
+    match fs::rename(from.join(name), to.join(name)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_breaks_ancestor_ties_and_voter_count_breaks_sibling_ties() {
+        let original = Incarnation::original([7; 32]);
+        let one = original.clone().fork(1, Some(10)).unwrap();
+        let two = original.clone().fork(2, Some(5)).unwrap();
+        let newer = two.clone().fork(2, Some(15)).unwrap();
+        let unrelated = Incarnation::original([3; 32]);
+        let probe = |identity, voters, committed| Probe {
+            identity: Some(identity),
+            voters,
+            committed: Some(committed),
+            ..Probe::default()
+        };
+        let parent = probe(original.clone(), 3, 10);
+        let one = probe(one, 1, 12);
+        let two = probe(two, 1, 15);
+        let newer = probe(newer, 1, 16);
+        assert!(one.wins_over(&parent));
+        assert!(!parent.wins_over(&one));
+        assert!(probe(original, 3, 11).wins_over(&one));
+        assert!(one.wins_over(&two));
+        assert!(!two.wins_over(&one));
+        assert!(newer.wins_over(&one));
+        assert!(Probe { voters: 2, ..two }.wins_over(&one));
+        assert!(!one.wins_over(&probe(unrelated, 3, 12)));
+        assert!(!one.wins_over(&Probe::default()));
+    }
+
+    #[test]
+    fn interrupted_switch_keeps_old_state_or_completes_without_mixing() {
+        for interruption in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            fs::create_dir(root.join("wal")).unwrap();
+            fs::write(root.join("wal/log"), b"old log").unwrap();
+            fs::write(root.join(SNAPSHOT_FILE), b"old snapshot").unwrap();
+            fs::write(root.join(IDENTITY_FILE), b"old identity").unwrap();
+            fs::create_dir(root.join(DISCARDED)).unwrap();
+            fs::write(root.join(DISCARDED).join("previous"), b"older archive").unwrap();
+            let identity = Incarnation::original([7; 32]).fork(1, None).unwrap();
+            let record = Record::new(
+                Some(identity.clone()),
+                SurvivorReason::PeerUnreachable,
+                Some(2),
+            );
+            let switch = Switch::prepare(root, 1, record).unwrap();
+            fs::write(switch.fresh().join(SNAPSHOT_FILE), b"fresh snapshot").unwrap();
+            let pending = root.join(PENDING);
+            let archive = pending.join("archive");
+            if interruption > 0 {
+                switch.publish().unwrap();
+            }
+            if interruption == 2 {
+                move_if_present(root, &archive, "wal").unwrap();
+            }
+            if interruption >= 3 {
+                for name in ACTIVE {
+                    move_if_present(root, &archive, name).unwrap();
+                }
+                fs::remove_dir_all(root.join(DISCARDED)).unwrap();
+                fs::rename(archive, root.join(DISCARDED)).unwrap();
+            }
+            if interruption == 4 {
+                atomic_write(&pending, INSTALL, |_| Ok(())).unwrap();
+                move_if_present(&pending.join("fresh"), root, IDENTITY_FILE).unwrap();
+            }
+            Switch::recover(root).unwrap();
+            Switch::recover(root).unwrap();
+            if interruption == 0 {
+                assert_eq!(fs::read(root.join(SNAPSHOT_FILE)).unwrap(), b"old snapshot");
+                assert_eq!(fs::read(root.join("wal/log")).unwrap(), b"old log");
+                assert!(!root.join(CLUSTER_ID_FILE).exists());
+                assert!(root.join("discarded/previous").exists());
+            } else {
+                assert_eq!(
+                    fs::read(root.join(SNAPSHOT_FILE)).unwrap(),
+                    b"fresh snapshot"
+                );
+                assert_eq!(
+                    Record::read(root, Some(identity.digest)).unwrap().identity,
+                    Some(identity)
+                );
+                assert!(!root.join("wal").exists());
+                assert_eq!(
+                    fs::read(root.join("discarded/wal/log")).unwrap(),
+                    b"old log"
+                );
+                assert_eq!(
+                    fs::read(root.join("discarded/snapshot.mpk")).unwrap(),
+                    b"old snapshot"
+                );
+                assert!(!root.join("discarded/previous").exists());
+                assert!(!pending.exists());
+            }
+        }
+    }
+}

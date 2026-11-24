@@ -3,6 +3,9 @@ replicaCount: 1
 additionalVoter:
   # Valid with replicaCount: 2. Adds a full voter without a client endpoint.
   enabled: false
+autoRecover:
+  # Allows a node to keep serving without quorum; a discarded branch loses its writes.
+  enabled: false
 
 image:
   repository: ""

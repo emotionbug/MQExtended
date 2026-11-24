@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 
@@ -9,15 +10,17 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
-use openraft::alias::{EntryPayloadOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
+use openraft::alias::{
+    EntryOf, EntryPayloadOf, MembershipOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf,
+};
 use openraft::storage::{EntryResponder, RaftStateMachine};
-use openraft::{EntryPayload, RaftSnapshotBuilder};
+use openraft::{BasicNode, EntryPayload, RaftSnapshotBuilder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::lease::{Leases, Stamp};
 use crate::membership::{Desired, MemberRole, MemberStatus, MembershipStatus};
-use crate::node::{Command, LogId, Types};
+use crate::node::{Command, Leadership, LogId, Types};
 use crate::snapshot_file::SnapshotData;
 use crate::transport::{decode, encode, invalid_data};
 use crate::{NodeEvent, StateMachine, version};
@@ -44,6 +47,7 @@ pub(crate) struct Applied<S> {
     retired: BTreeSet<u64>,
     last_applied: Option<LogId>,
     pub(crate) membership: StoredMembership,
+    sealed: bool,
 }
 
 pub(crate) struct Store<S> {
@@ -79,6 +83,7 @@ impl<S: StateMachine> Store<S> {
             retired: BTreeSet::new(),
             last_applied: None,
             membership: StoredMembership::default(),
+            sealed: false,
         };
         let snapshot = match open_private_file(&dir.join(SNAPSHOT_FILE)) {
             Ok(file) => {
@@ -129,6 +134,78 @@ impl<S: StateMachine> Store<S> {
 
     pub(crate) fn expire(&self, stamp: Stamp, timeout_ms: u64) -> Vec<crate::lease::LeaseCommand> {
         self.state.read().unwrap().leases.expired(stamp, timeout_ms)
+    }
+
+    pub(crate) fn last_applied(&self) -> Option<LogId> {
+        self.state.read().unwrap().last_applied
+    }
+
+    pub(crate) fn seal(&self) {
+        self.state.write().unwrap().sealed = true;
+    }
+
+    pub(crate) fn replay_for_fork(&self, entries: Vec<EntryOf<Types>>) -> io::Result<()> {
+        let mut state = self.state.write().unwrap();
+        for entry in entries {
+            let _ = state.apply_entry(&self.status, &self.events, self.format, entry, false)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fork_snapshot(
+        &self,
+        dir: &Path,
+        node_id: u64,
+        peers: BTreeMap<u64, SocketAddr>,
+        term: u64,
+    ) -> io::Result<()> {
+        let (meta, leases, app) = {
+            let mut state = self.state.write().unwrap();
+            let index = state.last_applied.map_or(Ok(0), |id| {
+                id.index
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("Raft index overflow"))
+            })?;
+            let term = state
+                .last_applied
+                .map_or(term, |id| term.max(id.leader_id.term))
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("Raft term overflow"))?;
+            let log_id = LogId::new(Leadership { term, node_id }, index);
+            let membership = MembershipOf::<Types>::from(BTreeMap::from([(
+                node_id,
+                BasicNode {
+                    addr: peers[&node_id].to_string(),
+                },
+            )]));
+            let meta = SnapshotMeta {
+                last_log_id: Some(log_id),
+                last_membership: StoredMembership::new(Some(log_id), membership),
+            };
+            let desired = Desired {
+                generation: state.desired.generation,
+                peers,
+            };
+            for &id in desired.peers.keys() {
+                state.leases.ensure(id);
+            }
+            // This is a new snapshot boundary, not a replicated removal.
+            let leases = encode(&MembershipState {
+                leases: &state.leases,
+                desired: &desired,
+                retired: &state.retired,
+            })?;
+            (meta, Bytes::from(leases), state.app.snapshot())
+        };
+        SnapshotData::build(
+            dir,
+            SNAPSHOT_FILE,
+            &meta,
+            leases,
+            &app,
+            (2, S::WRITE_VERSION),
+        )?;
+        Ok(())
     }
 
     pub(crate) async fn close(&self) -> io::Result<()> {
@@ -210,6 +287,72 @@ impl<S: StateMachine> Applied<S> {
         self.membership = meta.last_membership.clone();
         Ok(())
     }
+
+    fn apply_entry(
+        &mut self,
+        status: &watch::Sender<MembershipStatus>,
+        events: &broadcast::Sender<NodeEvent>,
+        format: u16,
+        entry: EntryOf<Types>,
+        respond: bool,
+    ) -> io::Result<Result<Option<Bytes>, String>> {
+        let log_id = entry.log_id;
+        let reply = match entry.payload {
+            EntryPayloadOf::<Types>::Blank => Ok(None),
+            EntryPayload::Membership(membership) => {
+                let previous = std::mem::take(&mut self.membership);
+                self.retired.extend(
+                    previous
+                        .nodes()
+                        .filter_map(|(&id, _)| membership.get_node(&id).is_none().then_some(id)),
+                );
+                for (&id, _) in membership.nodes() {
+                    self.leases.ensure(id);
+                }
+                self.membership = StoredMembership::new(Some(log_id), membership);
+                self.publish_membership(status)?;
+                Ok(None)
+            }
+            EntryPayload::Normal(Command::App(body)) => {
+                let command = version::command::<S>(&body).map_err(invalid_data)?;
+                let response = self.app.apply(log_id.index, command);
+                if respond {
+                    encode(&response)
+                        .map(|bytes| Some(bytes.into()))
+                        .map_err(|error| error.to_string())
+                } else {
+                    Ok(None)
+                }
+            }
+            EntryPayload::Normal(Command::Lease(command)) => {
+                if let Some(event) = self.leases.apply(log_id, command) {
+                    status.send_if_modified(|status| {
+                        if let Some(member) = status.members.get_mut(&event.node_id) {
+                            member.liveness = event.status;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    self.app.on_node_event(event);
+                    let _ = events.send(event);
+                }
+                Ok(None)
+            }
+            EntryPayload::Normal(Command::Desired(desired)) => {
+                if format == 1 {
+                    return Err(invalid_data("dynamic membership requires state format 2"));
+                }
+                if desired.generation > self.desired.generation {
+                    self.desired = desired;
+                    self.publish_membership(status)?;
+                }
+                Ok(None)
+            }
+        };
+        self.last_applied = Some(log_id);
+        Ok(reply)
+    }
 }
 
 impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
@@ -227,63 +370,16 @@ impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
     {
         while let Some((entry, responder)) = entries.try_next().await? {
             let mut state = self.state.write().unwrap();
-            let log_id = entry.log_id;
-            let reply: Result<Option<Bytes>, String> = match entry.payload {
-                EntryPayloadOf::<Types>::Blank => Ok(None),
-                EntryPayload::Membership(membership) => {
-                    let previous = std::mem::take(&mut state.membership);
-                    state.retired.extend(
-                        previous.nodes().filter_map(|(&id, _)| {
-                            membership.get_node(&id).is_none().then_some(id)
-                        }),
-                    );
-                    for (&id, _) in membership.nodes() {
-                        state.leases.ensure(id);
-                    }
-                    state.membership = StoredMembership::new(Some(log_id), membership);
-                    state.publish_membership(&self.status)?;
-                    Ok(None)
-                }
-                EntryPayload::Normal(Command::App(body)) => match version::command::<S>(&body) {
-                    Ok(command) => {
-                        let response = state.app.apply(log_id.index, command);
-                        if responder.is_some() {
-                            encode(&response)
-                                .map(|bytes| Some(bytes.into()))
-                                .map_err(|error| error.to_string())
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    Err(error) => return Err(invalid_data(error)),
-                },
-                EntryPayload::Normal(Command::Lease(command)) => {
-                    if let Some(event) = state.leases.apply(log_id, command) {
-                        self.status.send_if_modified(|status| {
-                            if let Some(member) = status.members.get_mut(&event.node_id) {
-                                member.liveness = event.status;
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        state.app.on_node_event(event);
-                        let _ = self.events.send(event);
-                    }
-                    Ok(None)
-                }
-                EntryPayload::Normal(Command::Desired(desired)) => {
-                    if self.format == 1 {
-                        return Err(invalid_data("dynamic membership requires state format 2"));
-                    }
-                    if desired.generation > state.desired.generation {
-                        state.desired = desired;
-                        state.publish_membership(&self.status)?;
-                    }
-                    Ok(None)
-                }
-            };
-            state.last_applied = Some(log_id);
+            if state.sealed {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let reply = state.apply_entry(
+                &self.status,
+                &self.events,
+                self.format,
+                entry,
+                responder.is_some(),
+            )?;
             if let Some(responder) = responder {
                 // A response serialization error must not stop Raft after the
                 // application command has already taken effect.
@@ -306,6 +402,9 @@ impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
                 let app = data.application()?;
                 {
                     let mut state = store.state.write().unwrap();
+                    if state.sealed {
+                        return Err(io::ErrorKind::BrokenPipe.into());
+                    }
                     let control = decode_membership::<S>(&data)?;
                     state.restore(&meta, control, data.app_version, &app)?;
                 }

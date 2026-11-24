@@ -104,6 +104,7 @@ pub struct MembershipControl {
     pub(crate) serving: watch::Receiver<Serving>,
     pub(crate) safe_until: watch::Receiver<Option<Instant>>,
     pub(crate) stop: watch::Receiver<bool>,
+    pub(crate) restart: Option<watch::Receiver<bool>>,
     pub(crate) leader: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
     pub(crate) dynamic: bool,
 }
@@ -236,6 +237,16 @@ impl MembershipControl {
                 return;
             }
         }
+    }
+
+    /// Wait until automatic recovery needs the server to restart.
+    pub async fn wait_restart(&self) {
+        if let Some(mut restart) = self.restart.clone()
+            && restart.wait_for(|restart| *restart).await.is_ok()
+        {
+            return;
+        }
+        std::future::pending::<()>().await;
     }
 
     /// Wait for durable local or remote confirmation that this ID was retired.

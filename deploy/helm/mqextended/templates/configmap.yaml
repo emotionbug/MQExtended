@@ -67,6 +67,9 @@ data:
     cluster_cafile /etc/mqextended/peer/ca.crt
     cluster_certfile /etc/mqextended/peer/tls.crt
     cluster_keyfile /etc/mqextended/peer/tls.key
+    {{- if include "mqextended.autoRecoverEnabled" . }}
+    auto_recover true
+    {{- end }}
     EOF
       {{- $voters := include "mqextended.voterCount" . | int }}
       {{- range $id := untilStep 1 (int (add1 $voters)) 1 }}

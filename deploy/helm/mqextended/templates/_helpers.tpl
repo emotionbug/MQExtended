@@ -19,6 +19,16 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 {{- end -}}
 
+{{- define "mqextended.autoRecoverEnabled" -}}
+{{- if not (kindIs "map" .Values.autoRecover) -}}
+{{- fail "autoRecover must be an object with an enabled field" -}}
+{{- end -}}
+{{- if not (kindIs "bool" .Values.autoRecover.enabled) -}}
+{{- fail "autoRecover.enabled must be a boolean" -}}
+{{- end -}}
+{{- if .Values.autoRecover.enabled -}}true{{- end -}}
+{{- end -}}
+
 {{/*
 Enabled client listeners as a JSON array of {name, port, protocol, tls}.
 Also validates the client-facing security values they depend on.

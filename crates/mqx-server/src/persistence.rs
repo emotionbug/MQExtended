@@ -1,6 +1,7 @@
 use std::{
-    io,
+    fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -21,6 +22,7 @@ const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub(super) struct Persistence {
     config: watch::Sender<PersistenceConfig>,
     writer: Mutex<()>,
+    writes_blocked: AtomicBool,
 }
 
 impl Persistence {
@@ -28,6 +30,7 @@ impl Persistence {
         Self {
             config: watch::Sender::new(config),
             writer: Mutex::new(()),
+            writes_blocked: AtomicBool::new(false),
         }
     }
 
@@ -44,19 +47,34 @@ impl Persistence {
             return Ok(());
         }
         let native = snapshot_path(&config.persistence);
-        let path = native.clone();
-        let image = file_job(RESTORE_FAILED, path.clone(), move || {
-            PersistentState::read_snapshot(&path)
-        })
-        .await?;
-        if let Some(image) = image {
-            let counts = image.counts();
-            broker
-                .restore_persistence(image)
-                .await
-                .map_err(ServerError::Cluster)?;
-            log_restored(counts);
-        } else if let Some(image) = read_mosquitto(config).await? {
+        let image = match load_database(
+            RESTORE_FAILED,
+            native.clone(),
+            config.auto_recover,
+            PersistentState::read_snapshot,
+        )
+        .await?
+        {
+            Load::Restored(image) => {
+                let counts = image.counts();
+                broker
+                    .restore_persistence(image)
+                    .await
+                    .map_err(ServerError::Cluster)?;
+                log_restored(counts);
+                return Ok(());
+            }
+            Load::Missing => read_mosquitto(config, config.auto_recover).await?,
+            // A broken native image may be newer than the original import.
+            // Starting empty avoids restoring messages already consumed.
+            Load::Discarded => return Ok(()),
+            Load::Unusable => {
+                // Keep saves off even if SIGHUP changes the path to an alias.
+                self.writes_blocked.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+        };
+        if let Load::Restored(image) = image {
             let counts = image.counts();
             broker
                 .restore_persistence(image)
@@ -81,7 +99,7 @@ impl Persistence {
         let _write = self.writer.lock().await;
         let path = {
             let config = self.config.borrow();
-            if !config.enabled {
+            if !self.writes_enabled(&config) {
                 return Ok(None);
             }
             snapshot_path(&config)
@@ -93,6 +111,10 @@ impl Persistence {
             .await
             .inspect_err(|error| tracing::error!("{error}"))?;
         Ok(Some(changes))
+    }
+
+    fn writes_enabled(&self, config: &PersistenceConfig) -> bool {
+        config.enabled && !self.writes_blocked.load(Ordering::Relaxed)
     }
 
     pub(super) async fn autosave(&self, broker: &Broker, mut stop: watch::Receiver<bool>) {
@@ -107,7 +129,7 @@ impl Persistence {
                 (
                     config.autosave_interval,
                     config.autosave_on_changes,
-                    config.enabled,
+                    self.writes_enabled(&config),
                 )
             };
             if *stop.borrow() {
@@ -164,7 +186,7 @@ pub(super) async fn migrate_cluster(
 ) -> Result<(), ServerError> {
     if config.persistence.enabled
         && broker.can_import_persistence()
-        && let Some(image) = read_mosquitto(config).await?
+        && let Load::Restored(image) = read_mosquitto(config, false).await?
     {
         let counts = image.counts();
         if broker
@@ -186,7 +208,7 @@ fn snapshot_path(config: &PersistenceConfig) -> PathBuf {
     path.into()
 }
 
-async fn read_mosquitto(config: &ServerConfig) -> Result<Option<PersistentState>, ServerError> {
+async fn read_mosquitto(config: &ServerConfig, auto_recover: bool) -> Result<Load, ServerError> {
     let path = config.persistence.mosquitto_path();
     let listeners = config.per_listener_settings.then(|| {
         config
@@ -199,8 +221,8 @@ async fn read_mosquitto(config: &ServerConfig) -> Result<Option<PersistentState>
             .map(|(index, listener)| (listener.port, index as u64 + 1))
             .collect::<Vec<_>>()
     });
-    file_job(IMPORT_FAILED, path.clone(), move || {
-        PersistentState::read_mosquitto(&path, |port| match &listeners {
+    load_database(IMPORT_FAILED, path, auto_recover, move |path| {
+        PersistentState::read_mosquitto(path, |port| match &listeners {
             Some(listeners) => listeners
                 .iter()
                 .find(|(candidate, _)| *candidate == port)
@@ -209,6 +231,80 @@ async fn read_mosquitto(config: &ServerConfig) -> Result<Option<PersistentState>
         })
     })
     .await
+}
+
+enum Load {
+    Missing,
+    Restored(PersistentState),
+    Discarded,
+    Unusable,
+}
+
+async fn load_database(
+    operation: &'static str,
+    path: PathBuf,
+    auto_recover: bool,
+    read: impl FnOnce(&Path) -> io::Result<Option<PersistentState>> + Send + 'static,
+) -> Result<Load, ServerError> {
+    file_job(operation, path.clone(), move || {
+        let result = if auto_recover {
+            // The legacy reader accepts empty files and can optionally
+            // follow symlinks. Neither is usable for auto-recovery.
+            match database_metadata(&path) {
+                Ok(Some(metadata)) if metadata.len() == 0 => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "persistence database is empty",
+                )),
+                Ok(Some(_)) => read(&path),
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            }
+        } else {
+            read(&path)
+        };
+        match result {
+            Ok(Some(image)) => Ok(Load::Restored(image)),
+            Ok(None) => Ok(Load::Missing),
+            Err(error) if auto_recover => {
+                tracing::warn!(
+                    "{operation} '{}': {error}; starting with empty state",
+                    path.display()
+                );
+                match discard_database(&path) {
+                    Ok(()) => Ok(Load::Discarded),
+                    Err(error) => {
+                        tracing::warn!(
+                            "Persistence writes disabled for '{}' for this run: {error}",
+                            path.display()
+                        );
+                        Ok(Load::Unusable)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
+}
+
+fn discard_database(path: &Path) -> io::Result<()> {
+    if database_metadata(path)?.is_some() {
+        let mut discarded = path.as_os_str().to_owned();
+        discarded.push(".discarded");
+        fs::rename(path, Path::new(&discarded))?;
+    }
+    Ok(())
+}
+
+fn database_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
+        Ok(metadata) if metadata.is_symlink() => Err(invalid("persistence database is a symlink")),
+        Ok(_) => Err(invalid("persistence database is not a regular file")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 async fn write_snapshot(path: PathBuf, state: PersistentState) -> Result<(), ServerError> {

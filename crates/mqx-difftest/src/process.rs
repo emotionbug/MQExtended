@@ -464,12 +464,59 @@ impl Brokers {
         Ok(self.nodes[check_index(index, self.nodes.len())?].log())
     }
 
+    pub(super) fn cluster_data_dir(&self, index: usize) -> Result<PathBuf, Error> {
+        let node = &self.nodes[check_index(index, self.nodes.len())?];
+        if node.mesh.is_empty() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "node is not clustered").into(),
+            );
+        }
+        Ok(node.dir.path().join("raft-data"))
+    }
+
     #[cfg(unix)]
-    pub(super) fn backup(&self, index: usize) -> Result<(), Error> {
+    pub(super) fn signal(&self, index: usize, signal: &str) -> Result<(), Error> {
         let node = &self.nodes[check_index(index, self.nodes.len())?];
         node.child.as_ref().ok_or(Error::NodeStopped(index))?;
-        node.signal("USR1")?;
+        node.signal(signal)?;
         Ok(())
+    }
+
+    pub(super) fn cluster_status(
+        &self,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        Ok(probe_status(
+            self.http_addr(index)?,
+            Instant::now() + timeout,
+        ))
+    }
+
+    pub(super) fn mqtt_ready(
+        &self,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<Option<bool>, Error> {
+        Ok(probe_http(
+            self.http_addr(index)?,
+            "/api/v1/mqx/ready",
+            Instant::now() + timeout,
+            |code, _| match code {
+                200 => Some(true),
+                503 => Some(false),
+                _ => None,
+            },
+        ))
+    }
+
+    fn http_addr(&self, index: usize) -> Result<SocketAddr, Error> {
+        let node = &self.nodes[check_index(index, self.nodes.len())?];
+        node.child.as_ref().ok_or(Error::NodeStopped(index))?;
+        match node.readiness {
+            Some(Readiness::HttpStatus(addr)) => Ok(addr),
+            _ => Err(Error::NoHttpStatusListener(index)),
+        }
     }
 
     /// Rewrites a node's configuration with `conf` in place of the scenario's
@@ -548,7 +595,7 @@ impl Brokers {
                 if node.child.is_some() {
                     node.check_child(self.kind, offset + 1)?;
                     observations.push(match node.readiness {
-                        Some(Readiness::HttpStatus(addr)) => probe_status(addr, deadline),
+                        Some(Readiness::HttpStatus(addr)) => probe_leader(addr, deadline),
                         _ => observed_leader(&node.log()),
                     });
                 }
@@ -672,8 +719,13 @@ fn node_config(
         "cluster_heartbeat_interval 30\n",
         "cluster_election_timeout 150 300\n",
         "cluster_lease_interval 200\n",
-        "cluster_lease_timeout 2000\n",
     ));
+    if !common
+        .lines()
+        .any(|line| line.split_ascii_whitespace().next() == Some("cluster_lease_timeout"))
+    {
+        conf.push_str("cluster_lease_timeout 2000\n");
+    }
     if let Some((addr, mode)) = readiness {
         // Keep the scenario listener's security intact on both probe modes.
         writeln!(
@@ -708,7 +760,12 @@ fn probe_connect(index: usize) -> Result<BytesMut, Error> {
     Ok(wire)
 }
 
-fn probe_status(addr: SocketAddr, deadline: Instant) -> Option<usize> {
+fn probe_http<T>(
+    addr: SocketAddr,
+    path: &str,
+    deadline: Instant,
+    parse: impl FnOnce(u16, &str) -> Option<T>,
+) -> Option<T> {
     let timeout = PROBE_TIMEOUT.min(time_left(deadline));
     if timeout.is_zero() {
         return None;
@@ -716,18 +773,29 @@ fn probe_status(addr: SocketAddr, deadline: Instant) -> Option<usize> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
-    stream
-        .write_all(
-            b"GET /api/v1/mqx/cluster HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        )
-        .ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
     let mut response = String::new();
     stream.take(64 * 1024).read_to_string(&mut response).ok()?;
     let (head, body) = response.split_once("\r\n\r\n")?;
-    if head.split_ascii_whitespace().nth(1)? != "200" {
-        return None;
-    }
-    let status: serde_json::Value = serde_json::from_str(body).ok()?;
+    parse(head.split_ascii_whitespace().nth(1)?.parse().ok()?, body)
+}
+
+fn probe_status(addr: SocketAddr, deadline: Instant) -> Option<serde_json::Value> {
+    probe_http(addr, "/api/v1/mqx/cluster", deadline, |code, body| {
+        if code == 200 {
+            serde_json::from_str(body).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn probe_leader(addr: SocketAddr, deadline: Instant) -> Option<usize> {
+    let status = probe_status(addr, deadline)?;
     let raft = &status["raft"];
     if raft["running"].as_bool()? {
         usize::try_from(raft["leader"].as_u64()?).ok()

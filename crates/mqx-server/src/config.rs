@@ -45,6 +45,8 @@ pub struct ServerConfig {
     pub enable_control_api: bool,
     pub persistence: PersistenceConfig,
     pub cluster: Option<ClusterConfig>,
+    pub auto_recover: bool,
+    pub auto_recover_timeout: Option<Duration>,
     /// Parse-time operator notices, emitted after the logging destinations are configured.
     pub notices: Vec<String>,
 }
@@ -480,6 +482,7 @@ struct Parser {
     log_dest_seen: bool,
     log_type_seen: bool,
     log_file_seen: bool,
+    auto_recover_seen: bool,
     cluster: Option<((PathBuf, usize), ClusterSection)>,
 }
 
@@ -506,6 +509,8 @@ impl Default for Parser {
                 enable_control_api: false,
                 persistence: PersistenceConfig::default(),
                 cluster: None,
+                auto_recover: false,
+                auto_recover_timeout: None,
                 notices: Vec::new(),
             },
             default_listener: None,
@@ -516,6 +521,7 @@ impl Default for Parser {
             log_dest_seen: false,
             log_type_seen: false,
             log_file_seen: false,
+            auto_recover_seen: false,
             cluster: None,
         }
     }
@@ -525,8 +531,19 @@ impl Parser {
     fn finish(mut self) -> Result<ServerConfig, ServerError> {
         bridge::finish(&mut self.config.bridges)
             .map_err(|error| ServerError::Arguments(format!("Error: {}", error.0)))?;
+        if !self.config.auto_recover && self.config.auto_recover_timeout.is_some() {
+            return Err(ServerError::Arguments(
+                "'auto_recover_timeout' requires 'auto_recover true'.".into(),
+            ));
+        }
         if let Some(((path, line), section)) = self.cluster.take() {
-            self.config.cluster = Some(section.finish().map_err(|error| error.at(&path, line))?);
+            let mut cluster = section.finish().map_err(|error| error.at(&path, line))?;
+            cluster.auto_recover = self.config.auto_recover;
+            cluster.auto_recover_timeout = self.config.auto_recover_timeout;
+            cluster
+                .validate_auto_recover()
+                .map_err(|error| ParseError(error.to_string()).at(&path, line))?;
+            self.config.cluster = Some(cluster);
             if self.config.persistence.enabled {
                 self.config.notices.push(
                     "Ignoring standalone persistence in cluster mode; state is durable in Raft."
@@ -691,6 +708,28 @@ impl Parser {
     ) -> ParseResult<()> {
         let name = v.name;
         match name {
+            "auto_recover" | "auto_recover_timeout" => {
+                let mut words = v.words().take_while(|word| !word.starts_with('#'));
+                let word = words.next().ok_or_else(|| empty(name))?;
+                if words.next().is_some() {
+                    return Err(format!("'{name}' requires one value.").into());
+                }
+                if name == "auto_recover" && !self.auto_recover_seen {
+                    self.config.auto_recover = v.boolean()?;
+                    self.auto_recover_seen = true;
+                } else if name == "auto_recover_timeout"
+                    && self.config.auto_recover_timeout.is_none()
+                {
+                    let millis = word
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|&millis| millis != 0)
+                        .ok_or_else(|| invalid(name, word))?;
+                    self.config.auto_recover_timeout = Some(Duration::from_millis(millis));
+                } else {
+                    return Err(format!("Duplicate '{name}' value in configuration.").into());
+                }
+            }
             "listener" => {
                 let mut words = v.words();
                 let mut port_value = v;
