@@ -137,6 +137,14 @@ jobs:
           sed "s|^ExecStart=.*|ExecStart=\"$bundle/bin/mqextended\" -c \"$bundle/etc/mqextended.conf\"|" \
             "$bundle/lib/systemd/system/mqextended.service" > "$RUNNER_TEMP/mqx-check.service"
           systemd-analyze verify "$RUNNER_TEMP/mqx-check.service"
+      - name: Retain the verified release for same-host broker comparisons
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mqextended-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/mqx-bundle/
+          if-no-files-found: error
+          retention-days: 3
 
   root-process:
     # Only a trusted revision may run a repository-built binary as root.
