@@ -10,7 +10,7 @@ each node:
   mqx-server   mosquitto.conf, listeners: TCP / TLS / WebSocket (mqx-ws), PROXY protocol (mqx-proxy)
     └ mqx-broker   sessions, QoS flows, retained, will, keepalive
         ├ mqx-auth    password_file / acl_file decisions; third-party plugin contract
-        ├ mqx-extauth mosquitto-auth-plug port and its back-end clients (wired in by mqx-server)
+        ├ mqx-extauth mosquitto-auth-plug and mosquitto-go-auth ports, back-end clients (wired in by mqx-server)
         ├ mqx-codec   MQTT 3.1 / 3.1.1 / 5 wire format
         ├ mqx-topic   validation, matching, subscription index
         └ mqx-cluster replicated state machine (Raft) + mesh RPC
@@ -23,7 +23,7 @@ each node:
 | `mqx-topic` | Topic validation and matching identical to Mosquitto; the subscription index used for routing |
 | `mqx-codec` | Encode/decode MQTT 3.1 / 3.1.1 packets (and MQTT 5 in `v5`); Mosquitto's per-protocol wire validation; no I/O |
 | `mqx-auth` | Load `password_file` / `acl_file`; answer allow / deny / ignore exactly as Mosquitto's built-in plugins |
-| `mqx-extauth` | Rust ports of third-party auth plugins behind the `mqx-auth` plugin contract, with their back-end clients (HTTP, SQL, LDAP, Redis, memcached, MongoDB). The only crate that performs back-end I/O for authorization |
+| `mqx-extauth` | Rust ports of third-party auth plugins behind the `mqx-auth` plugin contract, with their back-end clients (HTTP, SQL, LDAP, Redis, memcached, MongoDB, gRPC). The only crate that performs back-end I/O for authorization |
 | `mqx-proxy` | Read PROXY protocol v1/v2 headers and their TLS TLVs as Mosquitto's `enable_proxy_protocol` does; no I/O in the parser |
 | `mqx-ws` | Upgrade HTTP to WebSocket with Mosquitto's built-in handshake rules; expose the MQTT byte stream as `AsyncRead`/`AsyncWrite` |
 | `mqx-broker` | Protocol engine per connection; session lifecycle; delivery; talks to state only through the replicated-log interface |

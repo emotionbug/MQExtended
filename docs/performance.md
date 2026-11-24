@@ -8,7 +8,7 @@ How to measure MQExtended against Mosquitto and what the current numbers are. Th
 
 ```sh
 cargo build --release -p mqx-server -p mqx-bench
-export MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build
+export MOSQUITTO_BUILD_DIR=$HOME/mqx-reference/mosquitto/build
 target/release/mqx-bench compare \
     --seconds 30 --rate 100 --json results.json
 # persistent sessions, one-to-one:

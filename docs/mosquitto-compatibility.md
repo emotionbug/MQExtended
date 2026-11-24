@@ -58,7 +58,7 @@ See [client interoperability](testing.md#client-sdk-interoperability) for the di
 
 ### Plugins
 
-`plugin` and `auth_plugin` recognize the stock `.so` and `.dll` filenames, and the third-party `auth-plug` library by its file name. MQExtended runs the corresponding Rust implementation, not code from that path. `plugin_opt_` and `auth_opt_` are aliases. Use `global_plugin` for global scope, or `plugin_load` and `plugin_use` to attach a named plugin to a listener. Restart to change declarations or their options.
+`plugin` and `auth_plugin` recognize the stock `.so` and `.dll` filenames, and the third-party `auth-plug` and `go-auth` libraries by their file names. MQExtended runs the corresponding Rust implementation, not code from that path. `plugin_opt_` and `auth_opt_` are aliases. Use `global_plugin` for global scope, or `plugin_load` and `plugin_use` to attach a named plugin to a listener. Restart to change declarations or their options.
 
 | Module | Behavior |
 | --- | --- |
@@ -66,7 +66,7 @@ See [client interoperability](testing.md#client-sdk-interoperability) for the di
 | `mosquitto_password_file` | Set `plugin_opt_password_file` to the Mosquitto hash file. |
 | `mosquitto_acl_file` | Set `plugin_opt_acl_file` to the Mosquitto ACL file. |
 | `mosquitto_sparkplug_aware` | For an authorized `spBv1.0/+/NBIRTH/+` or `spBv1.0/+/DBIRTH/+/+` PUBLISH, publish a broker-origin copy at `$sparkplug/certificates/<original topic>` with the original QoS. Copies are retained if retention is enabled; an empty payload clears a stored certificate. A global plugin also sees inbound publications from outgoing bridges. |
-| `auth-plug` ([mosquitto-auth-plug](https://github.com/jpmens/mosquitto-auth-plug)) | See [third-party auth plugins](auth-plugins.md), including the combinations refused at startup. |
+| `auth-plug` ([mosquitto-auth-plug](https://github.com/jpmens/mosquitto-auth-plug)), `go-auth` ([mosquitto-go-auth](https://github.com/iegomez/mosquitto-go-auth)) | See [third-party auth plugins](auth-plugins.md), including the back-ends that fail to load and the combinations refused at startup. |
 
 Password and ACL plugins can be used together. SIGHUP rereads their **startup file paths**; an invalid policy file stops the broker. Validate replacement files before rotating them. MQExtended refuses different password files or different ACL files serving the same listener, and refuses an explicit file plugin and Dynamic Security on the same listener, rather than dropping a callback.
 

@@ -32,7 +32,7 @@ Differential tests need the Mosquitto reference binaries and are `#[ignore]` by 
 | `MQEXTENDED_BIN` | The `mqextended` binary under test; defaults to `target/debug/mqextended` |
 
 ```sh
-MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build cargo test -p <crate> -- --ignored
+MOSQUITTO_BUILD_DIR=$HOME/mqx-reference/mosquitto/build cargo test -p <crate> -- --ignored
 ```
 
 A differential test fails when a binary it needs is missing; it must never silently pass. Build the references as described in [development](development.md#mosquitto-reference-build).
@@ -49,7 +49,7 @@ Only generated client ids and clock-dependent expiry values are normalized, afte
 
 Failover tests have no Mosquitto counterpart; they assert MQTT's guarantees directly while killing (SIGKILL) and restarting nodes: persistent queues and DUP resends survive, a lost node's wills are published once, retained messages and subscriptions survive, takeover works across nodes, publishing resumes after leader loss.
 
-The `auth_plug` scenarios run Mosquitto with the real `auth-plug.so` against MQExtended's [port](auth-plugins.md), backed by real back-end servers. Besides the transcripts, they compare every request the back-ends receive, duplicates included: with caching off the plugin asks once per check, so the number of requests is part of the contract. The comparison reads the requests as soon as the script ends. End a scenario on an observable result of every check it starts, such as a delivery, not on silence. Build the reference first ([development](development.md#legacy-mosquitto-auth-plug)).
+The `auth_plug` and `go_auth` scenarios run Mosquitto with the real `auth-plug.so` or `go-auth.so` against MQExtended's [ports](auth-plugins.md), backed by real back-end servers. Besides the transcripts, they compare every HTTP and JWT request the back-ends receive, duplicates included, and the PostgreSQL, MariaDB and Redis operation counts: with caching off the plugin asks once per check, so the number of requests is part of the contract. The comparison reads the requests as soon as the script ends. End a scenario on an observable result of every check it starts, such as a delivery, not on silence. The `mqx-extauth` reference tests compare individual back-ends, gRPC included, below the broker. Build the references first ([development](development.md#legacy-mosquitto-auth-plug)).
 
 ### Client SDK interoperability
 
@@ -63,12 +63,12 @@ The `auth_plug` scenarios run Mosquitto with the real `auth-plug.so` against MQE
 With Python 3.9 or newer and Node.js 24 on `PATH`, run from the repository root:
 
 ```sh
-python3 -m venv /tmp/mqx-client-venv
-. /tmp/mqx-client-venv/bin/activate
+python3 -m venv "$HOME/mqx-reference/venv"
+. "$HOME/mqx-reference/venv/bin/activate"
 python3 -m pip install --require-hashes --only-binary=:all: -r crates/mqx-difftest/tests/clients/requirements.txt
 npm ci --prefix crates/mqx-difftest/tests/clients --ignore-scripts --no-audit --no-fund
 cargo build --locked -p mqx-server
-MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build MOSQUITTO_WS_BUILD_DIR=/tmp/mosquitto/build-ws \
+MOSQUITTO_BUILD_DIR=$HOME/mqx-reference/mosquitto/build MOSQUITTO_WS_BUILD_DIR=$HOME/mqx-reference/mosquitto/build-ws \
   cargo test --locked -p mqx-difftest --test client_sdks -- --ignored
 ```
 
