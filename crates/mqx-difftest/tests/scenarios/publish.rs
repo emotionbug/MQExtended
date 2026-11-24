@@ -420,6 +420,52 @@ fn qos1_roundtrip(h: &mut Harness) {
     disconnect(h, publisher);
 }
 
+// database.c: a persistent session replays only the unacknowledged suffix
+// with DUP set, even when a contiguous PUBACK burst precedes DISCONNECT.
+scenario!(qos1_burst_resume_suffix, config(ANONYMOUS));
+fn qos1_burst_resume_suffix(h: &mut Harness) {
+    let settings = Connect {
+        clean_session: false,
+        ..options("burst-reader")
+    };
+    let reader = connect_with(h, settings.clone(), false);
+    let writer = client(h, "burst-writer");
+    let topic = "burst/samples";
+    subscribe(h, reader, 1, &[(topic, Q1)]);
+    let msg = |n: u16| Publish {
+        payload: Bytes::copy_from_slice(&n.to_be_bytes()),
+        ..publish(topic, b"", Q1, n)
+    };
+    let mut burst = BytesMut::new();
+    for n in 1..=18 {
+        encode(&Packet::Publish(msg(n)), &mut burst).unwrap();
+    }
+    raw(h, writer, &burst);
+    for n in 1..=18 {
+        received(h, writer, Packet::PubAck(id(n)));
+        received(h, reader, Packet::Publish(msg(n)));
+    }
+    burst.clear();
+    for n in 1..=16 {
+        encode(&Packet::PubAck(id(n)), &mut burst).unwrap();
+    }
+    encode(&Packet::Disconnect, &mut burst).unwrap();
+    raw(h, reader, &burst);
+    closed(h, reader);
+    let resumed = connect_with(h, settings, true);
+    for n in 17..=18 {
+        accept_publish(
+            h,
+            resumed,
+            Publish {
+                dup: true,
+                ..msg(n)
+            },
+        );
+    }
+    ping(h, resumed);
+}
+
 // lib/packet_mosq.c: packet__read_single refreshes keepalive while the body
 // of a large packet is still arriving, not just when the packet is complete.
 scenario!(keepalive_during_large_publish, config(ANONYMOUS));

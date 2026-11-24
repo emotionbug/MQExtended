@@ -15,6 +15,7 @@ use openraft::async_runtime::WatchReceiver;
 use openraft::errors::{ClientWriteError, InitializeError, LinearizableReadError, RaftError};
 use openraft::raft::{
     AppendEntriesRequest, Precondition, StreamAppendResult, TransferLeaderRequest, VoteRequest,
+    WriteOption,
 };
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use openraft::{BasicNode, ChangeMembers, Raft, ReadPolicy, ServerState};
@@ -41,8 +42,9 @@ use crate::survivor::{
     SurvivorEvent, SurvivorReason, Switch,
 };
 use crate::transport::{
-    APPEND_WINDOW, CLUSTER_ID_FILE, Connection, Endpoint, Frame, Limits, Network, Op,
-    SESSION_HEADER_LEN, decode, decode_session_header, encode, invalid_data, write_control,
+    APPEND_WINDOW, CLUSTER_ID_FILE, Connection, Endpoint, Frame, Limits, MAX_APPEND_ENTRIES,
+    Network, Op, SESSION_HEADER_LEN, decode, decode_session_header, encode, invalid_data,
+    write_control,
 };
 use crate::wal::{Wal, WalMetrics};
 use crate::{ClusterConfig, ClusterError, Mesh, NodeEvent, NodeStatus, StateMachine, version};
@@ -1806,11 +1808,30 @@ impl<S: StateMachine> Core<S> {
                 elected_at = Instant::now();
             }
             if let Some(leader) = leader.filter(|_| elected_at.elapsed() >= self.lease_timeout) {
-                for command in self.store.expire(self.stamp(leader), timeout_ms) {
-                    let _ =
-                        timeout(self.request_timeout, self.write(Command::Lease(command))).await;
-                }
+                self.expire_leases_once(leader, timeout_ms).await;
             }
+        }
+    }
+
+    async fn expire_leases_once(&self, leader: Leadership, timeout_ms: u64) {
+        let expired = self.store.expire(self.stamp(leader), timeout_ms);
+        // Keep each expiry as its own Raft entry (with its own event index and
+        // heartbeat check), but don't wait for a fresh quorum write per peer.
+        for batch in expired.chunks(MAX_APPEND_ENTRIES as usize) {
+            let _ = timeout(self.request_timeout, async {
+                if let Ok(mut results) = self
+                    .raft
+                    .client_write_many(
+                        batch.iter().copied().map(Command::Lease),
+                        WriteOption::expect_leader(leader),
+                    )
+                    .await
+                {
+                    // Wait for application before scanning for more expiries.
+                    while let Some(Ok(Ok(_))) = results.next().await {}
+                }
+            })
+            .await;
         }
     }
 
@@ -3237,6 +3258,89 @@ mod tests {
         for node in &nodes {
             node.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_lease_expiries_share_a_sync_and_replay_after_a_crash() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let mut config = ClusterConfig::new(
+            1,
+            "127.0.0.1:0".parse().unwrap(),
+            BTreeMap::from([(1, "127.0.0.1:1".parse().unwrap())]),
+            data.clone(),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        config.snapshot_policy = SnapshotPolicy::Never;
+        config.lease_interval = Duration::from_secs(60);
+        config.lease_timeout = Duration::from_secs(120);
+        let max_append_size = config.max_append_size;
+        let node = Cluster::start(config, Counter::default()).await.unwrap();
+        timeout(
+            Duration::from_secs(5),
+            node.membership_control().wait_serving(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let core = &node.0.core;
+        for id in 2..=3 {
+            core.raft
+                .add_learner(
+                    id,
+                    BasicNode {
+                        addr: format!("127.0.0.1:{id}"),
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut events = core.store.events.subscribe();
+        let before = node.wal_metrics().await.unwrap();
+        core.expire_leases_once(core.leadership().unwrap(), 120_000)
+            .await;
+        let expired = node.wal_metrics().await.unwrap();
+        assert_eq!(expired.appended_entries, before.appended_entries + 2);
+        assert_eq!(expired.sync_batches, before.sync_batches + 1);
+        let downs = [events.try_recv().unwrap(), events.try_recv().unwrap()];
+        assert_eq!(
+            downs.map(|e| (e.node_id, e.status)),
+            [(2, NodeStatus::Down), (3, NodeStatus::Down)]
+        );
+        assert_eq!(downs[1].index, downs[0].index + 1);
+
+        // The next required sync carries the expiry batch's committed index.
+        // Copy the resulting image before graceful shutdown can log a newer
+        // commit index; then replay it without a live quorum or a snapshot.
+        assert_eq!(node.submit(7).await.unwrap(), (downs[1].index + 1, 7));
+        let image = root.path().join("crashed");
+        std::fs::create_dir_all(image.join("wal")).unwrap();
+        for file in data.join("wal").read_dir().unwrap() {
+            let file = file.unwrap();
+            std::fs::copy(file.path(), image.join("wal").join(file.file_name())).unwrap();
+        }
+        let mut wal = Wal::open(&image.join("wal"), max_append_size, 2).unwrap();
+        assert_eq!(
+            wal.read_committed().await.unwrap().unwrap().index,
+            downs[1].index
+        );
+        let mut replay = Store::open(Counter::default(), image, 2).unwrap();
+        let mut replayed_events = replay.events.subscribe();
+        openraft::storage::StorageHelper::new(&mut wal, &mut replay)
+            .with_id(1)
+            .get_initial_state()
+            .await
+            .unwrap();
+        let replayed_downs = std::iter::from_fn(|| replayed_events.try_recv().ok())
+            .filter(|event| event.status == NodeStatus::Down)
+            .collect::<Vec<_>>();
+        assert_eq!(replayed_downs, downs);
+        assert_eq!(replay.last_applied().unwrap().index, downs[1].index);
+        assert_eq!(replay.state.read().unwrap().app.0, 0);
+        wal.close().await.unwrap();
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]

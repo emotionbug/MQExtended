@@ -858,6 +858,12 @@ impl State {
             .is_some_and(|inbox| inbox.has_outbound(&self.config))
     }
 
+    pub(crate) fn can_ack_prefix(&self, lease: &Lease, ids: &[PacketId]) -> bool {
+        self.claimed_session(lease)
+            .and_then(|session| session.inbox.as_ref())
+            .is_some_and(|inbox| inbox.can_ack_prefix(ids))
+    }
+
     pub(crate) fn outbound_reservation(
         &self,
         lease: &Lease,
@@ -967,8 +973,13 @@ impl State {
 
     pub(crate) fn apply(&mut self, command: Command) -> Outcome {
         let mut effects = Vec::new();
+        let reply = self.apply_into(command, &mut effects);
+        Outcome { reply, effects }
+    }
+
+    pub(super) fn apply_into(&mut self, command: Command, effects: &mut Vec<Effect>) -> Reply {
         let eager = matches!(&command, Command::EagerBatch(_));
-        let reply = match command {
+        match command {
             Command::ReloadLimits(limits) => {
                 self.set_limits(limits);
                 Reply::NoChange
@@ -982,10 +993,7 @@ impl State {
                     let parsed = match text.as_ref().map(|text| AclFile::parse(text)).transpose() {
                         Ok(acl) => acl.map(Arc::new),
                         Err(_) => {
-                            return Outcome {
-                                reply: Reply::InvalidAcl,
-                                effects,
-                            };
+                            return Reply::InvalidAcl;
                         }
                     };
                     self.install_local_acl(security, parsed);
@@ -1001,8 +1009,8 @@ impl State {
                     Reply::NoChange
                 }
             }
-            Command::DynamicSecurityControl(control) => self.dynamic_control(control, &mut effects),
-            Command::BrokerControl(control) => self.broker_control(control, &mut effects),
+            Command::DynamicSecurityControl(control) => self.dynamic_control(control, effects),
+            Command::BrokerControl(control) => self.broker_control(control, effects),
             Command::Boot {
                 owner,
                 previous,
@@ -1013,14 +1021,11 @@ impl State {
                     if node.incarnation != previous {
                         // A forwarded boot from the previous process may
                         // arrive after its successor has installed a fence.
-                        return Outcome {
-                            reply: Reply::Stale,
-                            effects,
-                        };
+                        return Reply::Stale;
                     }
                     node.incarnation = Some(owner.incarnation);
                     node.down = false;
-                    self.lose_node(owner.node, now, &mut effects);
+                    self.lose_node(owner.node, now, effects);
                 }
                 Reply::NoChange
             }
@@ -1028,14 +1033,14 @@ impl State {
                 owner,
                 token,
                 request,
-            } => self.claim(owner, token, request, &mut effects),
+            } => self.claim(owner, token, request, effects),
             Command::ImportPersistence {
                 offset,
                 bytes,
                 finish,
             } => self.apply_import_part(offset, bytes, finish),
             Command::Sys(tick) => {
-                self.sample_sys(tick, &mut effects, |_| {});
+                self.sample_sys(tick, effects, |_| {});
                 Reply::NoChange
             }
             Command::SysLog {
@@ -1048,12 +1053,12 @@ impl State {
                     payload,
                     now,
                     Some(now.saturating_add(Duration::from_secs(20))),
-                    &mut effects,
+                    effects,
                 );
                 Reply::NoChange
             }
             Command::Expire(now) => {
-                self.expire(now, &mut effects);
+                self.expire(now, effects);
                 Reply::NoChange
             }
             Command::ResolveVerdicts {
@@ -1062,10 +1067,10 @@ impl State {
                 mut verdicts,
             } => {
                 ResolvedVerdict::sort(&mut verdicts);
-                self.resolve_verdicts(now, target, &verdicts, &mut effects);
+                self.resolve_verdicts(now, target, &verdicts, effects);
                 Reply::NoChange
             }
-            Command::Act(lease, action) => self.act(&lease, action, None, &mut effects),
+            Command::Act(lease, action) => self.act(&lease, action, None, effects),
             Command::Batch(batch) | Command::EagerBatch(batch) => Reply::Batched(
                 batch
                     .into_iter()
@@ -1074,7 +1079,7 @@ impl State {
                             owner,
                             token,
                             request,
-                        } => vec![self.claim(owner, token, *request, &mut effects)],
+                        } => vec![self.claim(owner, token, *request, effects)],
                         BatchEntry::Act(entry) => {
                             let mut operations = entry.operations.into_iter().peekable();
                             let mut pinned = Vec::new();
@@ -1102,7 +1107,7 @@ impl State {
                             for operation in operations {
                                 let first_effect = effects.len();
                                 let reply =
-                                    self.act(&entry.lease, operation, pins.as_ref(), &mut effects);
+                                    self.act(&entry.lease, operation, pins.as_ref(), effects);
                                 if eager {
                                     self.reserve_ready(&mut effects[first_effect..]);
                                 }
@@ -1120,8 +1125,7 @@ impl State {
                     })
                     .collect(),
             ),
-        };
-        Outcome { reply, effects }
+        }
     }
 
     // database.c: db__message_insert_outgoing calls
@@ -1135,7 +1139,7 @@ impl State {
             };
             let session = self.sessions.get_mut(&lease.id).unwrap();
             if session.owner.is_some_and(|owner| owner != Owner::LOCAL)
-                && let Some(packet) = session.inbox.as_mut().unwrap().reserve_ready_qos1()
+                && let Some(packet) = session.inbox.as_mut().unwrap().reserve_ready_qos1(|_| true)
             {
                 *effect = Effect::ReservedOutbound {
                     owner: lease.epoch,

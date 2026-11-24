@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use mqx_codec::{
-    Packet, ProtocolVersion, QoS,
+    Packet, PacketId, ProtocolVersion, QoS,
     v5::{Packet as Packet5, ReasonCode as R},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -61,7 +61,7 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<Step, BrokerError> {
     let config = session.broker.0.config.startup();
     let mut publications = Vec::with_capacity(BATCH_PACKETS);
-    let mut ids = Vec::with_capacity(BATCH_PACKETS);
+    let mut ids = [None; BATCH_PACKETS];
     let mount_point = listener.mount_point.as_deref();
     let mut packet = first;
     loop {
@@ -74,15 +74,10 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
                 break;
             }
         };
-        ids.push(publication.packet.packet_id);
+        ids[publications.len()] = publication.packet.packet_id;
         publications.push(publication);
         if publications.len() == BATCH_PACKETS
-            || remaining == 0
-            || !wire
-                .input
-                .first()
-                .is_some_and(|&header| next_is_eligible(header, listener, config))
-            || !frame_within(&wire.input, remaining)
+            || !can_follow(&wire.input, remaining, listener, config)
         {
             break;
         }
@@ -113,6 +108,7 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
         let reason = match reply {
             Reply::PublishReason(reason) => R(reason),
             Reply::ControlAccepted { .. } => R::SUCCESS,
+            Reply::ExternalAclError => return Ok(Step::End(End::ExternalAcl)),
             Reply::Stale => return Ok(Step::End(End::Takeover)),
             Reply::ProtocolError => return Err(BrokerError::Protocol),
             _ => unreachable!("QoS 0/1 pipeline got a handshake reply"),
@@ -128,14 +124,50 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(Step::Continue)
 }
 
-fn frame_within(input: &[u8], budget: usize) -> bool {
-    let mut length = 0;
-    for (i, &byte) in input.iter().skip(1).take(4).enumerate() {
-        length |= usize::from(byte & 0x7f) << (7 * i);
-        if byte & 0x80 == 0 {
-            let size = length + i + 2;
-            return size <= budget && size <= input.len();
-        }
+// Never wait to fill a batch. Inspect only canonical, complete legacy PUBACKs;
+// the first incomplete, noncanonical or unrelated frame belongs to the main loop.
+pub(super) async fn acknowledge<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &Active<'_>,
+    wire: &mut Wire<S>,
+    first: PacketId,
+    config: &BrokerConfig,
+    protocol: ProtocolVersion,
+) -> Result<Step, BrokerError> {
+    let mut ids = [first; BATCH_PACKETS];
+    let mut count = 1;
+    for frame in wire.input.as_chunks::<4>().0.iter().take(BATCH_PACKETS - 1) {
+        let [0x40, 2, hi, lo] = *frame else { break };
+        let Some(id) = PacketId::new(u16::from_be_bytes([hi, lo])) else {
+            break;
+        };
+        ids[count] = id;
+        count += 1;
     }
-    false
+    if count > 1
+        && let Some(reply) = wire
+            .prefetch(session.broker.ack_prefix(&session.live, &ids[..count]))
+            .await?
+    {
+        for _ in 1..count {
+            // Reuse normal decoding and traffic accounting; bytes were only
+            // peeked above, and prefetch can append but never consumes input.
+            let packet = wire.packet(config, protocol)?;
+            debug_assert!(matches!(packet, Some(Frame::Legacy(Packet::PubAck(_)))));
+        }
+        return super::action_result(reply);
+    }
+    wire.prefetch(session.ack(first, crate::inbox::Ack::Acknowledged))
+        .await
+}
+
+pub(super) fn can_follow(
+    input: &[u8],
+    budget: usize,
+    listener: &ListenerPolicy,
+    config: &BrokerConfig,
+) -> bool {
+    input
+        .first()
+        .is_some_and(|&header| next_is_eligible(header, listener, config))
+        && super::frame_size(input).is_some_and(|size| size <= budget.min(input.len()))
 }

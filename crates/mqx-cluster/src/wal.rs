@@ -462,6 +462,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_updates_write_only_the_highest_marker_with_the_next_vote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), crate::DEFAULT_MAX_APPEND_SIZE, 2).unwrap();
+        let leader = Leadership {
+            term: 1,
+            node_id: 1,
+        };
+        let ids = [LogId::new(leader, 0), LogId::new(leader, 1)];
+        let (tx, rx) = Types::oneshot();
+        wal.append(
+            ids.map(|log_id| Entry {
+                log_id,
+                payload: openraft::alias::EntryPayloadOf::<Types>::Blank,
+            }),
+            IOFlushed::signal(tx),
+        )
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+        let before = wal.read().await.unwrap().log.stat();
+        for id in [ids[0], ids[1], ids[0], ids[1]] {
+            wal.save_committed(Some(id)).await.unwrap();
+        }
+        assert_eq!(wal.read_committed().await.unwrap(), Some(ids[1]));
+        let pending = wal.read().await.unwrap().log.stat();
+        assert_eq!(
+            pending.open_chunk.records_count,
+            before.open_chunk.records_count
+        );
+        assert_eq!(
+            pending.flush_metrics.sync_batch_count,
+            before.flush_metrics.sync_batch_count
+        );
+
+        wal.save_vote(&Vote::new(2, 1)).await.unwrap();
+        let stored = wal.read().await.unwrap().log.stat();
+        assert_eq!(
+            stored.open_chunk.records_count,
+            before.open_chunk.records_count + 2
+        );
+        assert_eq!(
+            stored.open_chunk.log_state.committed().map(|id| id.0),
+            Some(ids[1])
+        );
+        assert_eq!(
+            stored.flush_metrics.sync_batch_count,
+            before.flush_metrics.sync_batch_count + 1
+        );
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn conflicting_suffix_is_truncated_before_a_snapshot_can_be_published() {
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(dir.path(), crate::DEFAULT_MAX_APPEND_SIZE, 2).unwrap();

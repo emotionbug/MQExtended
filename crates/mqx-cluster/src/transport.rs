@@ -42,8 +42,9 @@ pub(crate) const CLUSTER_ID_FILE: &str = "cluster.id";
 const HEADER_LEN: usize = 53;
 // Fixed read-ahead for plaintext sessions, independent of the peer's frame length.
 const SESSION_READ_AHEAD: usize = 4 * 1024;
-// Copy only small TLS frames to avoid sending separate records for header and body.
-const INLINE_FRAME_LEN: usize = 4 * 1024;
+// Bound copies for TLS and coalesce only this much ready session traffic at once.
+pub(crate) const INLINE_FRAME_LEN: usize = 4 * 1024;
+pub(crate) const READY_FRAMES: usize = 16;
 pub(crate) const SESSION_HEADER_LEN: usize = 13;
 pub(crate) const MAX_APPEND_ENTRIES: u64 = 128;
 pub(crate) const APPEND_WINDOW: usize = 8;
@@ -641,6 +642,14 @@ pub(crate) fn decode_session_header(header: [u8; SESSION_HEADER_LEN]) -> (u64, u
     )
 }
 
+pub(crate) fn session_header(id: u64, tag: u8, len: usize) -> [u8; SESSION_HEADER_LEN] {
+    let mut header = [0; SESSION_HEADER_LEN];
+    header[..8].copy_from_slice(&id.to_be_bytes());
+    header[8] = tag;
+    header[9..].copy_from_slice(&(len as u32).to_be_bytes());
+    header
+}
+
 // Reuse the coalescing buffer across writes. Vectored sockets never allocate it.
 #[derive(Default)]
 pub(crate) struct SessionFrame(Vec<u8>);
@@ -653,11 +662,47 @@ impl SessionFrame {
         tag: u8,
         body: &[u8],
     ) -> io::Result<()> {
-        let mut header = [0; SESSION_HEADER_LEN];
-        header[..8].copy_from_slice(&id.to_be_bytes());
-        header[8] = tag;
-        header[9..].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        let header = session_header(id, tag, body.len());
         write_frame_parts(writer, &header, body, &mut self.0).await?;
+        writer.flush().await
+    }
+
+    // The writer has already bounded the number and total size of ready frames.
+    pub(crate) async fn write_mesh_requests(
+        &mut self,
+        writer: &mut (impl AsyncWrite + Unpin),
+        frames: &[(u64, Bytes)],
+    ) -> io::Result<()> {
+        let tag = Op::MeshRequest as u8;
+        if let [(id, body)] = frames {
+            return self.write(writer, *id, tag, body).await;
+        }
+        if writer.is_write_vectored() {
+            let mut headers = [[0; SESSION_HEADER_LEN]; READY_FRAMES];
+            let mut parts = [IoSlice::new(&[]); READY_FRAMES * 2];
+            for (header, (id, body)) in headers.iter_mut().zip(frames) {
+                *header = session_header(*id, tag, body.len());
+            }
+            let mut count = 0;
+            for (header, (_, body)) in headers.iter().zip(frames) {
+                parts[count] = IoSlice::new(header);
+                count += 1;
+                if !body.is_empty() {
+                    parts[count] = IoSlice::new(body);
+                    count += 1;
+                }
+            }
+            write_frame_slices(writer, &mut parts[..count]).await?;
+        } else {
+            self.0.clear();
+            self.0.reserve_exact(INLINE_FRAME_LEN);
+            for (id, body) in frames {
+                self.0
+                    .extend_from_slice(&session_header(*id, tag, body.len()));
+                self.0.extend_from_slice(body);
+            }
+            writer.write_all(&self.0).await?;
+        }
         writer.flush().await
     }
 }
@@ -673,18 +718,7 @@ async fn write_frame_parts(
     }
     if writer.is_write_vectored() {
         let mut parts = [IoSlice::new(header), IoSlice::new(body)];
-        let mut remaining = &mut parts[..];
-        while remaining.len() > 1 {
-            let written = writer.write_vectored(remaining).await?;
-            if written == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-            IoSlice::advance_slices(&mut remaining, written);
-        }
-        return match remaining.first() {
-            Some(tail) => writer.write_all(tail).await,
-            None => Ok(()),
-        };
+        return write_frame_slices(writer, &mut parts).await;
     }
     let total = header.len() + body.len();
     if total <= INLINE_FRAME_LEN {
@@ -697,6 +731,23 @@ async fn write_frame_parts(
     // Do not allocate or copy a large body to combine it with the header.
     writer.write_all(header).await?;
     writer.write_all(body).await
+}
+
+async fn write_frame_slices(
+    writer: &mut (impl AsyncWrite + Unpin),
+    mut remaining: &mut [IoSlice<'_>],
+) -> io::Result<()> {
+    while remaining.len() > 1 {
+        let written = writer.write_vectored(remaining).await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+    match remaining.first() {
+        Some(tail) => writer.write_all(tail).await,
+        None => Ok(()),
+    }
 }
 
 pub(crate) async fn write_control<T: Serialize>(
@@ -1048,6 +1099,38 @@ impl Mesh {
         self.call(node_id, Op::MeshRequest, body).await
     }
 
+    /// Pipeline requests in input order on one peer session, ignoring reply bodies.
+    /// Success means every handler completed successfully within one request
+    /// deadline. A failed group may have been partly handled and is not replayed.
+    pub async fn request_many(
+        &self,
+        node_id: u64,
+        mut bodies: Vec<Bytes>,
+    ) -> Result<(), ClusterError> {
+        match bodies.len() {
+            0 => return Ok(()),
+            1 => return self.request(node_id, bodies.pop().unwrap()).await.map(drop),
+            _ => {}
+        }
+        let deadline = Instant::now() + self.timeout;
+        let address = self.voter_address(node_id, deadline).await?;
+        if bodies
+            .iter()
+            .any(|body| body.len() > self.endpoint.limits.mesh)
+        {
+            return Err(invalid_data("mesh body exceeds the cluster mesh limit").into());
+        }
+        let client = self
+            .endpoint
+            .session(node_id, address, deadline)
+            .await
+            .map_err(|source| Self::call_error(node_id, CallError::Unsent(source)))?;
+        client
+            .call_many(bodies, deadline)
+            .await
+            .map_err(|error| Self::call_error(node_id, error))
+    }
+
     /// Send without waiting for the handler. Success means the bytes were handed
     /// to the socket; it does not prove the handler ran or make retries safe.
     pub async fn send(&self, node_id: u64, body: Bytes) -> Result<(), ClusterError> {
@@ -1055,10 +1138,25 @@ impl Mesh {
     }
 
     async fn call(&self, node_id: u64, op: Op, body: Bytes) -> Result<Bytes, ClusterError> {
+        let deadline = Instant::now() + self.timeout;
+        let address = self.voter_address(node_id, deadline).await?;
+        if body.len() > self.endpoint.limits.mesh {
+            return Err(invalid_data("mesh body exceeds the cluster mesh limit").into());
+        }
+        self.endpoint
+            .call_at(node_id, address, op, body, deadline, deadline)
+            .await
+            .map_err(|error| Self::call_error(node_id, error))
+    }
+
+    async fn voter_address(
+        &self,
+        node_id: u64,
+        deadline: Instant,
+    ) -> Result<SocketAddr, ClusterError> {
         if *self.stop.borrow() {
             return Err(ClusterError::Shutdown);
         }
-        let deadline = Instant::now() + self.timeout;
         if self.endpoint.status.borrow().members.is_empty() {
             let mut status = self.endpoint.status.clone();
             timeout_at(
@@ -1069,33 +1167,29 @@ impl Mesh {
             .map_err(|_| ClusterError::Deadline)?
             .map_err(|_| ClusterError::Shutdown)?;
         }
-        if !self
-            .endpoint
+        self.endpoint
             .status
             .borrow()
             .members
             .get(&node_id)
-            .is_some_and(|m| m.role == MemberRole::Voter)
-        {
-            return Err(ClusterError::UnknownNode(node_id));
+            .filter(|member| member.role == MemberRole::Voter)
+            .map(|member| member.address)
+            .ok_or(ClusterError::UnknownNode(node_id))
+    }
+
+    fn call_error(node_id: u64, error: CallError) -> ClusterError {
+        // The public mesh error makes neither form safe to replay.
+        match error {
+            CallError::Unsent(source) | CallError::Uncertain(source)
+                if source.kind() == io::ErrorKind::TimedOut =>
+            {
+                ClusterError::MeshTimeout(node_id)
+            }
+            CallError::Unsent(source) | CallError::Uncertain(source) => {
+                ClusterError::Unreachable { node_id, source }
+            }
+            CallError::Remote(source) => ClusterError::MeshHandler(source.to_string()),
         }
-        if body.len() > self.endpoint.limits.mesh {
-            return Err(invalid_data("mesh body exceeds the cluster mesh limit").into());
-        }
-        self.endpoint
-            .call(node_id, op, body, deadline, deadline)
-            .await
-            .map_err(|error| match error {
-                CallError::Unsent(source) if source.kind() != io::ErrorKind::TimedOut => {
-                    ClusterError::Unreachable { node_id, source }
-                }
-                CallError::Unsent(_) => ClusterError::MeshTimeout(node_id),
-                CallError::Uncertain(source) if source.kind() == io::ErrorKind::TimedOut => {
-                    ClusterError::MeshTimeout(node_id)
-                }
-                CallError::Uncertain(source) => ClusterError::Unreachable { node_id, source },
-                CallError::Remote(source) => ClusterError::MeshHandler(source.to_string()),
-            })
     }
 
     pub(crate) async fn handle(&self, from: u64, body: Bytes) -> Result<Bytes, ClusterError> {
@@ -1111,6 +1205,93 @@ impl Mesh {
 mod tests {
     use super::*;
     use crate::node::{Leadership, LogId};
+
+    #[tokio::test]
+    async fn mesh_requests_pipeline_legacy_frames_and_wait_for_the_last_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let members = BTreeMap::from([(
+            2,
+            crate::MemberStatus {
+                address,
+                role: MemberRole::Voter,
+                liveness: crate::NodeStatus::Alive,
+            },
+        )]);
+        let status = watch::channel(MembershipStatus {
+            members,
+            ..MembershipStatus::default()
+        })
+        .1;
+        let budget = Duration::from_secs(5);
+        let endpoint = Arc::new(Endpoint::new(
+            1,
+            BTreeMap::new(),
+            (PathBuf::new(), Some([42; 32])),
+            status,
+            None,
+            1,
+            (
+                Limits {
+                    command: 1024,
+                    append: 1024,
+                    mesh: 8192,
+                },
+                budget,
+            ),
+        ));
+        let mesh = Mesh::new(endpoint.clone(), budget);
+        let bodies = vec![
+            Bytes::from_static(b"first"),
+            Bytes::new(),
+            Bytes::from(vec![7; INLINE_FRAME_LEN]),
+            Bytes::from_static(b"last"),
+        ];
+        let expected = bodies.clone();
+        let (partial, partial_sent) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut opening = [0; HEADER_LEN];
+            socket.read_exact(&mut opening).await.unwrap();
+            assert_eq!(opening, endpoint.rpc_header(2, Op::Session).unwrap());
+            socket.write_u8(0).await.unwrap();
+
+            // An old peer reads the regular id/op/length frames. All must be
+            // readable before the first completion, on the same session.
+            for (offset, body) in expected.into_iter().enumerate() {
+                assert_eq!(socket.read_u64().await.unwrap(), offset as u64 + 1);
+                assert_eq!(socket.read_u8().await.unwrap(), Op::MeshRequest as u8);
+                assert_eq!(socket.read_u32().await.unwrap() as usize, body.len());
+                let mut actual = vec![0; body.len()];
+                socket.read_exact(&mut actual).await.unwrap();
+                assert_eq!(actual.as_slice(), body.as_ref());
+            }
+
+            for id in 1..=3 {
+                socket.write_u64(id).await.unwrap();
+                socket.write_u8(0).await.unwrap();
+                socket.write_u32(0).await.unwrap();
+            }
+            socket.write_u64(4).await.unwrap();
+            partial.send(()).unwrap();
+            released.await.unwrap();
+            socket.write_u8(0).await.unwrap();
+            socket.write_u32(2).await.unwrap();
+            socket.write_all(b"ok").await.unwrap();
+        });
+
+        let mut batch = std::pin::pin!(mesh.request_many(2, bodies));
+        tokio::select! {
+            _ = &mut batch => panic!("mesh group finished before the last reply"),
+            ready = partial_sent => ready.unwrap(),
+        }
+        assert!(futures_util::poll!(&mut batch).is_pending());
+        release.send(()).unwrap();
+        batch.await.unwrap();
+        peer.await.unwrap();
+    }
 
     #[tokio::test]
     async fn vectored_frame_handles_short_writes_across_header_and_body() {

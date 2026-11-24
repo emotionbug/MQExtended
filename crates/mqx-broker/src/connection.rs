@@ -312,7 +312,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut deferred = None;
     let clustered = broker.is_clustered();
     // External WRITE errors must stop the stream at the rejected packet.
-    let pipeline_enabled = clustered && listener.security.3.is_none();
+    let pipeline_enabled = listener.security.3.is_none();
     let result = 'active: loop {
         if session.live.taken.load(Ordering::Acquire) {
             break Ok(if session.live.kicked.load(Ordering::Relaxed) {
@@ -353,7 +353,16 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                                     break Err(error);
                                 }
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                if deferred.is_none()
+                                    && let Err(error) = wire.coalesce_ready(
+                                        &session.live,
+                                        listener.mount_point.as_deref(),
+                                    )
+                                {
+                                    break Err(error);
+                                }
+                            }
                             Err(error) => break Err(error),
                         }
                         prefer_input = true;
@@ -378,7 +387,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     let packet_bytes = input_bytes - wire.input.len();
                     let step = if pipeline_enabled
                         && packet_bytes < pipeline::PREFETCH_BYTES
-                        && wire.input.first().is_some_and(|byte| byte >> 4 == 3)
+                        && pipeline::can_follow(
+                            &wire.input,
+                            pipeline::PREFETCH_BYTES - packet_bytes,
+                            listener,
+                            config,
+                        )
                         && pipeline::eligible(&packet, listener, config)
                         && broker.can_pipeline(&session.live)
                     {
@@ -391,6 +405,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                             pipeline::PREFETCH_BYTES - packet_bytes,
                         )
                         .await
+                    } else if clustered
+                        && session.live.inbox.is_none()
+                        && let Frame::Legacy(Packet::PubAck(id)) = &packet
+                        && wire.input.starts_with(&[0x40, 2])
+                    {
+                        pipeline::acknowledge(&session, &mut wire, *id, config, connect.protocol)
+                            .await
                     } else {
                         match packet {
                             Frame::Legacy(packet) => {
@@ -1470,6 +1491,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             }
             self.enqueue(self.output.len());
         } else {
+            let before = self.output.len();
             mqx_codec::encode_publish(
                 &mut self.output,
                 topic,
@@ -1479,10 +1501,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 delivery.retain,
                 dup,
             )?;
-            self.enqueue(self.output.len());
+            self.enqueue(self.output.len() - before);
         }
         self.broker.0.traffic.add(Metric::PublishSent, 1);
         Ok(None)
+    }
+
+    // database.c: db__message_write_inflight_out_all emits already admitted
+    // packets in send order. Don't wait for more, reserve durable messages,
+    // or put another delivery ahead of input or a deferred acknowledgement.
+    fn coalesce_ready(&mut self, live: &Live, mount: Option<&str>) -> Result<(), BrokerError> {
+        const MAX_BYTES: usize = 16 * 1024;
+        if self.v5.is_some() || !self.input.is_empty() || self.output.len() >= MAX_BYTES {
+            return Ok(());
+        }
+        let Some(inbox) = &live.inbox else {
+            return Ok(());
+        };
+        let mut inbox = inbox.lock().unwrap();
+        for _ in 1..16 {
+            let room = MAX_BYTES - self.output.len();
+            let Some(packet) = inbox.reserve_ready_qos1(|d| {
+                // At most 5 fixed-header bytes, two topic-length bytes and a MID.
+                d.message.topic.len() + d.message.payload.len() + 9 <= room
+            }) else {
+                break;
+            };
+            // The reserved legacy PUBLISH has no expiry or maximum-packet check.
+            let dropped = self.delivery(packet, mount, Duration::ZERO)?;
+            debug_assert!(dropped.is_none());
+        }
+        Ok(())
     }
 
     async fn terminate_v5(&mut self, reason: R) {

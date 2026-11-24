@@ -518,12 +518,16 @@ impl Inbox {
         self.next_unsent != 0
     }
 
-    pub(crate) fn reserve_ready_qos1(&mut self) -> Option<Outbound> {
+    pub(crate) fn reserve_ready_qos1(
+        &mut self,
+        fits: impl FnOnce(&Delivery) -> bool,
+    ) -> Option<Outbound> {
         let entry = self.in_flight.get_mut(self.next_unsent)?;
         // An ACK has no timestamp. Expiring messages use the timed path.
         if entry.phase != Phase::Publish
             || entry.delivery.qos != QoS::AtLeastOnce
             || entry.delivery.message.expires.is_some()
+            || !fits(&entry.delivery)
         {
             return None;
         }
@@ -606,6 +610,19 @@ impl Inbox {
 
     pub(crate) fn in_flight(&self, id: PacketId) -> bool {
         self.in_flight.iter().any(|entry| entry.id == Some(id))
+    }
+
+    // Batch only the prefix already sent, with nothing to promote between
+    // ACKs. Unknown, duplicate, queued and QoS 2 IDs need single-packet handling.
+    pub(crate) fn can_ack_prefix(&self, ids: &[PacketId]) -> bool {
+        self.queued.is_empty()
+            && self.next_unsent == self.in_flight.len()
+            && ids.len() <= self.next_unsent
+            && self
+                .in_flight
+                .iter()
+                .zip(ids)
+                .all(|(entry, id)| entry.phase == Phase::AwaitAck && entry.id == Some(*id))
     }
 
     fn acknowledge(

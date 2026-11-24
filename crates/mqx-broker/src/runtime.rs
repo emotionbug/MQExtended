@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use mqx_auth::AclFile;
 use mqx_cluster::{Cluster, ClusterConfig, ClusterError, NodeEvent, NodeStatus, StateMachine};
-use mqx_codec::{PacketId, QoS, v5::ReasonCode as R};
+use mqx_codec::{PacketId, QoS};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -93,6 +93,8 @@ enum Log {
         started: Instant,
         wall_origin: Duration,
         expiry_changed: watch::Sender<()>,
+        transient_acks: AtomicU64,
+        watching_changes: AtomicBool,
     },
     Replicated(ReplicatedLog),
 }
@@ -116,6 +118,7 @@ struct LocalLog {
     security_revision: u64,
     expiry_running: bool,
     persistence_changed: Option<watch::Sender<u64>>,
+    effects: Vec<Effect>,
 }
 
 #[derive(Default)]
@@ -232,6 +235,8 @@ impl Broker {
                 started: Instant::now(),
                 wall_origin: wall_now(),
                 expiry_changed: watch::Sender::new(()),
+                transient_acks: AtomicU64::new(0),
+                watching_changes: AtomicBool::new(false),
             },
             runtime: Arc::new(Mutex::new(Runtime {
                 local: Some(LocalLog {
@@ -240,6 +245,7 @@ impl Broker {
                     security_revision: SECURITY_REVISION.load(Ordering::Acquire),
                     expiry_running: false,
                     persistence_changed: None,
+                    effects: Vec::new(),
                 }),
                 ..Runtime::default()
             })),
@@ -489,8 +495,20 @@ impl Broker {
 
     /// Subscribe to the standalone broker's autosave-counted mutations.
     pub fn watch_persistence_changes(&self) -> Option<watch::Receiver<u64>> {
+        let Log::Local {
+            transient_acks,
+            watching_changes,
+            ..
+        } = &self.0.log
+        else {
+            return None;
+        };
         let mut runtime = self.0.runtime.lock().unwrap();
         let local = runtime.local.as_mut()?;
+        // An ACK must land either in this initial count or in a subsequent
+        // notification. Pair this store/swap with the ACK's increment/load.
+        watching_changes.store(true, Ordering::SeqCst);
+        local.flush_transient_acks(transient_acks);
         Some(
             local
                 .persistence_changed
@@ -500,19 +518,36 @@ impl Broker {
     }
 
     pub(super) fn count_transient_ack(&self, ack: crate::inbox::Ack) {
-        if !self.is_clustered() && ack.counts_for_persistence() {
-            let mut runtime = self.0.runtime.lock().unwrap();
-            let local = runtime.local.as_mut().unwrap();
-            local.state.persistence_changes += 1;
-            local.notify_persistence_change();
+        if let Log::Local {
+            transient_acks,
+            watching_changes,
+            ..
+        } = &self.0.log
+            && ack.counts_for_persistence()
+        {
+            transient_acks.fetch_add(1, Ordering::SeqCst);
+            if watching_changes.load(Ordering::SeqCst) {
+                self.0
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .local
+                    .as_mut()
+                    .unwrap()
+                    .flush_transient_acks(transient_acks);
+            }
         }
     }
 
     /// Capture standalone state and its autosave change watermark under one lock.
     pub fn persistence_snapshot(&self, shutdown: bool) -> Option<(u64, PersistentState)> {
+        let Log::Local { transient_acks, .. } = &self.0.log else {
+            return None;
+        };
         let mut runtime = self.0.runtime.lock().unwrap();
         let now = self.now();
         let local = runtime.local.as_mut()?;
+        local.flush_transient_acks(transient_acks);
         if shutdown {
             let mut effects = Vec::new();
             local.state.flush_shutdown_wills(now, &mut effects);
@@ -800,6 +835,40 @@ impl Broker {
         }
     }
 
+    pub(super) async fn ack_prefix(
+        &self,
+        live: &Live,
+        ids: &[PacketId],
+    ) -> Result<Option<Reply>, BrokerError> {
+        let Log::Replicated(log) = &self.0.log else {
+            return Ok(None);
+        };
+        if !log
+            .cluster
+            .read(|machine| machine.state.can_ack_prefix(&live.lease, ids))
+        {
+            return Ok(None);
+        }
+        {
+            let outbox = live.outbox.lock().unwrap();
+            if outbox.interrupted || !outbox.packets.is_empty() {
+                return Ok(None);
+            }
+        }
+        let operations = ids
+            .iter()
+            .map(|&id| Operation::Ack(id, crate::inbox::Ack::Acknowledged))
+            .collect();
+        // Each ACK still applies in order under the lease, with one durable
+        // commit. The apply loop stops at the first protocol error or takeover.
+        Ok(Some(
+            log.propose(live, operations)
+                .await?
+                .pop()
+                .expect("nonempty ACK prefix"),
+        ))
+    }
+
     pub(super) async fn receive(
         &self,
         live: &Live,
@@ -833,11 +902,24 @@ impl Broker {
     // Only a publisher with no possible self-delivery may aggregate PUBACKs:
     // Mosquitto can deliver a self-publication before its corresponding ACK.
     pub(super) fn can_pipeline(&self, live: &Live) -> bool {
-        let Log::Replicated(log) = &self.0.log else {
-            return false;
+        let publisher_only = match &self.0.log {
+            Log::Local { .. } => {
+                if self.0.external_enabled.load(Ordering::Acquire) {
+                    return false;
+                }
+                let runtime = self.0.runtime.lock().unwrap();
+                runtime
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .publisher_only(&live.lease)
+            }
+            Log::Replicated(log) => log
+                .cluster
+                .read(|machine| machine.state.publisher_only(&live.lease)),
         };
-        log.cluster
-            .read(|machine| machine.state.publisher_only(&live.lease))
+        publisher_only
             && live.inbox.as_ref().map_or_else(
                 || live.outbox.lock().unwrap().packets.is_empty(),
                 |inbox| {
@@ -854,24 +936,36 @@ impl Broker {
         sparkplug_aware: bool,
     ) -> Result<Vec<Reply>, BrokerError> {
         let Log::Replicated(log) = &self.0.log else {
-            unreachable!()
+            return self
+                .receive_many_local(live, publications, sparkplug_aware)
+                .await;
         };
         let mut responses = Vec::with_capacity(publications.len());
         let mut durable = Vec::new();
+        let mut fast = None;
         for publication in publications {
             self.0.traffic.add(
                 Metric::PayloadReceived,
                 publication.packet.payload.len() as i64,
             );
             if publication.packet.topic.starts_with(crate::control::PREFIX) {
+                if log.flush_fast(live, &mut fast, &mut responses).await? {
+                    return Ok(responses);
+                }
                 if !durable.is_empty() {
                     responses.extend(log.propose(live, std::mem::take(&mut durable)).await?);
-                    if matches!(responses.last(), Some(Reply::Stale | Reply::ProtocolError)) {
+                    if matches!(
+                        responses.last(),
+                        Some(Reply::Stale | Reply::ProtocolError | Reply::ExternalAclError)
+                    ) {
                         return Ok(responses);
                     }
                 }
                 let reply = self.receive_control(live, publication).await?;
-                let stop = reply == Reply::Stale || live.taken.load(Ordering::Acquire);
+                let stop = matches!(
+                    reply,
+                    Reply::Stale | Reply::ProtocolError | Reply::ExternalAclError
+                ) || live.taken.load(Ordering::Acquire);
                 responses.push(reply);
                 if stop {
                     return Ok(responses);
@@ -887,7 +981,10 @@ impl Broker {
             };
             if plan.is_some() && !durable.is_empty() {
                 responses.extend(log.propose(live, std::mem::take(&mut durable)).await?);
-                if matches!(responses.last(), Some(Reply::Stale | Reply::ProtocolError)) {
+                if matches!(
+                    responses.last(),
+                    Some(Reply::Stale | Reply::ProtocolError | Reply::ExternalAclError)
+                ) {
                     return Ok(responses);
                 }
                 // Re-read after a durable predecessor. In particular, the
@@ -895,6 +992,28 @@ impl Broker {
                 plan = log.plan(live, &publication, local);
             }
             if let Some((index, route)) = plan {
+                if let Some(node) = route.sole_peer(log.owner.node) {
+                    let reason = Reply::PublishReason(route.reason());
+                    let body = ReplicatedLog::encode_mesh_request(&fast::Request::Publish(
+                        fast::Publication {
+                            index,
+                            epoch: live.lease.epoch,
+                            sequence: live.sequence.fetch_add(1, Ordering::Relaxed),
+                            message: publication.into_message(route.source),
+                            targets: route.targets.into_values().next().unwrap(),
+                        },
+                    ));
+                    if log
+                        .queue_fast(live, node, body, reason, &mut fast, &mut responses)
+                        .await?
+                    {
+                        return Ok(responses);
+                    }
+                    continue;
+                }
+                if log.flush_fast(live, &mut fast, &mut responses).await? {
+                    return Ok(responses);
+                }
                 responses.push(
                     self.forward_fast(log, live, index, route, publication)
                         .await?,
@@ -903,13 +1022,88 @@ impl Broker {
                     return Ok(responses);
                 }
             } else {
+                if log.flush_fast(live, &mut fast, &mut responses).await? {
+                    return Ok(responses);
+                }
                 durable.push(Operation::receive(publication, local, birth));
             }
+        }
+        if log.flush_fast(live, &mut fast, &mut responses).await? {
+            return Ok(responses);
         }
         if !durable.is_empty() {
             responses.extend(log.propose(live, durable).await?);
         }
         Ok(responses)
+    }
+
+    async fn receive_many_local(
+        &self,
+        live: &Live,
+        publications: Vec<Publication>,
+        sparkplug_aware: bool,
+    ) -> Result<Vec<Reply>, BrokerError> {
+        let mut replies = Vec::with_capacity(publications.len());
+        let mut publications = publications.into_iter().peekable();
+        let ordinary = |publication: &Publication| {
+            !publication.packet.topic.starts_with(crate::control::PREFIX)
+        };
+        while let Some(publication) = publications.next() {
+            if ordinary(&publication) {
+                let mut runtime = self.0.runtime.lock().unwrap();
+                // Registration can race the connection's pipeline check.
+                // Don't bypass external authorization if it is now enabled.
+                if !self.0.external_enabled.load(Ordering::Acquire) {
+                    let old_expiry = runtime.local.as_ref().unwrap().state.next_expiry();
+                    let run = std::iter::once(publication)
+                        .chain(std::iter::from_fn(|| publications.next_if(ordinary)));
+                    let mut stop = false;
+                    for publication in run {
+                        self.0.traffic.add(
+                            Metric::PayloadReceived,
+                            publication.packet.payload.len() as i64,
+                        );
+                        // can_pipeline checked the transport's incoming
+                        // handshake state. No one else can modify it.
+                        let admitted =
+                            publication.packet.qos == QoS::AtLeastOnce && live.inbox.is_some();
+                        let birth = sparkplug_aware && publication.sparkplug_birth();
+                        let operation = Operation::receive(publication, admitted, birth);
+                        let reply = runtime.apply_local(
+                            Command::Act(live.lease.clone(), operation),
+                            &self.0.config,
+                            None,
+                        );
+                        stop = matches!(
+                            reply,
+                            Reply::Stale | Reply::ProtocolError | Reply::ExternalAclError
+                        );
+                        replies.push(reply);
+                        if stop {
+                            break;
+                        }
+                    }
+                    if old_expiry != runtime.local.as_ref().unwrap().state.next_expiry() {
+                        self.schedule_local_expiry(&mut runtime);
+                    }
+                    if stop {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            let birth = sparkplug_aware && publication.sparkplug_birth();
+            let reply = self.receive(live, publication, birth).await?;
+            let stop = matches!(
+                reply,
+                Reply::Stale | Reply::ProtocolError | Reply::ExternalAclError
+            ) || live.taken.load(Ordering::Acquire);
+            replies.push(reply);
+            if stop {
+                break;
+            }
+        }
+        Ok(replies)
     }
 
     async fn forward_fast(
@@ -923,18 +1117,14 @@ impl Broker {
         if live.taken.load(Ordering::Acquire) {
             return Ok(Reply::Stale);
         }
-        let reason = if route.matched {
-            R::SUCCESS
-        } else {
-            R::NO_MATCHING_SUBSCRIBERS
-        };
+        let reason = route.reason();
         if !route.targets.is_empty() {
             self.route_fast(log, live, index, route, publication).await;
         }
         Ok(if live.taken.load(Ordering::Acquire) {
             Reply::Stale
         } else {
-            Reply::PublishReason(reason.0)
+            Reply::PublishReason(reason)
         })
     }
 
@@ -1367,6 +1557,84 @@ impl ReplicatedLog {
         Ok(())
     }
 
+    // Replies in the pending run are provisional until every remote handler
+    // has finished. Return true if this publisher was taken over.
+    async fn queue_fast(
+        &self,
+        live: &Live,
+        node: u64,
+        body: Result<Bytes, ClusterError>,
+        reply: Reply,
+        pending: &mut Option<fast::PeerBatch>,
+        replies: &mut Vec<Reply>,
+    ) -> Result<bool, ClusterError> {
+        if pending
+            .as_ref()
+            .is_some_and(|batch| !body.as_ref().is_ok_and(|body| batch.can_append(node, body)))
+            && self.flush_fast(live, pending, replies).await?
+        {
+            return Ok(true);
+        }
+        if live.taken.load(Ordering::Acquire) {
+            if !self.flush_fast(live, pending, replies).await? {
+                replies.push(Reply::Stale);
+            }
+            return Ok(true);
+        }
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(%error, node, "transient mesh delivery was not confirmed");
+                replies.push(reply);
+                return Ok(false);
+            }
+        };
+        let batch = match pending {
+            Some(batch) => {
+                batch.push(body);
+                batch
+            }
+            None => pending.insert(fast::PeerBatch::new(node, replies.len(), body)),
+        };
+        replies.push(reply);
+        if batch.is_full() {
+            return self.flush_fast(live, pending, replies).await;
+        }
+        Ok(false)
+    }
+
+    async fn flush_fast(
+        &self,
+        live: &Live,
+        pending: &mut Option<fast::PeerBatch>,
+        replies: &mut Vec<Reply>,
+    ) -> Result<bool, ClusterError> {
+        let Some(batch) = pending.take() else {
+            return Ok(false);
+        };
+        if !live.taken.load(Ordering::Acquire) {
+            let mesh = self.cluster.mesh();
+            match batch.bodies {
+                fast::PeerBodies::One(body) => {
+                    if let Err(error) = mesh.request(batch.node, body).await {
+                        tracing::debug!(%error, node = batch.node, "transient mesh delivery was not confirmed");
+                    }
+                }
+                fast::PeerBodies::Many(bodies) => {
+                    // Never replay or advance beyond a burst whose completion is
+                    // uncertain: a later replicated mutation could overtake it.
+                    mesh.request_many(batch.node, bodies).await?;
+                }
+            }
+        }
+        let taken = live.taken.load(Ordering::Acquire);
+        if taken {
+            replies.truncate(batch.first_reply);
+            replies.push(Reply::Stale);
+        }
+        Ok(taken)
+    }
+
     async fn fence_peers(&self, index: u64) -> Result<(), ClusterError> {
         // An acknowledged subscription (or ACL change) must already be
         // visible to any existing publisher's local routing replica. A down
@@ -1601,26 +1869,34 @@ impl Runtime {
         local.update_security(security);
         let changes = local.state.persistence_changes;
         let reload = matches!(&command, Command::ReloadLimits(_));
-        let outcome = local.state.apply(command);
+        let reply = local.state.apply_into(command, &mut local.effects);
         if reload {
             config.update(local.state.config());
         }
-        if outcome.reply.dynamic_security_mutated() {
+        if reply.dynamic_security_mutated() {
             self.save_dynamic_security(&self.local.as_ref().unwrap().state);
         }
-        if !outcome.effects.is_empty() {
-            self.dispatch(outcome.effects, &config.load(), Owner::LOCAL, None);
+        let local = self.local.as_mut().unwrap();
+        if !local.effects.is_empty() {
+            let mut effects = std::mem::take(&mut local.effects);
+            let effective = local.state.config().clone();
+            self.dispatch(effects.drain(..), &effective, Owner::LOCAL, None);
+            // Keep the normal one-consumer buffer, not a broad fan-out's
+            // high-water mark.
+            if effects.capacity() <= 64 {
+                self.local.as_mut().unwrap().effects = effects;
+            }
         }
         let local = self.local.as_ref().unwrap();
         if local.state.persistence_changes != changes {
             local.notify_persistence_change();
         }
-        outcome.reply
+        reply
     }
 
     fn dispatch(
         &mut self,
-        effects: Vec<Effect>,
+        effects: impl IntoIterator<Item = Effect>,
         config: &BrokerConfig,
         here: Owner,
         abandoned: Option<&mpsc::UnboundedSender<Lease>>,
@@ -1732,6 +2008,14 @@ impl Runtime {
 }
 
 impl LocalLog {
+    fn flush_transient_acks(&mut self, pending: &AtomicU64) {
+        let count = pending.swap(0, Ordering::SeqCst);
+        if count != 0 {
+            self.state.persistence_changes += count;
+            self.notify_persistence_change();
+        }
+    }
+
     fn notify_persistence_change(&self) {
         if let Some(changed) = &self.persistence_changed {
             changed.send_replace(self.state.persistence_changes);
@@ -1935,8 +2219,272 @@ async fn cluster_maintenance(
 
 #[cfg(test)]
 mod tests {
+    use mqx_codec::v5::ReasonCode as R;
+
     use super::*;
     use crate::{inbox::Publisher, state::SessionSettings};
+
+    #[test]
+    fn enabling_change_autosave_includes_prior_clean_session_acks() {
+        use crate::inbox::Ack;
+
+        let broker = Broker::new(BrokerConfig::default());
+        broker.count_transient_ack(Ack::Acknowledged);
+        assert_eq!(broker.persistence_snapshot(false).unwrap().0, 1);
+        broker.count_transient_ack(Ack::Acknowledged);
+        let mut changes = broker.watch_persistence_changes().unwrap();
+        assert_eq!(*changes.borrow_and_update(), 2);
+        broker.count_transient_ack(Ack::Acknowledged);
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(*changes.borrow_and_update(), 3);
+        assert_eq!(broker.persistence_snapshot(false).unwrap().0, 3);
+    }
+
+    #[tokio::test]
+    async fn local_publish_batch_routes_in_order_and_rejects_a_taken_over_publisher() {
+        for persistent in [false, true] {
+            let broker = Broker::new(BrokerConfig::default());
+            let security = SecurityHandle::default();
+            let claim = |id: &str| Claim {
+                publisher: Publisher {
+                    id: Arc::from(id),
+                    username: None,
+                    security: 0,
+                    dynamic_security: None,
+                    external: None,
+                },
+                clean_start: !persistent,
+                bridge: false,
+                max_qos: QoS::ExactlyOnce,
+                will: None,
+                v5: None,
+                now: Duration::ZERO,
+                internal_bridge: None,
+                dynamic_security_revision: None,
+                verdicts: Vec::new(),
+            };
+            let ClaimResult::Accepted(publisher, false) =
+                broker.claim(&security, claim("pub"), None).await.unwrap()
+            else {
+                panic!("publisher claim failed")
+            };
+            let ClaimResult::Accepted(subscriber, false) =
+                broker.claim(&security, claim("sub"), None).await.unwrap()
+            else {
+                panic!("subscriber claim failed")
+            };
+            let subscription =
+                crate::state::SubscriptionRequest::legacy(("a/1".into(), QoS::AtLeastOnce));
+            assert!(matches!(
+                broker
+                    .act(
+                        &subscriber,
+                        Operation::subscribe(vec![subscription], broker.now()),
+                    )
+                    .await
+                    .unwrap(),
+                Reply::Subscribed(_)
+            ));
+            assert!(broker.can_pipeline(&publisher));
+            assert!(!broker.can_pipeline(&subscriber));
+            let publish = |id, topic: &str, payload| {
+                Publication::legacy(
+                    mqx_codec::Publish {
+                        dup: false,
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        topic: topic.into(),
+                        packet_id: PacketId::new(id),
+                        payload: Bytes::from_static(payload),
+                    },
+                    broker.now(),
+                )
+            };
+            assert_eq!(
+                broker
+                    .receive_many(
+                        &publisher,
+                        vec![
+                            publish(1, "a/1", b"one"),
+                            publish(2, "a/2", b"miss"),
+                            publish(3, "a/1", b"three"),
+                        ],
+                        false,
+                    )
+                    .await
+                    .unwrap(),
+                [
+                    Reply::PublishReason(R::SUCCESS.0),
+                    Reply::PublishReason(R::NO_MATCHING_SUBSCRIBERS.0),
+                    Reply::PublishReason(R::SUCCESS.0),
+                ]
+            );
+            for (mid, payload) in [(1, &b"one"[..]), (2, &b"three"[..])] {
+                assert!(matches!(
+                    broker.next_outbound(&subscriber).await.unwrap(),
+                    Some(Outbound::Publish { delivery, id: Some(id), dup: false })
+                        if id.get() == mid && delivery.message.payload.as_ref() == payload
+                ));
+            }
+            assert!(matches!(
+                broker.claim(&security, claim("pub"), None).await.unwrap(),
+                ClaimResult::Accepted(_, _)
+            ));
+            assert_eq!(
+                broker
+                    .receive_many(
+                        &publisher,
+                        vec![publish(4, "a/1", b"old"), publish(5, "a/1", b"old")],
+                        false,
+                    )
+                    .await
+                    .unwrap(),
+                [Reply::Stale]
+            );
+            assert!(broker.next_outbound(&subscriber).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_publish_batch_preserves_order_across_retained_and_control() {
+        use crate::control::{RESPONSE_TOPIC, TOPIC};
+
+        let storage = tempfile::tempdir().unwrap();
+        let sockets = [1, 2].map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let peers: BTreeMap<_, _> = (1..=2)
+            .zip(sockets.iter().map(|socket| socket.local_addr().unwrap()))
+            .collect();
+        let config = |node| {
+            ClusterConfig::new(
+                node,
+                peers[&node],
+                peers.clone(),
+                storage.path().join(node.to_string()),
+                mqx_cluster::ClusterSecurity::InsecurePlaintext,
+            )
+        };
+        drop(sockets);
+        let (origin, remote) = tokio::join!(
+            Broker::clustered(BrokerConfig::default(), config(1)),
+            Broker::clustered(BrokerConfig::default(), config(2)),
+        );
+        let (origin, remote) = (origin.unwrap(), remote.unwrap());
+        origin.register_control_api(crate::ControlInventory::new(Vec::new(), &[]));
+
+        let security = SecurityHandle::default();
+        let claim = |id: &str| Claim {
+            publisher: Publisher {
+                id: Arc::from(id),
+                username: None,
+                security: 0,
+                dynamic_security: None,
+                external: None,
+            },
+            clean_start: true,
+            bridge: false,
+            max_qos: QoS::ExactlyOnce,
+            will: None,
+            v5: None,
+            now: Duration::ZERO,
+            internal_bridge: None,
+            dynamic_security_revision: None,
+            verdicts: Vec::new(),
+        };
+        let ClaimResult::Accepted(publisher, false) =
+            origin.claim(&security, claim("pub"), None).await.unwrap()
+        else {
+            panic!("publisher claim failed");
+        };
+        let ClaimResult::Accepted(subscriber, false) =
+            remote.claim(&security, claim("sub"), None).await.unwrap()
+        else {
+            panic!("subscriber claim failed");
+        };
+        let filters = ["order", RESPONSE_TOPIC]
+            .into_iter()
+            .map(|topic| {
+                crate::state::SubscriptionRequest::legacy((topic.into(), QoS::AtLeastOnce))
+            })
+            .collect();
+        assert!(matches!(
+            remote
+                .act(&subscriber, Operation::subscribe(filters, remote.now()))
+                .await
+                .unwrap(),
+            Reply::Subscribed(_)
+        ));
+        assert!(origin.can_pipeline(&publisher));
+
+        let now = origin.now();
+        let publish = |id, topic: &str, payload, retain| {
+            Publication::legacy(
+                mqx_codec::Publish {
+                    dup: false,
+                    qos: QoS::AtLeastOnce,
+                    retain,
+                    topic: topic.into(),
+                    packet_id: PacketId::new(id),
+                    payload: Bytes::from_static(payload),
+                },
+                now,
+            )
+        };
+        let publications = vec![
+            publish(1, "order", b"1", false),
+            publish(2, "order", b"2", false),
+            publish(3, "order", b"3", true),
+            publish(4, "order", b"4", false),
+            publish(5, "order", b"5", false),
+            publish(
+                6,
+                TOPIC,
+                br#"{"commands":[{"command":"listListeners"}]}"#,
+                false,
+            ),
+            publish(7, "order", b"7", false),
+            publish(8, "order", b"8", false),
+        ];
+        let Log::Replicated(log) = &origin.0.log else {
+            unreachable!()
+        };
+        let (_, route) = log.plan(&publisher, &publications[0], true).unwrap();
+        assert_eq!(route.sole_peer(log.owner.node), Some(2));
+        let ok = Reply::PublishReason(R::SUCCESS.0);
+        assert_eq!(
+            origin
+                .receive_many(&publisher, publications, false)
+                .await
+                .unwrap(),
+            [
+                ok.clone(),
+                ok.clone(),
+                ok.clone(),
+                ok.clone(),
+                ok.clone(),
+                Reply::ControlAccepted { changed: false },
+                ok.clone(),
+                ok,
+            ]
+        );
+        let payloads: [&[u8]; 8] = [b"1", b"2", b"3", b"4", b"5", b"", b"7", b"8"];
+        for expected in payloads {
+            let Some(Outbound::Publish { delivery, .. }) =
+                remote.next_outbound(&subscriber).await.unwrap()
+            else {
+                panic!("missing delivery after confirmed mesh burst");
+            };
+            if expected.is_empty() {
+                assert_eq!(delivery.message.topic.as_ref(), RESPONSE_TOPIC);
+            } else {
+                assert_eq!(delivery.message.topic.as_ref(), "order");
+                assert_eq!(delivery.message.payload.as_ref(), expected);
+            }
+        }
+        assert!(remote.next_outbound(&subscriber).await.unwrap().is_none());
+        let (origin, remote) = tokio::join!(origin.shutdown_cluster(), remote.shutdown_cluster());
+        origin.unwrap();
+        remote.unwrap();
+    }
 
     #[tokio::test]
     async fn routing_fences_overlap_and_wait_for_every_live_peer() {

@@ -50,16 +50,25 @@ fn c_bytes(s: &str) -> &[u8] {
 
 /// Validates a topic used for PUBLISH (`mosquitto_pub_topic_check`).
 pub fn validate_topic_name(topic: &str) -> Result<(), TopicError> {
-    let bytes = c_bytes(topic);
-    let mut levels = 0usize;
-    for &c in bytes {
+    validated_topic_name(topic).map(|_| ())
+}
+
+fn validated_topic_name(topic: &str) -> Result<&str, TopicError> {
+    let mut end = topic.len();
+    let mut levels = 0;
+    for (i, c) in topic.bytes().enumerate() {
         match c {
+            0 => {
+                end = i;
+                break;
+            }
             b'+' | b'#' => return Err(TopicError::WildcardInTopicName),
             b'/' => levels += 1,
             _ => {}
         }
     }
-    check_len_and_levels(bytes.len(), levels)
+    check_len_and_levels(end, levels)?;
+    Ok(&topic[..end])
 }
 
 /// Validates a topic filter used for SUBSCRIBE or in ACLs
