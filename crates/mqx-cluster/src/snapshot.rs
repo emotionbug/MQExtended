@@ -401,34 +401,32 @@ impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
         meta: &SnapshotMeta,
         data: SnapshotData,
     ) -> io::Result<()> {
-        let mut current = self.snapshot.lock().await;
+        let mut current = self.snapshot.clone().lock_owned().await;
         let meta = meta.clone();
         let store = self.clone();
-        *current = Some(
-            tokio::task::spawn_blocking(move || {
-                let app = data.application()?;
-                {
-                    let mut state = store.state.write().unwrap();
-                    if state.sealed {
-                        return Err(io::ErrorKind::BrokenPipe.into());
-                    }
-                    let control = decode_membership::<S>(&data)?;
-                    state.restore(&meta, control, data.app_version, &app)?;
+        tokio::task::spawn_blocking(move || {
+            let app = data.application()?;
+            {
+                let mut state = store.state.write().unwrap();
+                if state.sealed {
+                    return Err(io::ErrorKind::BrokenPipe.into());
                 }
-                drop(app);
-                let _disk = store.lock_disk()?;
-                let snapshot = data.publish(&store.dir, SNAPSHOT_FILE)?;
-                store
-                    .state
-                    .read()
-                    .unwrap()
-                    .publish_membership(&store.status)?;
-                Ok::<_, io::Error>(Snapshot { meta, snapshot })
-            })
-            .await
-            .map_err(io::Error::other)??,
-        );
-        Ok(())
+                let control = decode_membership::<S>(&data)?;
+                state.restore(&meta, control, data.app_version, &app)?;
+            }
+            drop(app);
+            let _disk = store.lock_disk()?;
+            let snapshot = data.publish(&store.dir, SNAPSHOT_FILE)?;
+            store
+                .state
+                .read()
+                .unwrap()
+                .publish_membership(&store.status)?;
+            *current = Some(Snapshot { meta, snapshot });
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn get_current_snapshot(&mut self) -> io::Result<Option<Snapshot>> {
@@ -444,35 +442,38 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
     type SnapshotData = SnapshotData;
 
     async fn build_snapshot(&mut self) -> io::Result<Snapshot> {
-        let mut current = self.snapshot.lock().await;
-        let (meta, leases, app) = {
-            let state = self.state.read().unwrap();
-            let meta = SnapshotMeta {
-                last_log_id: state.last_applied,
-                last_membership: state.membership.clone(),
-            };
-            if let Some(current) = current
-                .as_ref()
-                .filter(|current| current.meta.last_log_id == meta.last_log_id)
-            {
-                return Ok(current.clone());
-            }
-            (
-                meta,
-                Bytes::from(if self.format == 1 {
-                    encode(&state.leases)?
-                } else {
-                    encode(&MembershipState {
-                        leases: &state.leases,
-                        desired: &state.desired,
-                        retired: &state.retired,
-                    })?
-                }),
-                state.app.snapshot(),
-            )
-        };
+        // A spawned blocking job can outlive its caller. Keep the publication
+        // lock through both the rename and the matching cache update.
+        let mut current = self.snapshot.clone().lock_owned().await;
         let store = self.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
+            let (meta, leases, app) = {
+                let state = store.state.read().unwrap();
+                let meta = SnapshotMeta {
+                    last_log_id: state.last_applied,
+                    last_membership: state.membership.clone(),
+                };
+                if let Some(current) = current
+                    .as_ref()
+                    .filter(|current| current.meta.last_log_id == meta.last_log_id)
+                {
+                    return Ok(current.clone());
+                }
+                (
+                    meta,
+                    Bytes::from(if store.format == 1 {
+                        encode(&state.leases)?
+                    } else {
+                        encode(&MembershipState {
+                            leases: &state.leases,
+                            desired: &state.desired,
+                            retired: &state.retired,
+                        })?
+                    }),
+                    state.app.snapshot(),
+                )
+            };
+            // Release the state read lock before writing or syncing the file.
             let _disk = store.lock_disk()?;
             let snapshot = SnapshotData::build(
                 &store.dir,
@@ -482,12 +483,12 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
                 &app,
                 (store.format, S::WRITE_VERSION),
             )?;
-            Ok::<_, io::Error>(Snapshot { meta, snapshot })
+            let snapshot = Snapshot { meta, snapshot };
+            *current = Some(snapshot.clone());
+            Ok(snapshot)
         })
         .await
-        .map_err(io::Error::other)??;
-        *current = Some(snapshot.clone());
-        Ok(snapshot)
+        .map_err(io::Error::other)?
     }
 }
 
@@ -579,4 +580,63 @@ fn create_durable_dir(dir: &Path) -> io::Result<()> {
         parent
     };
     File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct PausedEncoder {
+        entered: Arc<tokio::sync::Notify>,
+        release: SyncMutex<mpsc::Receiver<()>>,
+    }
+
+    impl StateMachine for PausedEncoder {
+        type Command = ();
+        type Response = ();
+        fn apply(&mut self, _: u64, _: ()) {}
+        fn snapshot(&self) -> Vec<u8> {
+            self.entered.notify_one();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            vec![42]
+        }
+        fn restore(&mut self, _: &[u8]) -> Result<(), crate::ClusterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_snapshot_builder_publishes_matching_disk_and_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, wait) = mpsc::channel();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut store = Store::open(
+            PausedEncoder {
+                entered: entered.clone(),
+                release: SyncMutex::new(wait),
+            },
+            dir.path().into(),
+            2,
+        )
+        .unwrap();
+        let mut builder = store.clone();
+        let job = tokio::spawn(async move { builder.build_snapshot().await });
+        // This task must still run on a single worker while encoding is paused.
+        entered.notified().await;
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        let cached = store.get_current_snapshot().await.unwrap().unwrap();
+        let (meta, disk) =
+            SnapshotData::open(File::open(dir.path().join(SNAPSHOT_FILE)).unwrap()).unwrap();
+        assert_eq!(cached.meta, meta);
+        assert_eq!(cached.snapshot.application().unwrap(), [42]);
+        assert_eq!(disk.application().unwrap(), [42]);
+    }
 }

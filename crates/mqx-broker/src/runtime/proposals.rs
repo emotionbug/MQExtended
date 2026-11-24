@@ -84,6 +84,7 @@ impl Proposal {
                     | Operation::ReceivedInFlight(_)
                     | Operation::ReserveOutbound(_)
                     | Operation::ReserveOutboundWithQos0Expiry(_)
+                    | Operation::ReserveOutboundPrefix(_)
                     | Operation::Authorize(_)
             )
         }))

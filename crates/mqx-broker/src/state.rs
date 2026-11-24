@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BrokerConfig, ReloadableLimits,
-    inbox::{Ack, Delivery, Inbox, Message, Offer, Outbound, PublishProperty, Publisher, Receive},
+    inbox::{
+        Ack, Delivery, Inbox, Message, Offer, Outbound, OutboundPrefix, PublishProperty, Publisher,
+        Receive,
+    },
     persistence::PendingImport,
     retained::Retained,
     sys::{Metric, Sampler, Tick, Values},
@@ -300,6 +303,9 @@ pub(crate) enum Operation {
     // binaries cannot decode this command.
     ReceivedInFlight(PacketId),
     Authorize(Vec<ResolvedVerdict>),
+    // Only proposed after an operator enables the upgraded command. Never
+    // reinterpret old single reservations, including those in EagerBatch.
+    ReserveOutboundPrefix(OutboundPrefix),
 }
 
 impl Operation {
@@ -505,6 +511,16 @@ impl Session {
         self.v5
             .as_ref()
             .map_or(self.inbox.is_some(), |v5| v5.session_expiry != 0)
+    }
+
+    fn can_batch_outbound(&self) -> bool {
+        // The legacy socket can combine these writes without v5 packet size,
+        // topic alias or send-credit decisions in the replicated inbox.
+        !self.bridge
+            && self.internal_bridge.is_none()
+            && self.v5.is_none()
+            && self.persistent()
+            && self.owner.is_some_and(|owner| owner != Owner::LOCAL)
     }
 }
 
@@ -875,10 +891,17 @@ impl State {
     pub(crate) fn outbound_reservation(
         &self,
         lease: &Lease,
+        batch: bool,
         clock: impl FnOnce() -> Duration,
     ) -> Option<Operation> {
         let session = self.claimed_session(lease)?;
         let inbox = session.inbox.as_ref()?;
+        if batch
+            && session.can_batch_outbound()
+            && let Some(prefix) = inbox.outbound_prefix()
+        {
+            return Some(Operation::ReserveOutboundPrefix(prefix));
+        }
         if !inbox.has_outbound(&self.config) {
             return None;
         }
@@ -1795,6 +1818,24 @@ impl State {
                     Reply::NoChange
                 }
             }
+            Operation::ReserveOutboundPrefix(prefix) => {
+                if !session.can_batch_outbound() {
+                    return Reply::NoChange;
+                }
+                let owner = session.epoch;
+                if session
+                    .inbox
+                    .as_mut()
+                    .unwrap()
+                    .reserve_outbound_prefix(prefix, |packet| {
+                        effects.push(Effect::ReservedOutbound { owner, packet });
+                    })
+                {
+                    Reply::OutboundReserved
+                } else {
+                    Reply::NoChange
+                }
+            }
             Operation::Authorize(_) => Reply::NoChange,
         }
     }
@@ -2424,6 +2465,120 @@ mod tests {
                 verdicts: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn outbound_prefix_is_lease_fenced_and_replays_without_the_startup_gate() {
+        let mut state = State::new(Arc::new(BrokerConfig::default()));
+        let owner = |node| Owner {
+            node,
+            incarnation: [0; 16],
+        };
+        for node in [1, 2] {
+            state.apply(Command::Boot {
+                owner: owner(node),
+                previous: None,
+                now: Duration::ZERO,
+            });
+        }
+        let id = Arc::<str>::from("subscriber");
+        let claim = |state: &mut State, node, present| {
+            let Reply::Claimed {
+                lease,
+                present: actual,
+            } = state
+                .apply(make_claim(owner(node), [0; 16], id.clone(), false, None))
+                .reply
+            else {
+                panic!("claim failed");
+            };
+            assert_eq!(actual, present);
+            lease
+        };
+        let reserve = |state: &State, lease: &Lease, batch| {
+            state
+                .outbound_reservation(lease, batch, || Duration::ZERO)
+                .unwrap()
+        };
+        let initial = claim(&mut state, 1, false);
+        state.apply(Command::Act(
+            initial.clone(),
+            Operation::Subscribe(
+                vec![SubscriptionRequest::legacy((
+                    "queue".into(),
+                    QoS::AtLeastOnce,
+                ))],
+                Duration::ZERO,
+            ),
+        ));
+        state.apply(Command::Act(
+            initial,
+            Operation::Disconnect {
+                now: Duration::ZERO,
+                graceful: true,
+                expiry: None,
+            },
+        ));
+        let packet = Arc::new(Message {
+            source: state.sessions[&id].publisher.clone(),
+            topic: "queue".into(),
+            payload: Bytes::from_static(b"offline"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            properties: Vec::new(),
+            expires: None,
+        });
+        for _ in 0..2 {
+            state.publish(packet.clone(), Duration::ZERO, &mut Vec::new());
+        }
+
+        let old = claim(&mut state, 1, true);
+        assert!(matches!(
+            reserve(&state, &old, false),
+            Operation::ReserveOutbound(_)
+        ));
+        let stale = reserve(&state, &old, true);
+        assert!(matches!(stale, Operation::ReserveOutboundPrefix(_)));
+        let new = claim(&mut state, 2, true);
+        let outcome = state.apply(Command::Act(old, stale));
+        assert_eq!(outcome.reply, Reply::Stale);
+        assert!(outcome.effects.is_empty());
+
+        let reserve_batch = |state: &State, lease: &Lease| {
+            Command::EagerBatch(vec![BatchEntry::Act(Mutations {
+                lease: lease.clone(),
+                operations: vec![reserve(state, lease, true)],
+            })])
+        };
+        let mut restored = State::new(Arc::new(BrokerConfig::default()));
+        restored.restore(&state.snapshot()).unwrap();
+        let bytes = rmp_serde::to_vec(&reserve_batch(&state, &new)).unwrap();
+        let apply = |state: &mut State| state.apply(rmp_serde::from_slice(&bytes).unwrap());
+        let outcome = apply(&mut state);
+        assert_eq!(apply(&mut restored), outcome);
+        assert_eq!(
+            outcome.reply,
+            Reply::Batched(vec![vec![Reply::OutboundReserved]])
+        );
+        assert_eq!(restored.snapshot(), state.snapshot());
+
+        let assert_reserved = |outcome: Outcome, lease: &Lease, expected_dup| {
+            assert_eq!(outcome.effects.len(), 2);
+            for (index, effect) in outcome.effects.into_iter().enumerate() {
+                assert!(matches!(
+                    effect,
+                    Effect::ReservedOutbound {
+                        owner,
+                        packet: Outbound::Publish { id: Some(mid), dup, .. },
+                    } if owner == lease.epoch && usize::from(mid.get()) == index + 1 && dup == expected_dup
+                ));
+            }
+        };
+        assert_reserved(outcome, &new, false);
+        restored.restore(&state.snapshot()).unwrap();
+        let resumed = claim(&mut restored, 1, true);
+        let outcome = restored.apply(reserve_batch(&restored, &resumed));
+        assert_reserved(outcome, &resumed, true);
     }
 
     #[test]

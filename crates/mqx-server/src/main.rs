@@ -928,6 +928,7 @@ fn broker_config(config: &ServerConfig) -> BrokerConfig {
         global_max_connections: 0,
         global_max_clients: limits.global_max_clients,
         connection_messages: config.log.connection_messages,
+        cluster_qos1_replay_batch: config.cluster_qos1_replay_batch,
         sparkplug_aware: config.sparkplug_aware,
     }
 }

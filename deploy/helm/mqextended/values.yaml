@@ -6,6 +6,9 @@ additionalVoter:
 autoRecover:
   # Allows a node to keep serving without quorum; a discarded branch loses its writes.
   enabled: false
+qos1ReplayBatch:
+  # Set only after every voter and learner can replay the new WAL command.
+  enabled: false
 
 image:
   repository: ""

@@ -867,6 +867,30 @@ impl Broker {
         }
     }
 
+    pub(super) fn emitted_ack_head(&self, live: &Live, id: PacketId, mount_len: usize) -> bool {
+        self.emitted_acks(live, &[id], mount_len) == 1
+    }
+
+    fn emitted_acks(&self, live: &Live, ids: &[PacketId], mount_len: usize) -> usize {
+        let Log::Replicated(log) = &self.0.log else {
+            return 0;
+        };
+        // Apply dispatches the corresponding reservations under the same
+        // state lock. With the wire idle, a reserved packet not still in the
+        // outbox has already been written (unless the listener stripped its
+        // whole topic). Count all outbox packets conservatively: some, such
+        // as QoS 0, need not occupy a slot in the reserved prefix.
+        log.cluster.read(|machine| {
+            let outbox = live.outbox.lock().unwrap();
+            if outbox.interrupted {
+                return 0;
+            }
+            machine
+                .state
+                .emitted_ack_prefix(&live.lease, ids, outbox.packets.len(), mount_len)
+        })
+    }
+
     pub(super) async fn ack_prefix(
         &self,
         live: &Live,
@@ -876,20 +900,7 @@ impl Broker {
         let Log::Replicated(log) = &self.0.log else {
             return Ok(None);
         };
-        // Apply dispatches the corresponding reservations under the same
-        // state lock. With the wire idle, a reserved packet not still in the
-        // outbox has already been written (unless the listener stripped its
-        // whole topic). Count all outbox packets conservatively: some, such
-        // as QoS 0, need not occupy a slot in the reserved prefix.
-        let count = log.cluster.read(|machine| {
-            let outbox = live.outbox.lock().unwrap();
-            if outbox.interrupted {
-                return 0;
-            }
-            machine
-                .state
-                .emitted_ack_prefix(&live.lease, ids, outbox.packets.len(), mount_len)
-        });
+        let count = self.emitted_acks(live, ids, mount_len);
         if count < 2 {
             return Ok(None);
         }
@@ -1266,36 +1277,47 @@ impl Broker {
             return Ok(inbox.next_outbound(self.0.config.startup(), now));
         }
         if let Log::Replicated(log) = &self.0.log {
-            if let Some(packet) = live.pop_reserved()? {
-                return Ok(Some(packet));
-            }
-            let Some(operation) = log.cluster.read(|machine| {
-                machine
-                    .state
-                    .outbound_reservation(&live.lease, || self.now())
-            }) else {
-                // A later committed delivery wakes the transport on apply.
-                return Ok(None);
-            };
-            // Advance the replicated cursor before sending. The owning replica
-            // already has the payload, so only a small reply crosses Raft RPC.
-            let reply = self.act(live, operation).await?;
-            match reply {
-                Reply::OutboundReserved | Reply::NoChange => {
-                    let packet = live.pop_reserved()?;
-                    if packet.is_none()
-                        && reply == Reply::OutboundReserved
-                        && !live.taken.load(Ordering::Acquire)
-                    {
-                        return Err(ClusterError::WriteUncertain(
-                            "outbound reservation applied without a local packet".into(),
-                        )
-                        .into());
-                    }
-                    return Ok(packet);
+            let mut batch = self.0.config.startup().cluster_qos1_replay_batch;
+            loop {
+                if let Some(packet) = live.pop_reserved()? {
+                    return Ok(Some(packet));
                 }
-                Reply::Stale => return Ok(None),
-                _ => unreachable!(),
+                let Some(operation) = log.cluster.read(|machine| {
+                    machine
+                        .state
+                        .outbound_reservation(&live.lease, batch, || self.now())
+                }) else {
+                    // A later committed delivery wakes the transport on apply.
+                    return Ok(None);
+                };
+                // Advance the replicated cursor before sending. The owning
+                // replica already has the payload; the reply only names the
+                // outcome, even when the reservation covers several packets.
+                let planned_prefix = matches!(operation, Operation::ReserveOutboundPrefix(_));
+                let reply = self.act(live, operation).await?;
+                match reply {
+                    Reply::NoChange if planned_prefix => {
+                        // A concurrent commit moved the cursor or changed the
+                        // observed head. Drain its effects first, then fall
+                        // back to the normal single reservation, never spin.
+                        batch = false;
+                    }
+                    Reply::OutboundReserved | Reply::NoChange => {
+                        let packet = live.pop_reserved()?;
+                        if packet.is_none()
+                            && reply == Reply::OutboundReserved
+                            && !live.taken.load(Ordering::Acquire)
+                        {
+                            return Err(ClusterError::WriteUncertain(
+                                "outbound reservation applied without a local packet".into(),
+                            )
+                            .into());
+                        }
+                        return Ok(packet);
+                    }
+                    Reply::Stale => return Ok(None),
+                    _ => unreachable!(),
+                }
             }
         }
         match self.act(live, Operation::NextOutbound(self.now())).await? {
@@ -2410,6 +2432,7 @@ mod tests {
         let broker = Broker::clustered(
             BrokerConfig {
                 max_inflight_messages: 3,
+                cluster_qos1_replay_batch: true,
                 ..BrokerConfig::default()
             },
             ClusterConfig::new(
@@ -2532,6 +2555,10 @@ mod tests {
                 broker.next_outbound(&resumed).await.unwrap(),
                 Some(Outbound::Publish { id: Some(id), dup: true, .. }) if id == mid(expected)
             ));
+            assert_eq!(
+                resumed.outbox.lock().unwrap().packets.len(),
+                usize::from(5 - expected)
+            );
         }
         assert!(broker.next_outbound(&resumed).await.unwrap().is_none());
         broker

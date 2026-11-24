@@ -17,6 +17,12 @@
       "required": ["enabled"],
       "properties": { "enabled": { "type": "boolean" } }
     },
+    "qos1ReplayBatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": { "enabled": { "type": "boolean" } }
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,

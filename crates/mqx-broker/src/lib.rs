@@ -67,6 +67,8 @@ pub struct BrokerConfig {
     pub global_max_connections: usize,
     pub global_max_clients: usize,
     pub connection_messages: bool,
+    /// Emit guarded replay-window commands only after all replicas can read them.
+    pub cluster_qos1_replay_batch: bool,
     /// Global plugin callbacks also receive publications from outgoing bridges.
     pub sparkplug_aware: bool,
 }
@@ -118,6 +120,7 @@ impl BrokerConfig {
             global_max_connections: self.global_max_connections,
             global_max_clients: self.global_max_clients,
             connection_messages: self.connection_messages,
+            cluster_qos1_replay_batch: self.cluster_qos1_replay_batch,
             sparkplug_aware: self.sparkplug_aware,
         }
     }
@@ -149,6 +152,7 @@ impl Default for BrokerConfig {
             global_max_connections: 0,
             global_max_clients: 0,
             connection_messages: true,
+            cluster_qos1_replay_batch: false,
             sparkplug_aware: false,
         }
     }

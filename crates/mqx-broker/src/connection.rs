@@ -244,6 +244,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut session = Active {
         broker,
         live,
+        security,
         sparkplug_aware: info.listener.sparkplug_aware,
         graceful: false,
         expiry_override: None,
@@ -324,8 +325,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         if *shutdown.borrow() {
             break Ok(End::Shutdown);
         }
-        if security.has_changed().unwrap_or(false) {
-            let snapshot = security.borrow_and_update().clone();
+        if session.security.has_changed().unwrap_or(false) {
+            let snapshot = session.security.borrow_and_update().clone();
             if !identity
                 .reauthenticate(broker, &listener.security, &session.live.lease.id, snapshot)
                 .await
@@ -411,16 +412,16 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         .await
                     } else if clustered
                         && session.live.inbox.is_none()
-                        && let Frame::Legacy(Packet::PubAck(id)) = &packet
-                        && wire.input.starts_with(&[0x40, 2])
+                        && let Some(id) = pipeline::simple_ack(&packet)
                     {
                         pipeline::acknowledge(
                             &session,
                             &mut wire,
-                            *id,
-                            config,
+                            id,
                             connect.protocol,
                             listener.mount_point.as_deref(),
+                            connect.keep_alive,
+                            &mut shutdown,
                         )
                         .await
                     } else {
@@ -538,7 +539,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             biased;
             _ = shutdown.changed() => break Ok(End::Shutdown),
             // Mark and use the exact security snapshot observed by this wakeup.
-            snapshot = wait_security(&mut security) => {
+            snapshot = wait_security(&mut session.security) => {
                 if !identity.reauthenticate(broker, &listener.security, &session.live.lease.id, snapshot).await {
                     break Ok(End::Security);
                 }
@@ -889,6 +890,7 @@ async fn timeout(deadline: Option<Instant>) {
 struct Active<'a> {
     broker: &'a Broker,
     live: Arc<Live>,
+    security: watch::Receiver<Arc<Security>>,
     sparkplug_aware: bool,
     graceful: bool,
     expiry_override: Option<u32>,
@@ -1606,6 +1608,102 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         request.await
     }
 
+    // A committed reservation is independent of the outstanding PUBACK, but
+    // executing another input packet or requesting a new reservation is not.
+    async fn while_acknowledging(
+        &mut self,
+        session: &Active<'_>,
+        id: mqx_codec::PacketId,
+        mount: Option<&str>,
+        keep_alive: u16,
+        shutdown: &mut watch::Receiver<bool>,
+        request: impl Future<Output = Result<(usize, Step), BrokerError>>,
+    ) -> Result<(usize, Step), BrokerError> {
+        let mut request = pin!(request);
+        let live = &session.live;
+        let mut expires = deadline(keep_alive);
+        let mut ready = true;
+        let mut emitted = None;
+        let mut dropped = None;
+        loop {
+            if live.taken.load(Ordering::Acquire) {
+                return Ok((1, Step::End(End::Takeover)));
+            }
+            let bytes = self.input.len();
+            let read = if self.pending_error.is_none() && !self.eof {
+                pipeline::PREFETCH_BYTES.saturating_sub(bytes)
+            } else {
+                0
+            };
+            let idle = self.idle();
+            let can_send = ready
+                && emitted != Some(false)
+                && dropped.is_none()
+                && idle
+                && bytes == 0
+                && read != 0;
+            // A complete packet is already waiting for the ordered handler.
+            // Only use the receive timeout if more input is actually needed.
+            let waiting_for_input = frame_size(&self.input).is_none_or(|size| size > bytes);
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Ok((1, Step::End(End::Shutdown))),
+                _ = timeout(expires), if waiting_for_input => return Ok((1, Step::End(End::Timeout))),
+                reply = &mut request => {
+                    let (count, step) = reply?;
+                    if let Some(dropped) = dropped
+                        && matches!(step, Step::Continue)
+                        && !live.taken.load(Ordering::Acquire)
+                    {
+                        let step = session.ack(dropped, Ack::Dropped).await?;
+                        return Ok((count, step));
+                    }
+                    return Ok((count, step));
+                }
+                _ = live.ready.notified() => {
+                    // A snapshot can invalidate this outbox even while a
+                    // transport write is already pending.
+                    live.pop_reserved_if(|_| false)?;
+                    ready = true;
+                }
+                result = self.progress(read), if read != 0 || !idle => {
+                    result?;
+                    if expires.is_some()
+                        && self.input.len() != bytes
+                        && frame_size(&self.input).is_some_and(|size| {
+                            size.saturating_sub(self.input.len()) > 1000
+                        })
+                    {
+                        expires = deadline(keep_alive);
+                    }
+                }
+                _ = std::future::ready(()), if can_send => {
+                    // Leave queued packets for reauthentication in the outer loop.
+                    if session.security.has_changed().unwrap_or(true) {
+                        emitted = Some(false);
+                        continue;
+                    }
+                    if !*emitted.get_or_insert_with(|| {
+                        session.broker.emitted_ack_head(live, id, mount.map_or(0, str::len))
+                    }) {
+                        continue;
+                    }
+                    let packet = live.pop_reserved_if(|packet| {
+                        matches!(packet, Outbound::Publish { delivery, id: Some(mid), .. }
+                            if delivery.qos == QoS::AtLeastOnce && *mid != id)
+                    })?;
+                    ready = packet.is_some();
+                    if let Some(packet) = packet {
+                        // Use the ordinary encoder (alias allocation, packet
+                        // size checks, and expiry). If it drops a packet,
+                        // settle that drop after the preceding ACK applies.
+                        dropped = self.delivery(packet, mount, self.broker.now())?;
+                    }
+                }
+            }
+        }
+    }
+
     // Drive both halves without splitting the transport or letting another
     // MQTT packet accumulate in the output buffer behind a stalled write.
     async fn progress(&mut self, read_budget: usize) -> std::io::Result<()> {
@@ -1911,6 +2009,265 @@ mod tests {
         assert_eq!(&wire.input[cap - 1..], b"n");
         wire.progress(usize::MAX).await.unwrap();
         assert_eq!(&wire.input[cap - 1..], b"next");
+    }
+
+    #[tokio::test]
+    async fn durable_qos1_writes_a_reservation_before_the_previous_ack_finishes() {
+        use std::collections::BTreeMap;
+
+        use mqx_cluster::{ClusterConfig, ClusterSecurity};
+        use mqx_codec::{PacketId, Publish};
+        use tokio::{
+            io::AsyncWriteExt,
+            net::{TcpListener, TcpStream},
+            sync::oneshot,
+        };
+
+        let storage = tempfile::tempdir().unwrap();
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let broker = Broker::clustered(
+            BrokerConfig {
+                max_inflight_messages: 3,
+                ..BrokerConfig::default()
+            },
+            ClusterConfig::new(
+                1,
+                address,
+                BTreeMap::from([(1, address)]),
+                storage.path().join("node"),
+                ClusterSecurity::InsecurePlaintext,
+            ),
+        )
+        .await
+        .unwrap();
+        let security = SecurityHandle::default();
+        let claim = |id: &str, clean_start| Claim {
+            publisher: Publisher {
+                id: Arc::from(id),
+                username: None,
+                security: 0,
+                dynamic_security: None,
+                external: None,
+            },
+            clean_start,
+            bridge: false,
+            max_qos: QoS::ExactlyOnce,
+            will: None,
+            v5: None,
+            now: broker.now(),
+            internal_bridge: None,
+            dynamic_security_revision: None,
+            verdicts: Vec::new(),
+        };
+        let ClaimResult::Accepted(live, false) = broker
+            .claim(&security, claim("sink", false), None)
+            .await
+            .unwrap()
+        else {
+            panic!("persistent subscriber claim failed");
+        };
+        let ClaimResult::Accepted(source, false) = broker
+            .claim(&security, claim("source", true), None)
+            .await
+            .unwrap()
+        else {
+            panic!("publisher claim failed");
+        };
+        let mut session = Active {
+            broker: &broker,
+            live,
+            security: security.0.snapshots.subscribe(),
+            sparkplug_aware: false,
+            graceful: false,
+            expiry_override: None,
+            detached: false,
+        };
+        let subscription = SubscriptionRequest::legacy(("mount/queue".into(), QoS::AtLeastOnce));
+        session
+            .act(Operation::subscribe(vec![subscription], broker.now()))
+            .await
+            .unwrap();
+        let mid = |id| PacketId::new(id).unwrap();
+        let publications = (1..=3)
+            .map(|id| {
+                Publication::legacy(
+                    Publish {
+                        packet_id: Some(mid(id)),
+                        topic: "mount/queue".into(),
+                        qos: QoS::AtLeastOnce,
+                        dup: false,
+                        retain: false,
+                        payload: Bytes::from_static(b"message"),
+                    },
+                    broker.now(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            broker
+                .receive_many(&source, publications, false)
+                .await
+                .unwrap(),
+            vec![Reply::PublishReason(R::SUCCESS.0); 3]
+        );
+
+        async fn read_publish(socket: &mut TcpStream, topic: &str, id: PacketId) {
+            let mut expected = BytesMut::new();
+            codec5::encode(
+                &Packet5::Publish(codec5::Publish {
+                    packet_id: Some(id),
+                    topic: topic.into(),
+                    qos: QoS::AtLeastOnce,
+                    dup: false,
+                    retain: false,
+                    properties: vec![Property::TopicAlias(1)],
+                    payload: Bytes::from_static(b"message"),
+                }),
+                &mut expected,
+            )
+            .unwrap();
+            let mut received = vec![0; expected.len()];
+            socket.read_exact(&mut received).await.unwrap();
+            assert_eq!(received.as_slice(), &expected[..]);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        let mut client = client.unwrap();
+        let mut wire = Wire::new(server.unwrap().0, broker.clone());
+        wire.v5 = Some(v5::WireState::new(
+            &crate::ListenerPolicy::default(),
+            &v5::Negotiated {
+                maximum_packet_size: 32,
+                alias_maximum: 1,
+                ..v5::Negotiated::default()
+            },
+        ));
+        let mount = Some("mount/");
+        let first = broker.next_outbound(&session.live).await.unwrap().unwrap();
+        assert_eq!(wire.delivery(first, mount, broker.now()).unwrap(), None);
+        while !wire.idle() {
+            wire.progress(0).await.unwrap();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            read_publish(&mut client, "queue", mid(1)),
+        )
+        .await
+        .unwrap();
+        let (_shutdown, mut shutdown) = watch::channel(false);
+        for (id, input, reload) in [
+            (mid(3), &[][..], false),
+            (mid(1), &[][..], true),
+            (mid(1), &[0xc0, 0x00][..], false),
+        ] {
+            if reload {
+                security.0.snapshots.send_modify(|_| {});
+            }
+            // An unsent ID is not an eligibility proof, and a buffered
+            // control must not be passed even when the ACK itself is valid.
+            wire.input.extend_from_slice(input);
+            {
+                let mut waiting = pin!(wire.while_acknowledging(
+                    &session,
+                    id,
+                    mount,
+                    0,
+                    &mut shutdown,
+                    pending(),
+                ));
+                assert!(futures_util::poll!(&mut waiting).is_pending());
+            }
+            assert!(wire.idle());
+            let mut head = None;
+            session
+                .live
+                .pop_reserved_if(|packet| {
+                    if let Outbound::Publish { id, .. } = packet {
+                        head = *id;
+                    }
+                    false
+                })
+                .unwrap();
+            assert_eq!(head, Some(mid(2)));
+            session.security.borrow_and_update();
+        }
+        assert!(matches!(
+            wire.packet(broker.0.config.startup(), ProtocolVersion::V311)
+                .unwrap(),
+            Some(Frame::V5(Packet5::PingReq)),
+        ));
+
+        let (finish, done) = oneshot::channel();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                wire.while_acknowledging(&session, mid(1), mount, 0, &mut shutdown, async {
+                    done.await.unwrap();
+                    Ok((1, session.ack(mid(1), Ack::Acknowledged).await?))
+                }),
+                async {
+                    // The pending durable ACK cannot complete until this
+                    // socket has seen both remaining PUBLISH packets.
+                    read_publish(&mut client, "", mid(2)).await;
+                    read_publish(&mut client, "", mid(3)).await;
+                    finish.send(()).unwrap();
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result.unwrap(), (1, Step::Continue)));
+
+        let extended = Packet5::PubAck(codec5::PublishAck {
+            packet_id: mid(4),
+            reason: R::NOT_AUTHORIZED,
+            properties: vec![Property::ReasonString("denied".into())],
+        });
+        let mut raw = BytesMut::new();
+        for id in [mid(2), mid(3)] {
+            codec5::encode(&Packet5::PubAck(v5::publish_ack(id, R::SUCCESS)), &mut raw).unwrap();
+        }
+        codec5::encode(&extended, &mut raw).unwrap();
+        codec5::encode(&Packet5::PingReq, &mut raw).unwrap();
+        client.write_all(&raw).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while wire.input.len() < raw.len() {
+                wire.progress(usize::MAX).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let config = broker.0.config.startup();
+        let protocol = ProtocolVersion::V311;
+        let first = wire.packet(config, protocol).unwrap().unwrap();
+        let id = pipeline::simple_ack(&first).unwrap();
+        assert!(matches!(
+            pipeline::acknowledge(&session, &mut wire, id, protocol, mount, 0, &mut shutdown)
+                .await
+                .unwrap(),
+            Step::Continue,
+        ));
+        assert!(matches!(
+            wire.packet(config, protocol).unwrap(),
+            Some(Frame::V5(packet)) if packet == extended,
+        ));
+        assert!(matches!(
+            wire.packet(config, protocol).unwrap(),
+            Some(Frame::V5(Packet5::PingReq)),
+        ));
+        assert!(broker.next_outbound(&session.live).await.unwrap().is_none());
+        broker
+            .detach(session.live.lease.clone(), true, None)
+            .await
+            .unwrap();
+        session.detached = true;
+        broker.shutdown_cluster().await.unwrap();
     }
 
     // Expected strings come from glibc inet_ntop via Python's socket.inet_ntop.

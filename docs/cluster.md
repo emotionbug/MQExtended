@@ -25,6 +25,7 @@ Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExte
 | `cluster_join true` | Start an empty node as a new member of a running cluster instead of bootstrapping one | false |
 | `cluster_membership_generation <n>` | Version of the `cluster_peer` list; raise it to request a membership change | 0 |
 | `cluster_state_format <1\|2>` | On-disk and wire format this node writes; see [upgrades](#upgrades) | 2 |
+| `cluster_qos1_replay_batch true` | Reserve a bounded window of ready MQTT 3.x QoS 1 messages in one commit when a persistent subscriber resumes; see [upgrades](#upgrades) | false |
 | `auto_recover true` | Recover from quorum loss, a lost peer or unusable local state without operator action, giving up consistency; see [automatic recovery](#automatic-recovery). Also applies to a standalone broker | false |
 | `auto_recover_timeout <ms>` | How long a node waits without quorum before it continues alone; requires `auto_recover true` | `cluster_lease_timeout` |
 
@@ -196,6 +197,8 @@ Use a rolling upgrade only if every running binary can replay every command that
 2. Once every node runs the new binary, roll the setting to the new format, again one node at a time.
 
 Don't change membership in the middle of an upgrade.
+
+Leave `cluster_qos1_replay_batch` off during a rolling upgrade. Enable it at startup (`qos1ReplayBatch.enabled=true` in Helm) only after every voter and learner can read replay-window commands, including binaries used to recover from a backup. Switching it off stops new commands; it does not rewrite the WAL for a downgrade. Take a cold backup before enabling it if you need to return to an older binary.
 
 When upgrading a build that predates the MQTT broker control API, use a cold upgrade if clients can publish to `$CONTROL/` topics. Requests to disabled or unknown endpoints also produce a replicated `BrokerControl` command that the old build cannot replay. Turning off `enable_control_api` is not a mixed-version compatibility switch. Drain clients, stop all voters, take the cold backup above and upgrade all voters before restoring traffic.
 

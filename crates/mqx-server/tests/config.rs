@@ -820,6 +820,28 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
 }
 
 #[test]
+fn cluster_replay_window_requires_explicit_opt_in() {
+    let base = format!("{CLUSTER}{CLUSTER_TLS}");
+    assert!(
+        !ServerConfig::parse(&base)
+            .unwrap()
+            .cluster_qos1_replay_batch
+    );
+    let enabled = format!("{base}cluster_qos1_replay_batch true\n");
+    assert!(
+        ServerConfig::parse(&enabled)
+            .unwrap()
+            .cluster_qos1_replay_batch
+    );
+    for extra in [
+        "cluster_qos1_replay_batch twice\n",
+        "cluster_qos1_replay_batch false\n",
+    ] {
+        assert!(ServerConfig::parse(&format!("{enabled}{extra}")).is_err());
+    }
+}
+
+#[test]
 fn automatic_recovery_is_opt_in_and_validates_its_timeout_and_state_format() {
     assert!(!ServerConfig::default().auto_recover);
     let standalone = ServerConfig::parse("auto_recover true\nauto_recover_timeout 700\n").unwrap();

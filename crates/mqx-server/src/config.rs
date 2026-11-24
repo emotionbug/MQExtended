@@ -45,6 +45,7 @@ pub struct ServerConfig {
     pub enable_control_api: bool,
     pub persistence: PersistenceConfig,
     pub cluster: Option<ClusterConfig>,
+    pub cluster_qos1_replay_batch: bool,
     pub auto_recover: bool,
     pub auto_recover_timeout: Option<Duration>,
     /// Parse-time operator notices, emitted after the logging destinations are configured.
@@ -509,6 +510,7 @@ impl Default for Parser {
                 enable_control_api: false,
                 persistence: PersistenceConfig::default(),
                 cluster: None,
+                cluster_qos1_replay_batch: false,
                 auto_recover: false,
                 auto_recover_timeout: None,
                 notices: Vec::new(),
@@ -537,6 +539,7 @@ impl Parser {
             ));
         }
         if let Some(((path, line), section)) = self.cluster.take() {
+            self.config.cluster_qos1_replay_batch = section.qos1_replay_batch.unwrap_or(false);
             let mut cluster = section.finish().map_err(|error| error.at(&path, line))?;
             cluster.auto_recover = self.config.auto_recover;
             cluster.auto_recover_timeout = self.config.auto_recover_timeout;
@@ -1261,6 +1264,7 @@ struct ClusterSection {
     join: Option<bool>,
     membership_generation: Option<u64>,
     state_format: Option<u16>,
+    qos1_replay_batch: Option<bool>,
     data_dir: Option<PathBuf>,
     heartbeat: Option<Duration>,
     election: Option<(Duration, Duration)>,
@@ -1308,6 +1312,7 @@ impl ClusterSection {
             | "cluster_join"
             | "cluster_membership_generation"
             | "cluster_state_format"
+            | "cluster_qos1_replay_batch"
             | "cluster_heartbeat_interval"
             | "cluster_lease_interval"
             | "cluster_lease_timeout"
@@ -1336,6 +1341,9 @@ impl ClusterSection {
                     "2" => 2,
                     _ => return Err(invalid(name, first)),
                 });
+            }
+            "cluster_qos1_replay_batch" if self.qos1_replay_batch.is_none() => {
+                self.qos1_replay_batch = Some(value.boolean()?);
             }
             "cluster_peer" => {
                 let id = positive(first)?;

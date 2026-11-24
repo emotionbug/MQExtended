@@ -4,11 +4,15 @@ use mqx_codec::{
     Packet, PacketId, ProtocolVersion, QoS,
     v5::{Packet as Packet5, ReasonCode as R},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::watch,
+};
 
 use super::{Active, End, Frame, Step, Wire, mount, v5};
 use crate::{
     BrokerConfig, BrokerError, ListenerPolicy,
+    inbox::Ack,
     state::{Publication, Reply},
 };
 
@@ -124,15 +128,28 @@ pub(super) async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(Step::Continue)
 }
 
-// Never wait to fill a batch. Inspect only canonical, complete legacy PUBACKs;
-// the first incomplete, noncanonical or unrelated frame belongs to the main loop.
+// The compact PUBACK is identical in v3 and v5. Other v5 reasons and
+// properties continue to use the individual packet handler.
+pub(super) fn simple_ack(packet: &Frame) -> Option<PacketId> {
+    match packet {
+        Frame::Legacy(Packet::PubAck(id)) => Some(*id),
+        Frame::V5(Packet5::PubAck(ack))
+            if ack.reason == R::SUCCESS && ack.properties.is_empty() =>
+        {
+            Some(ack.packet_id)
+        }
+        _ => None,
+    }
+}
+
 pub(super) async fn acknowledge<S: AsyncRead + AsyncWrite + Unpin>(
     session: &Active<'_>,
     wire: &mut Wire<S>,
     first: PacketId,
-    config: &BrokerConfig,
     protocol: ProtocolVersion,
     mount_point: Option<&str>,
+    keep_alive: u16,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Step, BrokerError> {
     debug_assert!(wire.idle());
     let mut ids = [first; BATCH_PACKETS];
@@ -145,25 +162,30 @@ pub(super) async fn acknowledge<S: AsyncRead + AsyncWrite + Unpin>(
         ids[count] = id;
         count += 1;
     }
-    if count > 1
-        && let Some((count, reply)) = wire
-            .prefetch(session.broker.ack_prefix(
-                &session.live,
-                &ids[..count],
-                mount_point.map_or(0, str::len),
-            ))
-            .await?
-    {
-        for _ in 1..count {
-            // Reuse normal decoding and traffic accounting; bytes were only
-            // peeked above, and prefetch can append but never consumes input.
-            let packet = wire.packet(config, protocol)?;
-            debug_assert!(matches!(packet, Some(Frame::Legacy(Packet::PubAck(_)))));
-        }
-        return super::action_result(reply);
+    let (count, step) = wire
+        .while_acknowledging(session, first, mount_point, keep_alive, shutdown, async {
+            if count > 1
+                && let Some((applied, reply)) = session
+                    .broker
+                    .ack_prefix(
+                        &session.live,
+                        &ids[..count],
+                        mount_point.map_or(0, str::len),
+                    )
+                    .await?
+            {
+                return Ok((applied, super::action_result(reply)?));
+            }
+            Ok((1, session.ack(first, Ack::Acknowledged).await?))
+        })
+        .await?;
+    for _ in 1..count {
+        // Reuse normal decoding and traffic accounting. Only complete compact
+        // acknowledgements were selected, and transport progress never consumes input.
+        let packet = wire.packet(session.broker.0.config.startup(), protocol)?;
+        debug_assert!(packet.as_ref().and_then(simple_ack).is_some());
     }
-    wire.prefetch(session.ack(first, crate::inbox::Ack::Acknowledged))
-        .await
+    Ok(step)
 }
 
 pub(super) fn can_follow(

@@ -70,6 +70,9 @@ data:
     {{- if include "mqextended.autoRecoverEnabled" . }}
     auto_recover true
     {{- end }}
+    {{- if (.Values.qos1ReplayBatch).enabled }}
+    cluster_qos1_replay_batch true
+    {{- end }}
     EOF
       {{- $voters := include "mqextended.voterCount" . | int }}
       {{- range $id := untilStep 1 (int (add1 $voters)) 1 }}

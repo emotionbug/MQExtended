@@ -170,6 +170,17 @@ struct Outgoing {
     phase: Phase,
 }
 
+// Match the legacy socket's write coalescing budget; the in-flight window
+// itself can be larger or unlimited.
+const REPLAY_BATCH_PACKETS: usize = 16;
+const REPLAY_BATCH_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct OutboundPrefix {
+    next_unsent: usize,
+    ids: Vec<PacketId>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Counters {
     count: usize,
@@ -539,6 +550,66 @@ impl Inbox {
         }
         self.next_unsent += 1;
         Some(reserve_publish(entry))
+    }
+
+    fn replay_prefix_ids(&self) -> impl Iterator<Item = PacketId> + '_ {
+        let mut room = REPLAY_BATCH_BYTES;
+        self.in_flight
+            .iter()
+            .skip(self.next_unsent)
+            .take(REPLAY_BATCH_PACKETS)
+            .map_while(move |entry| {
+                let message = &entry.delivery.message;
+                if entry.phase != Phase::Publish
+                    || entry.delivery.qos != QoS::AtLeastOnce
+                    || message.expires.is_some()
+                    || message.topic.starts_with(crate::control::PREFIX)
+                {
+                    return None;
+                }
+                let id = entry.id?;
+                // At most five fixed header bytes, two topic-length bytes
+                // and two MID bytes. A mount point can only shorten the topic.
+                room = room.checked_sub(message.topic.len() + message.payload.len() + 9)?;
+                Some(id)
+            })
+    }
+
+    pub(crate) fn outbound_prefix(&self) -> Option<OutboundPrefix> {
+        let mut ready = self.replay_prefix_ids();
+        let first = ready.next()?;
+        let second = ready.next()?;
+        let mut ids = Vec::with_capacity(REPLAY_BATCH_PACKETS);
+        ids.extend([first, second]);
+        ids.extend(ready);
+        Some(OutboundPrefix {
+            next_unsent: self.next_unsent,
+            ids,
+        })
+    }
+
+    pub(crate) fn reserve_outbound_prefix(
+        &mut self,
+        prefix: OutboundPrefix,
+        mut emit: impl FnMut(Outbound),
+    ) -> bool {
+        let count = prefix.ids.len();
+        // The owning socket serializes its ACKs, drops and timed reservations
+        // with this request. Other publications only append, or reserve a
+        // ready packet in apply order, advancing the cursor. The lease fences
+        // off a reconnect (which resets the cursor). Check the whole observed
+        // prefix before committing any attempt; never skip or promote here.
+        if self.next_unsent != prefix.next_unsent
+            || !(2..=REPLAY_BATCH_PACKETS).contains(&count)
+            || !self.replay_prefix_ids().take(count).eq(prefix.ids)
+        {
+            return false;
+        }
+        for entry in self.in_flight.iter_mut().skip(self.next_unsent).take(count) {
+            emit(reserve_publish(entry));
+        }
+        self.next_unsent += count;
+        true
     }
 
     // database.c: db__message_write_inflight_out_latest starts at the head
@@ -928,6 +999,131 @@ mod tests {
         assert!(
             matches!(inbox.next_outbound(config, Duration::ZERO), Some(Outbound::Publish { id: Some(id), dup: false, .. }) if id.get() == expected)
         );
+    }
+
+    #[test]
+    fn replay_prefix_stops_at_each_noneligible_entry_and_ignores_a_concurrent_append() {
+        let config = BrokerConfig::default();
+        for kind in 0..5 {
+            let mut inbox = Inbox::default();
+            let lead = delivery(b"lead", QoS::AtLeastOnce);
+            for packet in [lead.clone(), lead] {
+                assert_eq!(
+                    inbox.offer(packet, true, QoS::ExactlyOnce, &config),
+                    Offer::Ready
+                );
+            }
+            let qos = match kind {
+                0 => QoS::AtMostOnce,
+                1 => QoS::ExactlyOnce,
+                _ => QoS::AtLeastOnce,
+            };
+            assert_eq!(
+                inbox.offer(delivery(b"barrier", qos), true, QoS::ExactlyOnce, &config),
+                Offer::Ready
+            );
+            let barrier = &mut inbox.in_flight[2];
+            match kind {
+                0 => {}
+                1 => barrier.phase = Phase::Release,
+                2 => {
+                    Arc::get_mut(&mut barrier.delivery.message).unwrap().expires =
+                        Some(Duration::from_secs(1));
+                }
+                3 => barrier.id = None,
+                _ => {
+                    Arc::get_mut(&mut barrier.delivery.message).unwrap().topic =
+                        "$CONTROL/test".into();
+                }
+            }
+
+            let prefix = inbox.outbound_prefix().unwrap();
+            assert_eq!(prefix.ids.len(), 2);
+            assert_eq!(
+                inbox.offer(
+                    delivery(b"append", QoS::AtLeastOnce),
+                    true,
+                    QoS::ExactlyOnce,
+                    &config
+                ),
+                Offer::Ready
+            );
+            let mut packets = Vec::new();
+            assert!(inbox.reserve_outbound_prefix(prefix, |packet| packets.push(packet)));
+            assert_eq!(packets.len(), 2);
+            for (index, packet) in packets.into_iter().enumerate() {
+                assert!(matches!(
+                    packet,
+                    Outbound::Publish { id: Some(id), dup: false, .. }
+                        if usize::from(id.get()) == index + 1
+                ));
+            }
+            assert_eq!(inbox.next_unsent, 2);
+            assert!(inbox.outbound_prefix().is_none());
+            assert!(!inbox.in_flight[3].dup);
+        }
+    }
+
+    #[test]
+    fn replay_prefix_rejects_ack_or_reservation_races_without_partial_effects() {
+        let config = BrokerConfig::default();
+        for acknowledged in [false, true] {
+            let mut inbox = Inbox::default();
+            for _ in 0..4 {
+                assert_eq!(
+                    inbox.offer(
+                        delivery(b"", QoS::AtLeastOnce),
+                        true,
+                        QoS::ExactlyOnce,
+                        &config
+                    ),
+                    Offer::Ready
+                );
+            }
+            let planned = inbox.outbound_prefix().unwrap();
+            if acknowledged {
+                assert!(inbox.ack(PacketId::new(2).unwrap(), Ack::Acknowledged, &config));
+            } else {
+                assert!(inbox.reserve_ready_qos1(|_| true).is_some());
+            }
+            assert!(!inbox.reserve_outbound_prefix(planned, |_| panic!("stale reservation")));
+            assert_publish_id(&mut inbox, &config, if acknowledged { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn replay_prefix_bounds_count_and_bytes() {
+        let config = BrokerConfig::default();
+        let mut inbox = Inbox::default();
+        for _ in 0..=REPLAY_BATCH_PACKETS {
+            assert_eq!(
+                inbox.offer(
+                    delivery(b"", QoS::AtLeastOnce),
+                    true,
+                    QoS::ExactlyOnce,
+                    &config
+                ),
+                Offer::Ready
+            );
+        }
+        assert_eq!(
+            inbox.outbound_prefix().unwrap().ids.len(),
+            REPLAY_BATCH_PACKETS
+        );
+
+        let mut inbox = Inbox::default();
+        for _ in 0..2 {
+            assert_eq!(
+                inbox.offer(
+                    delivery(&[0; REPLAY_BATCH_BYTES / 2], QoS::AtLeastOnce),
+                    true,
+                    QoS::ExactlyOnce,
+                    &config
+                ),
+                Offer::Ready
+            );
+        }
+        assert!(inbox.outbound_prefix().is_none());
     }
 
     // util_mosq.c: mosquitto__mid_generate skips zero at wraparound.
