@@ -8,9 +8,9 @@ mod transport;
 use std::{io, path::PathBuf};
 
 pub use config::{
-    BrokerLimits, DynamicSecurityConfig, FilePlugins, ListenerConfig, ListenerProtocol, LogConfig,
-    LogDestination, LogType, PersistenceConfig, ProxyProtocol, SecurityConfig, ServerConfig,
-    SocketDomain, TlsConfig, TlsVersion, parse_command_line_port,
+    BrokerLimits, DynamicSecurityConfig, ExternalPluginConfig, FilePlugins, ListenerConfig,
+    ListenerProtocol, LogConfig, LogDestination, LogType, PersistenceConfig, ProxyProtocol,
+    SecurityConfig, ServerConfig, SocketDomain, TlsConfig, TlsVersion, parse_command_line_port,
 };
 pub use http_api::HttpApi;
 pub use listener::{BrokerSignal, CertIdentity, CertificateReloader, Connection, Server};
@@ -67,4 +67,8 @@ pub enum ServerError {
     /// listeners__start's status 1 for bind, address and TLS load failures.
     #[error(transparent)]
     Listen(Box<ServerError>),
+    /// An auth plugin stopped initialization after reporting why itself, as
+    /// auth-plug's `log.c: _fatal` does before `exit(1)`.
+    #[error("auth plugin initialization aborted")]
+    PluginAbort,
 }

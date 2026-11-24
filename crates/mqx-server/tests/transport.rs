@@ -469,7 +469,14 @@ async fn tls_websocket_dispatches_mqtt_with_and_without_a_proxy_v1_prefix() {
         stream.flush().await.unwrap();
         read_upgrade(&mut stream).await;
         websocket_connect(&mut stream).await;
-        assert_eq!(broker.observed().await, (Some(source), CertIdentity::None));
+        // A presented certificate without identity mapping is still visible to
+        // v4 plugins (mosquitto_client_certificate).
+        let identity = if mtls {
+            CertIdentity::Presented
+        } else {
+            CertIdentity::None
+        };
+        assert_eq!(broker.observed().await, (Some(source), identity));
         broker.stop().await;
     }
 }
@@ -894,7 +901,7 @@ async fn client_certificate_date_opt_in_still_checks_crl_dates_and_revocation() 
         let result = timeout(DEADLINE, dial(addr, client)).await.unwrap();
         if accepted {
             assert_eq!(result.unwrap(), 42);
-            assert_eq!(identities.try_recv().unwrap(), CertIdentity::None);
+            assert_eq!(identities.try_recv().unwrap(), CertIdentity::Presented);
         } else {
             assert!(result.is_err(), "{label} CRL did not stop the handshake");
             assert!(identities.try_recv().is_err());

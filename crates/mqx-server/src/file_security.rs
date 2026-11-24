@@ -3,9 +3,10 @@ use std::{
     fs::OpenOptions,
     io::{self, Read},
     path::Path,
+    sync::Arc,
 };
 
-use mqx_auth::{AclFileError, PasswordFile, PasswordFileError};
+use mqx_auth::{AclFileError, PasswordFile, PasswordFileError, external::ExternalSecurity};
 use mqx_broker::{Broker, SecurityHandle};
 use mqx_server::{ServerConfig, ServerError};
 
@@ -20,7 +21,12 @@ struct PolicyGroup {
 }
 
 impl SecurityHandles {
-    pub(super) fn new(config: &ServerConfig) -> Result<Self, ServerError> {
+    /// `external` holds the initialized auth plugins, indexed like
+    /// [`ServerConfig::external_plugins`].
+    pub(super) fn new(
+        config: &ServerConfig,
+        external: &[Arc<dyn ExternalSecurity>],
+    ) -> Result<Self, ServerError> {
         let mut by_plugin = BTreeMap::new();
         let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
         let mut slots = Vec::with_capacity(config.listeners.len());
@@ -33,7 +39,11 @@ impl SecurityHandles {
                 // Named plugins can vary by listener without per_listener_settings.
                 // Group by their immutable startup paths, not reloadable built-ins.
                 *by_plugin
-                    .entry((password.map(Path::as_os_str), acl.map(Path::as_os_str)))
+                    .entry((
+                        password.map(Path::as_os_str),
+                        acl.map(Path::as_os_str),
+                        listener.external_plugin,
+                    ))
                     .or_insert(groups.len())
             };
             if group == groups.len() {
@@ -41,7 +51,8 @@ impl SecurityHandles {
                 // at 1; new listener-specific groups use the first listener index.
                 let id = if config.per_listener_settings {
                     index as u64 + 1
-                } else if password.is_some() || acl.is_some() {
+                } else if password.is_some() || acl.is_some() || listener.external_plugin.is_some()
+                {
                     index as u64 + 2
                 } else {
                     1
@@ -56,12 +67,24 @@ impl SecurityHandles {
             .into_iter()
             .map(|(id, listeners)| {
                 let credentials = Credentials::load(config, listeners[0])?;
-                let handle = credentials
+                let mut handle = credentials
                     .install(|password, acl| SecurityHandle::with_id(id, password, acl))?;
+                if let Some(plugin) = config.listeners[listeners[0]].external_plugin {
+                    // The declaration index is identical on every node.
+                    handle = handle.with_external(plugin as u32, external[plugin].clone());
+                }
                 Ok(PolicyGroup { handle, listeners })
             })
             .collect::<Result<_, ServerError>>()?;
         Ok(Self { groups, slots })
+    }
+
+    /// Every policy handle, for [`Broker::clustered_with_security`].
+    pub(super) fn handles(&self) -> Vec<SecurityHandle> {
+        self.groups
+            .iter()
+            .map(|group| group.handle.clone())
+            .collect()
     }
 
     pub(super) fn for_listener(&self, index: usize) -> SecurityHandle {

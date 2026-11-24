@@ -396,16 +396,12 @@ async fn upgrade<S: TransportIo + 'static>(
                 .accept()
                 .await
                 .map_err(|error| NegotiationError::Tls(io::Error::other(error)))?;
-            let certificate = if tls.use_identity_as_username || tls.use_subject_as_username {
-                stream
-                    .ssl()
-                    .peer_certificate()
-                    .map(|cert| cert.to_der())
-                    .transpose()
-                    .map_err(tls_error)?
-            } else {
-                None
-            };
+            let certificate = stream
+                .ssl()
+                .peer_certificate()
+                .map(|cert| cert.to_der())
+                .transpose()
+                .map_err(tls_error)?;
             *identity = tls::identity(tls, certificate.as_deref());
             // src/handle_connect.c: SSL_get_cipher_version and SSL_get_cipher_name.
             *session = stream

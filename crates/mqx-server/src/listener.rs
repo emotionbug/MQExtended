@@ -40,6 +40,9 @@ pub enum CertIdentity {
     None,
     /// Identity from the client's certificate on the locally verified TLS connection.
     Username(String),
+    /// A client certificate on the locally verified TLS connection, with no
+    /// username mapping; CONNECT credentials still authenticate the client.
+    Presented,
     /// Common Name asserted by the upstream PROXY peer, not locally authenticated.
     ForwardedUsername(String),
     /// The transport is valid, but the broker must refuse CONNECT as bad credentials.
@@ -51,6 +54,7 @@ impl From<CertIdentity> for mqx_broker::CertIdentity {
         match identity {
             CertIdentity::None => Self::None,
             CertIdentity::Username(name) => Self::Username(name),
+            CertIdentity::Presented => Self::Presented,
             CertIdentity::ForwardedUsername(name) => Self::ForwardedUsername(name),
             CertIdentity::MissingOrInvalid => Self::MissingOrInvalid,
         }

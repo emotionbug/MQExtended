@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use mqx_auth::external::ExternalSecurity;
 use mqx_bridge::Bridges;
 use mqx_broker::{
     Broker, BrokerConfig, ConnectionInfo, ListenerPolicy, ReloadableLimits, SecurityHandle,
@@ -202,7 +203,7 @@ fn start() -> Result<ExitCode, StartupError> {
     shutdown.finish(&result);
     Ok(match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(ServerError::Listen(_)) => ExitCode::FAILURE,
+        Err(ServerError::Listen(_) | ServerError::PluginAbort) => ExitCode::FAILURE,
         Err(ServerError::File { operation, .. })
             if [persistence::RESTORE_FAILED, persistence::IMPORT_FAILED].contains(&operation) =>
         {
@@ -220,8 +221,11 @@ impl ShutdownLog {
     // final persistence state. Startup failures take the same path.
     fn finish(&mut self, result: &Result<(), ServerError>) {
         if !std::mem::replace(&mut self.0, true) {
-            if let Err(error) = result {
-                tracing::error!("{error}");
+            match result {
+                // auth-plug log.c: _fatal calls exit(1) after its own lines.
+                Err(ServerError::PluginAbort) => return,
+                Err(error) => tracing::error!("{error}"),
+                Ok(()) => {}
             }
             tracing::info!("{TERMINATING}");
         }
@@ -262,10 +266,43 @@ fn add_local_http(config: &mut ServerConfig) {
                 .listeners
                 .first()
                 .and_then(|listener| listener.dynamic_security.clone()),
+            // Only a global plugin can apply without configured listeners.
+            external_plugin: config
+                .listeners
+                .first()
+                .and_then(|listener| listener.external_plugin),
             sparkplug_aware: config.sparkplug_aware,
             ..ListenerConfig::default()
         });
     }
+}
+
+/// Mosquitto src/plugin_init.c: plugin__load_all initializes plugins before
+/// any listener opens; plugin_v4.c: plugin__load_v4 logs the callbacks it
+/// found and registers them.
+async fn load_external_plugins(
+    config: &ServerConfig,
+) -> Result<Vec<Arc<dyn ExternalSecurity>>, ServerError> {
+    let mut loaded = Vec::with_capacity(config.external_plugins.len());
+    for plugin in &config.external_plugins {
+        tracing::info!("Loading plugin: {}", plugin.path);
+        mqx_extauth::announce(plugin.library);
+        tracing::info!(" ├── Username/password checking enabled.");
+        tracing::info!(" ├── TLS-PSK checking enabled.");
+        tracing::info!(" └── Extended authentication not enabled.");
+        let security = mqx_extauth::load(
+            plugin.library,
+            plugin.options.clone(),
+            plugin.deny_special_chars,
+        )
+        .await
+        .map_err(|_| ServerError::PluginAbort)?;
+        for event in ["reload", "basic-auth", "acl-check", "psk-key"] {
+            tracing::info!("Plugin has registered to receive '{event}' events.");
+        }
+        loaded.push(security);
+    }
+    Ok(loaded)
 }
 
 /// Broker-wide options Mosquitto 2.1.4 rereads on SIGHUP but never applies:
@@ -416,7 +453,8 @@ async fn run_broker(
             .listeners
             .iter()
             .any(|listener| listener.security.file_plugins.paths() != (None, None));
-    let security = Arc::new(SecurityHandles::new(&config)?);
+    let external = load_external_plugins(&config).await?;
+    let security = Arc::new(SecurityHandles::new(&config, &external)?);
     let listener_policies = |config: &ServerConfig| -> Vec<Arc<ListenerPolicy>> {
         config
             .listeners
@@ -468,9 +506,10 @@ async fn run_broker(
                 .first_key_value()
                 .is_some_and(|(&id, _)| id == cluster.node_id);
         let migration_node = bootstrap_node && cluster.membership_generation == 0;
-        let broker = Broker::clustered(broker_config(&config), cluster)
-            .await
-            .map_err(ServerError::Cluster)?;
+        let broker =
+            Broker::clustered_with_security(broker_config(&config), cluster, &security.handles())
+                .await
+                .map_err(ServerError::Cluster)?;
         let membership = broker
             .cluster_membership()
             .expect("the clustered broker owns membership control");

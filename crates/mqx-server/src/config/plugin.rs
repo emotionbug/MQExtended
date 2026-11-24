@@ -1,6 +1,6 @@
 use super::{
-    DynamicSecurityConfig, ListenerConfig, ParseResult, Parser, Path, PathBuf, ServerConfig,
-    ServerError, Value, empty, require_listener, unsupported,
+    DynamicSecurityConfig, ExternalPluginConfig, ListenerConfig, ParseResult, Parser, Path,
+    PathBuf, ServerConfig, ServerError, Value, empty, require_listener, unsupported,
 };
 
 /// Startup-only file callbacks declared through the plugin directives.
@@ -45,10 +45,12 @@ impl ServerConfig {
         self.security.file_plugins = bound.security.file_plugins.clone();
         self.sparkplug_aware = bound.sparkplug_aware;
         self.plugin_inventory.clone_from(&bound.plugin_inventory);
+        self.external_plugins.clone_from(&bound.external_plugins);
         self.dynamic_security = bound.dynamic_security.clone();
         for (fresh, bound) in self.listeners.iter_mut().zip(&bound.listeners) {
             fresh.security.file_plugins = bound.security.file_plugins.clone();
             fresh.dynamic_security = bound.dynamic_security.clone();
+            fresh.external_plugin = bound.external_plugin;
             fresh.sparkplug_aware = bound.sparkplug_aware;
         }
         self.validate_file_plugins()
@@ -62,6 +64,19 @@ impl ServerConfig {
             {
                 return Err(ServerError::Arguments(format!(
                     "Cannot combine a file plugin with Dynamic Security on listener {}: their auth or ACL callbacks overlap.",
+                    listener.port,
+                )));
+            }
+            // plugin_init.c: mosquitto_security_init registers plugin callbacks in
+            // declaration order. Only an external plugin followed by the built-in
+            // password_file/acl_file callbacks has a fixed, replicable order here.
+            if listener.external_plugin.is_some()
+                && (local.is_declared()
+                    || global.is_declared()
+                    || listener.dynamic_security.is_some())
+            {
+                return Err(ServerError::Arguments(format!(
+                    "Cannot combine an auth plugin with Dynamic Security or a file plugin on listener {}; use the password_file and acl_file options instead of the file plugins.",
                     listener.port,
                 )));
             }
@@ -118,6 +133,7 @@ enum Kind {
     PasswordFile(Option<PathBuf>),
     AclFile(Option<PathBuf>),
     SparkplugAware,
+    External(ExternalPluginConfig),
 }
 
 impl Kind {
@@ -127,6 +143,7 @@ impl Kind {
             Self::PasswordFile(_) => "password-file",
             Self::AclFile(_) => "acl-file",
             Self::SparkplugAware => "sparkplug-aware",
+            Self::External(plugin) => plugin.library.label(),
         }
     }
 
@@ -147,6 +164,8 @@ impl Kind {
             Self::PasswordFile(file) if key == "password_file" => *file = Some(value.into()),
             Self::AclFile(file) if key == "acl_file" => *file = Some(value.into()),
             Self::SparkplugAware => {}
+            // plugin_v4.c: plugin__load_v4 hands every option to the library.
+            Self::External(plugin) => plugin.options.push((key.into(), value.into())),
             other => return Err(format!("{}: Unknown option '{key}'.", other.label()).into()),
         }
         Ok(())
@@ -232,11 +251,15 @@ impl Parser {
                 *current = Some(index);
             }
             "auth_plugin_deny_special_chars" => {
-                if current.is_none() {
+                let Some(index) = *current else {
                     return Err("An auth_plugin_deny_special_chars option exists in the config file without a plugin.".into());
+                };
+                let deny = v.boolean()?;
+                // plugin_acl_check.c: acl__pre_check applies it to v2-v4 plugins
+                // only; v5 callbacks ignore it.
+                if let Kind::External(plugin) = &mut self.plugins[index].kind {
+                    plugin.deny_special_chars = deny;
                 }
-                // plugin_acl_check.c: this option has no effect on v5 callbacks.
-                v.boolean()?;
             }
             _ => {
                 let index = current.ok_or_else(|| {
@@ -293,7 +316,16 @@ impl Parser {
             Some(("mosquitto_password_file", "so" | "dll")) => Kind::PasswordFile(None),
             Some(("mosquitto_acl_file", "so" | "dll")) => Kind::AclFile(None),
             Some(("mosquitto_sparkplug_aware", "so" | "dll")) => Kind::SparkplugAware,
-            _ => return Err(unsupported(directive, &format!("plugin '{path}'"))),
+            _ => match mqx_extauth::Library::from_path(path) {
+                Some(library) => Kind::External(ExternalPluginConfig {
+                    path: path.into(),
+                    library,
+                    options: Vec::new(),
+                    // conf.c: config__plugin_load sets the default.
+                    deny_special_chars: true,
+                }),
+                None => return Err(unsupported(directive, &format!("plugin '{path}'"))),
+            },
         };
         let index = self.plugins.len();
         self.plugins.push(Plugin {
@@ -374,6 +406,24 @@ impl Parser {
                         }
                     }
                     config.sparkplug_aware |= plugin.global;
+                }
+                Kind::External(external) => {
+                    let id = config.external_plugins.len();
+                    for (index, listener) in config.listeners.iter_mut().enumerate() {
+                        if plugin.global || local.contains(&index) {
+                            if listener.external_plugin.is_some() {
+                                return Err(ServerError::Arguments(format!(
+                                    "Cannot combine two auth plugins on listener {}.",
+                                    listener.port,
+                                )));
+                            }
+                            listener.external_plugin = Some(id);
+                        }
+                    }
+                    config.external_plugins.push(external);
+                    // broker_control.c: add_plugin_info skips plugins without a
+                    // name, which v2-v4 libraries never set.
+                    continue;
                 }
                 kind => {
                     let apply = |files: &mut FilePlugins| {

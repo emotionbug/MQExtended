@@ -595,7 +595,12 @@ fn cipher_matches(suite: SupportedCipherSuite, selector: &str, ssl12: bool) -> O
 
 pub(crate) fn identity(tls: &TlsConfig, peer: Option<&[u8]>) -> CertIdentity {
     if !tls.use_identity_as_username && !tls.use_subject_as_username {
-        return CertIdentity::None;
+        // v2-v4 plugins can still see it (mosquitto_client_certificate).
+        return if peer.is_some() {
+            CertIdentity::Presented
+        } else {
+            CertIdentity::None
+        };
     }
     let identity = || {
         let (_, cert) = parse_x509_certificate(peer?).ok()?;

@@ -34,6 +34,9 @@ pub struct ServerConfig {
     pub sparkplug_aware: bool,
     /// Explicit plugins in initialization order.
     pub plugin_inventory: Vec<&'static str>,
+    /// Natively implemented third-party auth plugins in declaration order.
+    /// A listener refers to one by its index.
+    pub external_plugins: Vec<ExternalPluginConfig>,
     pub limits: BrokerLimits,
     pub log: LogConfig,
     pub user: String,
@@ -52,6 +55,18 @@ pub struct DynamicSecurityConfig {
     pub password_init_file: Option<PathBuf>,
     /// Whether the plugin's callbacks run before the built-in file callbacks.
     pub before_file: bool,
+}
+
+/// A third-party auth plugin (`auth_plugin`/`plugin` naming a library that
+/// `mqx_extauth` implements) and its options.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalPluginConfig {
+    pub path: String,
+    pub library: mqx_extauth::Library,
+    /// `auth_opt_*`/`plugin_opt_*` with the prefix removed, in order.
+    pub options: Vec<(String, String)>,
+    /// `auth_plugin_deny_special_chars`.
+    pub deny_special_chars: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +149,8 @@ pub struct ListenerConfig {
     pub mount_point: Option<String>,
     pub security: SecurityConfig,
     pub dynamic_security: Option<DynamicSecurityConfig>,
+    /// Index into [`ServerConfig::external_plugins`].
+    pub external_plugin: Option<usize>,
     pub sparkplug_aware: bool,
     pub tls: TlsConfig,
     pub bind_interface: Option<String>,
@@ -324,6 +341,7 @@ impl Default for ListenerConfig {
             mount_point: None,
             security: SecurityConfig::default(),
             dynamic_security: None,
+            external_plugin: None,
             sparkplug_aware: false,
             tls: TlsConfig::default(),
             bind_interface: None,
@@ -478,6 +496,7 @@ impl Default for Parser {
                 dynamic_security: None,
                 sparkplug_aware: false,
                 plugin_inventory: Vec::new(),
+                external_plugins: Vec::new(),
                 limits: BrokerLimits::default(),
                 log: LogConfig::default(),
                 // Mosquitto src/conf.c: config__parse_args.
