@@ -222,6 +222,13 @@ impl Live {
     }
 
     fn pop_reserved(&self) -> Result<Option<Outbound>, BrokerError> {
+        self.pop_reserved_if(|_| true)
+    }
+
+    pub(super) fn pop_reserved_if(
+        &self,
+        fits: impl FnOnce(&Outbound) -> bool,
+    ) -> Result<Option<Outbound>, BrokerError> {
         let mut outbox = self.outbox.lock().unwrap();
         if outbox.interrupted {
             return Err(ClusterError::WriteUncertain(
@@ -229,7 +236,11 @@ impl Live {
             )
             .into());
         }
-        Ok(outbox.packets.pop_front())
+        if !self.taken.load(Ordering::Acquire) && outbox.packets.front().is_some_and(fits) {
+            Ok(outbox.packets.pop_front())
+        } else {
+            Ok(None)
+        }
     }
 
     fn bridge_queued(&self, pending: usize) {
@@ -860,34 +871,38 @@ impl Broker {
         &self,
         live: &Live,
         ids: &[PacketId],
-    ) -> Result<Option<Reply>, BrokerError> {
+        mount_len: usize,
+    ) -> Result<Option<(usize, Reply)>, BrokerError> {
         let Log::Replicated(log) = &self.0.log else {
             return Ok(None);
         };
-        if !log
-            .cluster
-            .read(|machine| machine.state.can_ack_prefix(&live.lease, ids))
-        {
+        // Apply dispatches the corresponding reservations under the same
+        // state lock. With the wire idle, a reserved packet not still in the
+        // outbox has already been written (unless the listener stripped its
+        // whole topic). Count all outbox packets conservatively: some, such
+        // as QoS 0, need not occupy a slot in the reserved prefix.
+        let count = log.cluster.read(|machine| {
+            let outbox = live.outbox.lock().unwrap();
+            if outbox.interrupted {
+                return 0;
+            }
+            machine
+                .state
+                .emitted_ack_prefix(&live.lease, ids, outbox.packets.len(), mount_len)
+        });
+        if count < 2 {
             return Ok(None);
         }
-        {
-            let outbox = live.outbox.lock().unwrap();
-            if outbox.interrupted || !outbox.packets.is_empty() {
-                return Ok(None);
-            }
-        }
-        let operations = ids
+        let operations = ids[..count]
             .iter()
             .map(|&id| Operation::Ack(id, crate::inbox::Ack::Acknowledged))
             .collect();
         // Each ACK still applies in order under the lease, with one durable
         // commit. The apply loop stops at the first protocol error or takeover.
-        Ok(Some(
-            log.propose(live, operations)
-                .await?
-                .pop()
-                .expect("nonempty ACK prefix"),
-        ))
+        let mut replies = log.propose(live, operations).await?;
+        let applied = replies.len();
+        let reply = replies.pop().expect("nonempty ACK prefix");
+        Ok(Some((applied, reply)))
     }
 
     pub(super) async fn receive(
@@ -2381,6 +2396,153 @@ mod tests {
             );
             assert!(broker.next_outbound(&subscriber).await.unwrap().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn durable_ack_prefix_stops_at_unsent_reservations_with_a_full_window() {
+        use crate::{inbox::Ack, state::SubscriptionRequest};
+
+        let storage = tempfile::tempdir_in(".").unwrap();
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let broker = Broker::clustered(
+            BrokerConfig {
+                max_inflight_messages: 3,
+                ..BrokerConfig::default()
+            },
+            ClusterConfig::new(
+                1,
+                address,
+                BTreeMap::from([(1, address)]),
+                storage.path().join("node"),
+                mqx_cluster::ClusterSecurity::InsecurePlaintext,
+            ),
+        )
+        .await
+        .unwrap();
+        let security = SecurityHandle::default();
+        let claim = |id: &str, clean_start| Claim {
+            publisher: Publisher {
+                id: Arc::from(id),
+                username: None,
+                security: 0,
+                dynamic_security: None,
+                external: None,
+            },
+            clean_start,
+            bridge: false,
+            max_qos: QoS::ExactlyOnce,
+            will: None,
+            v5: None,
+            now: Duration::ZERO,
+            internal_bridge: None,
+            dynamic_security_revision: None,
+            verdicts: Vec::new(),
+        };
+        let ClaimResult::Accepted(sink, false) = broker
+            .claim(&security, claim("sink", false), None)
+            .await
+            .unwrap()
+        else {
+            panic!("persistent subscriber claim failed")
+        };
+        let ClaimResult::Accepted(source, false) = broker
+            .claim(&security, claim("source", true), None)
+            .await
+            .unwrap()
+        else {
+            panic!("publisher claim failed")
+        };
+        let mid = |id| PacketId::new(id).unwrap();
+        let subscription = SubscriptionRequest::legacy(("queue".into(), QoS::AtLeastOnce));
+        broker
+            .act(
+                &sink,
+                Operation::subscribe(vec![subscription], broker.now()),
+            )
+            .await
+            .unwrap();
+        let publications = (1..=6)
+            .map(|id| {
+                Publication::legacy(
+                    mqx_codec::Publish {
+                        dup: false,
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        topic: "queue".into(),
+                        packet_id: Some(mid(id)),
+                        payload: Bytes::from_static(b"message"),
+                    },
+                    broker.now(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            broker
+                .receive_many(&source, publications, false)
+                .await
+                .unwrap(),
+            vec![Reply::PublishReason(R::SUCCESS.0); 6]
+        );
+
+        let ids = [1, 2, 3, 4].map(mid);
+        // Model a completed socket write of each popped packet. The third
+        // reservation is still waiting in the outbox, and the fourth is queued.
+        assert!(matches!(
+            broker.next_outbound(&sink).await.unwrap(),
+            Some(Outbound::Publish { id: Some(id), dup: false, .. }) if id == mid(1)
+        ));
+        assert_eq!(broker.ack_prefix(&sink, &ids, 0).await.unwrap(), None);
+        assert!(sink.pop_reserved_if(|_| false).unwrap().is_none());
+        assert!(matches!(
+            sink.pop_reserved_if(|_| true).unwrap(),
+            Some(Outbound::Publish { id: Some(id), dup: false, .. }) if id == mid(2)
+        ));
+        assert_eq!(
+            broker.ack_prefix(&sink, &ids, 0).await.unwrap(),
+            Some((2, Reply::NoChange))
+        );
+        // Both ACKs promoted and reserved a successor in their own apply
+        // steps, without removing the older reservation from the outbox.
+        let reserved: Vec<_> = sink
+            .outbox
+            .lock()
+            .unwrap()
+            .packets
+            .iter()
+            .map(|packet| match packet {
+                Outbound::Publish { id: Some(id), .. } => id.get(),
+                _ => panic!("expected a QoS 1 reservation"),
+            })
+            .collect();
+        assert_eq!(reserved, [3, 4, 5]);
+
+        let ClaimResult::Accepted(resumed, true) = broker
+            .claim(&security, claim("sink", false), None)
+            .await
+            .unwrap()
+        else {
+            panic!("subscriber must resume its session")
+        };
+        assert!(sink.pop_reserved().unwrap().is_none());
+        for expected in 3..=5 {
+            assert!(matches!(
+                broker.next_outbound(&resumed).await.unwrap(),
+                Some(Outbound::Publish { id: Some(id), dup: true, .. }) if id == mid(expected)
+            ));
+        }
+        assert!(broker.next_outbound(&resumed).await.unwrap().is_none());
+        broker
+            .act(&resumed, Operation::Ack(mid(3), Ack::Acknowledged))
+            .await
+            .unwrap();
+        assert!(matches!(
+            broker.next_outbound(&resumed).await.unwrap(),
+            Some(Outbound::Publish { id: Some(id), dup: false, .. }) if id == mid(6)
+        ));
+        broker.shutdown_cluster().await.unwrap();
     }
 
     #[tokio::test]

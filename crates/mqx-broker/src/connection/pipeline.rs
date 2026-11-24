@@ -132,7 +132,9 @@ pub(super) async fn acknowledge<S: AsyncRead + AsyncWrite + Unpin>(
     first: PacketId,
     config: &BrokerConfig,
     protocol: ProtocolVersion,
+    mount_point: Option<&str>,
 ) -> Result<Step, BrokerError> {
+    debug_assert!(wire.idle());
     let mut ids = [first; BATCH_PACKETS];
     let mut count = 1;
     for frame in wire.input.as_chunks::<4>().0.iter().take(BATCH_PACKETS - 1) {
@@ -144,8 +146,12 @@ pub(super) async fn acknowledge<S: AsyncRead + AsyncWrite + Unpin>(
         count += 1;
     }
     if count > 1
-        && let Some(reply) = wire
-            .prefetch(session.broker.ack_prefix(&session.live, &ids[..count]))
+        && let Some((count, reply)) = wire
+            .prefetch(session.broker.ack_prefix(
+                &session.live,
+                &ids[..count],
+                mount_point.map_or(0, str::len),
+            ))
             .await?
     {
         for _ in 1..count {

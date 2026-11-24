@@ -30,7 +30,7 @@ use tokio::{
 use crate::{
     Broker, BrokerConfig, BrokerError, CertIdentity, ConnectionInfo, Live, Security,
     SecurityHandle,
-    inbox::{Ack, Outbound, Publisher, Receive},
+    inbox::{Ack, Delivery, Outbound, Publisher, Receive},
     runtime::ClaimResult,
     state::{Claim, Operation, Publication, Reply, SubscriptionRequest},
     sys::Metric,
@@ -346,6 +346,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 match next {
                     Ok(Some(outbound)) => {
+                        let coalesce = deferred.is_none()
+                            && (session.live.inbox.is_some()
+                                || matches!(&outbound, Outbound::Publish { delivery, .. }
+                                    if delivery.qos == QoS::AtLeastOnce));
                         match wire.delivery(outbound, listener.mount_point.as_deref(), broker.now())
                         {
                             Ok(Some(id)) => {
@@ -354,7 +358,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                             }
                             Ok(None) => {
-                                if deferred.is_none()
+                                if coalesce
                                     && let Err(error) = wire.coalesce_ready(
                                         &session.live,
                                         listener.mount_point.as_deref(),
@@ -410,8 +414,15 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         && let Frame::Legacy(Packet::PubAck(id)) = &packet
                         && wire.input.starts_with(&[0x40, 2])
                     {
-                        pipeline::acknowledge(&session, &mut wire, *id, config, connect.protocol)
-                            .await
+                        pipeline::acknowledge(
+                            &session,
+                            &mut wire,
+                            *id,
+                            config,
+                            connect.protocol,
+                            listener.mount_point.as_deref(),
+                        )
+                        .await
                     } else {
                         match packet {
                             Frame::Legacy(packet) => {
@@ -1513,26 +1524,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     }
 
     // database.c: db__message_write_inflight_out_all emits already admitted
-    // packets in send order. Don't wait for more, reserve durable messages,
-    // or put another delivery ahead of input or a deferred acknowledgement.
+    // packets in send order. Don't wait for more, make another durable
+    // reservation, or put another delivery ahead of already-buffered input
+    // or a deferred acknowledgement.
     fn coalesce_ready(&mut self, live: &Live, mount: Option<&str>) -> Result<(), BrokerError> {
         const MAX_BYTES: usize = 16 * 1024;
         if self.v5.is_some() || !self.input.is_empty() || self.output.len() >= MAX_BYTES {
             return Ok(());
         }
-        let Some(inbox) = &live.inbox else {
-            return Ok(());
+        let fits = |delivery: &Delivery, room| {
+            // At most 5 fixed-header bytes, two topic-length bytes and a MID.
+            delivery.message.topic.len() + delivery.message.payload.len() + 9 <= room
         };
-        let mut inbox = inbox.lock().unwrap();
+        let mut inbox = live.inbox.as_ref().map(|inbox| inbox.lock().unwrap());
+        if inbox.is_none() && !self.broker.is_clustered() {
+            return Ok(());
+        }
         for _ in 1..16 {
             let room = MAX_BYTES - self.output.len();
-            let Some(packet) = inbox.reserve_ready_qos1(|d| {
-                // At most 5 fixed-header bytes, two topic-length bytes and a MID.
-                d.message.topic.len() + d.message.payload.len() + 9 <= room
-            }) else {
-                break;
+            let packet = if let Some(inbox) = &mut inbox {
+                inbox.reserve_ready_qos1(|delivery| fits(delivery, room))
+            } else {
+                live.pop_reserved_if(|packet| {
+                    matches!(packet, Outbound::Publish { delivery, .. }
+                        if delivery.qos == QoS::AtLeastOnce && fits(delivery, room))
+                })?
             };
-            // The reserved legacy PUBLISH has no expiry or maximum-packet check.
+            let Some(packet) = packet else { break };
             let dropped = self.delivery(packet, mount, Duration::ZERO)?;
             debug_assert!(dropped.is_none());
         }

@@ -48,6 +48,8 @@ struct Inner {
     log: raft_log::RaftLog<WalTypes>,
     pending_commit: Option<LogId>,
     appended_entries: u64,
+    #[cfg(target_os = "linux")]
+    reserved_until: u64,
 }
 
 impl Inner {
@@ -56,6 +58,33 @@ impl Inner {
             self.log.commit(Packed(id))?;
         }
         Ok(())
+    }
+
+    // Reserve physical blocks, never extend EOF: chunked-wal uses append
+    // mode and the next byte after its last record must remain the real EOF.
+    // Failure is only a missed allocation hint. The WAL worker is still
+    // responsible for writing and syncing every acknowledged record.
+    #[cfg(target_os = "linux")]
+    fn reserve_extent(&mut self) -> io::Result<tokio::task::JoinHandle<rustix::io::Result<()>>> {
+        use rustix::fs::{Mode, OFlags, open};
+
+        // Bound unused space on record-count rotations and small volumes.
+        const WINDOW: u64 = 256 * 1024;
+        let chunk = self.log.stat().open_chunk;
+        let start = chunk.size / WINDOW * WINDOW;
+        let path = self.log.config().wal.chunk_path(chunk.chunk_id);
+        let file = open(
+            path.as_str(),
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        self.reserved_until = chunk
+            .global_start
+            .saturating_add(start)
+            .saturating_add(WINDOW);
+        Ok(tokio::task::spawn_blocking(move || {
+            rustix::fs::fallocate(file, rustix::fs::FallocateFlags::KEEP_SIZE, start, WINDOW)
+        }))
     }
 }
 
@@ -90,6 +119,8 @@ impl Wal {
                 log,
                 pending_commit: None,
                 appended_entries: 0,
+                #[cfg(target_os = "linux")]
+                reserved_until: 0,
             }))),
             append_budget: max_append_size - crate::transport::MAX_CONTROL_FRAME,
             format,
@@ -259,9 +290,27 @@ impl RaftLogStorage<Types> for Wal {
         let mut log = self.write().await?;
         log.record_commit()?;
         let count = encoded.len() as u64;
-        log.log.append(encoded)?;
+        let _segment = log.log.append(encoded)?;
         log.log.flush(true, Some(Flushed::Raft(callback)))?;
         log.appended_entries += count;
+        #[cfg(target_os = "linux")]
+        if _segment.offset + _segment.size >= log.reserved_until {
+            let reservation = log.reserve_extent();
+            drop(log);
+            let result = match reservation {
+                Ok(job) => job
+                    .await
+                    .map_err(io::Error::other)
+                    .and_then(|r| r.map_err(io::Error::from)),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                tracing::debug!(%error, "WAL extent reservation unavailable; using ordinary appends");
+                if let Ok(mut log) = self.write().await {
+                    log.reserved_until = u64::MAX;
+                }
+            }
+        }
         Ok(())
     }
 

@@ -858,10 +858,18 @@ impl State {
             .is_some_and(|inbox| inbox.has_outbound(&self.config))
     }
 
-    pub(crate) fn can_ack_prefix(&self, lease: &Lease, ids: &[PacketId]) -> bool {
+    pub(crate) fn emitted_ack_prefix(
+        &self,
+        lease: &Lease,
+        ids: &[PacketId],
+        pending_writes: usize,
+        mount_len: usize,
+    ) -> usize {
         self.claimed_session(lease)
             .and_then(|session| session.inbox.as_ref())
-            .is_some_and(|inbox| inbox.can_ack_prefix(ids))
+            .map_or(0, |inbox| {
+                inbox.emitted_ack_prefix(ids, pending_writes, mount_len)
+            })
     }
 
     pub(crate) fn outbound_reservation(

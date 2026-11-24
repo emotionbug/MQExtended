@@ -618,17 +618,26 @@ impl Inbox {
         self.in_flight.iter().any(|entry| entry.id == Some(id))
     }
 
-    // Batch only the prefix already sent, with nothing to promote between
-    // ACKs. Unknown, duplicate, queued and QoS 2 IDs need single-packet handling.
-    pub(crate) fn can_ack_prefix(&self, ids: &[PacketId]) -> bool {
-        self.queued.is_empty()
-            && self.next_unsent == self.in_flight.len()
-            && ids.len() <= self.next_unsent
-            && self
-                .in_flight
-                .iter()
-                .zip(ids)
-                .all(|(entry, id)| entry.phase == Phase::AwaitAck && entry.id == Some(*id))
+    // Promotions during this batch must not make an input ID eligible for
+    // the same batch. Check only the already-written in-flight prefix.
+    pub(crate) fn emitted_ack_prefix(
+        &self,
+        ids: &[PacketId],
+        pending_writes: usize,
+        mount_len: usize,
+    ) -> usize {
+        self.in_flight
+            .iter()
+            .take(self.next_unsent.saturating_sub(pending_writes))
+            .zip(ids)
+            .take_while(|(entry, id)| {
+                let topic = &entry.delivery.message.topic;
+                entry.phase == Phase::AwaitAck
+                    && entry.id == Some(**id)
+                    && mount_len < topic.len()
+                    && topic.is_char_boundary(mount_len)
+            })
+            .count()
     }
 
     fn acknowledge(
