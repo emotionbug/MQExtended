@@ -6,7 +6,8 @@ MQExtended is a clustered MQTT broker in Rust that replaces Mosquitto without ch
 
 - `crates/mqx-topic` — Topic name/filter validation and matching, ported from Mosquitto's `libcommon/topic_common.c`; subscription index
 - `crates/mqx-codec` — Sans-IO MQTT 3.1 / 3.1.1 codec with Mosquitto's wire validation; `v5` module for MQTT 5
-- `crates/mqx-auth` — `password_file` (`$6$`, `$7$`) and `acl_file` parsing and checks
+- `crates/mqx-auth` — `password_file` (`$6$`, `$7$`) and `acl_file` parsing and checks; the contract for third-party auth plugins (`external`)
+- `crates/mqx-extauth` — Rust ports of third-party auth plugins (mosquitto-auth-plug) and their back-end clients
 - `crates/mqx-proxy` — Sans-IO PROXY protocol v1/v2 reader (`enable_proxy_protocol`)
 - `crates/mqx-ws` — MQTT-over-WebSocket transport with Mosquitto's built-in handshake rules
 - `crates/mqx-broker` — Protocol engine: sessions, QoS flows, retained, will, keepalive, takeover; state through a command-based state machine
@@ -28,6 +29,7 @@ MQExtended is a clustered MQTT broker in Rust that replaces Mosquitto without ch
 | [docs/cluster.md](docs/cluster.md) | Running a cluster: `cluster_*` directives, network, bootstrap, what clients see on node failure |
 | [docs/migration.md](docs/migration.md) | Moving a running Mosquitto deployment over: config check, version differences, client discovery from logs, cutover |
 | [docs/dynamic-security.md](docs/dynamic-security.md) | Built-in dynamic security plugin: enabling it, first start, cluster replication, differences |
+| [docs/auth-plugins.md](docs/auth-plugins.md) | Built-in mosquitto-auth-plug: enabling it, combinations, client-visible quirks, cluster behaviour, differences |
 | [docs/monitoring.md](docs/monitoring.md) | `$SYS` topics, Mosquitto HTTP API, cluster status endpoint, Prometheus metrics |
 | [docs/performance.md](docs/performance.md) | Running `mqx-bench`, current latency/throughput numbers, known performance gaps |
 | [docs/mosquitto-compatibility.md](docs/mosquitto-compatibility.md) | The parity contract: reference version, rule catalogue, deliberate deviations |

@@ -20,6 +20,7 @@ A message to a persistent session is reserved for sending in the same commit tha
 - **Wills are replicated at CONNECT.** A node that dies cannot publish its clients' wills; the node that removes it does.
 - **Bridge ownership is a claim.** A bridge runs on the node holding the claim on its local client id. A node stops its bridges as soon as it can no longer prove a fresh lease renewal, so it always steps down before a peer can take the bridge over.
 - **Security and `$SYS` state are replicated.** Dynamic-security changes and each `$SYS` sample are log commands, so every node enforces the same rules and serves the same retained `$SYS` tree.
+- **Third-party plugin verdicts are replicated, never computed in apply.** Reusable ACL verdicts from [auth plugins](auth-plugins.md), and the deliveries and wills waiting for a verdict, are state that commands write and Raft snapshots include ([architecture](architecture.md#request-flows)). A standalone `.mqx` file leaves both out: a restart drops the waiting deliveries and asks the plugin again.
 - **Limits follow Mosquitto defaults.** Queue length 1000 (`max_queued_messages`), in-flight window 20 (`max_inflight_messages`), no session expiry, QoS 0 not queued for offline sessions (`queue_qos0_messages false`). See [Mosquitto compatibility](mosquitto-compatibility.md#defaults). The options Mosquitto applies on SIGHUP are replicated state in a cluster: a reload commits them as one log command, so no node routes, queues or expires with a different value ([cluster](cluster.md#configuration)).
 
 ## Replication semantics

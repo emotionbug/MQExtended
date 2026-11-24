@@ -49,6 +49,8 @@ Only generated client ids and clock-dependent expiry values are normalized, afte
 
 Failover tests have no Mosquitto counterpart; they assert MQTT's guarantees directly while killing (SIGKILL) and restarting nodes: persistent queues and DUP resends survive, a lost node's wills are published once, retained messages and subscriptions survive, takeover works across nodes, publishing resumes after leader loss.
 
+The `auth_plug` scenarios run Mosquitto with the real `auth-plug.so` against MQExtended's [port](auth-plugins.md), backed by real back-end servers. Besides the transcripts, they compare every request the back-ends receive, duplicates included: with caching off the plugin asks once per check, so the number of requests is part of the contract. The comparison reads the requests as soon as the script ends. End a scenario on an observable result of every check it starts, such as a delivery, not on silence. Build the reference first ([development](development.md#legacy-mosquitto-auth-plug)).
+
 ### Client SDK interoperability
 
 `client_sdks` runs unmodified client libraries against Mosquitto 2.1.4, standalone MQExtended and a three-node MQExtended cluster. In cluster runs the publisher and subscriber connect to different nodes.
