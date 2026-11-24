@@ -352,12 +352,24 @@ fn outgoing_inflight_window(h: &mut Harness) {
     let publisher = client(h, "publisher");
     let topic = "inflight/one";
     subscribe(h, subscriber, 1, &[(topic, Q1)]);
+    let mut burst = BytesMut::new();
     for (mid, payload) in [
         (70, &b"first"[..]),
         (71, &b"second"[..]),
         (72, &b"third"[..]),
     ] {
-        publish_from(h, publisher, publish(topic, payload, Q1, mid));
+        encode(
+            &Packet::Publish(publish(topic, payload, Q1, mid)),
+            &mut burst,
+        )
+        .unwrap();
+    }
+    raw(h, publisher, &burst);
+    // A stalled subscriber must not hold its publisher or other recipients
+    // indefinitely. Don't acknowledge the first delivery until all three
+    // incoming publications have completed.
+    for mid in 70..=72 {
+        received(h, publisher, Packet::PubAck(id(mid)));
     }
     // src/database.c: db__ready_for_flight holds later QoS 1 packets until PUBACK frees a slot.
     received(

@@ -119,6 +119,8 @@ struct LocalLog {
     expiry_running: bool,
     persistence_changed: Option<watch::Sender<u64>>,
     effects: Vec<Effect>,
+    // Scratch for the publish run under the runtime lock, never a global gate.
+    backlogged_recipient: Option<Epoch>,
 }
 
 #[derive(Default)]
@@ -146,6 +148,7 @@ pub(super) struct Live {
     pub(super) taken: AtomicBool,
     pub(super) kicked: AtomicBool,
     pub(super) ready: Notify,
+    pub(super) drained: Notify,
     bridge_queue_peak: AtomicUsize,
     peer_address: Option<Arc<str>>,
     sequence: AtomicU64,
@@ -182,6 +185,7 @@ impl Live {
             taken: AtomicBool::new(false),
             kicked: AtomicBool::new(false),
             ready: Notify::new(),
+            drained: Notify::new(),
             bridge_queue_peak: AtomicUsize::new(0),
             peer_address,
             sequence: AtomicU64::new(0),
@@ -192,6 +196,22 @@ impl Live {
     fn close(&self) {
         self.taken.store(true, Ordering::Release);
         self.ready.notify_one();
+        self.drained.notify_waiters();
+    }
+
+    async fn yield_to_recipient(&self) {
+        // Subscribe before checking the inbox: an ACK can drain it on another
+        // worker. Never hold a broker/inbox lock while waiting, or let a dead
+        // reader prevent delivery to this publisher's other subscribers.
+        let drained = self.drained.notified();
+        if !self.taken.load(Ordering::Acquire)
+            && self
+                .inbox
+                .as_ref()
+                .is_some_and(|inbox| inbox.lock().unwrap().backlogged())
+        {
+            let _ = tokio::time::timeout(Duration::from_millis(25), drained).await;
+        }
     }
 
     fn interrupt_outbound(&self) {
@@ -246,6 +266,7 @@ impl Broker {
                     expiry_running: false,
                     persistence_changed: None,
                     effects: Vec::new(),
+                    backlogged_recipient: None,
                 }),
                 ..Runtime::default()
             })),
@@ -1044,6 +1065,7 @@ impl Broker {
         sparkplug_aware: bool,
     ) -> Result<Vec<Reply>, BrokerError> {
         let mut replies = Vec::with_capacity(publications.len());
+        let mut backlogged = None;
         let mut publications = publications.into_iter().peekable();
         let ordinary = |publication: &Publication| {
             !publication.packet.topic.starts_with(crate::control::PREFIX)
@@ -1055,6 +1077,7 @@ impl Broker {
                 // Don't bypass external authorization if it is now enabled.
                 if !self.0.external_enabled.load(Ordering::Acquire) {
                     let old_expiry = runtime.local.as_ref().unwrap().state.next_expiry();
+                    runtime.local.as_mut().unwrap().backlogged_recipient = None;
                     let run = std::iter::once(publication)
                         .chain(std::iter::from_fn(|| publications.next_if(ordinary)));
                     let mut stop = false;
@@ -1086,6 +1109,10 @@ impl Broker {
                     if old_expiry != runtime.local.as_ref().unwrap().state.next_expiry() {
                         self.schedule_local_expiry(&mut runtime);
                     }
+                    if let Some(epoch) = runtime.local.as_mut().unwrap().backlogged_recipient.take()
+                    {
+                        backlogged = runtime.live.get(&epoch).cloned();
+                    }
                     if stop {
                         break;
                     }
@@ -1102,6 +1129,9 @@ impl Broker {
             if stop {
                 break;
             }
+        }
+        if let Some(recipient) = backlogged {
+            recipient.yield_to_recipient().await;
         }
         Ok(replies)
     }
@@ -1988,7 +2018,15 @@ impl Runtime {
             if packet.dedup_id.is_some() && inbox.receive_maximum.is_some() {
                 packet.dedup_id = None;
             }
-            inbox.offer(packet, true, QoS::ExactlyOnce, config)
+            let result = inbox.offer(packet, true, QoS::ExactlyOnce, config);
+            if matches!(result, Offer::Queued | Offer::FirstDrop | Offer::Dropped)
+                && let Some(local) = &mut self.local
+                && local.backlogged_recipient.is_none()
+                && inbox.backlogged()
+            {
+                local.backlogged_recipient = Some(epoch);
+            }
+            result
         };
         if matches!(result, Offer::Dropped | Offer::FirstDrop) {
             self.transient_drops += 1;

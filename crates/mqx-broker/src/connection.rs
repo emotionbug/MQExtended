@@ -1088,10 +1088,15 @@ impl Active<'_> {
 
     async fn ack(&self, id: mqx_codec::PacketId, ack: Ack) -> Result<Step, BrokerError> {
         if let Some(inbox) = &self.live.inbox {
-            let acknowledged = inbox
-                .lock()
-                .unwrap()
-                .ack(id, ack, &self.broker.0.config.load());
+            let acknowledged = {
+                let mut inbox = inbox.lock().unwrap();
+                let backlogged = inbox.backlogged();
+                let ok = inbox.ack(id, ack, &self.broker.0.config.load());
+                if backlogged && !inbox.backlogged() {
+                    self.live.drained.notify_waiters();
+                }
+                ok
+            };
             if acknowledged {
                 self.broker.count_transient_ack(ack);
                 Ok(Step::Continue)

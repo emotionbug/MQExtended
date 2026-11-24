@@ -374,6 +374,12 @@ impl Inbox {
         self.in_flight.len() + self.queued.len()
     }
 
+    // A second window is already waiting behind the unacknowledged one.
+    // Cap the watermark so a large receive maximum doesn't hide congestion.
+    pub(crate) fn backlogged(&self) -> bool {
+        self.queued.len() >= self.in_flight.len().clamp(1, 32)
+    }
+
     pub(crate) fn offer_with_offline(
         &mut self,
         mut delivery: Delivery,

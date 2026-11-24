@@ -19,6 +19,8 @@ target/release/mqx-bench compare --pattern one-to-one --publishers 200 --subscri
 
 Run the comparison as an unprivileged user. MQTT clients connect over loopback TCP. Cluster peers use mutual TLS with a fresh CA and distinct node keys per run. The JSON report records the peer transport; older reports without this field used plaintext. `--state-dir` puts the three WALs on a chosen filesystem; use the disk type you will run in production.
 
+To compare two revisions without rebuilding locally, use the `mqextended-linux-<full commit SHA>` artifacts from the `linux-bundle` CI job. Extract each bundle into a separate directory, verify it with `sha256sum --check --strict SHA256SUMS` there, and restore the executable bit on `bin/mqextended`. Set `MQEXTENDED_RELEASE_BIN` to that binary's absolute path for each run. Keep the load-generator binary, worker count, storage and Mosquitto binary fixed.
+
 Each payload carries a send timestamp, so latency is end to end (publisher to subscriber). Loss counts expected deliveries still missing after drain; duplicates are counted separately.
 
 Use `--require-p99-below-ms` with a target `--rate` for release qualification. `load` checks the specified endpoints; `compare` checks every row. Both write their report before returning failure if p99 reaches the limit, fewer than 99% of scheduled publishes were sent, any duplicates or losses were observed, or a QoS handshake was still outstanding after drain. Delivery alone does not prove that the publisher received its acknowledgement.

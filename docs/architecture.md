@@ -47,6 +47,8 @@ Lower crates never depend on higher ones. `mqx-codec`, `mqx-topic`, `mqx-auth` a
 
 Standalone mode (no `cluster_*` directives) applies the same state machine to an in-memory log, matching Mosquitto's default `persistence false`. Persistent sessions are always inbox-backed, so in a cluster which node held a session stops mattering after failover. The state itself is described in [data model](data-model.md). Measured latency and throughput are in [performance](performance.md).
 
+Standalone publish bursts also respect active subscriber pressure. If a clean subscriber already has a second send window queued (watermark capped at 32 queued messages), the broker lets that subscriber drain before acknowledging the burst. It waits for at most one recipient, outside the routing lock, for at most 25 ms. Other publishers remain independent. A disconnected or persistently stalled reader cannot block the publisher indefinitely; the configured queue limits and overflow policy still apply.
+
 ## Why Raft first
 
 The replicated-log interface is narrow on purpose. The first implementation uses `openraft`, a leader-based Raft with production users. QuePaxa (leaderless liveness, used by Cloudflare's Meerkat) removes leader-election stalls, which matters on wide-area links. In one site with three nodes, Raft's failover pause is shorter than the clients' own reconnect window, so Raft is the conservative default. A QuePaxa implementation can be evaluated behind the same interface without touching the broker.
