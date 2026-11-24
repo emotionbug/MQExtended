@@ -501,9 +501,9 @@ pattern read test/%u
 pattern read test/%c
 ";
 
+    // tempfile honours TMPDIR, so fixtures follow the caller's temporary directory.
     fn tempdir() -> tempfile::TempDir {
-        tempfile::tempdir_in(std::env::var_os("TMPDIR").expect("set TMPDIR for test fixtures"))
-            .unwrap()
+        tempfile::tempdir().unwrap()
     }
 
     fn fixture(dir: &tempfile::TempDir, name: &str, text: &str) -> String {
