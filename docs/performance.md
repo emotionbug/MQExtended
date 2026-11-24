@@ -92,6 +92,8 @@ For a standalone reference, both brokers ran with `persistence true` and default
 
 On the same shared-disk setup, `8bd1490` → `8847eff` delivered **159 → 168 ms p99** at 250 publishes/s (32 pairs, 12 s). At 1,000/s (200 pairs, 16 s), the old build measured **2.68 s** and the new one **176 ms and 2.28 s**. One run per case except two final high-rate runs. The new build acknowledged and delivered every publication exactly once after drain; 11 of 3,000 and 94–588 of 16,000 deliveries arrived after the traffic window. The replay changes did **not** solve the 50 ms live target.
 
+Using the checksum-verified `2f42bfa` load generator for all three brokers, the 32-pair run measured **0.180 ms** p99 for Mosquitto 2.1.4, **0.238 ms** for MQExtended standalone and **159 ms** for MQExtended with three voters. Both standalone brokers used `persistence true` with default autosave, not a synchronous WAL quorum. Each broker acknowledged and delivered all 3,000 messages exactly once; only the cluster needed drain time (12 deliveries).
+
 `mqx-bench load`, one-to-one persistent QoS 1, 256-byte payloads, three fresh mTLS voters on the same NVMe/ext4 device and 10 s drain. `2331d24` and `8bd1490` ran sequentially on the same host:
 
 | Pairs | Offered rate / traffic window | Delivery p99 before → after | Final PUBACKs / unique deliveries |
