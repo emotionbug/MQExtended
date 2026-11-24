@@ -278,7 +278,7 @@ impl<S: StateMachine> Cluster<S> {
                     store.status.subscribe(),
                     tls,
                     max_snapshot_size,
-                    limits,
+                    (limits, request_timeout),
                 );
                 endpoint.set_recovery(recovery_timeout, record);
                 let wal = wal.with_term_floor(
@@ -371,7 +371,7 @@ impl<S: StateMachine> Cluster<S> {
                 wal.close().await?;
                 return Err(ClusterError::Removed(node_id));
             }
-            let rejoin = core.rejoin_choice(&local, &replies).or_else(|| {
+            let rejoin = Core::<S>::rejoin_choice(node_id, &local, &replies).or_else(|| {
                 // An empty volume has no proof that its ID is not already a
                 // voter. Let an existing replica identify the incarnation first.
                 (!repair && local.committed.is_none())
@@ -646,6 +646,24 @@ impl<S: StateMachine> Cluster<S> {
             .get(&node_id)
             .filter(|member| member.role == MemberRole::Voter)
             .map(|member| member.liveness)
+    }
+
+    /// Wait for the local replica to apply a Down event, demotion or removal.
+    /// A transport failure alone does not establish any of these.
+    pub async fn wait_voter_inactive(&self, node_id: u64) -> Result<(), ClusterError> {
+        self.0
+            .core
+            .store
+            .status
+            .subscribe()
+            .wait_for(|status| {
+                status.members.get(&node_id).is_none_or(|member| {
+                    member.role != MemberRole::Voter || member.liveness == NodeStatus::Down
+                })
+            })
+            .await
+            .map(|_| ())
+            .map_err(|_| ClusterError::Shutdown)
     }
 
     pub fn membership_control(&self) -> MembershipControl {
@@ -1035,6 +1053,7 @@ impl<S: StateMachine> Core<S> {
         Probe {
             timeout: endpoint.recovery_timeout(),
             identity: endpoint.identity(),
+            shared_digest: None,
             quorum,
             renewal_age,
             voters,
@@ -1100,26 +1119,58 @@ impl<S: StateMachine> Core<S> {
     }
 
     fn rejoin_choice(
-        &self,
+        node_id: u64,
         local: &Probe,
         replies: &BTreeMap<u64, Probe>,
     ) -> Option<IncarnationChange> {
-        let mut winner: Option<(u64, &Probe)> = None;
-        for (&peer, probe) in replies {
-            if probe.repair
-                || probe.identity.is_none()
-                || !(probe.wins_over(local) || (local.identity.is_none() && probe.quorum))
-            {
+        // No extra work on a healthy branch. With three divergent histories
+        // pairwise preference need not be transitive: an ancestor can beat
+        // one child on progress, lose to the other, and the first child can
+        // win between the siblings on voter count. Elect from the whole view,
+        // not just from the branches that beat this particular replica.
+        let eligible = |p: &Probe| {
+            !p.repair
+                && p.identity.as_ref().is_some_and(|identity| {
+                    local
+                        .identity
+                        .as_ref()
+                        .map_or(p.quorum, |ours| ours.related(identity))
+                })
+        };
+        if !replies.values().any(|p| {
+            p.identity.as_ref().map(|id| id.digest) != local.identity.as_ref().map(|id| id.digest)
+                && eligible(p)
+        }) {
+            return None;
+        }
+        let mut branches = BTreeMap::new();
+        for (peer, probe) in
+            std::iter::once((node_id, local)).chain(replies.iter().map(|(&id, p)| (id, p)))
+        {
+            let Some(identity) = probe.identity.as_ref() else {
+                continue;
+            };
+            if peer != node_id && !eligible(probe) {
                 continue;
             }
-            if winner.is_none_or(|(_, best)| {
-                probe.wins_over(best)
-                    || (probe.identity == best.identity && probe.committed > best.committed)
-            }) {
-                winner = Some((peer, probe));
+            let best = branches.entry(identity.digest).or_insert((peer, probe));
+            if (probe.committed, probe.voters, std::cmp::Reverse(peer))
+                > (best.1.committed, best.1.voters, std::cmp::Reverse(best.0))
+            {
+                *best = (peer, probe);
             }
         }
-        let (peer, probe) = winner?;
+        // Digest order and a single representative per branch give identical
+        // views the same winner regardless of who asked or responded first.
+        let (peer, probe) =
+            branches.into_values().reduce(
+                |best, next| {
+                    if next.1.wins_over(best.1) { next } else { best }
+                },
+            )?;
+        if probe.identity == local.identity {
+            return None;
+        }
         Some(IncarnationChange::Rejoin {
             peer,
             identity: probe.identity.clone()?,
@@ -1144,7 +1195,7 @@ impl<S: StateMachine> Core<S> {
             self.retire().await?;
             return Ok(None);
         }
-        if let Some(change) = self.rejoin_choice(&local, &replies) {
+        if let Some(change) = Self::rejoin_choice(self.mesh.endpoint.node_id, &local, &replies) {
             return Ok(Some(change));
         }
         if local.repair {
@@ -1209,10 +1260,10 @@ impl<S: StateMachine> Core<S> {
                 });
             (single_voter, reachable_quorum)
         };
-        // Replacing a sole voter with itself cannot restore an unavailable disk.
-        // Still probe for a winning branch, and let the supervisor handle a
-        // fatal Raft error. A joint promotion is not a sole-voter configuration.
-        if single_voter {
+        // A healthy sole voter cannot repair a disk stall by replacing itself.
+        // A fenced sole voter, however, cannot elect or obtain a learner grant:
+        // if no other branch returns, it needs the normal recovery timeout.
+        if single_voter && !local.repair {
             return Ok(None);
         }
         let wait = if self.store.last_applied().is_some() {
@@ -2003,6 +2054,7 @@ impl<S: StateMachine> Core<S> {
                         probe.learner_at = None;
                     }
                 }
+                probe.for_request(&request);
                 write_control(&mut stream, &probe).await?;
                 stream.flush().await
             })
@@ -2018,25 +2070,30 @@ impl<S: StateMachine> Core<S> {
         from: u64,
         deadline: Instant,
     ) -> io::Result<()> {
-        // A successor connection cannot overtake mesh work already being handled
-        // on the previous connection. The old reader and ordered worker both exit
-        // before this guard is released.
-        let _session = self.mesh.endpoint.accept_session(from)?;
-        timeout_at(deadline, async {
-            stream.write_u8(0).await?;
-            stream.flush().await
-        })
-        .await
-        .map_err(|_| io::ErrorKind::TimedOut)??;
-        let (reader, writer) = tokio::io::split(stream);
-        let (responses, replies) = mpsc::channel(SESSION_WINDOW);
-        let (mesh, mesh_rx) = mpsc::channel(SESSION_WINDOW);
-        let (append, append_rx) = mpsc::channel(SESSION_WINDOW);
+        let mut superseded = self.mesh.endpoint.accept_session(from, deadline).await?;
+        let session = async {
+            timeout_at(deadline, async {
+                stream.write_u8(0).await?;
+                stream.flush().await
+            })
+            .await
+            .map_err(|_| io::ErrorKind::TimedOut)??;
+            let (reader, writer) = tokio::io::split(stream);
+            let (responses, replies) = mpsc::channel(SESSION_WINDOW);
+            let (mesh, mesh_rx) = mpsc::channel(SESSION_WINDOW);
+            let (append, append_rx) = mpsc::channel(SESSION_WINDOW);
+            tokio::select! {
+                result = write_responses(writer, replies, self.request_timeout) => result,
+                result = self.read_calls(reader, from, &responses, mesh, append) => result,
+                () = self.run_ordered(from, mesh_rx, &responses) => Ok(()),
+                () = self.run_appends(from, append_rx, &responses) => Ok(()),
+            }
+        };
+        // Drop the old reader and ordered work before releasing `superseded`.
         tokio::select! {
-            result = write_responses(writer, replies, self.request_timeout) => result,
-            result = self.read_calls(reader, from, &responses, mesh, append) => result,
-            () = self.run_ordered(from, mesh_rx, &responses) => Ok(()),
-            () = self.run_appends(from, append_rx, &responses) => Ok(()),
+            biased;
+            _ = superseded.changed() => Ok(()),
+            result = session => result,
         }
     }
 
@@ -2622,6 +2679,107 @@ mod tests {
         ));
         assert!(last_viable <= renewal);
         node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn a_cycle_of_three_branch_preferences_has_one_rejoin_target() {
+        let root = Incarnation::original([7; 32]);
+        let older_fork = root.clone().fork(2, Some(10)).unwrap();
+        let newer_fork = root.clone().fork(3, Some(30)).unwrap();
+        let probe = |identity, voters| Probe {
+            identity: Some(identity),
+            voters,
+            committed: Some(20),
+            ..Probe::default()
+        };
+        let probes = BTreeMap::from([
+            (1, probe(root, 1)),
+            (2, probe(older_fork, 2)),
+            (3, probe(newer_fork, 1)),
+        ]);
+        assert!(probes[&1].wins_over(&probes[&2]));
+        assert!(probes[&2].wins_over(&probes[&3]));
+        assert!(probes[&3].wins_over(&probes[&1]));
+        let mut targets = BTreeSet::new();
+        for (&id, local) in &probes {
+            let mut others = probes.clone();
+            others.remove(&id);
+            targets.insert(match Core::<Counter>::rejoin_choice(id, local, &others) {
+                Some(IncarnationChange::Rejoin { peer, .. }) => peer,
+                None => id,
+                _ => unreachable!(),
+            });
+        }
+        assert_eq!(
+            targets.len(),
+            1,
+            "branches would abandon different winners: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_voter_with_a_lost_rejoin_marker_can_serve_again() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+        let peers = BTreeMap::from([(1, address)]);
+        let mut config = ClusterConfig::new(
+            1,
+            address,
+            peers.clone(),
+            root.path().join("data"),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        config.auto_recover = true;
+        config.auto_recover_timeout = Some(Duration::from_secs(1));
+        let original = Cluster::start(config.clone(), Counter::default())
+            .await
+            .unwrap();
+        original.membership_control().wait_serving().await.unwrap();
+        original.submit(17).await.unwrap();
+        original.shutdown().await.unwrap();
+        let core = &original.0.core;
+        // Disk image of a former learner, now the only committed voter. The
+        // snapshot survived but the marker authorizing its promotion did not.
+        let record = Record::new(
+            core.mesh.endpoint.identity(),
+            SurvivorReason::PeerWon,
+            Some(2),
+        );
+        let switch = Switch::prepare(core.store.dir(), 1, record).unwrap();
+        core.store
+            .fork_snapshot(
+                &switch.fresh(),
+                1,
+                peers,
+                core.store.last_applied().unwrap().leader_id.term,
+            )
+            .unwrap();
+        switch.commit().unwrap();
+
+        let fenced = Cluster::start(config.clone(), Counter::default())
+            .await
+            .unwrap();
+        let membership = fenced.membership_control();
+        assert!(!membership.is_serving());
+        timeout(Duration::from_secs(8), membership.wait_restart())
+            .await
+            .unwrap();
+        assert!(matches!(
+            fenced.shutdown().await,
+            Err(ClusterError::Restart)
+        ));
+        let restored = Cluster::start(config, Counter::default()).await.unwrap();
+        timeout(
+            Duration::from_secs(5),
+            restored.membership_control().wait_serving(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.submit(1).await.unwrap().1, 18);
+        restored.shutdown().await.unwrap();
     }
 
     #[tokio::test]

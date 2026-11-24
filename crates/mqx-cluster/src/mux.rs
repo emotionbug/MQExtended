@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use tokio::time::{Instant, timeout_at};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::transport::{Connection, Limits, Op, invalid_data};
 
@@ -48,8 +48,47 @@ impl Drop for Call {
     }
 }
 
+struct PendingReply {
+    op: Op,
+    reply: Reply,
+    _permit: OwnedSemaphorePermit,
+    expires: Instant,
+}
+
 #[derive(Default)]
-struct Pending(Mutex<BTreeMap<u64, (Op, Reply, OwnedSemaphorePermit)>>);
+struct Pending {
+    replies: Mutex<BTreeMap<u64, PendingReply>>,
+    ready: Notify,
+}
+
+impl Pending {
+    fn insert(&self, id: u64, reply: PendingReply) {
+        let mut replies = self.replies.lock().unwrap();
+        let was_empty = replies.is_empty();
+        replies.insert(id, reply);
+        if was_empty {
+            self.ready.notify_one();
+        }
+    }
+
+    async fn wait_for_stall(&self) {
+        loop {
+            // IDs and expiry times both increase in write order. Recheck after
+            // sleeping: that reply may have arrived while the timer was armed.
+            let oldest = self
+                .replies
+                .lock()
+                .unwrap()
+                .first_key_value()
+                .map(|(_, reply)| reply.expires);
+            match oldest {
+                Some(expires) if Instant::now() >= expires => return,
+                Some(expires) => sleep_until(expires).await,
+                None => self.ready.notified().await,
+            }
+        }
+    }
+}
 
 pub(crate) struct Client {
     calls: mpsc::Sender<Call>,
@@ -58,7 +97,11 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    pub(crate) fn start(stream: Connection, limits: Limits) -> Arc<Self> {
+    pub(crate) fn start(
+        stream: Connection,
+        limits: Limits,
+        request_timeout: Duration,
+    ) -> Arc<Self> {
         let (calls, rx) = mpsc::channel(IN_FLIGHT);
         let permits = Arc::new(Semaphore::new(IN_FLIGHT));
         // A second descriptor for the same socket, only to look for the
@@ -75,12 +118,19 @@ impl Client {
         let task = tokio::spawn(async move {
             let (rx_socket, tx_socket) = tokio::io::split(stream);
             let pending = Pending::default();
+            // A caller may time out or be dropped before its reply arrives (e.g.
+            // Raft's heartbeat deadline). Allow the server's frame read,
+            // dispatch, and response write budgets before recycling the session.
+            let reply_budget = request_timeout.saturating_mul(3);
             tokio::select! {
-                result = Self::write_calls(tx_socket, rx, &pending, probe.as_ref()) => {
+                result = Self::write_calls(tx_socket, rx, &pending, probe.as_ref(), reply_budget) => {
                     if let Err(error) = result { tracing::trace!(%error, "cluster session writer closed"); }
                 },
                 result = Self::read_replies(rx_socket, limits, &pending) => {
                     if let Err(error) = result { tracing::trace!(%error, "cluster session reader closed"); }
+                },
+                () = pending.wait_for_stall() => {
+                    tracing::debug!("cluster session closed after a stalled reply");
                 },
             }
         });
@@ -129,6 +179,7 @@ impl Client {
         mut calls: mpsc::Receiver<Call>,
         pending: &Pending,
         probe: Option<&std::net::TcpStream>,
+        reply_budget: Duration,
     ) -> io::Result<()> {
         let mut sequence = 0u64;
         while let Some(mut call) = calls.recv().await {
@@ -160,11 +211,15 @@ impl Client {
             let flushed = if matches!(call.op, Op::MeshSend) {
                 Some((reply, permit))
             } else {
-                pending
-                    .0
-                    .lock()
-                    .unwrap()
-                    .insert(sequence, (call.op, reply, permit));
+                pending.insert(
+                    sequence,
+                    PendingReply {
+                        op: call.op,
+                        reply,
+                        _permit: permit,
+                        expires: Instant::now() + reply_budget,
+                    },
+                );
                 None
             };
             timeout_at(call.deadline, async {
@@ -188,12 +243,15 @@ impl Client {
     ) -> io::Result<()> {
         loop {
             let id = reader.read_u64().await?;
-            let (op, reply, _permit) = pending
-                .0
+            // Keep the entry until the entire frame arrives. A connection that
+            // stalls after the ID still needs to expire and reclaim its slot.
+            let op = pending
+                .replies
                 .lock()
                 .unwrap()
-                .remove(&id)
-                .ok_or_else(|| invalid_data("unexpected cluster response id"))?;
+                .get(&id)
+                .ok_or_else(|| invalid_data("unexpected cluster response id"))?
+                .op;
             let status = reader.read_u8().await?;
             let max = match status {
                 0 => limits.response(op),
@@ -208,7 +266,8 @@ impl Client {
                     String::from_utf8_lossy(&body).into_owned(),
                 )))
             };
-            let _ = reply.send(result);
+            let entry = pending.replies.lock().unwrap().remove(&id).unwrap();
+            let _ = entry.reply.send(result);
         }
     }
 }
@@ -264,13 +323,138 @@ pub(crate) async fn write_responses(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_stalled_peer_releases_the_call_window_and_reconnects() {
+        use std::path::PathBuf;
+        use std::pin::pin;
+
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::watch;
+        use tokio::time::{advance, pause, resume};
+
+        use crate::membership::MembershipStatus;
+        use crate::transport::Endpoint;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let limits = Limits {
+            command: 1024,
+            append: 1024,
+            mesh: 1024,
+        };
+        let budget = Duration::from_secs(10);
+        let endpoint = |node_id| {
+            Endpoint::new(
+                node_id,
+                BTreeMap::from([(2, address)]),
+                (PathBuf::new(), Some([42; 32])),
+                watch::channel(MembershipStatus::default()).1,
+                None,
+                1,
+                (limits, budget),
+            )
+        };
+        let (caller, peer) = (endpoint(1), endpoint(2));
+        let accept = || async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (stream, from, op) = peer.accept(socket).await.unwrap();
+            assert_eq!(from, 1);
+            assert!(matches!(op, Op::Session));
+            stream
+        };
+        let body = Bytes::from_static(b"command");
+        let started = Instant::now();
+        let connect = started + Duration::from_secs(5);
+        let mut calls = FuturesUnordered::new();
+        for i in 0..IN_FLIGHT {
+            let deadline = started + Duration::from_secs(if i == 0 { 60 } else { 9 });
+            calls.push(caller.call(2, Op::Write, body.clone(), deadline, connect));
+        }
+        let interrupt = async {
+            let mut stream = accept().await;
+            let active = peer.accept_session(1, connect).await.unwrap();
+            stream.write_u8(0).await.unwrap();
+            for id in 1..=IN_FLIGHT as u64 {
+                assert_eq!(read_test_write(&mut stream, limits).await, id);
+            }
+            // Interrupt an ordinary reply mid-frame; the old peer connection
+            // doesn't close or notice EOF during the interruption.
+            stream.write_u64(1).await.unwrap();
+            (stream, active)
+        };
+        let (old_socket, mut old_session) = tokio::select! {
+            _ = calls.next() => panic!("a write completed before the interruption"),
+            old = timeout_at(connect, interrupt) => old.unwrap(),
+        };
+
+        pause();
+        let later = started + Duration::from_secs(120);
+        let mut waiting = pin!(caller.call(2, Op::Write, body.clone(), later, later));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        advance(budget).await;
+        for _ in 1..IN_FLIGHT {
+            assert!(matches!(
+                calls.next().await,
+                Some(Err(CallError::Uncertain(error))) if error.kind() == io::ErrorKind::TimedOut
+            ));
+        }
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        advance(budget.saturating_mul(3)).await;
+        assert!(matches!(
+            calls.next().await,
+            Some(Err(CallError::Uncertain(_)))
+        ));
+        assert!(matches!(
+            waiting.await,
+            Err(CallError::Unsent(error)) if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+        resume();
+
+        let connect = Instant::now() + Duration::from_secs(5);
+        let replacement = async {
+            let mut stream = accept().await;
+            let mut replacement = pin!(peer.accept_session(1, connect));
+            assert!(futures_util::poll!(&mut replacement).is_pending());
+            old_session.changed().await.unwrap();
+            drop(old_socket);
+            drop(old_session);
+            let _active = replacement.await.unwrap();
+            stream.write_u8(0).await.unwrap();
+            let id = read_test_write(&mut stream, limits).await;
+            assert_eq!(id, 1);
+            stream.write_u64(id).await.unwrap();
+            stream.write_u8(0).await.unwrap();
+            stream.write_u32(2).await.unwrap();
+            stream.write_all(b"ok").await.unwrap();
+        };
+        let (reply, reconnected) = tokio::join!(
+            caller.call(2, Op::Write, body, connect, connect),
+            timeout_at(connect, replacement),
+        );
+        reconnected.unwrap();
+        assert_eq!(reply.map_err(io::Error::from).unwrap().as_ref(), b"ok");
+    }
+
+    async fn read_test_write(stream: &mut Connection, limits: Limits) -> u64 {
+        let id = stream.read_u64().await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), Op::Write as u8);
+        let body = limits
+            .read_frame(stream, limits.command, false)
+            .await
+            .unwrap();
+        assert_eq!(&*body, b"command");
+        id
+    }
 
     // A leader that died before the request was written never read it. On a
     // single-threaded runtime the writer and reader of a new session race to
     // notice the closed socket; either way the call must be retryable.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_call_after_the_peer_closed_is_unsent() {
         let limits = Limits {
@@ -287,7 +471,7 @@ mod tests {
             assert_eq!(stream.peek(&mut probe).unwrap(), 0);
             stream.set_nonblocking(true).unwrap();
             let stream = tokio::net::TcpStream::from_std(stream).unwrap();
-            let client = Client::start(Connection::Plain(stream), limits);
+            let client = Client::start(Connection::Plain(stream), limits, Duration::from_secs(5));
             let deadline = Instant::now() + Duration::from_secs(5);
             let result = client
                 .call(Op::Write, Bytes::from_static(b"command"), deadline)

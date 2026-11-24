@@ -22,7 +22,7 @@ use openraft::raft::{
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit, watch};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit, watch};
 use tokio::time::{Instant, timeout_at};
 use tokio_rustls::TlsStream;
 
@@ -138,7 +138,7 @@ impl Limits {
 #[derive(Default)]
 struct PeerSlot {
     outgoing: Mutex<Option<Arc<Client>>>,
-    incoming: Arc<Mutex<()>>,
+    incoming: Mutex<watch::Sender<()>>,
 }
 
 pub(crate) struct Endpoint {
@@ -151,6 +151,7 @@ pub(crate) struct Endpoint {
     pub(crate) tls: Option<Tls>,
     pub(crate) max_snapshot_size: u64,
     pub(crate) limits: Limits,
+    request_timeout: Duration,
     slots: SyncMutex<BTreeMap<u64, Arc<PeerSlot>>>,
     recovery_timeout: Option<Duration>,
     incarnation: Option<Record>,
@@ -165,7 +166,7 @@ impl Endpoint {
         status: watch::Receiver<MembershipStatus>,
         tls: Option<Tls>,
         max_snapshot_size: u64,
-        limits: Limits,
+        (limits, request_timeout): (Limits, Duration),
     ) -> Self {
         let digest = OnceLock::new();
         if let Some(membership_digest) = membership_digest {
@@ -181,6 +182,7 @@ impl Endpoint {
             tls,
             max_snapshot_size,
             limits,
+            request_timeout,
             slots: SyncMutex::default(),
             recovery_timeout: None,
             incarnation: None,
@@ -248,11 +250,13 @@ impl Endpoint {
                     timeout: self.recovery_timeout,
                     digest: self.digest(),
                     repair,
+                    reuse_digest: true,
                 },
             )
             .await?;
             stream.flush().await?;
-            let info: Probe = self.limits.read_control(&mut stream).await?;
+            let mut info: Probe = self.limits.read_control(&mut stream).await?;
+            info.resolve_history(|| self.identity())?;
             self.observe_recovery_timeout(id, info.timeout);
             Ok(info)
         })
@@ -291,7 +295,7 @@ impl Endpoint {
             if stream.read_u8().await? != 0 {
                 return Err(invalid_data("cluster peer refused session"));
             }
-            let live = Client::start(stream, self.limits);
+            let live = Client::start(stream, self.limits, self.request_timeout);
             *session = Some(live.clone());
             Ok(live)
         })
@@ -335,12 +339,22 @@ impl Endpoint {
             .await
     }
 
-    pub(crate) fn accept_session(&self, from: u64) -> io::Result<OwnedMutexGuard<()>> {
-        self.slot(from)
-            .incoming
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| io::ErrorKind::WouldBlock.into())
+    pub(crate) async fn accept_session(
+        &self,
+        from: u64,
+        deadline: Instant,
+    ) -> io::Result<watch::Receiver<()>> {
+        let slot = self.slot(from);
+        timeout_at(deadline, async {
+            let incoming = slot.incoming.lock().await;
+            // A dead TCP connection need not report EOF. Retire its runner
+            // before admitting any requests from the successor.
+            let _ = incoming.send(());
+            incoming.closed().await;
+            incoming.subscribe()
+        })
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut.into())
     }
 
     pub(crate) async fn close(&self) {
@@ -977,11 +991,14 @@ mod tests {
                 watch::channel(MembershipStatus::default()).1,
                 None,
                 1,
-                Limits {
-                    command: 1024,
-                    append: 128 * 1024,
-                    mesh: 1024,
-                },
+                (
+                    Limits {
+                        command: 1024,
+                        append: 128 * 1024,
+                        mesh: 1024,
+                    },
+                    Duration::from_secs(2),
+                ),
             )
         };
         let original = Incarnation::original([42; 32]);
@@ -1022,7 +1039,7 @@ mod tests {
             watch::channel(MembershipStatus::default()).1,
             None,
             1,
-            limits,
+            (limits, Duration::from_secs(2)),
         ));
         let mut peer = Peer {
             endpoint: endpoint.clone(),
@@ -1136,11 +1153,14 @@ mod tests {
                 watch::channel(MembershipStatus::default()).1,
                 None,
                 1,
-                Limits {
-                    command: 1024,
-                    append: 128 * 1024,
-                    mesh: 1024,
-                },
+                (
+                    Limits {
+                        command: 1024,
+                        append: 128 * 1024,
+                        mesh: 1024,
+                    },
+                    Duration::from_secs(2),
+                ),
             )
         };
         let header = endpoint(1).rpc_header(2, Op::ReadIndex).unwrap();

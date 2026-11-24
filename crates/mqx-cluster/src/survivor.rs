@@ -1,7 +1,9 @@
 use std::cmp::Reverse;
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,10 @@ const JOURNAL: &str = "journal";
 const INSTALL: &str = "install";
 const KEEP_ARCHIVE: &str = "keep_archive";
 pub(crate) const JOINED: &str = "recovery.joined";
+// The root fork point and a tail fit even a worst-case MessagePack Probe in
+// the existing 64 KiB control frame. Never raise the RPC allocation limit to
+// accommodate an installation's age.
+const MAX_FORK_POINTS: usize = 512;
 const ACTIVE: [&str; 6] = [
     IDENTITY_FILE,
     CLUSTER_ID_FILE,
@@ -72,16 +78,24 @@ pub(crate) struct Incarnation {
     pub(crate) number: u64,
     pub(crate) founder: u64,
     pub(crate) digest: [u8; 32],
-    lineage: Vec<ForkPoint>,
+    lineage: Arc<VecDeque<ForkPoint>>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    omitted: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Incarnation {
     pub(crate) fn original(digest: [u8; 32]) -> Self {
+        static EMPTY: LazyLock<Arc<VecDeque<ForkPoint>>> = LazyLock::new(Arc::default);
         Self {
             number: 0,
             founder: 0,
             digest,
-            lineage: Vec::new(),
+            lineage: Arc::clone(&EMPTY),
+            omitted: 0,
         }
     }
 
@@ -101,7 +115,12 @@ impl Incarnation {
             .fill(&mut nonce)
             .map_err(|_| io::Error::other("unable to generate a cluster identity"))?;
         hash.update(nonce);
-        self.lineage.push(ForkPoint {
+        let lineage = Arc::make_mut(&mut self.lineage);
+        if lineage.len() == MAX_FORK_POINTS {
+            lineage.remove(1);
+            self.omitted += 1;
+        }
+        lineage.push_back(ForkPoint {
             parent: self.digest,
             applied,
             founder: node_id,
@@ -111,8 +130,16 @@ impl Incarnation {
         Ok(self)
     }
 
+    fn bound_history(&mut self) {
+        if self.lineage.len() > MAX_FORK_POINTS {
+            let excess = self.lineage.len() - MAX_FORK_POINTS;
+            Arc::make_mut(&mut self.lineage).drain(1..=excess);
+            self.omitted += excess as u64;
+        }
+    }
+
     fn root(&self) -> [u8; 32] {
-        self.lineage.first().map_or(self.digest, |fork| fork.parent)
+        self.lineage.front().map_or(self.digest, |fork| fork.parent)
     }
 
     pub(crate) fn related(&self, other: &Self) -> bool {
@@ -120,8 +147,9 @@ impl Incarnation {
     }
 
     fn is_valid(&self) -> bool {
-        self.number == self.lineage.len() as u64
-            && self.lineage.last().map_or(self.founder == 0, |fork| {
+        self.number.checked_sub(self.omitted) == Some(self.lineage.len() as u64)
+            && (self.omitted == 0 || self.lineage.len() == MAX_FORK_POINTS)
+            && self.lineage.back().map_or(self.founder == 0, |fork| {
                 self.founder != 0 && fork.founder == self.founder
             })
     }
@@ -132,12 +160,16 @@ pub(crate) struct ProbeRequest {
     pub(crate) timeout: Option<Duration>,
     pub(crate) digest: Option<[u8; 32]>,
     pub(crate) repair: bool,
+    #[serde(default)]
+    pub(crate) reuse_digest: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Probe {
     pub(crate) timeout: Option<Duration>,
     pub(crate) identity: Option<Incarnation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shared_digest: Option<[u8; 32]>,
     pub(crate) quorum: bool,
     // Age of the last successful renewal, not of this probe response.
     pub(crate) renewal_age: Option<Duration>,
@@ -149,6 +181,42 @@ pub(crate) struct Probe {
 }
 
 impl Probe {
+    pub(crate) fn for_request(&mut self, request: &ProbeRequest) {
+        if request.reuse_digest
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(|id| Some(id.digest) == request.digest)
+        {
+            self.identity = None;
+            self.shared_digest = request.digest;
+        }
+    }
+
+    pub(crate) fn resolve_history(
+        &mut self,
+        known: impl FnOnce() -> Option<Incarnation>,
+    ) -> io::Result<()> {
+        if let Some(digest) = self.shared_digest.take() {
+            if self.identity.is_some() {
+                return Err(invalid_data("ambiguous peer recovery incarnation"));
+            }
+            self.identity = Some(
+                known()
+                    .filter(|id| id.digest == digest)
+                    .ok_or_else(|| invalid_data("unknown shared recovery incarnation"))?,
+            );
+            return Ok(());
+        }
+        if let Some(identity) = &mut self.identity {
+            if !identity.is_valid() {
+                return Err(invalid_data("invalid peer recovery incarnation"));
+            }
+            identity.bound_history();
+        }
+        Ok(())
+    }
+
     pub(crate) fn wins_over(&self, other: &Self) -> bool {
         let (Some(a), Some(b)) = (&self.identity, &other.identity) else {
             return false;
@@ -208,11 +276,12 @@ impl Record {
                 }
             })?
             .read_to_end(&mut body)?;
-        let record: Self = decode(&body)?;
-        if let Some(identity) = &record.identity {
+        let mut record: Self = decode(&body)?;
+        if let Some(identity) = &mut record.identity {
             if Some(identity.digest) != digest || !identity.is_valid() {
                 return Err(invalid_data("invalid recovery incarnation record"));
             }
+            identity.bound_history();
         } else if digest.is_some() || record.event.reason != SurvivorReason::UnusableState {
             return Err(invalid_data("missing recovery incarnation identity"));
         }
@@ -221,15 +290,21 @@ impl Record {
 }
 
 pub(crate) fn join_complete(dir: &Path, applied: Option<u64>) -> io::Result<bool> {
-    let mut body = Vec::new();
-    match open_private_file(&dir.join(JOINED)) {
-        Ok(mut file) => file.read_to_end(&mut body)?,
+    let mut file = match open_private_file(&dir.join(JOINED)) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     // Only a valid catch-up marker can remove the learner fence. A damaged
     // marker is no proof of catch-up and can be replaced by the next repair.
-    Ok(decode::<u64>(&body).is_ok_and(|index| applied >= Some(index)))
+    let size = file.metadata()?.len();
+    let mut body = [0; 9]; // MessagePack u64 marker + 8 bytes.
+    if size > body.len() as u64 {
+        return Ok(false);
+    }
+    let body = &mut body[..size as usize];
+    file.read_exact(body)?;
+    Ok(decode::<u64>(body).is_ok_and(|index| applied >= Some(index)))
 }
 
 // The WAL lock lives inside the directory that gets renamed. Keep a separate
@@ -542,6 +617,76 @@ fn move_if_present(from: &Path, to: &Path, name: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_long_histories_still_fit_peer_probes_and_choose_a_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Incarnation::original([0xff; 32]);
+        let mut identity = root.clone();
+        let mut legacy_points = VecDeque::new();
+        let mut old_ancestor = None;
+        for index in 0..4096 {
+            identity = identity.fork(u64::MAX, Some(index)).unwrap();
+            legacy_points.push_back(identity.lineage.back().unwrap().clone());
+            if index == 1 {
+                old_ancestor = Some(identity.clone());
+            }
+        }
+        let mut legacy = identity.clone();
+        legacy.lineage = Arc::new(legacy_points);
+        legacy.omitted = 0;
+        let path = dir.path().join(RECORD_FILE);
+        let record = Record::new(Some(legacy), SurvivorReason::PeerUnreachable, None);
+        let bytes = encode(&record).unwrap();
+        assert!(bytes.len() > crate::transport::MAX_CONTROL_FRAME);
+        fs::write(path, bytes).unwrap();
+        let loaded = Record::read(dir.path(), Some(identity.digest)).unwrap();
+        assert_eq!(loaded.identity.as_ref(), Some(&identity));
+
+        let remote = Probe {
+            identity: loaded.identity,
+            voters: 2,
+            ..Probe::default()
+        };
+        let bytes = encode(&remote).unwrap();
+        assert!(bytes.len() <= crate::transport::MAX_CONTROL_FRAME);
+        let mut reply: Probe = decode(&bytes).unwrap();
+        reply.resolve_history(|| None).unwrap();
+        let ancestor = Probe {
+            identity: Some(root),
+            committed: Some(1),
+            ..Probe::default()
+        };
+        assert!(ancestor.wins_over(&reply)); // progress past the retained root fork
+        let old = Probe {
+            identity: old_ancestor,
+            voters: 3,
+            ..Probe::default()
+        };
+        assert!(old.wins_over(&reply)); // forgotten fork point: voter-count rule
+        assert!(!reply.wins_over(&old));
+        let recent = identity.clone().fork(1, None).unwrap();
+        assert!(
+            Probe {
+                identity: Some(recent),
+                ..Probe::default()
+            }
+            .wins_over(&reply)
+        );
+
+        reply.for_request(&ProbeRequest {
+            digest: Some(identity.digest),
+            reuse_digest: true,
+            repair: false,
+            timeout: None,
+        });
+        let bytes = encode(&reply).unwrap();
+        assert!(bytes.len() < 512);
+        let mut shared: Probe = decode(&bytes).unwrap();
+        assert!(shared.clone().resolve_history(|| None).is_err());
+        shared.resolve_history(|| Some(identity.clone())).unwrap();
+        assert_eq!(shared.identity, Some(identity));
+    }
 
     #[test]
     fn progress_breaks_ancestor_ties_and_voter_count_breaks_sibling_ties() {

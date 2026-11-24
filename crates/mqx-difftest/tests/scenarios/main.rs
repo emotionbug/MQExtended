@@ -129,7 +129,12 @@ fn read(h: &mut Harness, client: Connection, timeout: Duration) -> &Reading {
 
 #[track_caller]
 fn received(h: &mut Harness, client: Connection, expected: Packet) {
-    match read(h, client, RESPONSE) {
+    received_within(h, client, expected, RESPONSE);
+}
+
+#[track_caller]
+fn received_within(h: &mut Harness, client: Connection, expected: Packet, timeout: Duration) {
+    match read(h, client, timeout) {
         Reading::Received { packet, .. } => assert_eq!(packet, &expected, "{client:?}"),
         reading => panic!("{client:?}: expected {expected:?}, observed {reading:?}"),
     }
@@ -173,6 +178,17 @@ fn client(h: &mut Harness, client_id: &str) -> Connection {
 
 #[track_caller]
 fn subscribe(h: &mut Harness, client: Connection, mid: u16, filters: &[(&str, QoS)]) {
+    subscribe_within(h, client, mid, filters, RESPONSE);
+}
+
+#[track_caller]
+fn subscribe_within(
+    h: &mut Harness,
+    client: Connection,
+    mid: u16,
+    filters: &[(&str, QoS)],
+    timeout: Duration,
+) {
     let packet_id = id(mid);
     send(
         h,
@@ -185,17 +201,14 @@ fn subscribe(h: &mut Harness, client: Connection, mid: u16, filters: &[(&str, Qo
                 .collect(),
         }),
     );
-    received(
-        h,
-        client,
-        Packet::SubAck(SubAck {
-            packet_id,
-            return_codes: filters
-                .iter()
-                .map(|(_, qos)| SubscribeReturnCode::Success(*qos))
-                .collect(),
-        }),
-    );
+    let expected = Packet::SubAck(SubAck {
+        packet_id,
+        return_codes: filters
+            .iter()
+            .map(|(_, qos)| SubscribeReturnCode::Success(*qos))
+            .collect(),
+    });
+    received_within(h, client, expected, timeout);
 }
 
 #[track_caller]

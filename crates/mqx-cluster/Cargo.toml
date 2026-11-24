@@ -12,7 +12,7 @@ openraft = { version = "=0.10.1", default-features = false, features = ["serde",
 raft-log = "0.4.7"
 rmp-serde = "1"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 sha2 = "0.10"
 tempfile = "3.27.0"
 thiserror.workspace = true
@@ -26,3 +26,4 @@ workspace = true
 
 [dev-dependencies]
 rcgen = "0.14.10"
+tokio = { workspace = true, features = ["test-util"] }

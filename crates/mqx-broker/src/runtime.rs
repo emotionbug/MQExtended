@@ -1360,36 +1360,26 @@ impl ReplicatedLog {
             .into_iter()
             .filter(|&node| node != self.owner.node)
         {
-            let peer_gone = || {
-                self.cluster
-                    .voter_status(node)
-                    .is_none_or(|status| status == NodeStatus::Down)
-            };
-            loop {
-                if peer_gone() {
-                    break;
+            let notify = async {
+                loop {
+                    match self.request(node, &fast::Request::Fence(index)).await {
+                        Ok(()) => return Ok(()),
+                        Err(ClusterError::Shutdown) => return Err(ClusterError::Shutdown),
+                        // Refused connections can recover without a Down event.
+                        Err(_) => tokio::time::sleep(Duration::from_millis(30)).await,
+                    }
                 }
-                match tokio::time::timeout_at(
-                    deadline,
-                    self.request(node, &fast::Request::Fence(index)),
-                )
-                .await
-                {
-                    Ok(Ok(())) => break,
-                    Ok(Err(ClusterError::Shutdown)) => return Err(ClusterError::Shutdown),
-                    Ok(Err(_)) if Instant::now() < deadline => {
-                        // A failed TCP attempt does not fence the old owner:
-                        // allow Raft time to declare it durably Down.
-                        tokio::time::sleep(Duration::from_millis(30)).await;
-                    }
-                    _ => {
-                        if peer_gone() {
-                            break;
-                        }
-                        return Err(ClusterError::WriteUncertain(format!(
-                            "routing fence did not reach node {node}"
-                        )));
-                    }
+            };
+            // A suspended process can keep TCP open long after the quorum
+            // fenced it. Never wait out a network timeout after applying Down.
+            tokio::select! {
+                biased;
+                result = self.cluster.wait_voter_inactive(node) => result?,
+                result = notify => result?,
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(ClusterError::WriteUncertain(format!(
+                        "routing fence did not reach node {node}"
+                    )));
                 }
             }
         }

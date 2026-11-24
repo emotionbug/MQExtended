@@ -188,7 +188,8 @@ fn retained_messages_and_subscriptions_survive_node_loss() {
     closed(h, publisher);
     let subscriber = on(h, 3, settings, true);
     let fresh = on(h, 1, options("fresh"), false);
-    subscribe(h, fresh, 2, &[(retained, Q1)]);
+    // The routing fence can wait for a new election and durable lease expiry.
+    subscribe_within(h, fresh, 2, &[(retained, Q1)], ELECTION + WILL_DELIVERY);
     accept_publish(
         h,
         fresh,
@@ -201,6 +202,32 @@ fn retained_messages_and_subscriptions_survive_node_loss() {
     accept_publish(h, subscriber, publish(live, b"existing filter", Q1, 2));
     disconnect(h, subscriber);
     disconnect(h, fresh);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires cluster-enabled mqextended"]
+fn a_suspended_voter_does_not_delay_suback_after_lease_expiry() {
+    let h = &mut start_cluster(config(
+        "allow_anonymous true\ncluster_request_timeout 20000",
+    ));
+    let leader = h.wait_for_leader(ELECTION).unwrap();
+    let mut followers = (1..=3).filter(|&node| node != leader);
+    let paused = followers.next().unwrap();
+    let publisher = on(
+        h,
+        followers.next().unwrap(),
+        options("live-publisher"),
+        false,
+    );
+    let subscriber = on(h, leader, options("fenced-subscriber"), false);
+    subscribe(h, subscriber, 1, &[("before/pause", Q1)]);
+    h.suspend_node(paused).unwrap(); // Established mesh TCP stays open; no reply or FIN.
+    let topic = "during/pause";
+    subscribe_within(h, subscriber, 2, &[(topic, Q1)], WILL_DELIVERY);
+    publish_from(h, publisher, publish(topic, b"after fence", Q1, 8));
+    accept_publish(h, subscriber, publish(topic, b"after fence", Q1, 1));
+    h.resume_node(paused).unwrap();
 }
 
 #[test]
