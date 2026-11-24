@@ -27,7 +27,25 @@ Use `--require-p99-below-ms` with a target `--rate` for release qualification. `
 
 ## Current numbers
 
-### Clean sessions: cross-broker comparison
+### Clean sessions: optimized Mosquitto vs. optimized MQExtended
+
+Linux, Ryzen 5 2600X (6 cores / 12 threads), loopback MQTT, 64 one-to-one QoS 1 pairs, 256-byte payloads, 20 outstanding handshakes per publisher. Mosquitto 2.1.4 ran as one process; MQExtended had two Tokio workers **per process**, three processes and mTLS between voters for the cluster. These are deployment throughput comparisons on one host, not equal-CPU efficiency measurements. Both MQExtended revisions were checksum-verified CI release builds. Broker processes and connections were fresh for each run.
+
+| Broker | Saturated deliveries/s, before (`982e258`) | Saturated deliveries/s, after (`2331d24`) | After: saturated p99 | After: p99 at 60,000/s offered |
+| --- | ---: | ---: | ---: | ---: |
+| Mosquitto (reference in each run) | 85,538–93,026 | 93,713–94,471 | 24.12 ms | 5.24 ms |
+| MQExtended standalone | 132,319–136,350 | 229,834–233,956 | 16.25–17.83 ms | 1.77–1.97 ms |
+| MQExtended three voters | 55,868–86,329 | 192,476–193,302 | 31.46–35.65 ms | 3.93 ms |
+
+Ranges are the two observed runs, not confidence intervals. Rates count **unique subscriber deliveries inside the 8-second load window**. After up to 3 seconds of drain, every publication in these runs had a PUBACK and exactly one delivery. At saturation the final three-voter deployment delivered about twice as many messages per second as Mosquitto, but its tail latency at that higher throughput was worse. At the same 60,000/s offered load all three passed the 50 ms p99, delivery and handshake gates.
+
+A separate 30-second run offered 90,000/s (5 s drain, 50 ms p99 gate). Standalone delivered 89,989/s at 44.04 ms p99 and three voters 89,994/s at 17.83 ms; after drain all 2,699,964 and 2,699,930 publications respectively were acknowledged and received once. The comparison command exited nonzero: the Mosquitto row delivered 60,953/s at 226.49 ms p99 and missed the offered-rate gate. This is one longer run on a shared host, not a production latency bound.
+
+An intermediate standalone build (`190b632`) accepted 237–241k publishes/s but lost 107,737 and 148,538 deliveries in the same saturation test. It is **not** counted as a throughput win. Bounding an ingress burst by the affected active subscriber's drain progress removed the observed overflow without raising queue limits. This is not a guarantee for arbitrarily slow or disconnected subscribers.
+
+To reproduce, run `compare --pattern one-to-one --publishers 64 --subscribers 64 --qos 1 --seconds 8 --drain-seconds 3 --state-dir "$STATE" --json max.json`, then add `--rate 60000 --require-p99-below-ms 50` and use a different JSON path. For a 1 → 48 fan-out at 300 publishes/s, the final build and Mosquitto each delivered all **115,200** expected copies. P99 was 10.49 ms for Mosquitto, 9.44 ms standalone, and 14.68 ms for three voters.
+
+### Historical dev-profile comparison
 
 One Linux host, loopback TCP, QoS 1, 256-byte messages, 8 s of traffic and 3 s of drain. Both MQExtended builds used the unoptimized dev profile with two Tokio workers per process; the three voters used mutual TLS. Mosquitto 2.1.4 and Mochi MQTT 2.7.9 were optimized standalone builds (Mochi `GOMAXPROCS=2`). Use the before/after columns to compare MQExtended builds. The other brokers are reference points, **not** a release-to-release ranking.
 
@@ -41,6 +59,8 @@ At 8,000/s, three voters handled **5,328 → 7,999 publishes/s** versus revision
 With the rate limit removed (same 64 pairs), **in-window deliveries/s** rose from **12,616 to 19,300** standalone and **5,099 to 14,621** on three voters. Mosquitto delivered **92,281/s** and Mochi **18,150/s**. After drain, the final standalone run accounted for all 161,672 publications and the cluster for all 117,910, with no duplicates. An intermediate standalone build accepted 28,069 publishes/s but missed 93,972 deliveries after drain: a faster publisher alone is not higher broker throughput.
 
 ### Persistent sessions: shared-disk qualification
+
+With `2331d24`, 32 persistent pairs at 250 publishes/s for 8 s on one shared NVMe/ext4 device produced **2,000 PUBACKs and 2,000 unique deliveries** on every broker. The three-voter delivery p99 was **2.68 s** (2.78 s on `982e258`); 29 deliveries completed during drain. Standalone p99 was **0.22 ms**, Mosquitto **0.19 ms**. `compare` sets `persistence false` on both standalone processes; their sessions survive reconnect, not a crash. The cluster still waits for a durable quorum. These are different guarantees, and the cluster has **not** met the 50 ms persistent target on this disk.
 
 Persistent QoS 1, 200 one-to-one pairs, 256-byte payloads, 30 s of traffic and 10 s configured drain. Release brokers, mutual TLS between the three voters, all three WALs on the same consumer NVMe/ext4 device. These are local measurements under contention, **not a passing release qualification**. Reported latency is the publisher-to-subscriber histogram's p99.
 
