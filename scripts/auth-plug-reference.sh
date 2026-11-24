@@ -38,13 +38,39 @@ mapfile -t planned < <(awk '/^Inst / { print $2 }' <<< "$plan")
 # there too, even when apt's plan omits them because they are installed.
 mapfile -t shared < <(apt-cache depends "${development[@]}" |
     awk '/Depends: lib[^ ]+[0-9]([a-z][0-9]+)?$/ { print $2 }' | sort -u)
-postgres=$(apt-cache depends postgresql | awk '/Depends: postgresql-[0-9]+$/ { print $2; exit }')
+# Hosted runners preinstall packages from repositories they no longer list, so
+# apt's candidate can be a version nothing serves. Pick the newest version a
+# configured repository still serves.
+downloadable() {
+    local package
+    for package; do
+        # Read the whole table: exiting early would fail apt-cache with SIGPIPE.
+        apt-cache policy "$package" | awk -v package="$package" '
+            /^ (\*\*\*|   ) [^ ]+ [0-9]+$/ { version = $(NF - 1); next }
+            !found && version != "" && /^        [0-9]+ / && $2 != "/var/lib/dpkg/status" {
+                print package "=" version
+                found = 1
+            }
+            END {
+                if (!found) {
+                    print "no repository serves " package > "/dev/stderr"
+                    exit 1
+                }
+            }'
+    done
+}
+postgres=$(apt-cache show "$(downloadable postgresql)" |
+    awk '/^Depends:/ && !major && match($0, /postgresql-[0-9]+/) { major = substr($0, RSTART, RLENGTH) }
+        END { print major }')
 [[ -n $postgres ]]
 pg_major=${postgres#postgresql-}
+mapfile -t downloads < <(downloadable "${packages[@]}" "${planned[@]}" "${shared[@]}" \
+    "$postgres" "postgresql-client-$pg_major" \
+    mariadb-server-core mariadb-client mariadb-client-core mariadb-common)
+(( ${#downloads[@]} == ${#packages[@]} + ${#planned[@]} + ${#shared[@]} + 6 ))
 (
     cd "$prefix/debs"
-    apt-get download "${packages[@]}" "${planned[@]}" "${shared[@]}" "$postgres" "postgresql-client-$pg_major" \
-        mariadb-server-core mariadb-client mariadb-client-core mariadb-common
+    apt-get download "${downloads[@]}"
     for deb in ./*.deb; do dpkg-deb -x "$deb" "$root"; done
 )
 
