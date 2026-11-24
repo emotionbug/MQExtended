@@ -441,10 +441,28 @@ fn reload_config(
 
 async fn run_broker(
     cli: &Cli,
-    mut config: ServerConfig,
+    config: ServerConfig,
     logging: &Logging,
     log_topics: LogTopics,
     shutdown: &mut ShutdownLog,
+) -> Result<(), ServerError> {
+    let external = load_external_plugins(&config).await?;
+    let result = serve_broker(config, cli, logging, log_topics, shutdown, &external).await;
+    // Mosquitto plugin_v4.c: plugin__cleanup_v4 runs each plugin's cleanup
+    // only after serving has stopped.
+    for plugin in external {
+        plugin.halt().await;
+    }
+    result
+}
+
+async fn serve_broker(
+    mut config: ServerConfig,
+    cli: &Cli,
+    logging: &Logging,
+    log_topics: LogTopics,
+    shutdown: &mut ShutdownLog,
+    external: &[Arc<dyn ExternalSecurity>],
 ) -> Result<(), ServerError> {
     add_local_http(&mut config);
     let live_config = std::cell::RefCell::new(None);
@@ -453,8 +471,7 @@ async fn run_broker(
             .listeners
             .iter()
             .any(|listener| listener.security.file_plugins.paths() != (None, None));
-    let external = load_external_plugins(&config).await?;
-    let security = Arc::new(SecurityHandles::new(&config, &external)?);
+    let security = Arc::new(SecurityHandles::new(&config, external)?);
     let listener_policies = |config: &ServerConfig| -> Vec<Arc<ListenerPolicy>> {
         config
             .listeners

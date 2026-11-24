@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn reference_np_and_python_hashlib_vectors() {
-        // `/tmp/mosquitto-auth-plug/np -p password`.
+        // The reference build's `mosquitto-auth-plug/np -p password`.
         assert!(check(b"password", NP_HASH));
         assert!(!check(b"password!", NP_HASH));
         // Python hashlib.pbkdf2_hmac with dklen=20, 24 and 47 respectively.

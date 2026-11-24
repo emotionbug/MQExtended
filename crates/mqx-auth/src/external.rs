@@ -116,4 +116,9 @@ pub trait ExternalSecurity: Send + Sync + 'static {
         topic: &'a str,
         access: AclAccess,
     ) -> BoxFuture<'a, Authorization>;
+
+    /// Plugin cleanup after listeners and broker tasks have shut down.
+    fn halt(&self) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
 }

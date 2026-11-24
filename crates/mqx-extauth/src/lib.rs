@@ -10,6 +10,7 @@
 mod authplug;
 mod backend;
 mod backends;
+mod goauth;
 mod net;
 
 use std::sync::Arc;
@@ -23,6 +24,8 @@ pub use backend::LoadError;
 pub enum Library {
     /// jpmens/mosquitto-auth-plug, built as `auth-plug.so`.
     AuthPlug,
+    /// iegomez/mosquitto-go-auth, built as `go-auth.so`.
+    GoAuth,
 }
 
 impl Library {
@@ -31,6 +34,7 @@ impl Library {
         let basename = path.rsplit(std::path::is_separator).next().unwrap_or(path);
         match basename.rsplit_once('.') {
             Some(("auth-plug", "so" | "dylib" | "dll")) => Some(Self::AuthPlug),
+            Some(("go-auth", "so" | "dylib" | "dll")) => Some(Self::GoAuth),
             _ => None,
         }
     }
@@ -39,6 +43,7 @@ impl Library {
     pub fn label(self) -> &'static str {
         match self {
             Self::AuthPlug => "auth-plug",
+            Self::GoAuth => "go-auth",
         }
     }
 }
@@ -47,6 +52,8 @@ impl Library {
 pub fn announce(library: Library) {
     match library {
         Library::AuthPlug => authplug::announce(),
+        // auth-plugin.c: mosquitto_auth_plugin_version silently returns 4.
+        Library::GoAuth => {}
     }
 }
 
@@ -61,5 +68,6 @@ pub async fn load(
 ) -> Result<Arc<dyn ExternalSecurity>, LoadError> {
     match library {
         Library::AuthPlug => authplug::load(options, deny_special_chars).await,
+        Library::GoAuth => goauth::load(options, deny_special_chars).await,
     }
 }

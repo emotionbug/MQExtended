@@ -9,9 +9,9 @@ mod ldap;
 #[path = "mongo.rs"]
 mod mongo;
 #[path = "mysql.rs"]
-mod mysql;
+pub(crate) mod mysql;
 #[path = "postgres.rs"]
-mod postgres;
+pub(crate) mod postgres;
 #[path = "sqlite.rs"]
 mod sqlite;
 

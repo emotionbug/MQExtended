@@ -88,7 +88,7 @@ fn mysql_tls(options: &Options) -> Result<SslOpts, LoadError> {
         .with_danger_skip_domain_validation(!verify))
 }
 
-fn identity(cert: &Path, key: &Path) -> Option<ClientIdentity> {
+pub(crate) fn identity(cert: &Path, key: &Path) -> Option<ClientIdentity> {
     // mysql_async's native TLS client identity is PKCS#12 rather than two
     // PEM paths. Pack the configured chain and key in memory, not on disk.
     let certs = X509::stack_from_pem(&std::fs::read(cert).ok()?).ok()?;

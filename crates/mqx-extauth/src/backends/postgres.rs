@@ -195,37 +195,65 @@ fn pg_tls(options: &Options, mode: &str) -> Result<TlsConnector, LoadError> {
                     .filter(|path| path.exists())
             })
     };
-    let read_certs = |file| -> Result<Vec<CertificateDer<'static>>, LoadError> {
-        let file = std::fs::File::open(file).map_err(|_| error())?;
-        rustls_pemfile::certs(&mut BufReader::new(file))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| error())
-    };
-    let provider = rustls::crypto::ring::default_provider();
-    let mut roots = None;
-    let root_path = path(None, "PGSSLROOTCERT", "root.crt");
-    if matches!(mode, "verify-ca" | "verify-full") || (mode == "require" && root_path.is_some()) {
-        let mut store = RootCertStore::empty();
-        for root in read_certs(root_path.ok_or_else(error)?)? {
-            store.add(root).map_err(|_| error())?;
-        }
-        if store.is_empty() {
-            return Err(error());
-        }
-        roots = Some(store);
+    let root = path(None, "PGSSLROOTCERT", "root.crt");
+    let roots =
+        if matches!(mode, "verify-ca" | "verify-full") || (mode == "require" && root.is_some()) {
+            Some(pg_roots(root.as_deref().ok_or_else(error)?)?)
+        } else {
+            None
+        };
+    pg_tls_connector(
+        roots,
+        mode == "verify-full",
+        true,
+        path(Some("sslcert"), "PGSSLCERT", "postgresql.crt"),
+        path(Some("sslkey"), "PGSSLKEY", "postgresql.key"),
+    )
+}
+
+fn read_certs(
+    file: impl AsRef<std::path::Path>,
+) -> Result<Vec<CertificateDer<'static>>, LoadError> {
+    let error = || LoadError::new(CONNECTION_ERROR);
+    let file = std::fs::File::open(file).map_err(|_| error())?;
+    rustls_pemfile::certs(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| error())
+}
+
+pub(crate) fn pg_roots(file: &std::path::Path) -> Result<RootCertStore, LoadError> {
+    let error = || LoadError::new(CONNECTION_ERROR);
+    let mut store = RootCertStore::empty();
+    for root in read_certs(file)? {
+        store.add(root).map_err(|_| error())?;
     }
+    if store.is_empty() {
+        return Err(error());
+    }
+    Ok(store)
+}
+
+pub(crate) fn pg_tls_connector(
+    roots: Option<RootCertStore>,
+    verify_name: bool,
+    enable_sni: bool,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> Result<TlsConnector, LoadError> {
+    let error = || LoadError::new(CONNECTION_ERROR);
+    let provider = rustls::crypto::ring::default_provider();
     let verifier = PgVerifier {
         algorithms: provider.signature_verification_algorithms,
         roots,
-        verify_name: mode == "verify-full",
+        verify_name,
     };
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .map_err(|_| error())?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier));
-    let config = if let Some(cert) = path(Some("sslcert"), "PGSSLCERT", "postgresql.crt") {
-        let key = path(Some("sslkey"), "PGSSLKEY", "postgresql.key").ok_or_else(error)?;
+    let mut config = if let Some(cert) = cert {
+        let key = key.ok_or_else(error)?;
         let mut file = BufReader::new(std::fs::File::open(key).map_err(|_| error())?);
         let key = rustls_pemfile::private_key(&mut file)
             .map_err(|_| error())?
@@ -236,6 +264,7 @@ fn pg_tls(options: &Options, mode: &str) -> Result<TlsConnector, LoadError> {
     } else {
         builder.with_no_client_auth()
     };
+    config.enable_sni = enable_sni;
     Ok(Arc::new(config).into())
 }
 
@@ -315,20 +344,27 @@ pub(crate) async fn create(options: &Options) -> Result<Box<dyn Backend>, LoadEr
     }))
 }
 
-enum QueryError {
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QueryError {
+    #[error("PostgreSQL query failed")]
     Sql,
+    #[error("PostgreSQL connection lost")]
     Connection,
+    #[error("scannable destination with >1 columns ({0}) in result")]
+    Shape(usize),
+    #[error("pq: {0}")]
+    Remote(String),
 }
 
-fn cell(row: &DataRow) -> Result<&[u8], QueryError> {
+fn cell(row: &DataRow) -> Result<Option<&[u8]>, QueryError> {
     let mut data = row.data.as_ref();
     let len = data.try_get_i32().map_err(|_| QueryError::Connection)?;
     if len == -1 {
-        Ok(b"") // PQgetvalue returns an empty string for SQL NULL.
+        Ok(None)
     } else {
         usize::try_from(len)
             .ok()
-            .and_then(|n| data.get(..n))
+            .and_then(|n| data.get(..n).map(Some))
             .ok_or(QueryError::Connection)
     }
 }
@@ -337,14 +373,15 @@ fn cell(row: &DataRow) -> Result<&[u8], QueryError> {
 // PQexecParams: unnamed statement/portal, inferred parameter types, *text*
 // parameters and results. RowDescription distinguishes tuple-bearing result
 // sets (including 0 rows) from commands that did not return rows.
-async fn query(
+pub(crate) async fn query(
     client: &mut PgWireClient,
     sql: &str,
     params: Vec<Option<Bytes>>,
-    mut visit: impl FnMut(usize, &[u8]),
+    strict: bool,
+    mut visit: impl FnMut(usize, Option<&[u8]>, u32),
 ) -> Result<usize, QueryError> {
     let messages = [
-        Request::Parse(Parse::new(None, super::c_str(sql).to_owned(), vec![])),
+        Request::Parse(Parse::new(None, sql.to_owned(), vec![])),
         Request::Bind(Bind::new(None, None, vec![], params, vec![])),
         Request::Describe(Describe::new(TARGET_TYPE_BYTE_PORTAL, None)),
         Request::Execute(Execute::new(None, 0)),
@@ -359,12 +396,16 @@ async fn query(
     client.flush().await.map_err(|_| QueryError::Connection)?;
     let mut columns = None;
     let mut rows = 0;
-    let mut failed = false;
+    let mut ty = 0;
+    let mut failed = None;
     while let Some(reply) = client.next().await {
         match reply.map_err(|_| QueryError::Connection)? {
-            Reply::RowDescription(desc) => columns = Some(desc.fields.len()),
+            Reply::RowDescription(desc) => {
+                columns = Some(desc.fields.len());
+                ty = desc.fields.first().map_or(0, |field| field.type_id);
+            }
             Reply::DataRow(row) if columns == Some(1) => {
-                visit(rows, cell(&row)?);
+                visit(rows, cell(&row)?, ty);
                 rows += 1;
             }
             Reply::ParameterStatus(status) => {
@@ -379,12 +420,20 @@ async fn query(
                 if matches!(severity, "FATAL" | "PANIC") {
                     return Err(QueryError::Connection);
                 }
-                failed = true;
+                failed = Some(if strict {
+                    QueryError::Remote(error.message)
+                } else {
+                    QueryError::Sql
+                });
             }
             Reply::ReadyForQuery(ready) => {
                 client.set_transaction_status(ready.status);
-                return if failed || columns.is_none() {
+                return if let Some(error) = failed {
+                    Err(error)
+                } else if !strict && columns.is_none() {
                     Err(QueryError::Sql)
+                } else if strict && let Some(count @ 2..) = columns {
+                    Err(QueryError::Shape(count))
                 } else {
                     Ok(rows)
                 };
@@ -417,7 +466,17 @@ impl Postgres {
             if let Some(access) = access {
                 params.push(Some(Bytes::from(access.to_string())));
             }
-            let result = query(&mut conn, sql, params, visit).await;
+            let mut visit = visit;
+            let result = query(
+                &mut conn,
+                super::c_str(sql),
+                params,
+                false,
+                |row, value, _| {
+                    visit(row, value.unwrap_or(b"")); // libpq exposes NULL as an empty string.
+                },
+            )
+            .await;
             if !matches!(result, Err(QueryError::Connection)) {
                 *guard = Some(conn);
                 return result;
