@@ -2130,7 +2130,7 @@ impl<S: StateMachine> Core<S> {
                 result = write_responses(writer, replies, self.request_timeout) => result,
                 result = self.read_calls(reader, from, &responses, mesh, append) => result,
                 () = self.run_ordered(from, mesh_rx, &responses) => Ok(()),
-                () = self.run_appends(from, append_rx, &responses) => Ok(()),
+                () = reply_to_appends(append_rx, &responses, |request| self.rpc_response(from, request)) => Ok(()),
             }
         };
         // Drop the old reader and ordered work before releasing `superseded`.
@@ -2209,28 +2209,6 @@ impl<S: StateMachine> Core<S> {
     ) {
         while let Some(request) = calls.recv().await {
             self.process_rpc(from, request, responses).await;
-        }
-    }
-
-    async fn run_appends(
-        &self,
-        from: u64,
-        calls: mpsc::Receiver<Request>,
-        responses: &mpsc::Sender<Response>,
-    ) {
-        // Poll each request first in wire order. OpenRaft queues it to RaftCore
-        // before waiting on the durable response. Do not wait for one WAL sync
-        // before admitting the next request from the same leader.
-        let pipeline = unfold(calls, |mut calls| async {
-            calls.recv().await.map(|request| (request, calls))
-        })
-        .map(|request| self.rpc_response(from, request))
-        .buffered(APPEND_WINDOW);
-        let mut pipeline = std::pin::pin!(pipeline);
-        while let Some(response) = pipeline.next().await {
-            if responses.send(response).await.is_err() {
-                break;
-            }
         }
     }
 
@@ -2559,6 +2537,32 @@ struct Request {
     frame: Frame,
 }
 
+async fn reply_to_appends<T, F>(
+    calls: mpsc::Receiver<T>,
+    responses: &mpsc::Sender<Response>,
+    mut respond: impl FnMut(T) -> F,
+) where
+    F: Future<Output = Response>,
+{
+    // Buffered first-polls requests in wire order. OpenRaft enqueues each
+    // request (in FIFO order even if its channel is full) before waiting
+    // for the durable result. Do not spawn these requests out of order.
+    let pipeline = unfold(calls, |mut calls| async {
+        calls.recv().await.map(|request| (request, calls))
+    })
+    .map(|request| {
+        let response = respond(request);
+        // Send from the future, not from the ordered output stream. A heartbeat
+        // for an already-durable index need not wait for an unrelated append.
+        // The wire correlates replies by ID; the leader still yields the results
+        // of each replication stream to OpenRaft in order.
+        async move { responses.send(response.await).await }
+    })
+    .buffered(APPEND_WINDOW);
+    let mut pipeline = std::pin::pin!(pipeline);
+    while let Some(Ok(())) = pipeline.next().await {}
+}
+
 fn encode_command<S: StateMachine>(
     command: S::Command,
     max: usize,
@@ -2618,6 +2622,42 @@ mod tests {
             self.0 = decode(bytes)?;
             Ok(())
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn append_admission_is_fifo_but_ready_replies_do_not_wait_for_sync() {
+        let (calls, incoming) = mpsc::channel(2);
+        calls.try_send(1).unwrap();
+        calls.try_send(2).unwrap();
+        drop(calls);
+        let (responses, mut replies) = mpsc::channel(2);
+        let (release, stalled) = tokio::sync::oneshot::channel();
+        let mut stalled = Some(stalled);
+        let admitted = AtomicU64::new(0);
+        let driver = reply_to_appends(incoming, &responses, |id| {
+            let stalled = stalled.take();
+            let admitted = &admitted;
+            async move {
+                assert_eq!(admitted.fetch_add(1, Ordering::Relaxed) + 1, id);
+                if let Some(stalled) = stalled {
+                    stalled.await.unwrap();
+                }
+                Response {
+                    id,
+                    body: Ok(Bytes::new()),
+                }
+            }
+        });
+        let caller = async move {
+            assert_eq!(replies.recv().await.unwrap().id, 2);
+            release.send(()).unwrap();
+            assert_eq!(replies.recv().await.unwrap().id, 1);
+        };
+        timeout(Duration::from_secs(1), async {
+            tokio::join!(driver, caller)
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

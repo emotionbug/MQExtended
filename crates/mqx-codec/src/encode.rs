@@ -3,9 +3,9 @@ use thiserror::Error;
 
 use super::{
     CLEAN_SESSION_FLAG, CONNACK, CONNECT, Connect, DISCONNECT, DUP_FLAG, MAX_REMAINING_LENGTH,
-    PASSWORD_FLAG, PINGREQ, PINGRESP, PUBACK, PUBCOMP, PUBLISH, PUBREC, PUBREL, Packet, QoS,
-    RETAIN_FLAG, SUBACK, SUBSCRIBE, UNSUBACK, UNSUBSCRIBE, USERNAME_FLAG, Utf8Error, WILL_FLAG,
-    WILL_RETAIN_FLAG, remaining_length_bytes, valid_topic, validate_code_points,
+    PASSWORD_FLAG, PINGREQ, PINGRESP, PUBACK, PUBCOMP, PUBLISH, PUBREC, PUBREL, Packet, PacketId,
+    QoS, RETAIN_FLAG, SUBACK, SUBSCRIBE, UNSUBACK, UNSUBSCRIBE, USERNAME_FLAG, Utf8Error,
+    WILL_FLAG, WILL_RETAIN_FLAG, remaining_length_bytes, valid_topic, validate_code_points,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -37,9 +37,7 @@ pub enum EncodeError {
 /// setting the CONNACK session-present bit) are the application's responsibility.
 pub fn encode(packet: &Packet, dst: &mut BytesMut) -> Result<(), EncodeError> {
     let (command, length) = wire_shape(packet)?;
-    dst.reserve(1 + remaining_length_bytes(length) + length);
-    dst.put_u8(command);
-    put_remaining_length(dst, length);
+    put_header(dst, command, length);
     match packet {
         Packet::Connect(connect) => put_connect(dst, connect),
         Packet::ConnAck(ack) => {
@@ -47,11 +45,7 @@ pub fn encode(packet: &Packet, dst: &mut BytesMut) -> Result<(), EncodeError> {
             dst.put_u8(ack.code as u8);
         }
         Packet::Publish(packet) => {
-            put_blob(dst, packet.topic.as_bytes());
-            if let Some(packet_id) = packet.packet_id {
-                dst.put_u16(packet_id.get());
-            }
-            dst.extend_from_slice(&packet.payload);
+            put_publish(dst, &packet.topic, packet.packet_id, &packet.payload);
         }
         Packet::PubAck(id)
         | Packet::PubRec(id)
@@ -86,25 +80,14 @@ fn wire_shape(packet: &Packet) -> Result<(u8, usize), EncodeError> {
     Ok(match packet {
         Packet::Connect(connect) => (CONNECT, connect_len(connect)?),
         Packet::ConnAck(_) => (CONNACK, 2),
-        Packet::Publish(packet) => {
-            let has_id = packet.qos != QoS::AtMostOnce;
-            if packet.packet_id.is_some() != has_id {
-                return Err(EncodeError::PublishPacketIdMismatch);
-            }
-            if packet.dup && !has_id {
-                return Err(EncodeError::DupWithQosZero);
-            }
-            let mut command = PUBLISH | ((packet.qos as u8) << 1);
-            if packet.dup {
-                command |= DUP_FLAG;
-            }
-            if packet.retain {
-                command |= RETAIN_FLAG;
-            }
-            let header_len =
-                topic_len(&packet.topic, "PUBLISH topic", false)? + if has_id { 2 } else { 0 };
-            (command, add_len(header_len, packet.payload.len())?)
-        }
+        Packet::Publish(p) => publish_shape(
+            &p.topic,
+            p.payload.len(),
+            p.qos,
+            p.packet_id,
+            p.retain,
+            p.dup,
+        )?,
         Packet::PubAck(_) => (PUBACK, 2),
         Packet::PubRec(_) => (PUBREC, 2),
         Packet::PubRel(_) => (PUBREL | 2, 2),
@@ -140,6 +123,63 @@ fn wire_shape(packet: &Packet) -> Result<(u8, usize), EncodeError> {
         Packet::PingResp => (PINGRESP, 0),
         Packet::Disconnect => (DISCONNECT, 0),
     })
+}
+
+/// Append an MQTT 3.x PUBLISH directly from a shared topic and payload.
+/// Validation and wire bytes are identical to [`encode`].
+pub fn encode_publish(
+    dst: &mut BytesMut,
+    topic: &str,
+    payload: &[u8],
+    qos: QoS,
+    id: Option<PacketId>,
+    retain: bool,
+    dup: bool,
+) -> Result<(), EncodeError> {
+    let (command, length) = publish_shape(topic, payload.len(), qos, id, retain, dup)?;
+    put_header(dst, command, length);
+    put_publish(dst, topic, id, payload);
+    Ok(())
+}
+
+fn publish_shape(
+    topic: &str,
+    payload: usize,
+    qos: QoS,
+    id: Option<PacketId>,
+    retain: bool,
+    dup: bool,
+) -> Result<(u8, usize), EncodeError> {
+    let has_id = qos != QoS::AtMostOnce;
+    if id.is_some() != has_id {
+        return Err(EncodeError::PublishPacketIdMismatch);
+    }
+    if dup && !has_id {
+        return Err(EncodeError::DupWithQosZero);
+    }
+    let mut command = PUBLISH | ((qos as u8) << 1);
+    if dup {
+        command |= DUP_FLAG;
+    }
+    if retain {
+        command |= RETAIN_FLAG;
+    }
+    let header = topic_len(topic, "PUBLISH topic", false)? + usize::from(has_id) * 2;
+    Ok((command, add_len(header, payload)?))
+}
+
+fn put_header(dst: &mut BytesMut, command: u8, length: usize) {
+    dst.reserve(1 + remaining_length_bytes(length) + length);
+    dst.put_u8(command);
+    put_remaining_length(dst, length);
+}
+
+fn put_publish(dst: &mut BytesMut, topic: &str, id: Option<PacketId>, payload: &[u8]) {
+    put_blob(dst, topic.as_bytes());
+    if let Some(id) = id {
+        dst.put_u16(id.get());
+    }
+    dst.extend_from_slice(payload);
 }
 
 fn connect_len(connect: &Connect) -> Result<usize, EncodeError> {

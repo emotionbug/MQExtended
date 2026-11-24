@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use mqx_codec::{Packet, PacketId, Publish, QoS};
 use tokio::{
     task::JoinSet,
-    time::{Instant, sleep_until, timeout, timeout_at},
+    time::{Instant, sleep_until, timeout_at},
 };
 
 use crate::{
@@ -261,7 +261,15 @@ pub async fn load(addresses: &[SocketAddr], config: &Load) -> Result<LoadResult,
         sent[index] = published;
         acknowledged += acked;
     }
-    let delivered = timeout(HANDSHAKE_TIMEOUT, async {
+    // Receivers listen until the requested drain deadline, even if the
+    // publishers received all their ACKs early. Bound teardown after drain.
+    let shutdown_deadline =
+        drain_deadline
+            .checked_add(HANDSHAKE_TIMEOUT)
+            .ok_or(Error::Configuration(
+                "subscriber shutdown deadline overflows the clock",
+            ))?;
+    let delivered = timeout_at(shutdown_deadline, async {
         let mut delivered = Deliveries::default();
         while let Some(job) = receivers.join_next().await {
             let (coverage, stats) = job??;

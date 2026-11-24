@@ -18,7 +18,9 @@ async fn qos1_workload_loses_no_messages_on_any_broker() {
         payload_bytes: 256,
         rate: Some(100),
         duration: Duration::from_secs(5),
-        drain: Duration::from_secs(2),
+        // A healthy publisher can finish immediately; the full drain must
+        // still run, even when it exceeds the MQTT client's shutdown timeout.
+        drain: Duration::from_secs(11),
         clean_session: true,
         inflight: 20,
     };

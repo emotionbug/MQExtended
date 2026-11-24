@@ -4,6 +4,7 @@ use mqx_cluster::ClusterError;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
+    time::{Duration, Instant, sleep_until},
 };
 
 use crate::{
@@ -18,6 +19,7 @@ use super::{Inner, Log};
 const INPUT_BUDGET: usize = 1536 * 1024;
 const MAX_GROUPS: usize = 128;
 const MAX_IN_FLIGHT_GROUPS: usize = 64;
+const MAX_COALESCE_WAIT: Duration = Duration::from_millis(1);
 const ENVELOPE: usize = 64 * 1024;
 
 pub(super) struct Limits {
@@ -37,6 +39,7 @@ impl Limits {
 pub(super) struct Proposal {
     pub(super) entry: BatchEntry,
     pub(super) result: oneshot::Sender<Result<Vec<Reply>, ClusterError>>,
+    pub(super) local_inbox: bool,
 }
 
 fn publication_cost(payload_len: usize, topic_len: usize, properties: &[PublishProperty]) -> usize {
@@ -126,7 +129,21 @@ impl Proposal {
                             publish.packet.topic.len(),
                             &publish.properties,
                         );
-                        (body, body + 128 * 1024)
+                        // Only non-admitted publishes with an id can hand a
+                        // message back to a transient inbox. A lease fixes which
+                        // inbox it uses; a new claim invalidates the old lease.
+                        let local_message = self.local_inbox
+                            && publish.packet.packet_id.is_some()
+                            && matches!(
+                                operation,
+                                Operation::Receive(_)
+                                    | Operation::ReceiveBirth {
+                                        admitted_local: false,
+                                        ..
+                                    }
+                            );
+                        let reply = if local_message { body + 128 * 1024 } else { 0 };
+                        (body, reply)
                     }
                     Operation::Forward(message, _) | Operation::ForwardBirth { message, .. } => (
                         publication_cost(
@@ -187,11 +204,31 @@ pub(super) async fn run(inner: Weak<Inner>, mut requests: mpsc::Receiver<Proposa
         let (mut input, mut output) = first.cost();
         let mut group = Vec::with_capacity(1 + requests.len().min(MAX_GROUPS - 1));
         group.push(first);
-        // Gather other sockets' queued mutations without holding up the
-        // first one when there is nothing to batch.
+        // Send immediately while the pipeline is empty or has a single group.
+        // If commits fall behind, fill the next group as they run instead of
+        // feeding the same WAL a separate sparse entry for every socket.
+        // Never hold an unrelated socket for the duration of a stalled fsync.
+        // A full group or a control barrier still dispatches immediately.
+        let mut deadline = None;
         while group.len() < MAX_GROUPS && input < limits.input && output < limits.reply {
-            let Ok(request) = requests.try_recv() else {
-                break;
+            let request = match requests.try_recv() {
+                Ok(request) => request,
+                Err(mpsc::error::TryRecvError::Empty) if eager && in_flight.len() >= 2 => {
+                    let until = *deadline.get_or_insert_with(|| Instant::now() + MAX_COALESCE_WAIT);
+                    tokio::select! {
+                        biased;
+                        done = in_flight.join_next() => {
+                            done.unwrap().expect("broker proposal task panicked");
+                            continue;
+                        }
+                        _ = sleep_until(until) => break,
+                        request = requests.recv() => match request {
+                            Some(request) => request,
+                            None => break,
+                        }
+                    }
+                }
+                Err(_) => break,
             };
             let (more_input, more_output) = request.cost();
             if request.can_pipeline() != eager
@@ -227,7 +264,7 @@ async fn submit(inner: Arc<Inner>, mut group: Vec<Proposal>, eager: bool) {
         && group.len() == 1
         && !matches!(&group[0].entry, BatchEntry::Act(entry) if entry.operations.len() != 1)
     {
-        let Proposal { entry, result } = group.pop().unwrap();
+        let Proposal { entry, result, .. } = group.pop().unwrap();
         let command = match entry {
             BatchEntry::Claim {
                 owner,
@@ -249,7 +286,7 @@ async fn submit(inner: Arc<Inner>, mut group: Vec<Proposal>, eager: bool) {
     let mut waiters = Vec::with_capacity(group.len());
     let batch = group
         .into_iter()
-        .map(|Proposal { entry, result }| {
+        .map(|Proposal { entry, result, .. }| {
             waiters.push(result);
             entry
         })
@@ -280,5 +317,69 @@ fn as_uncertain(error: crate::BrokerError) -> ClusterError {
     match error {
         crate::BrokerError::Cluster(error) => error,
         _ => unreachable!("proposal submission only returns cluster errors"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use mqx_codec::{PacketId, Publish, QoS};
+
+    use super::*;
+    use crate::state::{Lease, Mutations, Publication};
+
+    #[test]
+    fn publication_reply_budget_only_reserves_payload_for_local_handoffs() {
+        let publish = |qos, id| {
+            Publication::legacy(
+                Publish {
+                    dup: false,
+                    qos,
+                    retain: true,
+                    topic: "data".into(),
+                    packet_id: id,
+                    payload: Bytes::from_static(b"payload"),
+                },
+                Duration::ZERO,
+            )
+        };
+        let qos1 = || publish(QoS::AtLeastOnce, PacketId::new(1));
+        let reply_cost = |local_inbox, operation| {
+            let (result, _receiver) = oneshot::channel();
+            Proposal {
+                entry: BatchEntry::Act(Mutations {
+                    lease: Lease {
+                        id: "source".into(),
+                        epoch: 1,
+                    },
+                    operations: vec![operation],
+                }),
+                result,
+                local_inbox,
+            }
+            .cost()
+            .1
+        };
+        let compact = reply_cost(false, Operation::Receive(qos1()));
+        assert_eq!(
+            reply_cost(true, Operation::ReceiveAdmitted(qos1())),
+            compact
+        );
+        assert_eq!(
+            reply_cost(true, Operation::receive(qos1(), true, true)),
+            compact
+        );
+        assert_eq!(
+            reply_cost(true, Operation::Receive(publish(QoS::AtMostOnce, None))),
+            compact
+        );
+        let handoff = reply_cost(true, Operation::Receive(qos1()));
+        assert!(handoff > compact + usize::from(u16::MAX)); // May carry a full-length source client ID.
+        assert_eq!(
+            reply_cost(true, Operation::receive(qos1(), false, true)),
+            handoff
+        );
     }
 }

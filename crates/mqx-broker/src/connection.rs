@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use mqx_auth::{
     DynamicSecurity,
     external::{Binding, Verdict},
@@ -19,7 +19,7 @@ use mqx_auth::{
 use mqx_codec::v5::{self as codec5, Packet as Packet5, Property, ReasonCode as R};
 use mqx_codec::{
     ConnAck, Connect, ConnectReturnCode as Code, DecodeContext, DecodeError, Packet,
-    ProtocolVersion, Publish, QoS, SubAck, decode, encode,
+    ProtocolVersion, QoS, SubAck, decode, encode,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
@@ -109,7 +109,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             _ = sleep_until(initial_deadline) => return Ok(()),
-            result = wire.progress(true) => result?,
+            result = wire.progress(usize::MAX) => result?,
         }
     };
 
@@ -512,7 +512,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             _ = timeout(deadline) => break Ok(End::Timeout),
-            result = wire.progress(!too_long) => if let Err(error) = result { break 'active Err(error.into()); },
+            result = wire.progress(if too_long { 0 } else { usize::MAX }) => if let Err(error) = result { break 'active Err(error.into()); },
             _ = session.live.ready.notified() => delivering = true,
         }
     };
@@ -831,7 +831,7 @@ async fn flush<S: AsyncRead + AsyncWrite + Unpin>(
         }
         tokio::select! {
             _ = shutdown.changed() => break,
-            result = wire.progress(false) => result?,
+            result = wire.progress(0) => result?,
         }
     }
     Ok(())
@@ -1470,14 +1470,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             }
             self.enqueue(self.output.len());
         } else {
-            self.output(&Packet::Publish(Publish {
+            mqx_codec::encode_publish(
+                &mut self.output,
+                topic,
+                &delivery.message.payload,
+                delivery.qos,
+                id,
+                delivery.retain,
                 dup,
-                qos: delivery.qos,
-                retain: delivery.retain,
-                topic: topic.to_owned(),
-                packet_id: id,
-                payload: delivery.message.payload.clone(),
-            }))?;
+            )?;
+            self.enqueue(self.output.len());
         }
         self.broker.0.traffic.add(Metric::PublishSent, 1);
         Ok(None)
@@ -1501,7 +1503,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     async fn flush_ready(&mut self) -> bool {
         poll_fn(|cx| {
             while !self.idle() {
-                if !matches!(pin!(self.progress(false)).poll(cx), Poll::Ready(Ok(()))) {
+                if !matches!(pin!(self.progress(0)).poll(cx), Poll::Ready(Ok(()))) {
                     return Poll::Ready(false);
                 }
             }
@@ -1522,10 +1524,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             && self.pending_error.is_none()
             && self.input.len() < pipeline::PREFETCH_BYTES
         {
+            let remaining = pipeline::PREFETCH_BYTES - self.input.len();
             tokio::select! {
                 biased;
                 reply = &mut request => return reply,
-                result = self.progress(true) => result?,
+                result = self.progress(remaining) => result?,
             }
         }
         request.await
@@ -1533,7 +1536,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
 
     // Drive both halves without splitting the transport or letting another
     // MQTT packet accumulate in the output buffer behind a stalled write.
-    async fn progress(&mut self, read: bool) -> std::io::Result<()> {
+    async fn progress(&mut self, read_budget: usize) -> std::io::Result<()> {
         poll_fn(|cx| {
             let mut progress = false;
             if !self.output.is_empty() {
@@ -1580,12 +1583,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                     Poll::Pending => {}
                 }
             }
-            // A backpressured client cannot make us buffer unlimited input.
-            if read && self.idle() && !self.eof {
+            // Opportunistic reads after a write must not grow a busy
+            // publisher's backlog forever. A read-only pass can still finish
+            // a legal packet larger than the prefetch window.
+            let read_budget = if progress {
+                read_budget.min(pipeline::PREFETCH_BYTES.saturating_sub(self.input.len()))
+            } else {
+                read_budget
+            };
+            if read_budget != 0 && self.idle() && !self.eof {
                 if self.input.capacity() == self.input.len() {
-                    self.input.reserve(4096);
+                    self.input.reserve(4096.min(read_budget));
                 }
-                let read = self.stream.read_buf(&mut self.input);
+                let mut space = (&mut self.input).limit(read_budget);
+                let read = self.stream.read_buf(&mut space);
                 match pin!(read).poll(cx) {
                     Poll::Ready(result) => {
                         let read = result?;
@@ -1802,8 +1813,33 @@ fn log_disconnected(addr: &Address, id: &str, result: &Result<End, BrokerError>)
 }
 
 #[cfg(test)]
-mod address_tests {
+mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_proposal_bounds_prefetch_even_after_a_large_packet() {
+        use tokio::io::AsyncWriteExt;
+
+        let cap = pipeline::PREFETCH_BYTES;
+        let (stream, mut client) = tokio::io::duplex(4096);
+        let mut wire = Wire::new(stream, Broker::new(BrokerConfig::default()));
+        wire.input.reserve(cap * 2);
+        wire.input.resize(cap - 1, 0);
+        client.write_all(b"next").await.unwrap();
+        let (finish, done) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = pin!(wire.prefetch(async {
+                done.await.unwrap();
+                Ok(())
+            }));
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            finish.send(()).unwrap();
+            pending.await.unwrap();
+        }
+        assert_eq!(&wire.input[cap - 1..], b"n");
+        wire.progress(usize::MAX).await.unwrap();
+        assert_eq!(&wire.input[cap - 1..], b"next");
+    }
 
     // Expected strings come from glibc inet_ntop via Python's socket.inet_ntop.
     #[test]

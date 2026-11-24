@@ -783,7 +783,7 @@ impl State {
             return None;
         }
         // Rotating the selected leaf is cluster-wide shared subscription state.
-        if !publish.topic.starts_with('$') {
+        if !self.groups.is_empty() && !publish.topic.starts_with('$') {
             let mut shared = false;
             self.shared
                 .for_each_match(&publish.topic, |_, _| shared = true)
@@ -792,7 +792,7 @@ impl State {
                 return None;
             }
         }
-        let mut targets = Vec::new();
+        let mut targets = BTreeMap::<_, Vec<_>>::new();
         let mut matched = false;
         let mut durable = false;
         self.normal
@@ -820,14 +820,14 @@ impl State {
                 if session.inbox.is_some() {
                     durable = true;
                 } else if let Some(owner) = session.owner {
-                    targets.push((
-                        owner.node,
-                        crate::fast::Target {
+                    targets
+                        .entry(owner.node)
+                        .or_default()
+                        .push(crate::fast::Target {
                             epoch: session.epoch,
                             qos: outgoing_qos(publish.qos, sub.qos, &self.config),
                             identifier: sub.identifier,
-                        },
-                    ));
+                        });
                 }
             })
             .ok()?;
@@ -1065,7 +1065,7 @@ impl State {
                 self.resolve_verdicts(now, target, &verdicts, &mut effects);
                 Reply::NoChange
             }
-            Command::Act(lease, action) => self.act(lease, action, None, &mut effects),
+            Command::Act(lease, action) => self.act(&lease, action, None, &mut effects),
             Command::Batch(batch) | Command::EagerBatch(batch) => Reply::Batched(
                 batch
                     .into_iter()
@@ -1101,12 +1101,8 @@ impl State {
                             let mut replies = Vec::with_capacity(operations.len());
                             for operation in operations {
                                 let first_effect = effects.len();
-                                let reply = self.act(
-                                    entry.lease.clone(),
-                                    operation,
-                                    pins.as_ref(),
-                                    &mut effects,
-                                );
+                                let reply =
+                                    self.act(&entry.lease, operation, pins.as_ref(), &mut effects);
                                 if eager {
                                     self.reserve_ready(&mut effects[first_effect..]);
                                 }
@@ -1462,7 +1458,7 @@ impl State {
 
     fn act(
         &mut self,
-        lease: Lease,
+        lease: &Lease,
         operation: Operation,
         pinned: Option<&PinnedVerdicts<'_>>,
         effects: &mut Vec<Effect>,
@@ -1504,7 +1500,7 @@ impl State {
                 if let Some((v5, expiry)) = session.v5.as_mut().zip(expiry) {
                     v5.session_expiry = expiry;
                 }
-                self.offline(lease.id, now, graceful, effects);
+                self.offline(lease.id.clone(), now, graceful, effects);
                 Reply::NoChange
             }
             Operation::BridgePrepare {
@@ -1754,7 +1750,7 @@ impl State {
                 if acknowledged {
                     self.persistence_changes += u64::from(ack.counts_for_persistence());
                     if inbox.has_outbound(&self.config) {
-                        effects.push(Effect::Ready(lease));
+                        effects.push(Effect::Ready(lease.clone()));
                     }
                     Reply::NoChange
                 } else {
@@ -2032,7 +2028,7 @@ impl State {
         let _ = self
             .normal
             .for_each_match(topic, |id, sub| router.route(id, *sub, false));
-        if !topic.starts_with('$') {
+        if !self.groups.is_empty() && !topic.starts_with('$') {
             let _ = self.shared.for_each_match(topic, |_, key| {
                 let members = &mut self.groups.get_mut(key).unwrap().members;
                 // subs.c: subs__shared_process rotates even for an offline

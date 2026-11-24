@@ -5,11 +5,11 @@
 //! transient peer delivery does not roll back or retry a publication.
 //!
 //! Receivers wait for the publishing replica's applied index before delivery.
-//! The sender drains a peer lane before the next publish can pass it, including
-//! a retained or QoS 2 operation that instead uses Raft. This is source order,
-//! not a total order between publishers on different nodes.
+//! Each publisher awaits its recipients before advancing to its next packet,
+//! including a retained or QoS 2 operation that instead uses Raft. Unrelated
+//! publishers do not have to take turns waiting for network round trips.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use mqx_codec::QoS;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ pub(crate) struct Route {
     // A matching subscription counts even when No Local or its read ACL
     // prevents delivery (Mosquitto subs.c: subs__process).
     pub(crate) matched: bool,
-    pub(crate) targets: Vec<(u64, Target)>,
+    pub(crate) targets: BTreeMap<u64, Vec<Target>>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]

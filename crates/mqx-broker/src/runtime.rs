@@ -104,9 +104,6 @@ struct ReplicatedLog {
     boot: OnceCell<()>,
     timeout: Duration,
     fence_timeout: Duration,
-    // MeshSend only confirms a socket write; waiting for each peer's
-    // handler response prevents a later connection overtaking this one.
-    peer_lanes: Mutex<BTreeMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     proposals: mpsc::Sender<proposals::Proposal>,
     batch_limits: proposals::Limits,
     max_command_size: usize,
@@ -320,7 +317,6 @@ impl Broker {
                 boot: OnceCell::new(),
                 timeout,
                 fence_timeout,
-                peer_lanes: Mutex::new(BTreeMap::new()),
                 proposals,
                 batch_limits,
                 max_command_size,
@@ -673,7 +669,7 @@ impl Broker {
                     token,
                     request: Box::new(request),
                 };
-                let mut reply = log.propose_one(proposal(claim)).await?;
+                let mut reply = log.propose_one(proposal(claim), false).await?;
                 if reply == Reply::Full
                     && let Some(mut request) = retry
                 {
@@ -697,7 +693,7 @@ impl Broker {
                         }
                         request.verdicts = self.resolve_claim(&request).await;
                         request.now = self.now();
-                        reply = log.propose_one(proposal(request)).await?;
+                        reply = log.propose_one(proposal(request), false).await?;
                     }
                 }
                 let (lease, present) = match reply {
@@ -768,14 +764,18 @@ impl Broker {
         operation: Operation,
     ) -> Result<Reply, BrokerError> {
         let verdicts = self.resolve_operation(&live.lease, &operation).await;
-        if verdicts.is_empty() {
+        if verdicts.is_empty() && matches!(&self.0.log, Log::Local { .. }) {
             return self
                 .submit(Command::Act(live.lease.clone(), operation))
                 .await;
         }
         let entry = BatchEntry::Act(Mutations {
             lease: live.lease.clone(),
-            operations: vec![Operation::Authorize(verdicts), operation],
+            operations: if verdicts.is_empty() {
+                vec![operation]
+            } else {
+                vec![Operation::Authorize(verdicts), operation]
+            },
         });
         match &self.0.log {
             Log::Local { .. } => {
@@ -785,7 +785,7 @@ impl Broker {
                 };
                 Ok(entries.pop().unwrap().pop().unwrap())
             }
-            Log::Replicated(log) => log.propose_one(entry).await,
+            Log::Replicated(log) => log.propose_one(entry, live.inbox.is_some()).await,
         }
     }
 
@@ -865,10 +865,7 @@ impl Broker {
             );
             if publication.packet.topic.starts_with(crate::control::PREFIX) {
                 if !durable.is_empty() {
-                    responses.extend(
-                        log.propose(live.lease.clone(), std::mem::take(&mut durable))
-                            .await?,
-                    );
+                    responses.extend(log.propose(live, std::mem::take(&mut durable)).await?);
                     if matches!(responses.last(), Some(Reply::Stale | Reply::ProtocolError)) {
                         return Ok(responses);
                     }
@@ -889,10 +886,7 @@ impl Broker {
                 log.plan(live, &publication, local)
             };
             if plan.is_some() && !durable.is_empty() {
-                responses.extend(
-                    log.propose(live.lease.clone(), std::mem::take(&mut durable))
-                        .await?,
-                );
+                responses.extend(log.propose(live, std::mem::take(&mut durable)).await?);
                 if matches!(responses.last(), Some(Reply::Stale | Reply::ProtocolError)) {
                     return Ok(responses);
                 }
@@ -913,7 +907,7 @@ impl Broker {
             }
         }
         if !durable.is_empty() {
-            responses.extend(log.propose(live.lease.clone(), durable).await?);
+            responses.extend(log.propose(live, durable).await?);
         }
         Ok(responses)
     }
@@ -935,8 +929,7 @@ impl Broker {
             R::NO_MATCHING_SUBSCRIBERS
         };
         if !route.targets.is_empty() {
-            self.route_fast(log, live, index, route, publication)
-                .await?;
+            self.route_fast(log, live, index, route, publication).await;
         }
         Ok(if live.taken.load(Ordering::Acquire) {
             Reply::Stale
@@ -950,41 +943,41 @@ impl Broker {
         log: &ReplicatedLog,
         live: &Live,
         index: u64,
-        route: fast::Route,
+        mut route: fast::Route,
         publication: Publication,
-    ) -> Result<(), BrokerError> {
+    ) {
         let sequence = live.sequence.fetch_add(1, Ordering::Relaxed);
         let message = publication.into_message(route.source);
-        let mut by_node: BTreeMap<u64, Vec<fast::Target>> = BTreeMap::new();
-        for (node, target) in route.targets {
-            by_node.entry(node).or_default().push(target);
+        let make = |targets| fast::Publication {
+            index,
+            epoch: live.lease.epoch,
+            sequence,
+            message: message.clone(),
+            targets,
+        };
+        if let Some(targets) = route.targets.remove(&log.owner.node) {
+            self.deliver_owned_fast(log, log.owner.node, make(targets));
         }
-        for (node, targets) in by_node {
-            let publication = fast::Publication {
-                index,
-                epoch: live.lease.epoch,
-                sequence,
-                message: message.clone(),
-                targets,
-            };
-            if node == log.owner.node {
-                self.deliver_owned_fast(log, node, publication);
-            } else {
-                let lane = log.peer_lane(node);
-                let _ordered = lane.lock().await;
-                // Do not retry an uncertain send: it may already be in a
-                // recipient's inbox, especially for QoS 0.
-                if let Err(error) = log
-                    .request(node, &fast::Request::Publish(publication))
-                    .await
-                {
-                    // A transient sink cannot survive a lost peer, and its
-                    // transport failure must not close the publishing client.
+        // The mesh already queues calls per peer and runs their handlers FIFO.
+        // Wait for this publisher's recipients, not unrelated publishers' RTTs.
+        let send = |(node, targets)| {
+            let request = fast::Request::Publish(make(targets));
+            async move {
+                if let Err(error) = log.request(node, &request).await {
+                    // Never replay an uncertain transient delivery.
                     tracing::debug!(%error, node, "transient mesh delivery was not confirmed");
                 }
             }
+        };
+        if route.targets.len() <= 1 {
+            if let Some(peer) = route.targets.into_iter().next() {
+                send(peer).await;
+            }
+        } else {
+            stream::iter(route.targets)
+                .for_each_concurrent(8, send)
+                .await;
         }
-        Ok(())
     }
 
     async fn receive_mesh(&self, from: u64, body: Bytes) -> Result<Bytes, ClusterError> {
@@ -1090,10 +1083,13 @@ impl Broker {
             }
             Log::Replicated(log) => match command {
                 Command::Act(lease, operation) => {
-                    log.propose_one(BatchEntry::Act(Mutations {
-                        lease,
-                        operations: vec![operation],
-                    }))
+                    log.propose_one(
+                        BatchEntry::Act(Mutations {
+                            lease,
+                            operations: vec![operation],
+                        }),
+                        true,
+                    )
                     .await
                 }
                 command => log.submit(command).await,
@@ -1203,15 +1199,6 @@ impl Broker {
 }
 
 impl ReplicatedLog {
-    fn peer_lane(&self, node: u64) -> Arc<tokio::sync::Mutex<()>> {
-        self.peer_lanes
-            .lock()
-            .unwrap()
-            .entry(node)
-            .or_default()
-            .clone()
-    }
-
     fn plan(
         &self,
         live: &Live,
@@ -1235,25 +1222,43 @@ impl ReplicatedLog {
 
     async fn propose(
         &self,
-        lease: Lease,
+        live: &Live,
         operations: Vec<Operation>,
     ) -> Result<Vec<Reply>, ClusterError> {
-        self.enqueue(BatchEntry::Act(Mutations { lease, operations }))
-            .await
+        self.enqueue(
+            BatchEntry::Act(Mutations {
+                lease: live.lease.clone(),
+                operations,
+            }),
+            live.inbox.is_some(),
+        )
+        .await
     }
 
-    async fn propose_one(&self, entry: BatchEntry) -> Result<Reply, BrokerError> {
+    async fn propose_one(
+        &self,
+        entry: BatchEntry,
+        local_inbox: bool,
+    ) -> Result<Reply, BrokerError> {
         Ok(self
-            .enqueue(entry)
+            .enqueue(entry, local_inbox)
             .await?
             .pop()
             .expect("single proposal reply"))
     }
 
-    async fn enqueue(&self, entry: BatchEntry) -> Result<Vec<Reply>, ClusterError> {
+    async fn enqueue(
+        &self,
+        entry: BatchEntry,
+        local_inbox: bool,
+    ) -> Result<Vec<Reply>, ClusterError> {
         let (result, replies) = oneshot::channel();
         self.proposals
-            .send(proposals::Proposal { entry, result })
+            .send(proposals::Proposal {
+                entry,
+                result,
+                local_inbox,
+            })
             .await
             .map_err(|_| ClusterError::Shutdown)?;
         replies.await.map_err(|_| ClusterError::Shutdown)?
@@ -1326,6 +1331,11 @@ impl ReplicatedLog {
     }
 
     async fn wait_applied(&self, index: u64) -> Result<(), ClusterError> {
+        // The leader applies before returning its reply; a follower can also
+        // already have the result. Only lagging replicas need a timed wait.
+        if *self.applied.borrow() >= index {
+            return Ok(());
+        }
         let mut observer = self.applied.clone();
         tokio::time::timeout(self.timeout, observer.wait_for(|applied| *applied >= index))
             .await
