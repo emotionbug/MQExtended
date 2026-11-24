@@ -9,6 +9,7 @@ mod ctext;
 mod dynamic_security;
 
 pub mod acl_file;
+pub mod external;
 pub mod password_file;
 
 pub use acl_file::{Access, AclFile, AclFileError, AclWarning};

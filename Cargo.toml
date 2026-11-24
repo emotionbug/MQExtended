@@ -4,6 +4,7 @@ members = [
     "crates/mqx-topic",
     "crates/mqx-codec",
     "crates/mqx-auth",
+    "crates/mqx-extauth",
     "crates/mqx-broker",
     "crates/mqx-bridge",
     "crates/mqx-server",
@@ -24,6 +25,7 @@ publish = false
 mqx-topic = { path = "crates/mqx-topic" }
 mqx-codec = { path = "crates/mqx-codec" }
 mqx-auth = { path = "crates/mqx-auth" }
+mqx-extauth = { path = "crates/mqx-extauth" }
 mqx-broker = { path = "crates/mqx-broker" }
 
 bytes = "1.12"

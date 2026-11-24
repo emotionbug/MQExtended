@@ -15,6 +15,7 @@ mqx-bridge = { path = "../mqx-bridge" }
 mqx-broker.workspace = true
 mqx-cluster = { path = "../mqx-cluster" }
 mqx-codec.workspace = true
+mqx-extauth.workspace = true
 mqx-proxy = { path = "../mqx-proxy", features = ["tokio"] }
 mqx-topic.workspace = true
 mqx-ws = { path = "../mqx-ws" }
