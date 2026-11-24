@@ -145,6 +145,8 @@ The disruption budget protects a majority from voluntary evictions. A worker dra
 
 Start all nodes with identical `cluster_peer` lines and no `cluster_membership_generation`, in any order. The first start bootstraps the cluster exactly once; later starts rejoin from `cluster_data_dir`, and from then on the replicated membership, not the config file, decides who the members are. Never reuse a data directory under a different `cluster_node_id`, and never copy one node's data directory to another.
 
+With automatic recovery off, the first voter waits for quorum even if its peers start later than `cluster_request_timeout`. That deadline limits individual requests, not the time allowed to form a cluster. The voter does not serve MQTT or declare startup ready while it waits.
+
 After a restart or loss of its lease, a follower only admits MQTT clients after renewing its lease and applying through a fresh quorum-confirmed read index. Keep it out of the load balancer until `/api/v1/mqx/ready` returns `200`; an open TCP port or an `Alive` membership entry alone is not sufficient.
 
 ### Cold backup and restore

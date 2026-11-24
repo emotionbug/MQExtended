@@ -572,7 +572,6 @@ async fn serve_broker(
             .set_packet_limit(packet_limit)
             .map_err(mqx_broker::BrokerError::from)
             .map_err(ServerError::Cluster)?;
-        let request_timeout = cluster.request_timeout;
         let broker =
             Broker::clustered_with_security(broker_config(&config), cluster, &security.handles())
                 .await
@@ -582,9 +581,11 @@ async fn serve_broker(
             .expect("the clustered broker owns membership control");
         if !deferred {
             let ready = async {
-                tokio::time::timeout(request_timeout, membership.wait_serving())
+                // A cold peer can start later than an individual Raft request
+                // deadline. Stay fenced and let the live election converge.
+                membership
+                    .wait_serving()
                     .await
-                    .unwrap_or(Err(ClusterError::Deadline))
                     .map_err(mqx_broker::BrokerError::from)
                     .map_err(ServerError::Cluster)?;
                 security.register(&broker).await?;

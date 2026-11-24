@@ -493,7 +493,7 @@ async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
                 "user root\nallow_anonymous true\nlistener {} 127.0.0.1\n\
                  listener {} 127.0.0.1\nprotocol http_api\n\
                  cluster_node_id {id}\ncluster_bind {}\ncluster_peer 1 {}\ncluster_peer 2 {}\n\
-                 cluster_data_dir {}\ncluster_lease_interval 100\ncluster_lease_timeout 3000\n{}",
+                 cluster_data_dir {}\ncluster_request_timeout 5000\ncluster_lease_interval 100\ncluster_lease_timeout 3000\n{}",
                 mqtt[index].port(),
                 http_addr[index].port(),
                 raft[index],
@@ -510,6 +510,9 @@ async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
     let notify = notify_paths
         .each_ref()
         .map(|path| UnixDatagram::bind(path).unwrap());
+    let late_peer = sockets[1][1].try_clone().unwrap();
+    late_peer.set_nonblocking(true).unwrap();
+    let late_peer = tokio::net::TcpListener::from_std(late_peer).unwrap();
     drop(sockets);
     let start = |index: usize| {
         tokio::process::Command::new(BIN)
@@ -522,7 +525,23 @@ async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
             .unwrap()
     };
 
-    let mut brokers = [start(0), start(1)];
+    let mut first = start(0);
+    // Wait for the first voter to contact its missing peer. Its own port
+    // opens before WAL initialization, which can take seconds on a slow disk.
+    let (attempt, _) = timeout(WAIT, late_peer.accept())
+        .await
+        .expect("first voter never contacted its peer")
+        .unwrap();
+    drop((attempt, late_peer));
+    // A staggered cold start must not require restarting the first voter
+    // when the second arrives after the configured Raft request deadline.
+    assert!(
+        timeout(Duration::from_millis(5500), first.wait())
+            .await
+            .is_err(),
+        "first voter exited before its peer started"
+    );
+    let mut brokers = [first, start(1)];
     for index in [0, 1] {
         wait_ready(&notify[index]).await;
         wait_for_readiness(http_addr[index], 200).await;
