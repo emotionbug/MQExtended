@@ -829,6 +829,34 @@ fn auto_recovery_discards_a_corrupt_snapshot_and_rejoins() {
 }
 
 #[test]
+#[ignore = "requires cluster-enabled mqextended"]
+fn auto_recovery_rejoins_after_losing_a_staged_switch() {
+    let h = &mut recovery_cluster(3, true);
+    let leader = h.wait_for_leader(ELECTION).unwrap();
+    let follower = leader % 3 + 1;
+    let topic = "recovery/interrupted";
+    let publisher = on(h, leader, options("switch-recovery-publisher"), false);
+    store_retained(h, publisher, topic, b"before repair");
+    expect_retained(h, follower, topic, b"before repair");
+    h.kill_node(follower).unwrap();
+
+    // The old WAL has been moved into the journal. The staged replacement
+    // is missing; neither the live directory nor the journal is usable alone.
+    let data = h.node_cluster_data_dir(follower).unwrap();
+    let archive = data.join(".mqx-survivor-switch/archive");
+    fs::create_dir_all(&archive).unwrap();
+    fs::rename(data.join("wal"), archive.join("wal")).unwrap();
+    store_retained(h, publisher, topic, b"while peer was down");
+
+    h.restart_node(follower).unwrap();
+    wait_recovered_voters(h, &[1, 2, 3], 0);
+    expect_retained(h, follower, topic, b"while peer was down");
+    let saved = data.join("discarded/interrupted-switch");
+    assert!(saved.join("journal/archive/wal").is_dir());
+    assert!(saved.join("node.mpk").is_file());
+}
+
+#[test]
 #[ignore = "requires the real Mosquitto binary to exercise process lifecycle"]
 fn mosquitto_process_can_be_killed_and_restarted() {
     let mut h = Harness::start(BrokerKind::Mosquitto, config(ANONYMOUS)).unwrap();

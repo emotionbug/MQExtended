@@ -212,8 +212,15 @@ impl Endpoint {
         self.recovery_timeout
     }
 
+    fn known_probe_peer(&self, id: u64) -> bool {
+        let status = self.status.borrow();
+        self.seeds.contains_key(&id)
+            || status.members.contains_key(&id)
+            || status.desired.contains_key(&id)
+    }
+
     pub(crate) fn observe_recovery_timeout(&self, from: u64, timeout: Option<Duration>) {
-        if !self.seeds.contains_key(&from) {
+        if !self.known_probe_peer(from) {
             return;
         }
         let mut warned = self.mismatch_warned.lock().unwrap();
@@ -411,8 +418,7 @@ impl Endpoint {
         stream.read_exact(&mut header).await?;
         let (from, op, digest) = self.check_header(&header, authenticated)?;
         if matches!(op, Op::Incarnation) {
-            if authenticated.is_none() && (!self.seeds.contains_key(&from) || from == self.node_id)
-            {
+            if authenticated.is_none() && (!self.known_probe_peer(from) || from == self.node_id) {
                 return Err(invalid_data(
                     "incarnation probe requires a configured plaintext peer",
                 ));

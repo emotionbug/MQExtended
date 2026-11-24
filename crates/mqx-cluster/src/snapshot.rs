@@ -160,7 +160,7 @@ impl<S: StateMachine> Store<S> {
         term: u64,
     ) -> io::Result<()> {
         let (meta, leases, app) = {
-            let mut state = self.state.write().unwrap();
+            let state = &mut *self.state.write().unwrap();
             let index = state.last_applied.map_or(Ok(0), |id| {
                 id.index
                     .checked_add(1)
@@ -182,9 +182,16 @@ impl<S: StateMachine> Store<S> {
                 last_log_id: Some(log_id),
                 last_membership: StoredMembership::new(Some(log_id), membership),
             };
-            let desired = Desired {
-                generation: state.desired.generation,
+            // Startup seeds can predate a committed membership change. Never
+            // replace its peer list while retaining the same generation.
+            let fallback = Desired {
+                generation: 0,
                 peers,
+            };
+            let desired = if state.desired.peers.is_empty() {
+                &fallback
+            } else {
+                &state.desired
             };
             for &id in desired.peers.keys() {
                 state.leases.ensure(id);
@@ -192,7 +199,7 @@ impl<S: StateMachine> Store<S> {
             // This is a new snapshot boundary, not a replicated removal.
             let leases = encode(&MembershipState {
                 leases: &state.leases,
-                desired: &desired,
+                desired,
                 retired: &state.retired,
             })?;
             (meta, Bytes::from(leases), state.app.snapshot())

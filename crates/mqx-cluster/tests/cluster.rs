@@ -1097,6 +1097,66 @@ async fn replaces_a_killed_voter_without_stopping_writes_and_refuses_its_wal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_reforms_the_committed_pair_after_online_expansion() {
+    async fn restart(config: &ClusterConfig) -> Node {
+        timeout(WAIT, async {
+            loop {
+                match Node::start(config.clone(), Kv::default()).await {
+                    Err(ClusterError::Restart) => continue,
+                    result => return result.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("branch selection must finish")
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let mut configs = configs(&root, 2, SnapshotPolicy::Never);
+    let mut first = configs.remove(&1).unwrap();
+    let mut second = configs.remove(&2).unwrap();
+    let desired = second.peers.clone();
+    first.peers.remove(&2);
+    first.auto_recover = true;
+    second.auto_recover = true;
+    second.join = true;
+
+    let founder = restart(&first).await;
+    serving([&founder]).await;
+    let membership = founder.membership_control();
+    membership.configure(1, desired.clone()).unwrap();
+    until(|| (membership.status().desired == desired).then_some(())).await;
+    let joiner = restart(&second).await;
+    serving([&joiner]).await;
+    assert_eq!(founder.voter_ids(), [1, 2]);
+
+    joiner.shutdown().await.unwrap();
+    timeout(WAIT, membership.wait_restart()).await.unwrap();
+    assert!(matches!(
+        founder.shutdown().await,
+        Err(ClusterError::Restart)
+    ));
+    let survivor = restart(&first).await;
+    serving([&survivor]).await;
+    let status = survivor.membership_control().status();
+    assert_eq!((status.generation, &status.desired), (1, &desired));
+    put(&survivor, "during-outage", "committed").await;
+
+    let returning = restart(&second).await;
+    serving([&returning]).await;
+    assert_eq!(returning.voter_ids(), [1, 2]);
+    assert_eq!(
+        put(&returning, "during-outage", "updated")
+            .await
+            .previous
+            .as_deref(),
+        Some("committed")
+    );
+    returning.shutdown().await.unwrap();
+    survivor.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adds_mtls_voters_then_refuses_a_quorum_losing_removal() {
     let root = tempfile::tempdir().unwrap();
     let mut configs = expanding_configs(&root, SnapshotPolicy::Never);

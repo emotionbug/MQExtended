@@ -206,7 +206,7 @@ impl<S: StateMachine> Cluster<S> {
                 prepare_dir(&data_dir, false)?;
                 let lock = survivor::lock(&data_dir, auto_recover)?;
                 if lock.is_some() {
-                    Switch::recover(&data_dir)?;
+                    Switch::recover(&data_dir, auto_recover.then_some(node_id))?;
                 }
                 match open_private_file(&data_dir.join(RETIRED_FILE)) {
                     Ok(_) => return Err(ClusterError::Removed(node_id)),
@@ -1052,17 +1052,32 @@ impl<S: StateMachine> Core<S> {
         let endpoint = &self.mesh.endpoint;
         let repair = self.repair.load(Ordering::Acquire);
         let deadline = Instant::now() + wait;
-        let mut pending: FuturesUnordered<_> = endpoint
-            .seeds
-            .iter()
-            .filter(|(id, _)| **id != endpoint.node_id)
-            .map(|(&id, &address)| async move {
-                endpoint
-                    .query_incarnation(id, address, repair, deadline)
-                    .await
-                    .map(|probe| (id, probe))
-            })
-            .collect();
+        let mut pending: FuturesUnordered<_> = {
+            let status = self.store.status.borrow();
+            let desired = if status.desired.is_empty() {
+                &endpoint.seeds
+            } else {
+                &status.desired
+            };
+            desired
+                .iter()
+                .map(|(&id, &addr)| (id, addr))
+                .chain(
+                    status
+                        .members
+                        .iter()
+                        .filter(|(id, _)| !desired.contains_key(*id))
+                        .map(|(&id, member)| (id, member.address)),
+                )
+                .filter(|&(id, _)| id != endpoint.node_id)
+                .map(|(id, address)| async move {
+                    endpoint
+                        .query_incarnation(id, address, repair, deadline)
+                        .await
+                        .map(|probe| (id, probe))
+                })
+                .collect()
+        };
         let mut replies = BTreeMap::new();
         while let Some(result) = pending.next().await {
             if let Ok((id, probe)) = result {

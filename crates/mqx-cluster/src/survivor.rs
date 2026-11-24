@@ -17,6 +17,10 @@ pub(crate) const LOCK_FILE: &str = ".mqx-survivor-lock";
 pub(crate) const DISCARDED: &str = "discarded";
 const STAGING: &str = ".mqx-survivor-stage";
 const PENDING: &str = ".mqx-survivor-switch";
+const DAMAGED: &str = ".mqx-survivor-damaged";
+const REPLACEMENT: &str = ".mqx-survivor-replacement";
+const INTERRUPTED: &str = "interrupted-switch";
+const JOURNAL: &str = "journal";
 const INSTALL: &str = "install";
 const KEEP_ARCHIVE: &str = "keep_archive";
 pub(crate) const JOINED: &str = "recovery.joined";
@@ -223,7 +227,9 @@ pub(crate) fn join_complete(dir: &Path, applied: Option<u64>) -> io::Result<bool
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    Ok(applied >= Some(decode(&body)?))
+    // Only a valid catch-up marker can remove the learner fence. A damaged
+    // marker is no proof of catch-up and can be replaced by the next repair.
+    Ok(decode::<u64>(&body).is_ok_and(|index| applied >= Some(index)))
 }
 
 // The WAL lock lives inside the directory that gets renamed. Keep a separate
@@ -288,54 +294,218 @@ impl Switch {
     }
 
     fn publish(&self) -> io::Result<()> {
-        fs::rename(&self.stage, self.root.join(PENDING))?;
-        File::open(&self.root)?.sync_all()
+        fs::rename(&self.stage, self.root.join(PENDING))
     }
 
     pub(crate) fn commit(self) -> io::Result<()> {
         self.publish()?;
-        Self::recover(&self.root)
+        Self::recover(&self.root, None)
     }
 
-    pub(crate) fn recover(root: &Path) -> io::Result<()> {
+    pub(crate) fn recover(root: &Path, repair_node: Option<u64>) -> io::Result<()> {
         let pending = root.join(PENDING);
-        if !pending.try_exists()? {
-            let stage = root.join(STAGING);
-            if stage.try_exists()? {
-                fs::remove_dir_all(stage)?;
-                File::open(root)?.sync_all()?;
+        let replacement = root.join(REPLACEMENT);
+        let damaged = root.join(DAMAGED);
+        if switch_dir_exists(&pending)? {
+            if switch_dir_exists(&replacement)? || switch_dir_exists(&damaged)? {
+                return Err(invalid_data("conflicting cluster switch journals"));
             }
-            return Ok(());
+            if let Replay::Incomplete(reason) = Self::replay(root, &pending, false)? {
+                let node = repair_node.ok_or_else(|| invalid_data(reason))?;
+                // Check the archive destination before quarantining anything.
+                switch_dir_exists(&root.join(DISCARDED))?;
+                tracing::warn!(
+                    node,
+                    reason,
+                    "Incomplete cluster switch; preserving both the live state and journal and rejoining empty"
+                );
+                fs::rename(&pending, &damaged)?;
+                File::open(root)?.sync_all()?;
+                return Self::replace_damaged(root, node);
+            }
+        } else if switch_dir_exists(&replacement)? {
+            if repair_node.is_none() {
+                return Err(invalid_data(
+                    "damaged cluster switch requires automatic recovery",
+                ));
+            }
+            Self::replay(root, &replacement, true)?.finish()?;
+        } else if switch_dir_exists(&damaged)? {
+            let node = repair_node.ok_or_else(|| {
+                invalid_data("damaged cluster switch requires automatic recovery")
+            })?;
+            // A restart may see the quarantine rename before it was synced.
+            File::open(root)?.sync_all()?;
+            return Self::replace_damaged(root, node);
+        } else {
+            let stage = root.join(STAGING);
+            if switch_dir_exists(&stage)? {
+                remove_stage(&File::open(root)?, &stage)?;
+            }
         }
-        let archive = pending.join("archive");
+        Ok(())
+    }
+
+    fn replace_damaged(root: &Path, node: u64) -> io::Result<()> {
+        // Until the replacement is published, leave the quarantine at the
+        // root: recovery may discard and rebuild any unpublished stage.
+        let record = Record::new(None, SurvivorReason::UnusableState, None);
+        let switch = Self::prepare(root, node, record)?;
+        let replacement = root.join(REPLACEMENT);
+        fs::rename(switch.stage, &replacement)?;
+        Self::replay(root, &replacement, true)?.finish()
+    }
+
+    fn replay(root: &Path, pending: &Path, replacing: bool) -> io::Result<Replay> {
+        let root_dir = File::open(root)?;
+        // A previous process may have renamed the journal without syncing it.
+        // Make publication durable before moving any of the live files.
+        root_dir.sync_all()?;
+        let fresh = pending.join("fresh");
+        if !switch_dir_exists(&fresh)? {
+            return Ok(Replay::Incomplete("missing fresh state in cluster switch"));
+        }
+        let installing = switch_file_exists(&pending.join(INSTALL))?;
+        for name in [IDENTITY_FILE, RECORD_FILE] {
+            if !(switch_file_exists(&fresh.join(name))?
+                || installing && switch_file_exists(&root.join(name))?)
+            {
+                return Ok(Replay::Incomplete("missing staged cluster switch metadata"));
+            }
+        }
         let discarded = root.join(DISCARDED);
-        if !pending.join(INSTALL).try_exists()? {
-            if archive.try_exists()? {
+        // The original discarded archive might already contain part of the
+        // interrupted switch. Keep it and one bounded slot for its other parts.
+        let interrupted = replacing.then(|| discarded.join(INTERRUPTED));
+        let destination = interrupted.as_deref().unwrap_or(&discarded);
+        if !installing {
+            let archive = pending.join("archive");
+            let keep_archive = switch_file_exists(&pending.join(KEEP_ARCHIVE))?;
+            if replacing && keep_archive {
+                return Err(invalid_data(
+                    "unexpected preserve marker in replacement switch",
+                ));
+            }
+            if switch_dir_exists(&archive)? {
+                if replacing {
+                    switch_dir_exists(&discarded)?;
+                    switch_dir_exists(destination)?;
+                    prepare_dir(&discarded, false)?;
+                    archive_damaged(root, &archive)?;
+                }
                 move_active(root, &archive)?;
-                if !pending.join(KEEP_ARCHIVE).try_exists()? {
+                if !keep_archive {
                     // The new archive is complete before replacing the previous one.
-                    match fs::symlink_metadata(&discarded) {
-                        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&discarded)?,
-                        Ok(_) => fs::remove_file(&discarded)?,
+                    match fs::symlink_metadata(destination) {
+                        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(destination)?,
+                        Ok(_) => fs::remove_file(destination)?,
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error),
                     }
-                    fs::rename(&archive, &discarded)?;
+                    fs::rename(&archive, destination)?;
+                    if !replacing {
+                        root_dir.sync_all()?;
+                    }
+                }
+            } else {
+                if keep_archive || !switch_dir_exists(destination)? {
+                    return Ok(Replay::Incomplete("missing archive in cluster switch"));
+                }
+                // Without the install marker, a promoted archive means all
+                // live paths were already moved. An older discarded directory
+                // alone does not prove that archiving completed.
+                for name in ACTIVE {
+                    match fs::symlink_metadata(root.join(name)) {
+                        Ok(_) => {
+                            return Ok(Replay::Incomplete("incomplete cluster switch archive"));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
                 }
             }
-            File::open(root)?.sync_all()?;
-            atomic_write(&pending, INSTALL, |_| Ok(()))?;
         }
-        let fresh = pending.join("fresh");
+        if replacing {
+            if switch_dir_exists(&root.join(DAMAGED))?
+                || !switch_dir_exists(&discarded)?
+                || !switch_dir_exists(destination)?
+                || !switch_dir_exists(&destination.join(JOURNAL))?
+            {
+                return Err(invalid_data(
+                    "missing archived journal in replacement switch",
+                ));
+            }
+            // A crash may have left the promotion rename visible but not durable.
+            File::open(&discarded)?.sync_all()?;
+        }
+        // Persist the archive rename's source directory before writing the
+        // marker, or persist an observed marker before resuming installation.
+        File::open(pending)?.sync_all()?;
+        if !installing {
+            atomic_write(pending, INSTALL, |_| Ok(()))?;
+        }
         move_active(&fresh, root)?;
         // Removing the journal via rename, rather than recursively, keeps it
         // recoverable until the new root and its discarded predecessor are durable.
         let stage = root.join(STAGING);
-        fs::rename(&pending, &stage)?;
-        File::open(root)?.sync_all()?;
-        fs::remove_dir_all(stage)?;
-        File::open(root)?.sync_all()
+        fs::rename(pending, &stage)?;
+        remove_stage(&root_dir, &stage)?;
+        Ok(Replay::Finished)
     }
+}
+
+enum Replay {
+    Finished,
+    Incomplete(&'static str),
+}
+
+impl Replay {
+    fn finish(self) -> io::Result<()> {
+        match self {
+            Self::Finished => Ok(()),
+            Self::Incomplete(reason) => Err(invalid_data(reason)),
+        }
+    }
+}
+
+fn archive_damaged(root: &Path, archive: &Path) -> io::Result<()> {
+    let damaged = root.join(DAMAGED);
+    let journal = archive.join(JOURNAL);
+    match (switch_dir_exists(&damaged)?, switch_dir_exists(&journal)?) {
+        (true, false) => fs::rename(damaged, journal),
+        (false, true) => Ok(()),
+        _ => Err(invalid_data(
+            "missing or conflicting quarantined switch journal",
+        )),
+    }
+}
+
+fn switch_dir_exists(path: &Path) -> io::Result<bool> {
+    switch_path_exists(path, fs::Metadata::is_dir)
+}
+
+fn switch_file_exists(path: &Path) -> io::Result<bool> {
+    switch_path_exists(path, fs::Metadata::is_file)
+}
+
+fn switch_path_exists(
+    path: &Path,
+    expected: impl FnOnce(&fs::Metadata) -> bool,
+) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if expected(&metadata) => Ok(true),
+        Ok(_) => Err(invalid_data("unexpected cluster switch path type")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_stage(root: &File, stage: &Path) -> io::Result<()> {
+    // Do not delete the contents until the root durably names them as staging
+    // instead of a pending journal, including when resuming after a crash.
+    root.sync_all()?;
+    fs::remove_dir_all(stage)?;
+    root.sync_all()
 }
 
 fn write_staged(path: &Path, body: &[u8]) -> io::Result<()> {
@@ -402,8 +572,33 @@ mod tests {
     }
 
     #[test]
+    fn damaged_join_marker_leaves_restarted_learner_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = root.join(JOINED);
+        assert!(!join_complete(root, Some(9)).unwrap());
+        for body in [&b""[..], &[0xcf, 0], &[0x01, 0x00]] {
+            fs::write(&marker, body).unwrap();
+            for _ in 0..2 {
+                assert!(!join_complete(root, Some(9)).unwrap());
+            }
+        }
+        fs::write(&marker, encode(&9_u64).unwrap()).unwrap();
+        assert!(!join_complete(root, None).unwrap());
+        assert!(!join_complete(root, Some(8)).unwrap());
+        assert!(join_complete(root, Some(9)).unwrap());
+
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(marker).unwrap();
+        assert_eq!(
+            join_complete(root, Some(9)).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn interrupted_switch_keeps_old_state_or_completes_without_mixing() {
-        for interruption in 0..5 {
+        for interruption in 0..7 {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             fs::create_dir(root.join("wal")).unwrap();
@@ -422,6 +617,7 @@ mod tests {
             fs::write(switch.fresh().join(SNAPSHOT_FILE), b"fresh snapshot").unwrap();
             let pending = root.join(PENDING);
             let archive = pending.join("archive");
+            let fresh = pending.join("fresh");
             if interruption > 0 {
                 switch.publish().unwrap();
             }
@@ -435,12 +631,19 @@ mod tests {
                 fs::remove_dir_all(root.join(DISCARDED)).unwrap();
                 fs::rename(archive, root.join(DISCARDED)).unwrap();
             }
-            if interruption == 4 {
+            if interruption >= 4 {
                 atomic_write(&pending, INSTALL, |_| Ok(())).unwrap();
-                move_if_present(&pending.join("fresh"), root, IDENTITY_FILE).unwrap();
+                move_if_present(&fresh, root, IDENTITY_FILE).unwrap();
             }
-            Switch::recover(root).unwrap();
-            Switch::recover(root).unwrap();
+            if interruption >= 5 {
+                move_active(&fresh, root).unwrap();
+                fs::rename(&pending, root.join(STAGING)).unwrap();
+            }
+            if interruption == 6 {
+                fs::remove_dir(root.join(STAGING).join("fresh")).unwrap();
+            }
+            Switch::recover(root, None).unwrap();
+            Switch::recover(root, None).unwrap();
             if interruption == 0 {
                 assert_eq!(fs::read(root.join(SNAPSHOT_FILE)).unwrap(), b"old snapshot");
                 assert_eq!(fs::read(root.join("wal/log")).unwrap(), b"old log");
@@ -465,8 +668,200 @@ mod tests {
                     b"old snapshot"
                 );
                 assert!(!root.join("discarded/previous").exists());
-                assert!(!pending.exists());
+            }
+            assert!(!pending.exists());
+            assert!(!root.join(STAGING).exists());
+        }
+    }
+
+    #[test]
+    fn resumed_install_does_not_replace_preserved_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let discarded = root.join(DISCARDED);
+        fs::create_dir(&discarded).unwrap();
+        fs::write(discarded.join("wal"), b"saved archive").unwrap();
+        fs::write(root.join(IDENTITY_FILE), b"repair identity").unwrap();
+        let identity = Incarnation::original([7; 32]);
+        let record = Record::new(
+            Some(identity.clone()),
+            SurvivorReason::UnusableState,
+            Some(2),
+        );
+        let switch = Switch::prepare(root, 1, record).unwrap();
+        switch.keep_archive().unwrap();
+        switch.publish().unwrap();
+
+        let pending = root.join(PENDING);
+        let fresh = pending.join("fresh");
+        move_active(root, &pending.join("archive")).unwrap();
+        // Emulate a restart that observes the install marker before the process
+        // which published it could sync the pending directory.
+        write_staged(&pending.join(INSTALL), b"").unwrap();
+        move_if_present(&fresh, root, IDENTITY_FILE).unwrap();
+
+        for _ in 0..2 {
+            Switch::recover(root, None).unwrap();
+            assert_eq!(
+                Record::read(root, Some(identity.digest)).unwrap().identity,
+                Some(identity.clone())
+            );
+            let node: (u8, u64, bytes::Bytes) =
+                decode(&fs::read(root.join(IDENTITY_FILE)).unwrap()).unwrap();
+            assert_eq!(node, (IDENTITY_VERSION, 1, bytes::Bytes::new()));
+            assert_eq!(fs::read(discarded.join("wal")).unwrap(), b"saved archive");
+            assert!(!pending.exists());
+            assert!(!root.join(STAGING).exists());
+        }
+    }
+
+    #[test]
+    fn incomplete_pending_switch_fails_closed_without_automatic_recovery() {
+        for missing in ["fresh", "archive", "fresh/node.mpk"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let discarded = root.join(DISCARDED);
+            fs::create_dir(&discarded).unwrap();
+            fs::write(discarded.join(SNAPSHOT_FILE), b"saved archive").unwrap();
+            fs::write(root.join(IDENTITY_FILE), b"live identity").unwrap();
+            fs::write(root.join(SNAPSHOT_FILE), b"live snapshot").unwrap();
+            let record = Record::new(None, SurvivorReason::UnusableState, None);
+            Switch::prepare(root, 1, record).unwrap().publish().unwrap();
+            let pending = root.join(PENDING);
+            let path = pending.join(missing);
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+
+            for _ in 0..2 {
+                assert_eq!(
+                    Switch::recover(root, None).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    fs::read(root.join(IDENTITY_FILE)).unwrap(),
+                    b"live identity"
+                );
+                assert_eq!(
+                    fs::read(root.join(SNAPSHOT_FILE)).unwrap(),
+                    b"live snapshot"
+                );
+                assert_eq!(
+                    fs::read(discarded.join(SNAPSHOT_FILE)).unwrap(),
+                    b"saved archive"
+                );
+                assert!(!pending.join(INSTALL).exists());
             }
         }
+    }
+
+    #[test]
+    fn damaged_switch_replacement_resumes_without_losing_evidence() {
+        for interruption in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let discarded = root.join(DISCARDED);
+            let interrupted = discarded.join(INTERRUPTED);
+            fs::create_dir_all(&interrupted).unwrap();
+            fs::write(discarded.join(RECORD_FILE), b"existing archive").unwrap();
+            fs::write(interrupted.join("older"), b"older interrupted switch").unwrap();
+            fs::write(root.join(IDENTITY_FILE), b"mixed identity").unwrap();
+            fs::write(root.join(SNAPSHOT_FILE), b"previous snapshot").unwrap();
+            fs::create_dir(root.join("wal")).unwrap();
+            fs::write(root.join("wal/log"), b"mixed log").unwrap();
+
+            let record = || Record::new(None, SurvivorReason::UnusableState, None);
+            Switch::prepare(root, 1, record())
+                .unwrap()
+                .publish()
+                .unwrap();
+            let pending = root.join(PENDING);
+            let damaged = root.join(DAMAGED);
+            let replacement = root.join(REPLACEMENT);
+            let archive = replacement.join("archive");
+            let fresh = replacement.join("fresh");
+            move_if_present(root, &pending.join("archive"), SNAPSHOT_FILE).unwrap();
+            fs::remove_dir_all(pending.join("fresh")).unwrap();
+            if interruption >= 1 {
+                fs::rename(&pending, &damaged).unwrap();
+            }
+            if interruption >= 2 {
+                Switch::prepare(root, 1, record()).unwrap();
+            }
+            if interruption >= 3 {
+                fs::rename(root.join(STAGING), &replacement).unwrap();
+            }
+            if interruption >= 4 {
+                archive_damaged(root, &archive).unwrap();
+                move_if_present(root, &archive, IDENTITY_FILE).unwrap();
+            }
+            if interruption >= 5 {
+                move_active(root, &archive).unwrap();
+                fs::remove_dir_all(&interrupted).unwrap();
+                fs::rename(&archive, &interrupted).unwrap();
+            }
+            if interruption >= 6 {
+                atomic_write(&replacement, INSTALL, |_| Ok(())).unwrap();
+                move_if_present(&fresh, root, IDENTITY_FILE).unwrap();
+            }
+            if interruption >= 7 {
+                move_active(&fresh, root).unwrap();
+                fs::rename(&replacement, root.join(STAGING)).unwrap();
+            }
+
+            for _ in 0..2 {
+                Switch::recover(root, Some(1)).unwrap();
+                let node: (u8, u64, bytes::Bytes) =
+                    decode(&fs::read(root.join(IDENTITY_FILE)).unwrap()).unwrap();
+                assert_eq!(node, (IDENTITY_VERSION, 1, bytes::Bytes::new()));
+                let record = Record::read(root, None).unwrap();
+                assert!(record.identity.is_none());
+                assert_eq!(record.event.reason, SurvivorReason::UnusableState);
+                assert_eq!(
+                    fs::read(discarded.join(RECORD_FILE)).unwrap(),
+                    b"existing archive"
+                );
+                assert_eq!(
+                    fs::read(interrupted.join(IDENTITY_FILE)).unwrap(),
+                    b"mixed identity"
+                );
+                assert_eq!(fs::read(interrupted.join("wal/log")).unwrap(), b"mixed log");
+                assert_eq!(
+                    fs::read(
+                        interrupted
+                            .join(JOURNAL)
+                            .join("archive")
+                            .join(SNAPSHOT_FILE)
+                    )
+                    .unwrap(),
+                    b"previous snapshot"
+                );
+                assert!(!interrupted.join("older").exists());
+                assert!(!root.join("wal").exists());
+                assert!(!root.join(SNAPSHOT_FILE).exists());
+                for name in [PENDING, REPLACEMENT, DAMAGED, STAGING] {
+                    assert!(!root.join(name).exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unexpected_journal_path_type_is_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let record = Record::new(None, SurvivorReason::UnusableState, None);
+        Switch::prepare(root, 1, record).unwrap().publish().unwrap();
+        let pending = root.join(PENDING);
+        fs::create_dir(pending.join(INSTALL)).unwrap();
+        assert_eq!(
+            Switch::recover(root, Some(1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(pending.join(INSTALL).is_dir());
+        assert!(!root.join(DAMAGED).exists());
+        assert!(!root.join(DISCARDED).exists());
     }
 }
