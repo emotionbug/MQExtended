@@ -107,6 +107,21 @@ cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-plugins -DCMAKE_PREFIX_PATH=/tmp
 cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
 ```
 
+### Legacy `mosquitto-auth-plug`
+
+On Ubuntu, refresh the apt package indexes for `main` and `universe` and make sure you have `build-essential`, `cmake`, `git`, `patch` and `libssl-dev`. Run the script as a regular user. It downloads and unpacks the backend packages without installing system services, builds a separate reference with MongoDB and PSK disabled, and prints the environment to use for this test binary. Use a new directory without spaces.
+
+```sh
+work=$(mktemp -d)
+bash scripts/auth-plug-reference.sh "$work/reference" > "$work/environment"
+. "$work/environment"
+cargo test --locked -p mqx-difftest --test auth_plug -- --ignored mosquitto_self
+cargo build --locked -p mqx-server
+cargo test --locked -p mqx-difftest --test auth_plug -- --ignored --skip mosquitto_self
+```
+
+The first test command runs each scenario twice against Mosquitto. The second compares the MQTT and HTTP exchanges with standalone and clustered MQExtended. Both brokers read the same config, but MQExtended recognizes `auth-plug.so` by name without loading it. The test binary starts its own loopback backend servers; do not run it as root.
+
 ## Commands
 
 See [testing](testing.md#commands) for checks. Workspace-wide lint settings live in the root `Cargo.toml`; crates opt in with `[lints] workspace = true`.

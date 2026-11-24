@@ -40,7 +40,7 @@ jobs:
           key: mosquitto-${{ env.MOSQUITTO_VERSION }}-${{ runner.os }}-v3
       - name: Install build and runtime packages
         # The HTTP API reference links libmicrohttpd dynamically, so it is needed on cache hits too.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libssl-dev libmicrohttpd-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake git patch libssl-dev libmicrohttpd-dev
       - name: Build Mosquitto references
         if: steps.mosquitto-cache.outputs.cache-hit != 'true'
         run: |
@@ -63,6 +63,8 @@ jobs:
             -DWITH_PLUGINS=ON -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_WEBSOCKETS=OFF -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
             -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
           cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
+      - name: Build auth-plug reference and unpack backend servers
+        run: bash scripts/auth-plug-reference.sh "$RUNNER_TEMP/auth-plug-reference" > "$RUNNER_TEMP/auth-plug.env"
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
@@ -81,8 +83,16 @@ jobs:
           MOSQUITTO_HTTP_BUILD_DIR: /tmp/mosquitto/build-http
           MOSQUITTO_PLUGIN_BUILD_DIR: /tmp/mosquitto/build-plugins
           MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
-        # mqx-bench's ignored test needs release builds; run it locally.
-        run: cargo test --locked --workspace --exclude mqx-bench --all-features -- --ignored
+        # mqx-bench needs release builds; auth-plug uses a separate environment below.
+        run: >-
+          cargo test --locked --workspace --exclude mqx-bench --all-features -- --ignored --skip auth_plug::
+      - name: Auth-plug differential tests
+        env:
+          MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
+        run: |
+          source "$RUNNER_TEMP/auth-plug.env"
+          cargo test --locked -p mqx-difftest --test auth_plug -- --ignored mosquitto_self
+          cargo test --locked -p mqx-difftest --test auth_plug -- --ignored --skip mosquitto_self
 
   linux-bundle:
     runs-on: ubuntu-latest
