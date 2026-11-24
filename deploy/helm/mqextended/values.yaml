@@ -9,6 +9,8 @@ autoRecover:
 qos1ReplayBatch:
   # Set only after every voter and learner can replay the new WAL command.
   enabled: false
+# Disable Nagle on accepted TCP connections. Small frames may use more packets.
+setTcpNoDelay: false
 
 image:
   repository: ""

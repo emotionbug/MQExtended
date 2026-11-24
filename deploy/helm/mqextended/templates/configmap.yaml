@@ -35,6 +35,9 @@ data:
       cat <<EOF
     per_listener_settings true
     log_dest stdout
+    {{- if .Values.setTcpNoDelay }}
+    set_tcp_nodelay true
+    {{- end }}
     EOF
       {{- range $listeners }}
       cat <<EOF

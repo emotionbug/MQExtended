@@ -60,6 +60,53 @@ fn persistent_inbox_resumes_on_different_node_after_kill() {
 
 #[test]
 #[ignore = "requires cluster-enabled mqextended"]
+fn partial_ack_of_a_replay_window_survives_owner_loss() {
+    let mut cluster = start_cluster(config(
+        "allow_anonymous true\nmax_inflight_messages 8\ncluster_qos1_replay_batch true",
+    ));
+    let h = &mut cluster;
+    let settings = persistent("window");
+    let topic = "failover/window";
+    let subscriber = on(h, 2, settings.clone(), false);
+    subscribe(h, subscriber, 1, &[(topic, Q1)]);
+    disconnect(h, subscriber);
+    let publisher = on(h, 1, options("publisher"), false);
+    let message = |n: u16| Publish {
+        payload: Bytes::copy_from_slice(&n.to_be_bytes()),
+        ..publish(topic, b"", Q1, n)
+    };
+    for n in 1..=16 {
+        publish_from(h, publisher, message(n));
+    }
+
+    let subscriber = on(h, 2, settings.clone(), true);
+    for n in 1..=8 {
+        received(h, subscriber, Packet::Publish(message(n)));
+    }
+    for n in 1..=3 {
+        send(h, subscriber, Packet::PubAck(id(n)));
+    }
+    // Seeing three replacements proves the three acknowledgements took effect.
+    for n in 9..=11 {
+        received(h, subscriber, Packet::Publish(message(n)));
+    }
+    h.kill_node(2).unwrap();
+    let resumed = on(h, 3, settings, true);
+    for n in 4..=16 {
+        accept_publish(
+            h,
+            resumed,
+            Publish {
+                dup: n <= 11,
+                ..message(n)
+            },
+        );
+    }
+    ping(h, resumed);
+}
+
+#[test]
+#[ignore = "requires cluster-enabled mqextended"]
 fn persistent_fanout_keeps_each_subscribers_send_state_after_kill() {
     let mut h = start_cluster(config("allow_anonymous true\nmax_inflight_messages 1"));
     let h = &mut h;

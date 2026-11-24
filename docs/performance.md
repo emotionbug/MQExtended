@@ -21,6 +21,8 @@ Run the comparison as an unprivileged user. MQTT clients connect over loopback T
 
 To compare two revisions without rebuilding locally, use the `mqextended-linux-<full commit SHA>` artifacts from the `linux-bundle` CI job. Extract each bundle into a separate directory, verify it with `sha256sum --check --strict SHA256SUMS` there, and restore the executable bit on `bin/mqextended`. Set `MQEXTENDED_RELEASE_BIN` to that binary's absolute path for each run. Keep the load-generator binary, worker count, storage and Mosquitto binary fixed.
 
+The same CI job publishes `mqx-bench-linux-<full commit SHA>` separately. Verify its `SHA256SUMS`, restore the executable bit on `mqx-bench`, and use that one binary for every row. Generators built before `31e8ab2` can time out while shutting down healthy subscribers if the drain is 10 seconds or longer; do not interpret a missing report as broker latency.
+
 Each payload carries a send timestamp, so latency is end to end (publisher to subscriber). Loss counts expected deliveries still missing after drain; duplicates are counted separately.
 
 Use `--require-p99-below-ms` with a target `--rate` for release qualification. `load` checks the specified endpoints; `compare` checks every row. Both write their report before returning failure if p99 reaches the limit, fewer than 99% of scheduled publishes were sent, any duplicates or losses were observed, or a QoS handshake was still outstanding after drain. Delivery alone does not prove that the publisher received its acknowledgement.
@@ -62,6 +64,19 @@ With the rate limit removed (same 64 pairs), **in-window deliveries/s** rose fro
 
 #### Draining an offline subscriber
 
+The current release comparison (`8bd1490` → `8847eff`) used three mTLS voters on one NVMe/ext4 device. A subscriber disconnected on voter 1, a publisher on voter 2 filled its session with 480 numbered 256-byte QoS 1 messages, and the subscriber resumed on voter 3. Drain time is CONNACK to PINGRESP after the final PUBACK; sync counts sum all three WALs. All runs below received the 480 messages in order with no duplicates.
+
+| Protocol / client ACK behavior | Comparison | Drain time | WAL sync batches |
+| --- | --- | ---: | ---: |
+| MQTT 5 / 16 compact PUBACKs per write | Old → new, default config | 6.20–6.70 s → 1.88–1.94 s | 1,514–1,522 → 159–165 |
+| MQTT 3.1.1 / immediate PUBACK | New, replay window off → on | 6.59–8.25 s → 0.52–0.96 s | 1,470–1,474 → 159–161 |
+
+Each range covers two runs. On the new binary, the first 16 packets reached the socket in **179–183 ms** with the window off and **10–12 ms** with it on, before the client sent its first ACK. The window is [opt-in for upgrade compatibility](cluster.md#upgrades). It is not faster in every run: with 16 PUBACKs per write and the window on, legacy drains ranged from 0.58 to 2.02 s.
+
+If clients send PUBACKs in bursts, also try `set_tcp_nodelay true` (`setTcpNoDelay=true` in Helm). With 16 PUBACKs per write on loopback and standalone disk persistence enabled, MQExtended **and** Mosquitto 2.1.4 took 1.19 s at the default and 7.7 ms with Nagle disabled. The same change on three voters with the replay window on took 0.58 → 0.34 s in one paired run. It can send more small TCP packets; it did not improve live 250/s cluster p99 (168 ms either way).
+
+**Earlier MQTT 3.1.1 comparison:**
+
 Compared release `2331d24` with `8bd1490` on three voters sharing one NVMe/ext4 device. A persistent MQTT 3.1.1 subscriber disconnected on node 1; a publisher on node 2 received PUBACK for 480 numbered, 256-byte QoS 1 messages. The subscriber resumed on node 3 with its original client ID and a 20-message in-flight window. Time starts at CONNACK and ends at the PINGRESP following the last PUBACK. Ranges cover three baseline runs and two final runs with fresh state; WAL sync batches are summed across the three voters during resume.
 
 | Subscriber sends PUBACK | Drain time before → after | WAL sync batches before → after |
@@ -74,6 +89,8 @@ Every run delivered all 480 messages once and in order. The broker does not wait
 For a standalone reference, both brokers ran with `persistence true` and default autosave. With a PUBACK after each PUBLISH, Mosquitto 2.1.4 drained the same 480 messages in **9.4 ms** and MQExtended in **8.5 ms**. With 16 PUBACKs per write they took **1.24 s** and **1.23 s**, respectively (one run per case). Neither standalone broker syncs a quorum before it acknowledges a publish.
 
 #### Live publishers and subscribers
+
+On the same shared-disk setup, `8bd1490` → `8847eff` delivered **159 → 168 ms p99** at 250 publishes/s (32 pairs, 12 s). At 1,000/s (200 pairs, 16 s), the old build measured **2.68 s** and the new one **176 ms and 2.28 s**. One run per case except two final high-rate runs. The new build acknowledged and delivered every publication exactly once after drain; 11 of 3,000 and 94–588 of 16,000 deliveries arrived after the traffic window. The replay changes did **not** solve the 50 ms live target.
 
 `mqx-bench load`, one-to-one persistent QoS 1, 256-byte payloads, three fresh mTLS voters on the same NVMe/ext4 device and 10 s drain. `2331d24` and `8bd1490` ran sequentially on the same host:
 
