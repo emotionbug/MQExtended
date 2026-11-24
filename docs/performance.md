@@ -60,6 +60,23 @@ With the rate limit removed (same 64 pairs), **in-window deliveries/s** rose fro
 
 ### Persistent sessions: shared-disk qualification
 
+#### Draining an offline subscriber
+
+Compared release `2331d24` with `6ca8f2d` on three voters sharing one NVMe/ext4 device. A persistent MQTT 3.1.1 subscriber disconnected on node 1; a publisher on node 2 received PUBACK for 480 numbered, 256-byte QoS 1 messages. The subscriber resumed on node 3 with its original client ID and a 20-message in-flight window. Time starts at CONNACK and ends at the PINGRESP following the last PUBACK. Each range covers two runs with fresh state; WAL sync batches are summed across the three voters during resume.
+
+| Subscriber sends PUBACK | Drain time before → after | WAL sync batches before → after |
+| --- | ---: | ---: |
+| After each PUBLISH | 8.25–17.50 s → 6.15–6.80 s | 1,469–1,487 → 1,111–1,170 |
+| 16 PUBACKs in one write | 10.72–10.89 s → 0.78–1.11 s | 1,490–1,504 → 158–161 |
+
+Every run delivered all 480 messages once and in order. The broker does not wait for a batch or require clients to change how they acknowledge. In a separate run, all three processes were killed after the publisher received its PUBACKs; the restarted cluster delivered all 480 from disk, in order, with `session_present` set. These are backlog drain times, not live-publish latency.
+
+For a standalone reference, both brokers ran with `persistence true` and default autosave. With a PUBACK after each PUBLISH, Mosquitto 2.1.4 drained the same 480 messages in **9.4 ms** and MQExtended in **8.5 ms**. With 16 PUBACKs per write they took **1.24 s** and **1.23 s**, respectively (one run per case). Neither standalone broker syncs a quorum before it acknowledges a publish.
+
+#### Live publishers and subscribers
+
+The `6ca8f2d` experiment also preallocated 256 KiB WAL extents on Linux without extending EOF. We dropped this change: on the **same binary** at 250 publishes/s, alternating runs that refused `fallocate` gave **159–193 ms** delivery p99, versus **2.15–3.22 s** with preallocation enabled. All four runs delivered all 3,000 messages. A short filesystem microbenchmark had favored preallocation; it did not predict the broker result.
+
 With `2331d24`, 32 persistent pairs at 250 publishes/s for 8 s on one shared NVMe/ext4 device produced **2,000 PUBACKs and 2,000 unique deliveries** on every broker. The three-voter delivery p99 was **2.68 s** (2.78 s on `982e258`); 29 deliveries completed during drain. Standalone p99 was **0.22 ms**, Mosquitto **0.19 ms**. `compare` sets `persistence false` on both standalone processes; their sessions survive reconnect, not a crash. The cluster still waits for a durable quorum. These are different guarantees, and the cluster has **not** met the 50 ms persistent target on this disk.
 
 Persistent QoS 1, 200 one-to-one pairs, 256-byte payloads, 30 s of traffic and 10 s configured drain. Release brokers, mutual TLS between the three voters, all three WALs on the same consumer NVMe/ext4 device. These are local measurements under contention, **not a passing release qualification**. Reported latency is the publisher-to-subscriber histogram's p99.

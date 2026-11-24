@@ -2344,7 +2344,6 @@ dependencies = [
  "raft-log",
  "rcgen",
  "rmp-serde",
- "rustix",
  "rustls",
  "serde",
  "sha2 0.10.9",
