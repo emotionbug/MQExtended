@@ -55,7 +55,7 @@ jobs:
             sleep 2
           done
           exit 1
-      - name: Check singleton recovery, pair quorum and broker failover
+      - name: Check singleton restart, two-broker quorum and automatic recovery, and three-voter failover
         run: bash scripts/test-kubernetes.sh
       - name: Diagnose a failed deployment
         if: failure()

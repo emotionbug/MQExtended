@@ -52,7 +52,8 @@ connect_to() {
     # later, and the previous forward's "Forwarding from" line would pass the wait.
     : >"$work/forward.log"
     "${k[@]}" port-forward --address 127.0.0.1 "$1" "29883:$port" >>"$work/forward.log" 2>&1 & forward=$!
-    local end=$((SECONDS+20))
+    local end=$((SECONDS+20)) deadline=${2:-}
+    if [[ -n $deadline ]] && (( deadline < end )); then end=$deadline; fi
     until grep -q 'Forwarding from' "$work/forward.log"; do
         if ! kill -0 "$forward" || (( SECONDS >= end )); then cat "$work/forward.log" >&2; return 1; fi
         sleep 0.2
@@ -60,7 +61,29 @@ connect_to() {
 }
 credentials=(-u device -P chart-test-password -q 1 -t charts/retained)
 publish() { timeout 15 mosquitto_pub "${transport[@]}" "${credentials[@]}" -r -m "$1"; }
-read_retained() { [[ $(mosquitto_sub "${transport[@]}" "${credentials[@]}" --retained-only -C 1 -W 12) == "$1" ]]; }
+read_retained() {
+    local payload budget=${2:-15}
+    if (( budget > 15 )); then budget=15; fi
+    payload=$(timeout --kill-after=2s "${budget}s" mosquitto_sub "${transport[@]}" "${credentials[@]}" \
+        --retained-only -C 1 -W 12) || return
+    if [[ $payload != "$1" ]]; then
+        printf 'Expected retained payload %q, got %q\n' "$1" "$payload" >&2
+        return 1
+    fi
+}
+wait_retained() {
+    local target=$1 expected=$2 end=$((SECONDS+$3)) remaining
+    while (( SECONDS < end )); do
+        # A recovery re-exec can interrupt port-forward. Reconnect for each read.
+        if connect_to "$target" "$end"; then
+            remaining=$((end-SECONDS))
+            if (( remaining > 0 )) && read_retained "$expected" "$remaining"; then return 0; fi
+        fi
+        if (( SECONDS < end )); then sleep 1; fi
+    done
+    printf '%s did not serve retained payload %q within %ss\n' "$target" "$expected" "$3" >&2
+    return 1
+}
 served_certificate() {
     openssl s_client -connect 127.0.0.1:29883 -servername localhost -CAfile "$work/ca.crt" </dev/null 2>/dev/null |
         openssl x509 -noout -fingerprint -sha256
@@ -111,6 +134,18 @@ stop_first pair
 restore_first pair; ready pair 2; connect_to service/pair; read_retained pair
 stop_forward; "${h[@]}" uninstall pair
 use_tls
+install recovery 2 false --set autoRecover.enabled=true
+connect_to pod/recovery-node-1-0; read_retained recovery
+stop_first recovery
+# Ready can still reflect the old lease, but a fresh subscription needs a
+# commit. Retry the read, then publish once and require a QoS 1 ACK.
+wait_retained pod/recovery-node-2-0 recovery 120
+publish recovered-while-alone; read_retained recovered-while-alone
+# Restore the Pod on its original PVC. Read through that Pod directly so the
+# survivor cannot satisfy the assertion.
+restore_first recovery
+wait_retained pod/recovery-node-1-0 recovered-while-alone 30
+stop_forward; "${h[@]}" uninstall recovery
 install ha 2 true
 # When the first broker is down, the MQTT Service must contain only the second,
 # not the additional voter. Pod #2 and voter #3 must still commit writes.
