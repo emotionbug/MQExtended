@@ -41,14 +41,15 @@ use crate::survivor::{
     SurvivorEvent, SurvivorReason, Switch,
 };
 use crate::transport::{
-    APPEND_WINDOW, CLUSTER_ID_FILE, Connection, Endpoint, Frame, Limits, Network, Op, decode,
-    encode, invalid_data, write_control,
+    APPEND_WINDOW, CLUSTER_ID_FILE, Connection, Endpoint, Frame, Limits, Network, Op,
+    SESSION_HEADER_LEN, decode, decode_session_header, encode, invalid_data, write_control,
 };
 use crate::wal::{Wal, WalMetrics};
 use crate::{ClusterConfig, ClusterError, Mesh, NodeEvent, NodeStatus, StateMachine, version};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_WINDOW: usize = 256;
+const HEALTHY_RECOVERY_SWEEP: Duration = Duration::from_secs(30);
 pub(crate) type Leadership = LeaderIdOf<Types>;
 pub(crate) type LogId = LogIdOf<Types>;
 type WriteResponse = Result<Option<Bytes>, String>;
@@ -1002,12 +1003,55 @@ impl<S: StateMachine> Core<S> {
             .min(wait);
         let mut ticks = tokio::time::interval(period);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let endpoint = &self.mesh.endpoint;
+        let mut membership = self.store.status.subscribe();
+        membership.mark_changed();
+        let mut settled = false;
+        let mut next_sweep = Instant::now();
         loop {
             ticks.tick().await;
+            if membership.has_changed().unwrap_or(false) {
+                let status = membership.borrow_and_update();
+                let desired = if status.desired.is_empty() {
+                    &endpoint.seeds
+                } else {
+                    &status.desired
+                };
+                let voters = status
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.role == MemberRole::Voter && m.liveness == NodeStatus::Alive)
+                    .map(|(id, m)| (id, &m.address));
+                settled = !status.joint
+                    && status.members.contains_key(&endpoint.node_id)
+                    && status.members.len() == desired.len()
+                    && voters.eq(desired);
+            }
+            let now = Instant::now();
+            // A routine probe opens a new (normally mTLS) connection to each
+            // peer. A settled voter already has quorum-backed renewal evidence.
+            // Keep an occasional full sweep for conflicting histories/settings.
+            if settled
+                && now < next_sweep
+                && let Some(renewed) = self.recent_renewal(now, wait)
+            {
+                last_viable = last_viable.max(renewed);
+                continue;
+            }
             if let Some(change) = self.check_recovery(wait, &mut last_viable).await? {
                 return Ok(Some(change));
             }
+            next_sweep = now + HEALTHY_RECOVERY_SWEEP;
         }
+    }
+
+    fn recent_renewal(&self, now: Instant, wait: Duration) -> Option<Instant> {
+        if self.repair.load(Ordering::Acquire) {
+            return None;
+        }
+        let until = (*self.safe_until.borrow()).filter(|&until| until > now)?;
+        let renewed = until - self.lease_window();
+        (now.saturating_duration_since(renewed) < wait).then_some(renewed)
     }
 
     fn incarnation_probe(&self, asking: Option<u64>) -> Probe {
@@ -2078,7 +2122,7 @@ impl<S: StateMachine> Core<S> {
             })
             .await
             .map_err(|_| io::ErrorKind::TimedOut)??;
-            let (reader, writer) = tokio::io::split(stream);
+            let (reader, writer) = stream.split_session();
             let (responses, replies) = mpsc::channel(SESSION_WINDOW);
             let (mesh, mesh_rx) = mpsc::channel(SESSION_WINDOW);
             let (append, append_rx) = mpsc::channel(SESSION_WINDOW);
@@ -2113,17 +2157,25 @@ impl<S: StateMachine> Core<S> {
                 result.map_err(io::Error::other)?;
             }
             // Idle sessions are normal. Once a frame begins, bound its receive time.
-            let mut id = [0; 8];
-            id[0] = reader.read_u8().await?;
+            let mut header = [0; SESSION_HEADER_LEN];
+            let received = reader.read(&mut header).await?;
+            if received == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
             let request = timeout(self.request_timeout, async {
-                reader.read_exact(&mut id[1..]).await?;
-                let id = u64::from_be_bytes(id);
-                let op = Op::try_from(reader.read_u8().await?)?;
+                reader.read_exact(&mut header[received..]).await?;
+                let (id, op, len) = decode_session_header(header);
+                let op = Op::try_from(op)?;
                 if id <= latest || matches!(op, Op::Session | Op::Snapshot | Op::Incarnation) {
                     return Err(invalid_data("invalid cluster session request"));
                 }
                 let frame = limits
-                    .read_frame(&mut reader, limits.request(op), matches!(op, Op::Append))
+                    .read_frame_body(
+                        &mut reader,
+                        len,
+                        limits.request(op),
+                        matches!(op, Op::Append),
+                    )
                     .await?;
                 Ok(Request { id, op, frame })
             })
@@ -2670,6 +2722,10 @@ mod tests {
         core.safe_until
             .send_replace(Some(renewal + core.lease_window()));
         assert!(core.incarnation_probe(None).quorum);
+        assert_eq!(
+            core.recent_renewal(Instant::now(), Duration::from_secs(1)),
+            None
+        );
         let mut last_viable = renewal - Duration::from_secs(1);
         assert!(matches!(
             core.check_recovery(Duration::from_secs(1), &mut last_viable)
@@ -3145,14 +3201,13 @@ mod tests {
 
     #[tokio::test]
     async fn remote_schema_mismatch_is_rejected_before_proposal() {
-        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reserve.local_addr().unwrap();
-        drop(reserve);
+        // A single voter never dials its advertised address. Let the OS
+        // choose the listening port at bind time instead of racing to rebind.
         let root = tempfile::tempdir().unwrap();
         let mut config = ClusterConfig::new(
             1,
-            address,
-            BTreeMap::from([(1, address)]),
+            "127.0.0.1:0".parse().unwrap(),
+            BTreeMap::from([(1, "127.0.0.1:1".parse().unwrap())]),
             root.path().join("data"),
             ClusterSecurity::InsecurePlaintext,
         );

@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+futures-util = "0.3"
 getrandom = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 mqx-auth.workspace = true

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, IoSlice};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -20,7 +20,9 @@ use openraft::raft::{
     TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf, ReadHalf, WriteHalf,
+};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit, watch};
 use tokio::time::{Instant, timeout_at};
@@ -38,6 +40,11 @@ use crate::survivor::{Incarnation, Probe, ProbeRequest, Record};
 const MAGIC: &[u8; 4] = b"MQX3";
 pub(crate) const CLUSTER_ID_FILE: &str = "cluster.id";
 const HEADER_LEN: usize = 53;
+// Fixed read-ahead for plaintext sessions, independent of the peer's frame length.
+const SESSION_READ_AHEAD: usize = 4 * 1024;
+// Copy only small TLS frames to avoid sending separate records for header and body.
+const INLINE_FRAME_LEN: usize = 4 * 1024;
+pub(crate) const SESSION_HEADER_LEN: usize = 13;
 pub(crate) const MAX_APPEND_ENTRIES: u64 = 128;
 pub(crate) const APPEND_WINDOW: usize = 8;
 pub(crate) const MAX_CONTROL_FRAME: usize = 64 * 1024;
@@ -535,6 +542,36 @@ impl Connection {
             Self::Tls(stream) => stream.get_ref().0,
         }
     }
+
+    pub(crate) fn split_session(self) -> (impl AsyncRead + Unpin, WriteHalf<Self>) {
+        let plain = matches!(&self, Self::Plain(_));
+        let (reader, writer) = tokio::io::split(self);
+        let reader = if plain {
+            SessionReader::Plain(BufReader::with_capacity(SESSION_READ_AHEAD, reader))
+        } else {
+            // rustls already buffers and decrypts full records.
+            SessionReader::Tls(reader)
+        };
+        (reader, writer)
+    }
+}
+
+enum SessionReader {
+    Plain(BufReader<ReadHalf<Connection>>),
+    Tls(ReadHalf<Connection>),
+}
+
+impl AsyncRead for SessionReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(reader) => Pin::new(reader).poll_read(cx, buf),
+            Self::Tls(reader) => Pin::new(reader).poll_read(cx, buf),
+        }
+    }
 }
 
 impl AsyncRead for Connection {
@@ -562,6 +599,25 @@ impl AsyncWrite for Connection {
         }
     }
 
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        parts: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, parts),
+            Self::Tls(stream) => {
+                let first = parts.iter().find(|part| !part.is_empty());
+                Pin::new(stream).poll_write(cx, first.map_or(&[], |part| &part[..]))
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        // rustls's vectored plaintext path allocates a Vec for multiple slices.
+        matches!(self, Self::Plain(stream) if stream.is_write_vectored())
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
@@ -575,6 +631,72 @@ impl AsyncWrite for Connection {
             Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
+}
+
+pub(crate) fn decode_session_header(header: [u8; SESSION_HEADER_LEN]) -> (u64, u8, u32) {
+    (
+        u64::from_be_bytes(header[..8].try_into().unwrap()),
+        header[8],
+        u32::from_be_bytes(header[9..].try_into().unwrap()),
+    )
+}
+
+// Reuse the coalescing buffer across writes. Vectored sockets never allocate it.
+#[derive(Default)]
+pub(crate) struct SessionFrame(Vec<u8>);
+
+impl SessionFrame {
+    pub(crate) async fn write(
+        &mut self,
+        writer: &mut (impl AsyncWrite + Unpin),
+        id: u64,
+        tag: u8,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let mut header = [0; SESSION_HEADER_LEN];
+        header[..8].copy_from_slice(&id.to_be_bytes());
+        header[8] = tag;
+        header[9..].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        write_frame_parts(writer, &header, body, &mut self.0).await?;
+        writer.flush().await
+    }
+}
+
+async fn write_frame_parts(
+    writer: &mut (impl AsyncWrite + Unpin),
+    header: &[u8],
+    body: &[u8],
+    combined: &mut Vec<u8>,
+) -> io::Result<()> {
+    if body.is_empty() {
+        return writer.write_all(header).await;
+    }
+    if writer.is_write_vectored() {
+        let mut parts = [IoSlice::new(header), IoSlice::new(body)];
+        let mut remaining = &mut parts[..];
+        while remaining.len() > 1 {
+            let written = writer.write_vectored(remaining).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            IoSlice::advance_slices(&mut remaining, written);
+        }
+        return match remaining.first() {
+            Some(tail) => writer.write_all(tail).await,
+            None => Ok(()),
+        };
+    }
+    let total = header.len() + body.len();
+    if total <= INLINE_FRAME_LEN {
+        combined.clear();
+        combined.reserve_exact(INLINE_FRAME_LEN);
+        combined.extend_from_slice(header);
+        combined.extend_from_slice(body);
+        return writer.write_all(combined).await;
+    }
+    // Do not allocate or copy a large body to combine it with the header.
+    writer.write_all(header).await?;
+    writer.write_all(body).await
 }
 
 pub(crate) async fn write_control<T: Serialize>(
@@ -620,7 +742,20 @@ impl Limits {
         max: usize,
         append: bool,
     ) -> io::Result<Frame> {
-        let len = read_length(stream, max as u64).await?;
+        let len = stream.read_u32().await?;
+        self.read_frame_body(stream, len, max, append).await
+    }
+
+    pub(crate) async fn read_frame_body(
+        self,
+        stream: &mut (impl AsyncRead + Unpin),
+        len: u32,
+        max: usize,
+        append: bool,
+    ) -> io::Result<Frame> {
+        if len as usize > max {
+            return Err(invalid_data("cluster frame exceeds the size limit"));
+        }
         // The process-wide budget grows with configured packet sizes. Leave room
         // for one AppendEntries batch so admitted client writes can commit.
         let total = (self.append.max(self.mesh) * 3).clamp(32 * 1024 * 1024, BODY_CAPACITY);
@@ -976,6 +1111,65 @@ impl Mesh {
 mod tests {
     use super::*;
     use crate::node::{Leadership, LogId};
+
+    #[tokio::test]
+    async fn vectored_frame_handles_short_writes_across_header_and_body() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            vectored: usize,
+        }
+
+        impl AsyncWrite for ShortWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let len = bytes.len().min(8);
+                self.bytes.extend_from_slice(&bytes[..len]);
+                Poll::Ready(Ok(len))
+            }
+
+            fn poll_write_vectored(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                parts: &[IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.vectored += 1;
+                let mut remaining = 8;
+                for part in parts {
+                    let len = part.len().min(remaining);
+                    self.bytes.extend_from_slice(&part[..len]);
+                    remaining -= len;
+                }
+                Poll::Ready(Ok(8 - remaining))
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut writer = ShortWriter::default();
+        SessionFrame::default()
+            .write(&mut writer, 0x102, 3, b"payload")
+            .await
+            .unwrap();
+        assert_eq!(writer.vectored, 2);
+        assert_eq!(
+            &writer.bytes[..],
+            b"\0\0\0\0\0\0\x01\x02\x03\0\0\0\x07payload"
+        );
+    }
 
     #[test]
     fn a_fork_rejects_old_raft_and_mesh_headers_but_accepts_the_probe() {

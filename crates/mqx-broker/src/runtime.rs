@@ -17,6 +17,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use mqx_auth::AclFile;
 use mqx_cluster::{Cluster, ClusterConfig, ClusterError, NodeEvent, NodeStatus, StateMachine};
 use mqx_codec::{PacketId, QoS, v5::ReasonCode as R};
@@ -1342,10 +1343,17 @@ impl ReplicatedLog {
         Ok(())
     }
 
+    fn encode_mesh_request(request: &fast::Request) -> Result<Bytes, ClusterError> {
+        rmp_serde::to_vec(request)
+            .map(Bytes::from)
+            .map_err(|error| ClusterError::MeshHandler(error.to_string()))
+    }
+
     async fn request(&self, node: u64, request: &fast::Request) -> Result<(), ClusterError> {
-        let body = rmp_serde::to_vec(request)
-            .map_err(|error| ClusterError::MeshHandler(error.to_string()))?;
-        self.cluster.mesh().request(node, Bytes::from(body)).await?;
+        self.cluster
+            .mesh()
+            .request(node, Self::encode_mesh_request(request)?)
+            .await?;
         Ok(())
     }
 
@@ -1353,37 +1361,60 @@ impl ReplicatedLog {
         // An acknowledged subscription (or ACL change) must already be
         // visible to any existing publisher's local routing replica. A down
         // node cannot host an active session until its next committed Boot.
+        const MAX_IN_FLIGHT: usize = 8;
         let deadline = Instant::now() + self.fence_timeout;
-        for node in self
+        let mut peers = self
             .cluster
             .voter_ids()
             .into_iter()
             .filter(|&node| node != self.owner.node)
-        {
-            let notify = async {
-                loop {
-                    match self.request(node, &fast::Request::Fence(index)).await {
-                        Ok(()) => return Ok(()),
-                        Err(ClusterError::Shutdown) => return Err(ClusterError::Shutdown),
-                        // Refused connections can recover without a Down event.
-                        Err(_) => tokio::time::sleep(Duration::from_millis(30)).await,
-                    }
-                }
-            };
-            // A suspended process can keep TCP open long after the quorum
-            // fenced it. Never wait out a network timeout after applying Down.
-            tokio::select! {
-                biased;
-                result = self.cluster.wait_voter_inactive(node) => result?,
-                result = notify => result?,
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err(ClusterError::WriteUncertain(format!(
-                        "routing fence did not reach node {node}"
-                    )));
-                }
-            }
+            .peekable();
+        let Some(first) = peers.next() else {
+            return Ok(());
+        };
+
+        let body = Self::encode_mesh_request(&fast::Request::Fence(index))?;
+        if peers.peek().is_none() {
+            return self.fence_peer(first, &body, deadline).await;
+        }
+        // Peer mesh lanes are independent. Bound the fan-out and give even
+        // the later peers the same deadline, not a fresh timeout per peer.
+        let mut fences = stream::iter(std::iter::once(first).chain(peers))
+            .map(|node| self.fence_peer(node, &body, deadline))
+            .buffer_unordered(MAX_IN_FLIGHT);
+        while let Some(result) = fences.next().await {
+            result?;
         }
         Ok(())
+    }
+
+    async fn fence_peer(
+        &self,
+        node: u64,
+        body: &Bytes,
+        deadline: Instant,
+    ) -> Result<(), ClusterError> {
+        let expired =
+            || ClusterError::WriteUncertain(format!("routing fence did not reach node {node}"));
+        let notify = async {
+            while Instant::now() < deadline {
+                match self.cluster.mesh().request(node, body.clone()).await {
+                    Ok(_) => return Ok(()),
+                    Err(ClusterError::Shutdown) => return Err(ClusterError::Shutdown),
+                    // Refused connections can recover without a Down event.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(30)).await,
+                }
+            }
+            Err(expired())
+        };
+        // A suspended process can keep TCP open long after the quorum
+        // fenced it. Never wait out a network timeout after applying Down.
+        tokio::select! {
+            biased;
+            result = self.cluster.wait_voter_inactive(node) => result,
+            result = notify => result,
+            _ = tokio::time::sleep_until(deadline) => Err(expired()),
+        }
     }
 
     async fn ensure_boot(&self) -> Result<(), BrokerError> {
@@ -1896,6 +1927,111 @@ async fn cluster_maintenance(
 mod tests {
     use super::*;
     use crate::{inbox::Publisher, state::SessionSettings};
+
+    #[tokio::test]
+    async fn routing_fences_overlap_and_wait_for_every_live_peer() {
+        const INDEX: u64 = 42;
+        let storage = tempfile::tempdir().unwrap();
+        let sockets = [1, 2, 3].map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let peers: BTreeMap<_, _> = (1..=3)
+            .zip(sockets.iter().map(|socket| socket.local_addr().unwrap()))
+            .collect();
+        let config = |id| {
+            ClusterConfig::new(
+                id,
+                peers[&id],
+                peers.clone(),
+                storage.path().join(id.to_string()),
+                mqx_cluster::ClusterSecurity::InsecurePlaintext,
+            )
+        };
+        let machine = |node| {
+            let config = Arc::new(BrokerConfig::default());
+            Machine {
+                state: State::new(config.clone()),
+                config: Arc::new(ConfigCell::new(config)),
+                owner: Owner {
+                    node,
+                    incarnation: new_token().unwrap(),
+                },
+                runtime: Arc::default(),
+                applied: watch::Sender::new(0),
+                abandoned: mpsc::unbounded_channel().0,
+            }
+        };
+        drop(sockets);
+        let (broker, first, last) = tokio::join!(
+            Broker::clustered(BrokerConfig::default(), config(1)),
+            Cluster::start(config(2), machine(2)),
+            Cluster::start(config(3), machine(3)),
+        );
+        let (broker, first, last) = (broker.unwrap(), first.unwrap(), last.unwrap());
+        let Log::Replicated(log) = &broker.0.log else {
+            unreachable!()
+        };
+        let arrived = Arc::new(tokio::sync::Barrier::new(3));
+        let release_first = Arc::new(Notify::new());
+        let release_last = Arc::new(Notify::new());
+        for (peer, release) in [(&first, &release_first), (&last, &release_last)] {
+            let arrived = arrived.clone();
+            let release = release.clone();
+            peer.mesh()
+                .register_handler(move |from, body| {
+                    let arrived = arrived.clone();
+                    let release = release.clone();
+                    async move {
+                        assert_eq!(from, 1);
+                        match rmp_serde::from_slice(&body).unwrap() {
+                            fast::Request::Fence(INDEX) => {
+                                arrived.wait().await;
+                                release.notified().await;
+                            }
+                            fast::Request::SysSample => {}
+                            _ => panic!("unexpected mesh request"),
+                        }
+                        Ok(Bytes::new())
+                    }
+                })
+                .unwrap();
+        }
+
+        let mut events = log.cluster.subscribe_node_events();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while [2, 3]
+                .into_iter()
+                .any(|node| log.cluster.voter_status(node) != Some(NodeStatus::Alive))
+            {
+                events.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("both remote voters must become live");
+
+        let mut fence = std::pin::pin!(log.fence_peers(INDEX));
+        tokio::select! {
+            result = &mut fence => panic!("fence finished without overlapping requests: {result:?}"),
+            _ = arrived.wait() => {}
+        }
+
+        // A later request along the same ordered mesh lane proves that the
+        // first fence response has reached this node. The other peer is held.
+        release_first.notify_one();
+        let marker = ReplicatedLog::encode_mesh_request(&fast::Request::SysSample).unwrap();
+        tokio::select! {
+            biased;
+            result = &mut fence => panic!("fence finished before the last live peer: {result:?}"),
+            result = log.cluster.mesh().request(2, marker) => { result.unwrap(); }
+        }
+        assert!(futures_util::poll!(&mut fence).is_pending());
+        release_last.notify_one();
+        fence.await.unwrap();
+
+        let (local, first, last) =
+            tokio::join!(broker.shutdown_cluster(), first.shutdown(), last.shutdown());
+        local.unwrap();
+        first.unwrap();
+        last.unwrap();
+    }
 
     #[tokio::test]
     async fn an_expired_mqtt5_session_cannot_block_cluster_admission() {

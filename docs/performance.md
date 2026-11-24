@@ -48,6 +48,18 @@ done
 
 The client endpoints speak plain MQTT without credentials; use isolated test listeners or protected tunnels to staging, not an anonymous listener on the production network. Tunnels and the client host contribute to end-to-end latency. Load runs create persistent sessions; use disposable staging state.
 
+### Cluster control traffic
+
+Five voters on one Linux host, debug brokers, fresh WALs on the same disk. Compared with `3e464a7` using the same 50 ms heartbeat, 250 ms lease interval and 5 s recovery timeout. These measurements cover idle traffic and subscription setup, not maximum publish throughput.
+
+With plaintext peers and no MQTT traffic for 32 s, the five brokers made **20 peer `connect()` calls instead of 2,560**. The window included one periodic full sweep. Peer socket read/write calls fell from **132,114 to 37,185** in the same trace. These are syscall entries, including would-block returns, not packet counts.
+
+With mutual TLS and 4 ms of added delay in each direction between voters, the time from `SUBSCRIBE` to `SUBACK` fell from **64.9 to 35.1 ms at p50** and **93.7 to 50.6 ms at p95**. Each value is the median of three runs. One MQTT client subscribed to 120 distinct topics sequentially on the leader after 10 warm-up subscriptions. No syscall tracer ran during timing.
+
+A two-voter plaintext control disabled automatic recovery to isolate peer framing from recovery scans. Over 8 idle seconds, peer read/write syscalls fell from 4,806 to 1,539. With tracing off, median subscription latency barely changed (15.2 vs. 15.0 ms); the three runs' p95 ranges overlapped (17–61 vs. 18–64 ms).
+
+A plaintext QoS 1 control used 32 publisher/subscriber pairs at 250 publishes/s for 8 s. Both builds acknowledged and delivered all 2,000 messages once with clean sessions, and again with persistent sessions. Clean-session delivery p99 stayed at 2.49 ms. The persistent run still exceeded 50 ms p99 (201 ms after the change); use separate disks and the release qualification above before setting a deployment target.
+
 ### Historical plaintext baseline
 
 Historical baseline: release builds, three nodes on one 12-thread laptop, **plaintext** loopback peer connections, WALs on a consumer NVMe (ext4), 256-byte payloads, 10-second runs. The host also ran an emulator and unrelated builds. These are observations under contention, not bounds on production latency. p99 end-to-end latency in milliseconds; every row delivered every message with no duplicates.

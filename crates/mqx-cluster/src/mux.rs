@@ -10,7 +10,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::{Instant, sleep_until, timeout_at};
 
-use crate::transport::{Connection, Limits, Op, invalid_data};
+use crate::transport::{
+    Connection, Limits, Op, SESSION_HEADER_LEN, SessionFrame, decode_session_header, invalid_data,
+};
 
 const IN_FLIGHT: usize = 256;
 
@@ -116,7 +118,7 @@ impl Client {
         #[cfg(not(unix))]
         let probe = None;
         let task = tokio::spawn(async move {
-            let (rx_socket, tx_socket) = tokio::io::split(stream);
+            let (rx_socket, tx_socket) = stream.split_session();
             let pending = Pending::default();
             // A caller may time out or be dropped before its reply arrives (e.g.
             // Raft's heartbeat deadline). Allow the server's frame read,
@@ -182,6 +184,7 @@ impl Client {
         reply_budget: Duration,
     ) -> io::Result<()> {
         let mut sequence = 0u64;
+        let mut frame = SessionFrame::default();
         while let Some(mut call) = calls.recv().await {
             let (reply, permit) = call.response.take().unwrap();
             if reply.is_closed() {
@@ -204,10 +207,6 @@ impl Client {
             sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| invalid_data("cluster request sequence exhausted"))?;
-            let mut header = [0u8; 13];
-            header[..8].copy_from_slice(&sequence.to_be_bytes());
-            header[8] = call.op as u8;
-            header[9..].copy_from_slice(&(call.body.len() as u32).to_be_bytes());
             let flushed = if matches!(call.op, Op::MeshSend) {
                 Some((reply, permit))
             } else {
@@ -222,11 +221,10 @@ impl Client {
                 );
                 None
             };
-            timeout_at(call.deadline, async {
-                writer.write_all(&header).await?;
-                writer.write_all(&call.body).await?;
-                writer.flush().await
-            })
+            timeout_at(
+                call.deadline,
+                frame.write(&mut writer, sequence, call.op as u8, &call.body),
+            )
             .await
             .map_err(|_| io::ErrorKind::TimedOut)??;
             if let Some((reply, _permit)) = flushed {
@@ -241,8 +239,10 @@ impl Client {
         limits: Limits,
         pending: &Pending,
     ) -> io::Result<()> {
+        let mut header = [0; SESSION_HEADER_LEN];
         loop {
-            let id = reader.read_u64().await?;
+            reader.read_exact(&mut header).await?;
+            let (id, status, len) = decode_session_header(header);
             // Keep the entry until the entire frame arrives. A connection that
             // stalls after the ID still needs to expire and reclaim its slot.
             let op = pending
@@ -252,13 +252,12 @@ impl Client {
                 .get(&id)
                 .ok_or_else(|| invalid_data("unexpected cluster response id"))?
                 .op;
-            let status = reader.read_u8().await?;
             let max = match status {
                 0 => limits.response(op),
                 1 => crate::transport::MAX_CONTROL_FRAME,
                 _ => return Err(invalid_data("unknown cluster response status")),
             };
-            let body = limits.read_frame(&mut reader, max, false).await?;
+            let body = limits.read_frame_body(&mut reader, len, max, false).await?;
             let result = if status == 0 {
                 Ok(body.bytes)
             } else {
@@ -300,6 +299,7 @@ pub(crate) async fn write_responses(
     mut responses: mpsc::Receiver<Response>,
     budget: Duration,
 ) -> io::Result<()> {
+    let mut frame = SessionFrame::default();
     while let Some(response) = responses.recv().await {
         let (status, body) = match response.body {
             Ok(body) => (0, body),
@@ -308,17 +308,9 @@ pub(crate) async fn write_responses(
                 (1, Bytes::from_static(b"cluster RPC rejected"))
             }
         };
-        let mut header = [0u8; 13];
-        header[..8].copy_from_slice(&response.id.to_be_bytes());
-        header[8] = status;
-        header[9..].copy_from_slice(&(body.len() as u32).to_be_bytes());
-        tokio::time::timeout(budget, async {
-            writer.write_all(&header).await?;
-            writer.write_all(&body).await?;
-            writer.flush().await
-        })
-        .await
-        .map_err(|_| io::ErrorKind::TimedOut)??;
+        tokio::time::timeout(budget, frame.write(&mut writer, response.id, status, &body))
+            .await
+            .map_err(|_| io::ErrorKind::TimedOut)??;
     }
     Ok(())
 }
@@ -326,6 +318,49 @@ pub(crate) async fn write_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fragmented_replies_keep_their_frame_boundaries() {
+        let (mut peer, reader) = tokio::io::duplex(7);
+        let reader = tokio::io::BufReader::with_capacity(64, reader);
+        let limits = Limits {
+            command: 1024,
+            append: 1024,
+            mesh: 1024,
+        };
+        let pending = Pending::default();
+        let permits = Arc::new(Semaphore::new(2));
+        let (first, first_reply) = oneshot::channel();
+        let (second, second_reply) = oneshot::channel();
+        for (id, reply) in [(1, first), (2, second)] {
+            pending.insert(
+                id,
+                PendingReply {
+                    op: Op::Write,
+                    reply,
+                    _permit: permits.clone().try_acquire_owned().unwrap(),
+                    expires: Instant::now() + Duration::from_secs(5),
+                },
+            );
+        }
+        let send = async move {
+            let mut frame = SessionFrame::default();
+            frame.write(&mut peer, 2, 0, b"second").await.unwrap();
+            frame.write(&mut peer, 1, 1, b"rejected").await.unwrap();
+        };
+        let ((), end) = tokio::join!(send, Client::read_replies(reader, limits, &pending));
+        assert_eq!(end.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert!(matches!(
+            first_reply.await.unwrap(),
+            Err(CallError::Remote(error)) if error.to_string() == "rejected"
+        ));
+        let second = second_reply
+            .await
+            .unwrap()
+            .map_err(io::Error::from)
+            .unwrap();
+        assert_eq!(second.as_ref(), b"second");
+    }
 
     #[tokio::test]
     async fn a_stalled_peer_releases_the_call_window_and_reconnects() {
