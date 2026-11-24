@@ -25,6 +25,8 @@ Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExte
 | `cluster_join true` | Start an empty node as a new member of a running cluster instead of bootstrapping one | false |
 | `cluster_membership_generation <n>` | Version of the `cluster_peer` list; raise it to request a membership change | 0 |
 | `cluster_state_format <1\|2>` | On-disk and wire format this node writes; see [upgrades](#upgrades) | 2 |
+| `auto_recover true` | Recover from quorum loss, a lost peer or unusable local state without operator action, giving up consistency; see [automatic recovery](#automatic-recovery). Also applies to a standalone broker | false |
+| `auto_recover_timeout <ms>` | How long a node waits without quorum before it continues alone; requires `auto_recover true` | `cluster_lease_timeout` |
 
 Example for node 2 of three:
 
@@ -55,7 +57,7 @@ To renew a certificate, replace the files in place (write a new file and rename 
 - Keep `cluster_bind` on a private network even with TLS. With `cluster_insecure_plaintext true` peer traffic is neither authenticated nor encrypted, and anyone who can reach the port can rewrite broker state; use it only on an isolated network or for tests.
 - The MQTT listeners sit behind your load balancer. Any node can serve any client, so the balancer needs no stickiness; least-connections spreads reconnect storms best.
 - Probe `GET /api/v1/mqx/ready` on an HTTP API listener, with credentials and a read ACL for just that path. It checks the same gate as MQTT admission: security registration and an unexpired quorum-backed voter lease. A partition may remain ready until that lease expires. A TCP connect or a successful cluster-status query only proves the process is up.
-- One voter can serve and persist data on its own, but has no failover. Two voters require both for a majority. Use three voters to keep serving through one failure. Never turn an isolated member of a larger cluster into a new single-voter cluster.
+- One voter can serve and persist data on its own, but has no failover. Two voters require both for a majority. Use three voters to keep serving through one failure, or enable [automatic recovery](#automatic-recovery) if you accept losing writes to keep serving. Without it, never turn an isolated member of a larger cluster into a new single-voter cluster.
 
 ## Quick start on EKS
 
@@ -64,9 +66,11 @@ The [Helm chart](../deploy/helm/mqextended) starts a new cluster without asking 
 | Helm values | MQTT-serving Pods | Total voters | If one voter stops |
 | --- | ---: | ---: | --- |
 | Defaults (`replicaCount=1`) | 1 | 1 | No service until that Pod restarts with its PVC. |
-| `replicaCount=2` | 2 | 2 | No quorum for writes; admission closes after the lease expires. Restart the missing voter with its PVC. |
+| `replicaCount=2` | 2 | 2 | No quorum for writes; admission closes after the lease expires. Restart the missing voter with its PVC. With `autoRecover.enabled=true`, the remaining Pod continues alone ([automatic recovery](#automatic-recovery)). |
 | `replicaCount=2,additionalVoter.enabled=true` | 2 | 3 | The remaining majority serves MQTT. If one serving Pod fails, **one MQTT Pod plus the additional voter** can still commit writes. |
 | `replicaCount=3` | 3 | 3 | The two survivors keep serving; any voter can receive MQTT traffic. |
+
+Add `autoRecover.enabled=true` to any topology to enable [automatic recovery](#automatic-recovery).
 
 The additional voter is a full replica, not a lightweight witness. Give each voter its own schedulable worker and volume. Spread workers and voters across availability zones if you need to survive loss of a zone. An EBS volume can reattach only in its own zone; a singleton cannot fail over across zones.
 
@@ -165,7 +169,19 @@ To add a node:
 
 To remove a node, delete its `cluster_peer` line on every remaining voter, raise `cluster_membership_generation`, and send SIGHUP. The removed node disconnects its MQTT clients (they reconnect through the load balancer) but keeps answering the HTTP status endpoints; stop it once the cluster lists its id as retired.
 
-To replace a node that died for good, do both in one change: a new id joins as above, and the desired peer list leaves out the dead id. A retired id stays retired across restarts; a node started with a retired id or with the data directory of a removed node is refused. If a majority is lost, bring the missing voters back. Re-bootstrapping a cluster that still has data discards it.
+To replace a node that died for good, do both in one change: a new id joins as above, and the desired peer list leaves out the dead id. A retired id stays retired across restarts; a node started with a retired id or with the data directory of a removed node is refused. If a majority is lost, bring the missing voters back, or let [automatic recovery](#automatic-recovery) continue without them. Re-bootstrapping a cluster that still has data discards it.
+
+## Automatic recovery
+
+With `auto_recover true` on every node, the cluster returns to serving by itself after any failure that leaves at least one node running. No step needs an operator. The price is consistency: writes that only reached a discarded branch are lost, even ones the client already saw acknowledged. Enable it when uninterrupted service matters more than every message, for example a two-node cluster that exists to share load.
+
+- **Losing quorum.** When a node has had no quorum, and no reachable member that has one, for `auto_recover_timeout`, it restarts itself as a single-voter cluster from everything it has applied. Clients connected to it reconnect. The wills of clients on the lost nodes are published once, as after any node loss.
+- **Coming back.** A node that returns asks its configured peers which branch continued. A branch that kept committing after the split wins. A majority that kept serving through a partition therefore beats the isolated node, and a node that continued alone beats a peer that crashed. Between two branches that both continued, the one with more voters wins, then the later one, then the one started by the lower node id. The losing node moves its data to `<cluster_data_dir>/discarded/`, rejoins as a learner, and votes and admits clients only after it has caught up. The cluster grows back to the configured `cluster_peer` list on its own, so a later failure can be recovered again.
+- **Unusable local state.** A node whose data directory cannot be loaded (a damaged WAL or snapshot, an identity for another node id, an unknown format version) moves it to `discarded/` and rejoins as an empty node. If no peer answers within six times `auto_recover_timeout`, it starts serving with empty state.
+- **Crashes during recovery.** Switching to a new branch is atomic on disk: a crash before the switch is published leaves the old state in place, and the next start completes a published switch. `discarded/` holds only the most recent copy, so repeated failures don't fill the disk.
+- **Process failures.** A runtime failure the broker cannot repair in place exits non-zero. The shipped systemd unit (`Restart=on-failure`, `RestartSec=5s`) and Kubernetes restart it. Configuration errors still stop the broker, because a restart can't fix them.
+
+Give every node the same `auto_recover` settings; a node logs a warning when a peer's differ. A retired node id stays retired: removing a node is a deliberate operator decision. `/api/v1/mqx/cluster` reports `auto_recover`, the branch `incarnation` and `last_survivor_event`, and Prometheus exports `mqx_cluster_auto_recover`, `mqx_cluster_incarnation` and `mqx_cluster_last_recovery_timestamp_seconds{reason=…}`, where the reason is `peer_unreachable`, `peer_won` or `unusable_state`.
 
 ## Upgrades
 
@@ -183,6 +199,8 @@ Also use a cold upgrade when crossing the introduction of `SubscribeDollarRoot`,
 Do not enable `mosquitto_sparkplug_aware` until every node runs a build that supports it. The first matching birth publication can write `ReceiveBirth` or `ForwardBirth` to the log. Existing log entries are not reinterpreted when you enable the plugin.
 
 Enable `auth-plug` or `go-auth` only once every node runs a build that supports it. Their ACL checks write `Authorize` and `ResolveVerdicts` entries, and the sessions of their clients carry verdicts and waiting deliveries that an older build cannot replay. Every node applies those entries through its own copy of the plugin, so add, remove or reconfigure a plugin with the whole cluster stopped. A node without the plugin would decide differently from the others. Existing log entries are not reinterpreted when you enable one.
+
+Enable `auto_recover` only once every node runs a build that supports it. Its branch identity files use a format an older build refuses to start with.
 
 ## What clients observe when a node fails
 

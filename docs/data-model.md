@@ -28,6 +28,7 @@ A message to a persistent session is reserved for sending in the same commit tha
 - **Apply runs on every node, in log order.** Side effects of an applied command (closing a taken-over connection, publishing a will) must check whether this node is the one that should act; the state itself is identical everywhere.
 - **`submit` can be uncertain.** When a proposal may have committed but the reply was lost, `submit` returns `WriteUncertain`. Commands therefore carry the identity needed to be applied idempotently (client id + epoch, message id), so a retry cannot double-apply.
 - **Node `Down` is liveness, not membership.** A lease expiry commits a `Down` event at one log index on every node; the node stays a Raft voter. A restarted node renews its lease and is marked `Alive`.
+- **[Automatic recovery](cluster.md#automatic-recovery) branches the log, never rewrites it.** A node that continues without quorum starts a new cluster identity (`cluster.id`, a higher incarnation, and its lineage) from its applied state. Peers on another branch refuse its traffic, and a losing branch is discarded whole rather than merged.
 - **Peers authenticate with mutual TLS.** Node certificates carry Common Name `mqx-node-<id>`; a peer may only speak for the id in its certificate. Plaintext peer traffic is an explicit opt-in ([cluster](cluster.md#network)).
 
 ## On-disk layout
@@ -37,8 +38,11 @@ A Raft cluster, including one configured with a single voter, uses the layout be
 ```text
 <data_dir>/
 ├── node.mpk        # node id and the static bootstrap peers (msgpack)
+├── cluster.id      # cluster identity digest; peers with another digest are refused
 ├── wal/            # Raft log entries, vote, commit frontier (raft-log chunk files)
-└── snapshot.mpk    # Raft snapshot metadata, node leases, application state
+├── snapshot.mpk    # Raft snapshot metadata, node leases, application state
+├── incarnation.mpk # auto_recover only: branch counter, founder, lineage, last recovery event
+└── discarded/      # auto_recover only: the most recently discarded state
 ```
 
 Entries and votes are fsynced before they are acknowledged. Commit frontiers are coalesced into the next required WAL sync, not synced separately before apply. Restart restores the snapshot and replays the locally recorded committed tail; Raft reestablishes any newer commit frontier. A snapshot is written to a temporary file, fsynced, renamed and the directory fsynced before the log is compacted behind it.
