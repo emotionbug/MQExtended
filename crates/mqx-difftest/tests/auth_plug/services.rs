@@ -53,6 +53,7 @@ fn port() -> u16 {
 
 struct Daemon {
     port: u16,
+    log: PathBuf,
     // Closing the test binary's stdin pipes on exit also cleans up after a panic.
     _lease: ChildStdin,
 }
@@ -86,6 +87,7 @@ impl Daemon {
             {
                 return Self {
                     port,
+                    log,
                     _lease: lease,
                 };
             }
@@ -178,99 +180,146 @@ fn sql_seed() -> String {
 }
 
 pub(super) fn postgres() -> u16 {
-    static SERVER: LazyLock<Daemon> = LazyLock::new(|| {
-        let bin = path("MOSQUITTO_AUTH_PLUG_POSTGRES");
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        run(Command::new(bin.join("initdb"))
-            .args([
-                "--auth=trust",
-                "--username=mqx",
-                "--no-locale",
-                "--encoding=UTF8",
-                "-D",
-            ])
-            .arg(&data));
-        let port = port();
-        let daemon = Daemon::start(
-            Command::new(bin.join("postgres"))
-                .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-k", "", "-D"])
-                .arg(&data),
-            dir,
-            port,
-        );
-        run(Command::new(bin.join("psql")).args([
-            "-X",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-U",
-            "mqx",
-            "-d",
-            "postgres",
-            "-c",
-            &sql_seed(),
-        ]));
-        daemon
-    });
+    static SERVER: LazyLock<Daemon> = LazyLock::new(|| start_postgres(false));
     SERVER.port
 }
 
+#[allow(dead_code)] // Used by the go_auth test binary.
+pub(super) fn traced_postgres() -> (u16, &'static std::path::Path) {
+    static SERVER: LazyLock<Daemon> = LazyLock::new(|| start_postgres(true));
+    (SERVER.port, &SERVER.log)
+}
+
+fn start_postgres(trace: bool) -> Daemon {
+    let bin = path("MOSQUITTO_AUTH_PLUG_POSTGRES");
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    run(Command::new(bin.join("initdb"))
+        .args([
+            "--auth=trust",
+            "--username=mqx",
+            "--no-locale",
+            "--encoding=UTF8",
+            "-D",
+        ])
+        .arg(&data));
+    let port = port();
+    let mut command = Command::new(bin.join("postgres"));
+    command
+        .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-k", "", "-D"])
+        .arg(&data);
+    if trace {
+        command.args(["-c", "log_statement=all"]);
+    }
+    let daemon = Daemon::start(&command, dir, port);
+    // PostgreSQL can listen before startup completes and reject the first
+    // database connection. Wait for the server's protocol readiness signal.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = Command::new(bin.join("pg_isready"));
+    ready.args([
+        "-q",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-U",
+        "mqx",
+        "-d",
+        "postgres",
+    ]);
+    while !ready.status().unwrap().success() {
+        assert!(
+            Instant::now() < deadline,
+            "PostgreSQL did not become ready:\n{}",
+            fs::read_to_string(&daemon.log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    run(Command::new(bin.join("psql")).args([
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-U",
+        "mqx",
+        "-d",
+        "postgres",
+        "-c",
+        &sql_seed(),
+    ]));
+    daemon
+}
+
 pub(super) fn mysql() -> u16 {
-    static SERVER: LazyLock<Daemon> = LazyLock::new(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let usr = root().join("usr");
-        let data = dir.path().join("data");
-        let socket = dir.path().join("server.sock");
-        let basedir = format!("--basedir={}", usr.display());
-        let datadir = format!("--datadir={}", data.display());
-        let socket = format!("--socket={}", socket.display());
-        let user = Command::new("id").arg("-un").output().unwrap();
-        assert!(user.status.success());
-        let user = std::str::from_utf8(&user.stdout).unwrap().trim();
-        run(tool("usr/bin/mariadb-install-db").args([
-            "--no-defaults",
-            &basedir,
-            &datadir,
-            &format!("--auth-root-socket-user={user}"),
-            "--skip-test-db",
-            "--skip-name-resolve",
-        ]));
-        let port = port();
-        let daemon = Daemon::start(
-            tool("usr/sbin/mariadbd").args([
-                "--no-defaults",
-                &basedir,
-                &datadir,
-                &socket,
-                "--bind-address=127.0.0.1",
-                "--skip-name-resolve",
-                &format!("--pid-file={}/server.pid", dir.path().display()),
-                &format!("--port={port}"),
-            ]),
-            dir,
-            port,
-        );
-        let sql = format!(
-            "CREATE DATABASE mqtt; CREATE USER 'mqx'@'127.0.0.1' IDENTIFIED BY 'fixture';\
+    static SERVER: LazyLock<(Daemon, PathBuf)> = LazyLock::new(|| start_mysql(false));
+    SERVER.0.port
+}
+
+#[allow(dead_code)] // Used by the go_auth test binary.
+pub(super) fn traced_mysql() -> (u16, &'static std::path::Path) {
+    static SERVER: LazyLock<(Daemon, PathBuf)> = LazyLock::new(|| start_mysql(true));
+    (SERVER.0.port, &SERVER.1)
+}
+
+fn start_mysql(trace: bool) -> (Daemon, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let usr = root().join("usr");
+    let data = dir.path().join("data");
+    let socket = dir.path().join("server.sock");
+    let basedir = format!("--basedir={}", usr.display());
+    let datadir = format!("--datadir={}", data.display());
+    let tmpdir = format!("--tmpdir={}", dir.path().display());
+    let socket = format!("--socket={}", socket.display());
+    let user = Command::new("id").arg("-un").output().unwrap();
+    assert!(user.status.success());
+    let user = std::str::from_utf8(&user.stdout).unwrap().trim();
+    run(tool("usr/bin/mariadb-install-db").args([
+        "--no-defaults",
+        &basedir,
+        &datadir,
+        &tmpdir,
+        &format!("--auth-root-socket-user={user}"),
+        "--skip-test-db",
+        "--skip-name-resolve",
+    ]));
+    let port = port();
+    let log = dir.path().join("queries.log");
+    let mut command = tool("usr/sbin/mariadbd");
+    command.args([
+        "--no-defaults",
+        &basedir,
+        &datadir,
+        &tmpdir,
+        &socket,
+        "--bind-address=127.0.0.1",
+        "--skip-name-resolve",
+        &format!("--pid-file={}/server.pid", dir.path().display()),
+        &format!("--port={port}"),
+    ]);
+    if trace {
+        command
+            .arg("--general-log")
+            .arg(format!("--general-log-file={}", log.display()));
+    }
+    let daemon = Daemon::start(&command, dir, port);
+    let sql = format!(
+        "CREATE DATABASE mqtt; CREATE USER 'mqx'@'127.0.0.1' IDENTIFIED BY 'fixture';\
              GRANT SELECT ON mqtt.* TO 'mqx'@'127.0.0.1'; USE mqtt; {}",
-            sql_seed()
-        );
-        run(tool("usr/bin/mariadb").args([
-            "--no-defaults",
-            "--protocol=socket",
-            &socket,
-            "-u",
-            user,
-            "-e",
-            &sql,
-        ]));
-        daemon
-    });
-    SERVER.port
+        sql_seed()
+    );
+    run(tool("usr/bin/mariadb").args([
+        "--no-defaults",
+        "--protocol=socket",
+        &socket,
+        "-u",
+        user,
+        "-e",
+        &sql,
+    ]));
+    (daemon, log)
 }
 
 pub(super) fn ldap() -> u16 {

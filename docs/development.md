@@ -27,7 +27,7 @@ Build on the oldest Linux userspace you intend to support, or on the deployment 
 From the repository root, stage into a temporary directory as a regular user:
 
 ```sh
-work=$(mktemp -d)
+work=$(mktemp -d "$HOME/mqx-stage.XXXXXX")
 bundle="$work/bundle"
 ./scripts/stage-linux.sh "$bundle"
 (cd "$bundle" && sha256sum --check --strict SHA256SUMS)
@@ -64,16 +64,23 @@ Connect a local MQTT client to `127.0.0.1:28883`, then stop the broker with Ctrl
 Differential tests run the real Mosquitto 2.1.4. Its CMake build needs cJSON as a CMake package even when you only want the broker, and the plugin directory needs SQLite. The `password_file` and `acl_file` support you compare against is compiled into the broker from `plugins/password-file` and `plugins/acl-file` regardless of `WITH_PLUGINS`, so turning plugins off is safe.
 
 ```sh
-git clone --depth 1 https://github.com/DaveGamble/cJSON.git /tmp/cJSON
-cmake -S /tmp/cJSON -B /tmp/cJSON/build -DCMAKE_INSTALL_PREFIX=/tmp/cjson-install \
-      -DENABLE_CJSON_TEST=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-cmake --build /tmp/cJSON/build && cmake --install /tmp/cJSON/build
+reference="$HOME/mqx-reference"
+mkdir -p "$reference/tmp"
+export TMPDIR="$reference/tmp"
+export MOSQUITTO_SRC="$reference/mosquitto"
+export MOSQUITTO_BUILD_DIR="$MOSQUITTO_SRC/build"
+export MOSQUITTO_CJSON_INCLUDE="$reference/cjson-install/include"
 
-git clone --depth 1 -b v2.1.4 https://github.com/eclipse-mosquitto/mosquitto.git /tmp/mosquitto
-cmake -S /tmp/mosquitto -B /tmp/mosquitto/build -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+git clone --depth 1 https://github.com/DaveGamble/cJSON.git "$reference/cJSON"
+cmake -S "$reference/cJSON" -B "$reference/cJSON/build" -DCMAKE_INSTALL_PREFIX="$reference/cjson-install" \
+      -DENABLE_CJSON_TEST=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake --build "$reference/cJSON/build" && cmake --install "$reference/cJSON/build"
+
+git clone --depth 1 -b v2.1.4 https://github.com/eclipse-mosquitto/mosquitto.git "$MOSQUITTO_SRC"
+cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_BUILD_DIR" -DCMAKE_PREFIX_PATH="$reference/cjson-install" \
       -DWITH_DOCS=OFF -DWITH_TESTS=OFF -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF \
       -DWITH_WEBSOCKETS=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/mosquitto/build -j"$(nproc)"
+cmake --build "$MOSQUITTO_BUILD_DIR" -j"$(nproc)"
 ```
 
 The binaries land in `build/src/mosquitto`, `build/client/mosquitto_{pub,sub}` and `build/apps/mosquitto_passwd/mosquitto_passwd`. Point `MOSQUITTO_BUILD_DIR` at `build/`. The source tree is also the reference you port from; keep it next to the build.
@@ -81,19 +88,21 @@ The binaries land in `build/src/mosquitto`, `build/client/mosquitto_{pub,sub}` a
 The `mqx-ws` differential test needs a second build with Mosquitto's built-in WebSocket support; point `MOSQUITTO_WS_BUILD_DIR` at it:
 
 ```sh
-cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-ws -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+export MOSQUITTO_WS_BUILD_DIR="$MOSQUITTO_SRC/build-ws"
+cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_WS_BUILD_DIR" -DCMAKE_PREFIX_PATH="$reference/cjson-install" \
       -DWITH_WEBSOCKETS=ON -DWITH_WEBSOCKETS_BUILTIN=ON -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
       -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/mosquitto/build-ws -j"$(nproc)"
+cmake --build "$MOSQUITTO_WS_BUILD_DIR" -j"$(nproc)"
 ```
 
 The `$SYS` and HTTP API differential tests need a third build with `WITH_HTTP_API=ON`, which links libmicrohttpd (`libmicrohttpd-dev`); point `MOSQUITTO_HTTP_BUILD_DIR` at it:
 
 ```sh
-cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-http -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
-      -DWITH_HTTP_API=ON -DHTTP_API_DIR=/tmp/mosquitto/www -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+export MOSQUITTO_HTTP_BUILD_DIR="$MOSQUITTO_SRC/build-http"
+cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_HTTP_BUILD_DIR" -DCMAKE_PREFIX_PATH="$reference/cjson-install" \
+      -DWITH_HTTP_API=ON -DHTTP_API_DIR="$MOSQUITTO_SRC/www" -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
       -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/mosquitto/build-http -j"$(nproc)"
+cmake --build "$MOSQUITTO_HTTP_BUILD_DIR" -j"$(nproc)"
 ```
 
 Without root, unpack the packages instead of installing them: `apt download libmicrohttpd-dev libmicrohttpd12t64`, `dpkg-deb -x` both into a directory, point `PKG_CONFIG_PATH` at its `usr/lib/x86_64-linux-gnu/pkgconfig` and add its library directory to `-DCMAKE_BUILD_RPATH`.
@@ -101,10 +110,11 @@ Without root, unpack the packages instead of installing them: `apt download libm
 The dynamic-security differential tests need a fourth build with plugins and `mosquitto_ctrl`; point `MOSQUITTO_PLUGIN_BUILD_DIR` at it:
 
 ```sh
-cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-plugins -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+export MOSQUITTO_PLUGIN_BUILD_DIR="$MOSQUITTO_SRC/build-plugins"
+cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_PLUGIN_BUILD_DIR" -DCMAKE_PREFIX_PATH="$reference/cjson-install" \
       -DWITH_PLUGINS=ON -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_WEBSOCKETS=OFF -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
       -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
+cmake --build "$MOSQUITTO_PLUGIN_BUILD_DIR" -j"$(nproc)"
 ```
 
 ### Legacy `mosquitto-auth-plug`
@@ -112,15 +122,39 @@ cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
 On Ubuntu, refresh the apt package indexes for `main` and `universe` and make sure you have `build-essential`, `cmake`, `git`, `patch` and `libssl-dev`. Run the script as a regular user. It downloads and unpacks the backend packages without installing system services, builds a separate reference with MongoDB and PSK disabled, and prints the environment to use for this test binary. Use a new directory without spaces.
 
 ```sh
-work=$(mktemp -d)
-bash scripts/auth-plug-reference.sh "$work/reference" > "$work/environment"
-. "$work/environment"
+bash scripts/auth-plug-reference.sh "$reference/auth-plug" > "$reference/auth-plug.env"
+. "$reference/auth-plug.env"
 cargo test --locked -p mqx-difftest --test auth_plug -- --ignored mosquitto_self
 cargo build --locked -p mqx-server
 cargo test --locked -p mqx-difftest --test auth_plug -- --ignored --skip mosquitto_self
 ```
 
 The first test command runs each scenario twice against Mosquitto. The second compares the MQTT and HTTP exchanges with standalone and clustered MQExtended. Both brokers read the same config, but MQExtended recognizes `auth-plug.so` by name without loading it. The test binary starts its own loopback backend servers; do not run it as root.
+
+The backend reference tests use the same environment. Set `MONGOD` to the absolute path of a `mongod` executable (the go-auth script below can supply it):
+
+```sh
+cargo test --locked -p mqx-extauth --test auth_plug_reference --test database_reference -- --ignored
+```
+
+### `mosquitto-go-auth`
+
+Build Mosquitto 2.1.4 and cJSON as above, and unpack the shared database fixtures by running the legacy reference script. Run both scripts as a regular user. The go-auth script builds the pinned upstream `go-auth.so` and `pw`; if Go 1.24 or newer is not on `PATH`, it downloads and checksum-verifies Go 1.24.11 on Linux x86-64 or ARM64. It also unpacks a checksum-verified MongoDB 8.2.3 Ubuntu 24.04 tarball, or uses the executable at `MONGOD` if set. Use a new directory without spaces.
+
+Redis cluster reference tests use the checksum-verified Redis 6.2.22 server built by the script; upstream go-auth's Redis client cannot parse the extended cluster metadata returned by Redis 7 and later.
+
+```sh
+bash scripts/go-auth-reference.sh "$reference/go-auth" > "$reference/go-auth.env"
+. "$reference/auth-plug.env"
+. "$reference/go-auth.env"
+cargo test --locked -p mqx-difftest --test go_auth -- --ignored mosquitto_self
+cargo build --locked -p mqx-server --all-features
+cargo test --locked -p mqx-difftest --test go_auth -- --ignored --skip mosquitto_self
+cargo test --locked -p mqx-extauth --test goauth_http -- --ignored
+cargo test --locked -p mqx-extauth --test goauth_databases -- --ignored
+```
+
+Set `MOSQUITTO_BUILD_DIR` and `MOSQUITTO_CJSON_INCLUDE` before building go-auth. The script locates the Mosquitto source tree above its build directory unless `MOSQUITTO_SRC` is set. The self-tests run each scenario twice against Mosquitto. The cross tests compare MQTT frames, HTTP/JWT requests, and PostgreSQL, MariaDB and Redis operation counts against both standalone and clustered MQExtended. The tests start local fixture services without installing system services.
 
 ## Commands
 

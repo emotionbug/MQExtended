@@ -28,6 +28,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Configure reference build paths
+        run: |
+          {
+            echo "TMPDIR=$RUNNER_TEMP"
+            echo "MOSQUITTO_SRC=$RUNNER_TEMP/mosquitto"
+            echo "MOSQUITTO_BUILD_DIR=$RUNNER_TEMP/mosquitto/build"
+            echo "MOSQUITTO_CJSON_INCLUDE=$RUNNER_TEMP/cjson-install/include"
+            echo "MQEXTENDED_BIN=$GITHUB_WORKSPACE/target/debug/mqextended"
+          } >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Cache Mosquitto reference builds
@@ -35,9 +44,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
-            /tmp/cjson-install
-            /tmp/mosquitto
-          key: mosquitto-${{ env.MOSQUITTO_VERSION }}-${{ runner.os }}-v3
+            ${{ runner.temp }}/cjson-install
+            ${{ runner.temp }}/mosquitto
+          key: mosquitto-${{ env.MOSQUITTO_VERSION }}-${{ runner.os }}-v4
       - name: Install build and runtime packages
         # The HTTP API reference links libmicrohttpd dynamically, so it is needed on cache hits too.
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake git patch libssl-dev libmicrohttpd-dev
@@ -45,26 +54,34 @@ jobs:
         if: steps.mosquitto-cache.outputs.cache-hit != 'true'
         run: |
           set -eu
-          git clone --depth 1 https://github.com/DaveGamble/cJSON.git /tmp/cJSON
-          cmake -S /tmp/cJSON -B /tmp/cJSON/build -DCMAKE_INSTALL_PREFIX=/tmp/cjson-install \
+          cjson="$RUNNER_TEMP/cJSON"
+          cjson_install="$RUNNER_TEMP/cjson-install"
+          git clone --depth 1 https://github.com/DaveGamble/cJSON.git "$cjson"
+          cmake -S "$cjson" -B "$cjson/build" -DCMAKE_INSTALL_PREFIX="$cjson_install" \
             -DENABLE_CJSON_TEST=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-          cmake --build /tmp/cJSON/build -j"$(nproc)" && cmake --install /tmp/cJSON/build
-          git clone --depth 1 -b "$MOSQUITTO_VERSION" https://github.com/eclipse-mosquitto/mosquitto.git /tmp/mosquitto
-          common="-DCMAKE_PREFIX_PATH=/tmp/cjson-install -DWITH_DOCS=OFF -DWITH_TESTS=OFF -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release"
-          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build $common -DWITH_WEBSOCKETS=OFF
-          cmake --build /tmp/mosquitto/build -j"$(nproc)"
-          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-ws $common -DWITH_WEBSOCKETS=ON -DWITH_WEBSOCKETS_BUILTIN=ON
-          cmake --build /tmp/mosquitto/build-ws -j"$(nproc)"
-          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-http -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
-            -DWITH_HTTP_API=ON -DHTTP_API_DIR=/tmp/mosquitto/www -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+          cmake --build "$cjson/build" -j"$(nproc)" && cmake --install "$cjson/build"
+          git clone --depth 1 -b "$MOSQUITTO_VERSION" https://github.com/eclipse-mosquitto/mosquitto.git "$MOSQUITTO_SRC"
+          common=(-DCMAKE_PREFIX_PATH="$cjson_install" -DWITH_DOCS=OFF -DWITH_TESTS=OFF -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release)
+          cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_BUILD_DIR" "${common[@]}" -DWITH_WEBSOCKETS=OFF
+          cmake --build "$MOSQUITTO_BUILD_DIR" -j"$(nproc)"
+          cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_SRC/build-ws" "${common[@]}" -DWITH_WEBSOCKETS=ON -DWITH_WEBSOCKETS_BUILTIN=ON
+          cmake --build "$MOSQUITTO_SRC/build-ws" -j"$(nproc)"
+          cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_SRC/build-http" -DCMAKE_PREFIX_PATH="$cjson_install" \
+            -DWITH_HTTP_API=ON -DHTTP_API_DIR="$MOSQUITTO_SRC/www" -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
             -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/mosquitto/build-http -j"$(nproc)"
-          cmake -S /tmp/mosquitto -B /tmp/mosquitto/build-plugins -DCMAKE_PREFIX_PATH=/tmp/cjson-install \
+          cmake --build "$MOSQUITTO_SRC/build-http" -j"$(nproc)"
+          cmake -S "$MOSQUITTO_SRC" -B "$MOSQUITTO_SRC/build-plugins" -DCMAKE_PREFIX_PATH="$cjson_install" \
             -DWITH_PLUGINS=ON -DWITH_PLUGIN_PERSIST_SQLITE=OFF -DWITH_WEBSOCKETS=OFF -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
             -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/mosquitto/build-plugins -j"$(nproc)"
+          cmake --build "$MOSQUITTO_SRC/build-plugins" -j"$(nproc)"
       - name: Build auth-plug reference and unpack backend servers
         run: bash scripts/auth-plug-reference.sh "$RUNNER_TEMP/auth-plug-reference" > "$RUNNER_TEMP/auth-plug.env"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.11'
+          cache: false
+      - name: Build go-auth reference
+        run: bash scripts/go-auth-reference.sh "$RUNNER_TEMP/go-auth-reference" > "$RUNNER_TEMP/go-auth.env"
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
@@ -75,24 +92,29 @@ jobs:
         run: |
           python3 -m pip install --require-hashes --only-binary=:all: -r crates/mqx-difftest/tests/clients/requirements.txt
           npm ci --prefix crates/mqx-difftest/tests/clients --ignore-scripts --no-audit --no-fund
-      - run: cargo build --locked -p mqx-server
+      - run: cargo build --locked -p mqx-server --all-features
       - name: Differential and failover tests
         env:
-          MOSQUITTO_BUILD_DIR: /tmp/mosquitto/build
-          MOSQUITTO_WS_BUILD_DIR: /tmp/mosquitto/build-ws
-          MOSQUITTO_HTTP_BUILD_DIR: /tmp/mosquitto/build-http
-          MOSQUITTO_PLUGIN_BUILD_DIR: /tmp/mosquitto/build-plugins
-          MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
-        # mqx-bench needs release builds; auth-plug uses a separate environment below.
+          MOSQUITTO_WS_BUILD_DIR: ${{ runner.temp }}/mosquitto/build-ws
+          MOSQUITTO_HTTP_BUILD_DIR: ${{ runner.temp }}/mosquitto/build-http
+          MOSQUITTO_PLUGIN_BUILD_DIR: ${{ runner.temp }}/mosquitto/build-plugins
+        # mqx-bench needs release builds; the auth plugins use separate environments below.
         run: >-
-          cargo test --locked --workspace --exclude mqx-bench --all-features -- --ignored --skip auth_plug::
+          cargo test --locked --workspace --exclude mqx-bench --exclude mqx-extauth --all-features -- --ignored --skip auth_plug:: --skip go_auth::
       - name: Auth-plug differential tests
-        env:
-          MQEXTENDED_BIN: ${{ github.workspace }}/target/debug/mqextended
         run: |
+          source "$RUNNER_TEMP/go-auth.env" # Provides MONGOD for database_reference.
           source "$RUNNER_TEMP/auth-plug.env"
           cargo test --locked -p mqx-difftest --test auth_plug -- --ignored mosquitto_self
           cargo test --locked -p mqx-difftest --test auth_plug -- --ignored --skip mosquitto_self
+          cargo test --locked -p mqx-extauth --test auth_plug_reference --test database_reference -- --ignored
+      - name: Go-auth differential tests
+        run: |
+          source "$RUNNER_TEMP/auth-plug.env"
+          source "$RUNNER_TEMP/go-auth.env"
+          cargo test --locked -p mqx-difftest --test go_auth -- --ignored mosquitto_self
+          cargo test --locked -p mqx-difftest --test go_auth -- --ignored --skip mosquitto_self
+          cargo test --locked -p mqx-extauth --test goauth_http --test goauth_databases -- --ignored
 
   linux-bundle:
     runs-on: ubuntu-latest

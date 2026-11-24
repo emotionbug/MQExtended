@@ -1,9 +1,7 @@
 //! Run with `cargo test --locked -p mqx-extauth --test auth_plug_reference -- --ignored`.
-//! Optional paths (defaults for the local reference build):
-//! - `MOSQUITTO_BUILD_DIR=/tmp/mosquitto/build`
-//! - `MQX_AUTH_REFERENCE_SO=/tmp/mosquitto-auth-plug/auth-plug.so`
-//! - `MQX_AUTH_SERVER_BIN=/tmp/authref/root/usr/bin` (redis-server, redis-cli, memcached)
-//! - `MQX_AUTH_REFERENCE_LD_LIBRARY_PATH=/tmp/authref/root/usr/lib/x86_64-linux-gnu:/tmp/mosquitto/build/lib`
+//! Source the environment from `scripts/auth-plug-reference.sh`. The tests
+//! use `MOSQUITTO_AUTH_PLUG_SO`, `MOSQUITTO_AUTH_PLUG_BINARY`,
+//! `MOSQUITTO_AUTH_PLUG_ROOT` (Redis and memcached), and `LD_LIBRARY_PATH`.
 
 use std::io;
 use std::net::{Ipv4Addr, TcpListener as StdListener};
@@ -22,30 +20,30 @@ const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const ID: &str = "differential";
 const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
-fn path(key: &str, default: &str) -> PathBuf {
-    std::env::var_os(key).map_or_else(|| PathBuf::from(default), PathBuf::from)
-}
-
-fn build_dir() -> PathBuf {
-    path("MOSQUITTO_BUILD_DIR", "/tmp/mosquitto/build")
+fn path(key: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(key).unwrap_or_else(|| {
+        panic!("set {key} by sourcing the output of scripts/auth-plug-reference.sh")
+    }))
 }
 
 fn command(program: PathBuf) -> Command {
     let mut command = Command::new(program);
-    let libs = std::env::var_os("MQX_AUTH_REFERENCE_LD_LIBRARY_PATH").unwrap_or_else(|| {
-        let mosquitto = build_dir().join("lib");
-        std::env::join_paths([
-            PathBuf::from("/tmp/authref/root/usr/lib/x86_64-linux-gnu"),
-            mosquitto,
-        ])
-        .unwrap()
-    });
-    command.env("LD_LIBRARY_PATH", libs).env("NO_PROXY", "*");
+    command
+        .env(
+            "LD_LIBRARY_PATH",
+            std::env::var_os("LD_LIBRARY_PATH")
+                .expect("source the auth-plug reference environment to set LD_LIBRARY_PATH"),
+        )
+        .env("NO_PROXY", "*");
     command
 }
 
 fn server(program: &str) -> Command {
-    command(path("MQX_AUTH_SERVER_BIN", "/tmp/authref/root/usr/bin").join(program))
+    command(
+        path("MOSQUITTO_AUTH_PLUG_ROOT")
+            .join("usr/bin")
+            .join(program),
+    )
 }
 
 struct Process {
@@ -98,10 +96,7 @@ fn unused_port() -> u16 {
 
 async fn reference(options: &[(&str, String)]) -> (Process, u16) {
     let port = unused_port();
-    let so = path(
-        "MQX_AUTH_REFERENCE_SO",
-        "/tmp/mosquitto-auth-plug/auth-plug.so",
-    );
+    let so = path("MOSQUITTO_AUTH_PLUG_SO");
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut config = format!(
         "listener {port} 127.0.0.1\nauth_plugin {}\nlog_type all\n",
@@ -112,7 +107,7 @@ async fn reference(options: &[(&str, String)]) -> (Process, u16) {
         writeln!(config, "auth_opt_{option} {value}").unwrap();
     }
     std::fs::write(file.path(), config).unwrap();
-    let mut cmd = command(build_dir().join("src/mosquitto"));
+    let mut cmd = command(path("MOSQUITTO_AUTH_PLUG_BINARY"));
     cmd.arg("-c").arg(file.path());
     let mut broker = Process::spawn(cmd);
     broker.ready(port).await;

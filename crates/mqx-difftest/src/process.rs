@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -32,10 +32,22 @@ pub enum Placement {
     Node(usize),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClusterReadiness {
+    /// Wait for an accepted anonymous MQTT CONNECT on a separate listener.
+    #[default]
+    Mqtt,
+    /// Wait for the MQTT listeners and a common live Raft leader via HTTP.
+    /// Scope auth plugins to the scenario listeners so they do not policy-check
+    /// the health request on the separate loopback HTTP API listener.
+    HttpStatus,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ClusterConfig {
     pub nodes: NonZeroUsize,
     pub placement: Placement,
+    pub readiness: ClusterReadiness,
 }
 
 impl Default for ClusterConfig {
@@ -43,6 +55,7 @@ impl Default for ClusterConfig {
         Self {
             nodes: NonZeroUsize::new(3).unwrap(),
             placement: Placement::RoundRobin,
+            readiness: ClusterReadiness::default(),
         }
     }
 }
@@ -122,11 +135,16 @@ fn generate_password_file(dir: &Path, users: &[(&str, &str)]) -> Result<(), Erro
     Ok(())
 }
 
+enum Readiness {
+    Mqtt(SocketAddr, BytesMut),
+    HttpStatus(SocketAddr),
+}
+
 struct BrokerProcess {
     child: Option<Child>,
     dir: TempDir,
     addr: SocketAddr,
-    readiness: Option<(SocketAddr, BytesMut)>,
+    readiness: Option<Readiness>,
     /// 1-based node index, its cluster mesh and the password/ACL directives, kept
     /// so that `write_config` can regenerate `mosquitto.conf` for a reload.
     index: usize,
@@ -143,7 +161,10 @@ impl BrokerProcess {
                 &format!("{}{conf}", self.prefix),
                 self.index,
                 &self.mesh,
-                self.readiness.as_ref().map(|(addr, _)| *addr),
+                self.readiness.as_ref().map(|probe| match probe {
+                    Readiness::Mqtt(addr, _) => (*addr, ClusterReadiness::Mqtt),
+                    Readiness::HttpStatus(addr) => (*addr, ClusterReadiness::HttpStatus),
+                }),
             ),
         )
     }
@@ -238,12 +259,11 @@ impl BrokerProcess {
         index: usize,
         deadline: Instant,
     ) -> Result<(), Error> {
-        if self.readiness.is_none() {
-            return Ok(());
-        }
         loop {
             self.check_child(kind, index)?;
-            let (addr, connect) = self.readiness.as_ref().expect("readiness probe configured");
+            let Some(Readiness::Mqtt(addr, connect)) = &self.readiness else {
+                return Ok(());
+            };
             let result = probe(*addr, index, connect, deadline);
             if matches!(result, Ok(true)) {
                 return Ok(());
@@ -374,12 +394,15 @@ impl Brokers {
         for (offset, ((dir, prefix), listener)) in dirs.into_iter().zip(listeners).enumerate() {
             let addr = listener.addr;
             let readiness_listener = readiness_listeners.next();
-            let readiness = readiness_listener
-                .as_ref()
-                .map(|listener| -> Result<_, Error> {
-                    Ok((listener.addr, probe_connect(offset + 1)?))
-                })
-                .transpose()?;
+            let readiness = match (readiness_listener.as_ref(), cluster) {
+                (Some(listener), Some(cluster)) => Some(match cluster.readiness {
+                    ClusterReadiness::Mqtt => {
+                        Readiness::Mqtt(listener.addr, probe_connect(offset + 1)?)
+                    }
+                    ClusterReadiness::HttpStatus => Readiness::HttpStatus(listener.addr),
+                }),
+                _ => None,
+            };
             if cluster.is_some() {
                 fs::create_dir(dir.path().join("raft-data"))?;
             }
@@ -416,6 +439,9 @@ impl Brokers {
         drop(startup);
         for (offset, node) in brokers.nodes.iter_mut().enumerate() {
             node.wait_until_accepting(kind, offset + 1, deadline)?;
+        }
+        if cluster.is_some_and(|config| config.readiness == ClusterReadiness::HttpStatus) {
+            brokers.wait_for_leader(time_left(deadline))?;
         }
         Ok(brokers)
     }
@@ -521,7 +547,10 @@ impl Brokers {
             for (offset, node) in self.nodes.iter_mut().enumerate() {
                 if node.child.is_some() {
                     node.check_child(self.kind, offset + 1)?;
-                    observations.push(observed_leader(&node.log()));
+                    observations.push(match node.readiness {
+                        Some(Readiness::HttpStatus(addr)) => probe_status(addr, deadline),
+                        _ => observed_leader(&node.log()),
+                    });
                 }
             }
             if let Some(Some(leader)) = observations.first().copied()
@@ -622,7 +651,7 @@ fn node_config(
     common: &str,
     index: usize,
     mesh: &[SocketAddr],
-    readiness: Option<SocketAddr>,
+    readiness: Option<(SocketAddr, ClusterReadiness)>,
 ) -> String {
     let mut conf = format!("listener {} 127.0.0.1\n{common}\n", listener.port());
     if mesh.is_empty() {
@@ -645,15 +674,17 @@ fn node_config(
         "cluster_lease_interval 200\n",
         "cluster_lease_timeout 2000\n",
     ));
-    if let Some(addr) = readiness {
-        // A successful CONNECT must commit a claim, even when the scenario listener
-        // refuses anonymous clients. Keep its configuration and password/ACL files intact.
+    if let Some((addr, mode)) = readiness {
+        // Keep the scenario listener's security intact on both probe modes.
         writeln!(
             conf,
             "listener {} 127.0.0.1\nlistener_allow_anonymous true",
             addr.port()
         )
         .unwrap();
+        if mode == ClusterReadiness::HttpStatus {
+            conf.push_str("protocol http_api\n");
+        }
     }
     conf
 }
@@ -675,6 +706,34 @@ fn probe_connect(index: usize) -> Result<BytesMut, Error> {
         &mut wire,
     )?;
     Ok(wire)
+}
+
+fn probe_status(addr: SocketAddr, deadline: Instant) -> Option<usize> {
+    let timeout = PROBE_TIMEOUT.min(time_left(deadline));
+    if timeout.is_zero() {
+        return None;
+    }
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    stream
+        .write_all(
+            b"GET /api/v1/mqx/cluster HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .ok()?;
+    let mut response = String::new();
+    stream.take(64 * 1024).read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if head.split_ascii_whitespace().nth(1)? != "200" {
+        return None;
+    }
+    let status: serde_json::Value = serde_json::from_str(body).ok()?;
+    let raft = &status["raft"];
+    if raft["running"].as_bool()? {
+        usize::try_from(raft["leader"].as_u64()?).ok()
+    } else {
+        None
+    }
 }
 
 fn observed_leader(log: &str) -> Option<usize> {
@@ -704,7 +763,10 @@ mod tests {
                     "allow_anonymous false",
                     index,
                     &mesh,
-                    Some(SocketAddr::from(([127, 0, 0, 1], 4030 + index as u16))),
+                    Some((
+                        SocketAddr::from(([127, 0, 0, 1], 4030 + index as u16)),
+                        ClusterReadiness::Mqtt,
+                    )),
                 ),
                 format!(
                     concat!(

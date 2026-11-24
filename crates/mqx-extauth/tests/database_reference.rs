@@ -1,13 +1,11 @@
 //! Database back-end differential tests (run as a non-root user):
 //! `cargo test --locked -p mqx-extauth --test database_reference -- --ignored`
 //!
-//! `AUTHREF_ROOT` defaults to `/tmp/authref`: extracted PostgreSQL 18, MariaDB,
-//! OpenLDAP and their shared libraries in `root/usr`, and `mongod` under
-//! `mongodb-linux-x86_64-ubuntu2404-8.2.3/bin`.
-//! `AUTHREF_MOSQUITTO_BUILD` defaults to `/tmp/mosquitto/build` (Mosquitto 2.1.4).
-//! `AUTHREF_PLUGIN` defaults to `/tmp/mosquitto-auth-plug/auth-plug.so`.
-//! `AUTHREF_MONGOD` overrides the mongod executable. The reference plugin is
-//! not built with MongoDB; that test uses expected verdicts from be-mongo.c.
+//! Source the environment from `scripts/auth-plug-reference.sh`. The tests
+//! use `MOSQUITTO_AUTH_PLUG_ROOT`, `MOSQUITTO_AUTH_PLUG_POSTGRES`,
+//! `MOSQUITTO_AUTH_PLUG_BINARY`, `MOSQUITTO_AUTH_PLUG_SO` and `LD_LIBRARY_PATH`.
+//! Set `MONGOD` to the mongod executable for the MongoDB test. The reference
+//! plugin is not built with MongoDB; that test uses verdicts from be-mongo.c.
 
 use std::{
     env,
@@ -36,24 +34,24 @@ type Options = Vec<(String, String)>;
 struct Fixtures {
     root: PathBuf,
     usr: PathBuf,
-    build: PathBuf,
+    binary: PathBuf,
     plugin: PathBuf,
 }
 
-fn path(var: &str, default: impl Into<PathBuf>) -> PathBuf {
-    env::var_os(var).map_or_else(|| default.into(), PathBuf::from)
+fn path(var: &str) -> PathBuf {
+    PathBuf::from(env::var_os(var).unwrap_or_else(|| panic!("set {var} for reference tests")))
 }
 
 impl Fixtures {
     fn new() -> Self {
-        let root = path("AUTHREF_ROOT", "/tmp/authref");
-        let build = path("AUTHREF_MOSQUITTO_BUILD", "/tmp/mosquitto/build");
-        let plugin = path("AUTHREF_PLUGIN", "/tmp/mosquitto-auth-plug/auth-plug.so");
-        let usr = root.join("root/usr");
+        let root = path("MOSQUITTO_AUTH_PLUG_ROOT");
+        let binary = path("MOSQUITTO_AUTH_PLUG_BINARY");
+        let plugin = path("MOSQUITTO_AUTH_PLUG_SO");
+        let usr = root.join("usr");
         Self {
             root,
             usr,
-            build,
+            binary,
             plugin,
         }
     }
@@ -62,11 +60,8 @@ impl Fixtures {
         let mut command = Command::new(binary.as_ref());
         command.env(
             "LD_LIBRARY_PATH",
-            env::join_paths([
-                self.usr.join("lib/x86_64-linux-gnu"),
-                self.build.join("lib"),
-            ])
-            .unwrap(),
+            env::var_os("LD_LIBRARY_PATH")
+                .expect("source the auth-plug reference environment to set LD_LIBRARY_PATH"),
         );
         command
     }
@@ -83,7 +78,7 @@ impl Fixtures {
             text.push_str(&format!("auth_opt_{key} {value}\n"));
         }
         fs::write(&config, text).unwrap();
-        let mut command = self.command(self.build.join("src/mosquitto"));
+        let mut command = self.command(&self.binary);
         command.arg("-c").arg(config);
         (Process::start(dir, &mut command, port), port)
     }
@@ -323,7 +318,7 @@ async fn sqlite_matches_auth_plug() {
 #[ignore = "requires PostgreSQL and Mosquitto 2.1.4 reference binaries"]
 async fn postgres_matches_auth_plug() {
     let fixtures = Fixtures::new();
-    let binaries = fixtures.usr.join("lib/postgresql/18/bin");
+    let binaries = path("MOSQUITTO_AUTH_PLUG_POSTGRES");
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let port = port();
@@ -345,9 +340,30 @@ async fn postgres_matches_auth_plug() {
     command
         .arg("-D")
         .arg(&data)
-        .args(["-h", HOST, "-p", &port.to_string(), "-k"])
-        .arg(dir.path());
+        .args(["-h", HOST, "-p", &port.to_string(), "-k", ""]);
     let postgres = Process::start(dir, &mut command, port);
+    // The listening socket may appear before the database accepts queries.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = fixtures.command(binaries.join("pg_isready"));
+    ready.args([
+        "-q",
+        "-h",
+        HOST,
+        "-p",
+        &port.to_string(),
+        "-U",
+        "mqtt",
+        "-d",
+        "postgres",
+    ]);
+    while !ready.status().unwrap().success() {
+        assert!(
+            Instant::now() < deadline,
+            "PostgreSQL did not become ready:\n{}",
+            postgres.log()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     let sql = format!(
         "CREATE TABLE users (name text, hash text, admin integer);\nINSERT INTO users VALUES ('al''ice', '{HASH}', 0);\nCREATE TABLE acl (name text, topic text, acc integer);\nINSERT INTO acl VALUES ('al''ice', 'units/%u', 4), ('al''ice', 'write', 2);\n"
     );
@@ -449,6 +465,7 @@ async fn mysql_matches_auth_plug() {
     let port = port();
     let location = format!("--basedir={}", fixtures.usr.display());
     let data = format!("--datadir={}", data.display());
+    let tmpdir = format!("--tmpdir={}", dir.path().display());
     let socket = format!("--socket={}", socket.display());
     let pid = format!("--pid-file={}", pid.display());
     run(
@@ -458,6 +475,7 @@ async fn mysql_matches_auth_plug() {
                 "--no-defaults",
                 &location,
                 &data,
+                &tmpdir,
                 "--skip-test-db",
                 "--force",
                 "--auth-root-authentication-method=normal",
@@ -469,6 +487,7 @@ async fn mysql_matches_auth_plug() {
         "--no-defaults",
         &location,
         &data,
+        &tmpdir,
         &socket,
         &pid,
         "--bind-address",
@@ -552,7 +571,7 @@ async fn ldap_matches_auth_plug() {
     fs::create_dir(&data).unwrap();
     let conf = dir.path().join("slapd.conf");
     let service = "cn=service,dc=test";
-    let schema = fixtures.root.join("root/etc/ldap/schema");
+    let schema = fixtures.root.join("etc/ldap/schema");
     let module = fixtures.usr.join("lib/ldap");
     let port = port();
     fs::write(&conf, format!("include {}/core.schema\ninclude {}/cosine.schema\nmodulepath {}\nmoduleload back_mdb\npidfile {}/slapd.pid\nargsfile {}/slapd.args\ndatabase mdb\nmaxsize 10485760\nsuffix dc=test\nrootdn {service}\nrootpw service-password\ndirectory {}\n",
@@ -620,19 +639,21 @@ async fn ldap_matches_auth_plug() {
 #[ignore = "requires mongod fixture; no C MongoDB reference backend"]
 async fn mongodb_matches_c_source_verdicts() {
     let fixtures = Fixtures::new();
-    let binary = path(
-        "AUTHREF_MONGOD",
-        fixtures
-            .root
-            .join("mongodb-linux-x86_64-ubuntu2404-8.2.3/bin/mongod"),
-    );
+    let binary = path("MONGOD");
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     fs::create_dir(&data).unwrap();
     let port = port();
     let mut command = fixtures.command(binary);
     command
-        .args(["--bind_ip", HOST, "--port", &port.to_string(), "--dbpath"])
+        .args([
+            "--bind_ip",
+            HOST,
+            "--port",
+            &port.to_string(),
+            "--nounixsocket",
+            "--dbpath",
+        ])
         .arg(data);
     let database = Process::start(dir, &mut command, port);
     let uri = format!("mongodb://{HOST}:{port}/?serverSelectionTimeoutMS=500");

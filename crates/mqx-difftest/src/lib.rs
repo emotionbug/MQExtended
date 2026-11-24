@@ -12,7 +12,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use mqx_codec::{
     DecodeContext, DecodeError, EncodeError, Packet, ProtocolVersion, decode, encode, v5,
 };
-pub use process::{ClusterConfig, Placement};
+pub use process::{ClusterConfig, ClusterReadiness, Placement};
 use thiserror::Error;
 
 use process::Brokers;
@@ -275,7 +275,7 @@ impl Harness {
         )?))
     }
 
-    /// Starts the cluster and waits for an accepted CONNECT on every node.
+    /// Starts the cluster and waits for the configured readiness check.
     pub fn start_cluster(config: BrokerConfig<'_>, cluster: ClusterConfig) -> Result<Self, Error> {
         Ok(Self::with_brokers(Brokers::start(
             BrokerKind::MqExtended,
@@ -362,7 +362,7 @@ impl Harness {
         self.brokers.log(index)
     }
 
-    /// Waits for all running nodes to report the same live leader in their logs.
+    /// Waits for all running nodes to report the same live leader.
     pub fn wait_for_leader(&mut self, timeout: Duration) -> Result<usize, Error> {
         self.brokers.wait_for_leader(timeout)
     }
