@@ -541,7 +541,9 @@ pub(crate) fn prepare_dir(dir: &Path, wal: bool) -> io::Result<()> {
     create_durable_dir(dir)?;
     let metadata = fs::symlink_metadata(dir)?;
     if !metadata.is_dir() {
-        return Err(invalid_data(
+        // A path error says nothing about the Raft contents. Do not archive a WAL symlink.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
             "cluster data and WAL paths must be real directories",
         ));
     }

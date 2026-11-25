@@ -297,6 +297,51 @@ async fn versioned_reader_restores_legacy_snapshot_and_versioned_wal_tail() {
     rebuilt.shutdown().await.unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_recovery_keeps_state_on_an_unsupported_wal_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = configs(&root, 1, SnapshotPolicy::Never).remove(&1).unwrap();
+    cfg.auto_recover = true;
+    let node = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
+    put(&node, "saved", "before relocation").await;
+    node.shutdown().await.unwrap();
+
+    let wal = cfg.data_dir.join("wal");
+    let moved = root.path().join("relocated-wal");
+    std::fs::rename(&wal, &moved).unwrap();
+    symlink(&moved, &wal).unwrap();
+    let try_start = |cfg| async move {
+        let result = Cluster::start(cfg, Kv::default()).await;
+        assert!(
+            matches!(result, Err(ClusterError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidInput)
+        );
+    };
+    try_start(cfg.clone()).await;
+    assert_eq!(std::fs::read_link(&wal).unwrap(), moved);
+    std::fs::remove_file(&wal).unwrap();
+    std::fs::rename(moved, &wal).unwrap();
+
+    let original = cfg.data_dir.clone();
+    cfg.data_dir = root.path().join(OsStr::from_bytes(b"state-\xff"));
+    std::fs::rename(&original, &cfg.data_dir).unwrap();
+    try_start(cfg.clone()).await;
+    std::fs::rename(&cfg.data_dir, &original).unwrap();
+    cfg.data_dir = original;
+    let node = Cluster::start(cfg, Kv::default()).await.unwrap();
+    assert_eq!(
+        put(&node, "saved", "after restart")
+            .await
+            .previous
+            .as_deref(),
+        Some("before relocation")
+    );
+    node.shutdown().await.unwrap();
+}
+
 async fn refuse_foreign_state_without_node_identity(only_snapshot: bool) {
     let root = tempfile::tempdir().unwrap();
     let policy = if only_snapshot {
@@ -533,16 +578,18 @@ async fn follower_installs_snapshot_when_its_missing_prefix_has_been_purged() {
             .filter(|index| *index > lagged_at && *index >= important.index)
     })
     .await;
-    let tail = put(&leader, "tail", "after compaction").await;
+    put(&leader, "tail", "after compaction").await;
     let mut cfg = configs[&follower_id].clone();
     cfg.snapshot_policy = SnapshotPolicy::Never;
     let returned = Cluster::start(cfg, Kv::default()).await.unwrap();
+    let expected_writes = leader.read(|kv| kv.durable.writes.clone());
     returned
         .linearizable_read(|kv| {
             assert_eq!(kv.durable.values["large"], large);
             assert_eq!(kv.durable.values["tail"], "after compaction");
-            assert_eq!(kv.restored, 1);
-            assert!(kv.durable.writes.contains(&tail.index));
+            // A voter can restore a local snapshot before installing a newer
+            // one. Its final application history must match the leader's.
+            assert_eq!(kv.durable.writes, expected_writes);
             assert!(!kv.applied_here.contains(&important.index));
         })
         .await

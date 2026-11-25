@@ -69,10 +69,10 @@ pub(crate) struct Wal {
 
 impl Wal {
     pub(crate) fn open(path: &Path, max_append_size: usize, format: u16) -> io::Result<Self> {
-        prepare_dir(path, true)?;
         let dir = path
             .to_str()
-            .ok_or_else(|| invalid_data("WAL path is not UTF-8"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "WAL path is not UTF-8"))?;
+        prepare_dir(path, true)?;
         let mut config = raft_log::Config {
             log_cache_capacity: Some(32 * 1024 * 1024),
             ..raft_log::Config::new(dir)
