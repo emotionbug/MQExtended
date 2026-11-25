@@ -59,7 +59,7 @@ jobs:
           cmake -S mosquitto -B reference -DCMAKE_BUILD_TYPE=Release -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
             -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DWITH_WEBSOCKETS=OFF
           cmake --build reference --target mosquitto -j"$(nproc)"
-      - name: Measure durable delivery on shared runner storage
+      - name: Measure persistent delivery on shared runner storage
         env:
           FIRST: ${{ matrix.first }}
           SECOND: ${{ matrix.second }}
@@ -68,6 +68,12 @@ jobs:
           export TMPDIR="$PWD/state" MQEXTENDED_RELEASE_BIN="$PWD/broker/bin/mqextended" MOSQUITTO_BUILD_DIR="$PWD/reference"
           mkdir -m 700 state results
           { echo "CI release: $RELEASE_SHA"; uname -srmo; findmnt -T state; lsblk -o NAME,TYPE,SIZE,MODEL; } > results/environment.txt
+          {
+            echo 'Three voters share one runner filesystem. This gate does not test power loss.'
+            echo '```'
+            cat results/environment.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           failed=0
           for rate in "$FIRST" "$SECOND"; do
             bench/mqx-bench compare --pattern one-to-one --publishers 200 --subscribers 200 \

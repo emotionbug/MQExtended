@@ -92,6 +92,10 @@ For a standalone reference, both brokers ran with `persistence true` and default
 
 #### Live publishers and subscribers
 
+The manual [Persistent session latency workflow](../.github/workflows/persistent-latency.yml) measures a successful `main` CI release on two fresh GitHub-hosted VMs. Each VM runs all three voters and both standalone references, reversing the rate order on the second VM. A green result covers the offered load, publisher ACKs, subscriber deliveries and latency on **that filesystem**. Check `environment.txt` alongside the JSON before comparing storage.
+
+For [release `168f30a` on hosted runners](https://github.com/emotionbug/MQExtended/actions/runs/45521650577), the two three-voter runs both measured 3.54 ms p99 at 100/s and 7.34 ms at 1,000/s. All sent messages were acknowledged and delivered exactly once. Both VMs used ext4 with `nobarrier,data=writeback` on a copy-on-write root. The broker still called for synchronous WAL writes; this result does **not** verify power-loss durability or qualify three hosts with independent disks. Do not copy those mount options to a production volume.
+
 The 50 ms delivery-p99 gate still fails on one shared NVMe/ext4 device. The following runs used 200 persistent pairs, MQTT 3.1.1 QoS 1, 256-byte payloads, 30 s of traffic, 10 s of drain and the same `2f42bfa` load generator. The standalones had default autosave; both three-voter clusters used mutual TLS and waited for durable quorum. The MQExtended binaries came from verified release bundles (`8847eff` and experimental `361e287`).
 
 | Offered publishes/s | Mosquitto 2.1.4 | Standalone MQExtended | Three voters, default WAL | Three voters, direct synchronous WAL |
