@@ -1,0 +1,84 @@
+name: Persistent session latency
+on:
+  workflow_dispatch:
+    inputs:
+      release_run:
+        description: Successful main CI run ID containing the release broker and load generator
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {first: 100, second: 1000}
+          - {first: 1000, second: 100}
+    steps:
+      - name: Select a trusted CI release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.release_run }}
+        run: |
+          [[ $RUN =~ ^[0-9]+$ ]]
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN" | jq -er --arg repo "$GITHUB_REPOSITORY" '
+            select(.head_repository.full_name == $repo and .event == "push" and .head_branch == "main" and
+                   .path == ".github/workflows/ci.yml" and .conclusion == "success") | .head_sha')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.release_run }}
+          name: mqextended-linux-${{ steps.release.outputs.sha }}
+          path: broker
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.release_run }}
+          name: mqx-bench-linux-${{ steps.release.outputs.sha }}
+          path: bench
+      - uses: actions/checkout@v7
+        with:
+          repository: eclipse-mosquitto/mosquitto
+          ref: d69b6b757d05857fc54fd3c12628f22cf4b1540d # v2.1.4
+          path: mosquitto
+          persist-credentials: false
+      - name: Prepare reference broker and verify release bundles
+        run: |
+          (cd broker && sha256sum --check --strict SHA256SUMS)
+          (cd bench && sha256sum --check --strict SHA256SUMS)
+          chmod +x broker/bin/mqextended bench/mqx-bench
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libcjson-dev
+          cmake -S mosquitto -B reference -DCMAKE_BUILD_TYPE=Release -DWITH_DOCS=OFF -DWITH_TESTS=OFF \
+            -DWITH_PLUGINS=OFF -DWITH_LIB_CPP=OFF -DWITH_CTRL_SHELL=OFF -DWITH_WEBSOCKETS=OFF
+          cmake --build reference --target mosquitto -j"$(nproc)"
+      - name: Measure durable delivery on shared runner storage
+        env:
+          FIRST: ${{ matrix.first }}
+          SECOND: ${{ matrix.second }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          export TMPDIR="$PWD/state" MQEXTENDED_RELEASE_BIN="$PWD/broker/bin/mqextended" MOSQUITTO_BUILD_DIR="$PWD/reference"
+          mkdir -m 700 state results
+          { echo "CI release: $RELEASE_SHA"; uname -srmo; findmnt -T state; lsblk -o NAME,TYPE,SIZE,MODEL; } > results/environment.txt
+          failed=0
+          for rate in "$FIRST" "$SECOND"; do
+            bench/mqx-bench compare --pattern one-to-one --publishers 200 --subscribers 200 \
+              --qos 1 --persistent --rate "$rate" --seconds 30 --drain-seconds 10 \
+              --require-p99-below-ms 50 --state-dir "$TMPDIR" --json "results/$rate.json" || failed=1
+          done
+          exit "$failed"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: persistent-first-${{ matrix.first }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
