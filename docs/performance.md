@@ -19,6 +19,8 @@ target/release/mqx-bench compare --pattern one-to-one --publishers 200 --subscri
 
 Run the comparison as an unprivileged user. MQTT clients connect over loopback TCP. Cluster peers use mutual TLS with a fresh CA and distinct node keys per run. The JSON report records the peer transport; older reports without this field used plaintext. `--state-dir` puts the three WALs on a chosen filesystem; use the disk type you will run in production.
 
+For the Linux direct-I/O WAL comparison, add `--cluster-wal-direct-io` to `compare`. The flag affects only the three cluster processes; the report records it as `cluster_wal_direct_io`. Keep the reference binary and load shape fixed between runs.
+
 To compare two revisions without rebuilding locally, use the `mqextended-linux-<full commit SHA>` artifacts from the `linux-bundle` CI job. Extract each bundle into a separate directory, verify it with `sha256sum --check --strict SHA256SUMS` there, and restore the executable bit on `bin/mqextended`. Set `MQEXTENDED_RELEASE_BIN` to that binary's absolute path for each run. Keep the load-generator binary, worker count, storage and Mosquitto binary fixed.
 
 The same CI job publishes `mqx-bench-linux-<full commit SHA>` separately. Verify its `SHA256SUMS`, restore the executable bit on `mqx-bench`, and use that one binary for every row. Generators built before `31e8ab2` can time out while shutting down healthy subscribers if the drain is 10 seconds or longer; do not interpret a missing report as broker latency.

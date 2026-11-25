@@ -1266,6 +1266,7 @@ struct ClusterSection {
     state_format: Option<u16>,
     qos1_replay_batch: Option<bool>,
     data_dir: Option<PathBuf>,
+    wal_direct_io: Option<bool>,
     heartbeat: Option<Duration>,
     election: Option<(Duration, Duration)>,
     lease_interval: Option<Duration>,
@@ -1312,6 +1313,7 @@ impl ClusterSection {
             | "cluster_join"
             | "cluster_membership_generation"
             | "cluster_state_format"
+            | "cluster_wal_direct_io"
             | "cluster_qos1_replay_batch"
             | "cluster_heartbeat_interval"
             | "cluster_lease_interval"
@@ -1377,6 +1379,9 @@ impl ClusterSection {
             "cluster_insecure_plaintext" if self.insecure_plaintext.is_none() => {
                 self.insecure_plaintext = Some(value.boolean()?);
             }
+            "cluster_wal_direct_io" if self.wal_direct_io.is_none() => {
+                self.wal_direct_io = Some(value.boolean()?);
+            }
             "cluster_max_snapshot_size" if self.max_snapshot_size.is_none() => {
                 let size = positive(first)?;
                 if size > MAX_SNAPSHOT_SIZE {
@@ -1439,6 +1444,7 @@ impl ClusterSection {
             }
         };
         let mut config = ClusterConfig::new(id, bind, self.peers, data_dir, security);
+        config.wal_direct_io = self.wal_direct_io.unwrap_or(false);
         config.join = join;
         config.membership_generation = generation;
         if let Some(format) = self.state_format {

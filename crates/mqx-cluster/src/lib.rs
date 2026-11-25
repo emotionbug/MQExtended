@@ -123,6 +123,8 @@ pub struct ClusterConfig {
     /// Defaults to the lease timeout; only valid with automatic recovery enabled.
     pub auto_recover_timeout: Option<Duration>,
     pub data_dir: PathBuf,
+    /// Create a direct-I/O WAL on an empty Linux storage directory. Never converts a legacy WAL.
+    pub wal_direct_io: bool,
     pub security: ClusterSecurity,
     pub heartbeat_interval: Duration,
     pub election_timeout_min: Duration,
@@ -163,6 +165,7 @@ impl ClusterConfig {
             auto_recover: false,
             auto_recover_timeout: None,
             data_dir,
+            wal_direct_io: false,
             security,
             heartbeat_interval: Duration::from_millis(100),
             election_timeout_min: Duration::from_millis(400),

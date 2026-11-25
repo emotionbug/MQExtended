@@ -61,9 +61,22 @@ fn persistent_inbox_resumes_on_different_node_after_kill() {
 #[test]
 #[ignore = "requires cluster-enabled mqextended"]
 fn partial_ack_of_a_replay_window_survives_owner_loss() {
-    let mut cluster = start_cluster(config(
+    partial_ack_after_owner_loss(config(
         "allow_anonymous true\nmax_inflight_messages 8\ncluster_qos1_replay_batch true",
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires cluster-enabled mqextended and storage supporting direct I/O"]
+fn direct_wal_partial_ack_of_a_replay_window_survives_owner_loss() {
+    partial_ack_after_owner_loss(config(
+        "allow_anonymous true\nmax_inflight_messages 8\ncluster_qos1_replay_batch true\ncluster_wal_direct_io true",
+    ));
+}
+
+fn partial_ack_after_owner_loss(conf: BrokerConfig<'_>) {
+    let mut cluster = start_cluster(conf);
     let h = &mut cluster;
     let settings = persistent("window");
     let topic = "failover/window";

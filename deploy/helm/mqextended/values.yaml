@@ -20,6 +20,8 @@ storage:
   # Null uses the default StorageClass; "" requests a volume with no class.
   storageClassName: null
   size: 10Gi
+  # Linux only. Selects the WAL format for a fresh volume; does not convert an existing WAL.
+  directIO: false
 
 # Client listeners, each on the client Service and every client-facing Pod.
 # Enable the ones your existing clients use. Ports 7000 and 9883 are reserved.

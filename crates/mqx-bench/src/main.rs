@@ -59,6 +59,9 @@ enum Command {
         /// Existing directory on the filesystem to use for cluster WALs.
         #[arg(long, default_value = ".")]
         state_dir: PathBuf,
+        /// Create the three cluster WALs using Linux direct, synchronous I/O.
+        #[arg(long)]
+        cluster_wal_direct_io: bool,
         /// Tokio runtime workers per MQExtended process.
         #[arg(long, default_value_t = 2)]
         broker_workers: usize,
@@ -195,6 +198,7 @@ impl Traffic {
 #[derive(Serialize)]
 struct Report<'a> {
     cluster_peer_transport: &'static str,
+    cluster_wal_direct_io: bool,
     broker_workers: usize,
     state_dir: &'a Path,
     results: &'a [Comparison],
@@ -285,11 +289,13 @@ async fn run(command: Command) -> Result<(), Box<dyn error::Error>> {
             pattern,
             shape,
             state_dir,
+            cluster_wal_direct_io,
             broker_workers,
             json,
         } => {
             let options = ComparisonOptions {
                 state_dir,
+                cluster_wal_direct_io,
                 broker_workers,
             };
             let workloads = match pattern {
@@ -299,6 +305,7 @@ async fn run(command: Command) -> Result<(), Box<dyn error::Error>> {
             let results = compare(&options, &workloads).await?;
             let report = Report {
                 cluster_peer_transport: "mtls",
+                cluster_wal_direct_io,
                 broker_workers,
                 state_dir: &options.state_dir,
                 results: &results,

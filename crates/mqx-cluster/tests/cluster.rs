@@ -297,6 +297,32 @@ async fn versioned_reader_restores_legacy_snapshot_and_versioned_wal_tail() {
     rebuilt.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_io_configuration_cannot_discard_an_existing_wal() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = configs(&root, 1, SnapshotPolicy::Never).remove(&1).unwrap();
+    cfg.auto_recover = true;
+    let node = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
+    put(&node, "key", "committed before config change").await;
+    node.shutdown().await.unwrap();
+
+    cfg.wal_direct_io = true;
+    let result = Cluster::start(cfg.clone(), Kv::default()).await;
+    assert!(matches!(
+        result, Err(ClusterError::Io(err)) if matches!(
+            err.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        )
+    ));
+
+    cfg.wal_direct_io = false;
+    let node = Cluster::start(cfg, Kv::default()).await.unwrap();
+    assert_eq!(
+        put(&node, "key", "after restart").await.previous.as_deref(),
+        Some("committed before config change"),
+    );
+    node.shutdown().await.unwrap();
+}
+
 async fn refuse_foreign_state_without_node_identity(only_snapshot: bool) {
     let root = tempfile::tempdir().unwrap();
     let policy = if only_snapshot {
@@ -509,8 +535,23 @@ async fn concurrent_bootstrap_forwarding_failover_and_rejoining() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_installs_snapshot_when_its_missing_prefix_has_been_purged() {
+    snapshot_catchup(false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires storage with Linux direct I/O and STATX_DIOALIGN"]
+async fn mixed_wal_voters_catch_up_after_compaction() {
+    snapshot_catchup(true).await;
+}
+
+async fn snapshot_catchup(mixed: bool) {
     let root = tempfile::tempdir().unwrap();
-    let configs = configs(&root, 3, SnapshotPolicy::LogsSinceLast(8));
+    let mut configs = configs(&root, 3, SnapshotPolicy::LogsSinceLast(8));
+    if mixed {
+        configs.get_mut(&1).unwrap().wal_direct_io = true;
+        configs.get_mut(&2).unwrap().wal_direct_io = true;
+    }
     let mut nodes = start(&configs).await;
     let leader_id = elected(&nodes).await;
     let follower_id = *nodes.keys().find(|&&id| id != leader_id).unwrap();
@@ -533,16 +574,18 @@ async fn follower_installs_snapshot_when_its_missing_prefix_has_been_purged() {
             .filter(|index| *index > lagged_at && *index >= important.index)
     })
     .await;
-    let tail = put(&leader, "tail", "after compaction").await;
+    put(&leader, "tail", "after compaction").await;
     let mut cfg = configs[&follower_id].clone();
     cfg.snapshot_policy = SnapshotPolicy::Never;
     let returned = Cluster::start(cfg, Kv::default()).await.unwrap();
+    let expected_writes = leader.read(|kv| kv.durable.writes.clone());
     returned
         .linearizable_read(|kv| {
             assert_eq!(kv.durable.values["large"], large);
             assert_eq!(kv.durable.values["tail"], "after compaction");
-            assert_eq!(kv.restored, 1);
-            assert!(kv.durable.writes.contains(&tail.index));
+            // A voter can restore a local snapshot before installing a newer
+            // one. Its final application history must match the leader's.
+            assert_eq!(kv.durable.writes, expected_writes);
             assert!(!kv.applied_here.contains(&important.index));
         })
         .await

@@ -67,6 +67,9 @@ data:
     cluster_node_id $MQX_NODE_ID
     cluster_bind 0.0.0.0:7000
     cluster_data_dir /var/lib/mqextended/raft
+    {{- if .Values.storage.directIO }}
+    cluster_wal_direct_io true
+    {{- end }}
     cluster_cafile /etc/mqextended/peer/ca.crt
     cluster_certfile /etc/mqextended/peer/tls.crt
     cluster_keyfile /etc/mqextended/peer/tls.key

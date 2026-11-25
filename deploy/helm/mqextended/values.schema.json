@@ -38,6 +38,7 @@
       "additionalProperties": false,
       "required": ["size"],
       "properties": {
+        "directIO": { "type": "boolean" },
         "storageClassName": { "type": ["string", "null"] },
         "size": { "type": "string", "minLength": 1 }
       }

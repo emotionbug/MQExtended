@@ -173,6 +173,7 @@ impl<S: StateMachine> Cluster<S> {
             join,
             membership_generation,
             state_format,
+            wal_direct_io,
             auto_recover,
             auto_recover_timeout,
             heartbeat_interval,
@@ -239,8 +240,13 @@ impl<S: StateMachine> Cluster<S> {
                     }
                 }
                 let recover = |error| unusable_state(&data_dir, node_id, auto_recover, error);
-                let wal = Wal::open(&data_dir.join("wal"), max_append_size, state_format)
-                    .map_err(|error| recover(error.into()))?;
+                let wal = Wal::open_with_direct(
+                    &data_dir.join("wal"),
+                    max_append_size,
+                    state_format,
+                    wal_direct_io,
+                )
+                .map_err(|error| recover(error.into()))?;
                 let loaded = (|| {
                     let (initial, digest, existing, record) = load_identity(
                         &data_dir,

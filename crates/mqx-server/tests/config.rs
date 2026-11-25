@@ -784,6 +784,7 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
     assert_eq!(config.peers[&2], "192.0.2.2:9002".parse().unwrap());
     assert_eq!(config.peers[&u64::MAX], "[::1]:9001".parse().unwrap());
     assert_eq!(config.data_dir, Path::new("raft storage"));
+    assert!(!config.wal_direct_io);
     let ClusterSecurity::Tls {
         ca_file,
         cert_file,
@@ -807,7 +808,7 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
         cluster_election_timeout 360 700\n\
         cluster_lease_interval 1700\n\
         cluster_lease_timeout 4800\n\
-        cluster_request_timeout 6900\ncluster_max_snapshot_size 123456\n"
+        cluster_request_timeout 6900\ncluster_max_snapshot_size 123456\ncluster_wal_direct_io true\n"
     );
     let config = ServerConfig::parse(&custom).unwrap().cluster.unwrap();
     assert_eq!(config.heartbeat_interval, Duration::from_millis(150));
@@ -817,6 +818,7 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
     assert_eq!(config.lease_timeout, Duration::from_millis(4800));
     assert_eq!(config.request_timeout, Duration::from_millis(6900));
     assert_eq!(config.max_snapshot_size, 123456);
+    assert!(config.wal_direct_io);
 }
 
 #[test]

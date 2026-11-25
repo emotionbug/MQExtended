@@ -25,6 +25,7 @@ Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExte
 | `cluster_join true` | Start an empty node as a new member of a running cluster instead of bootstrapping one | false |
 | `cluster_membership_generation <n>` | Version of the `cluster_peer` list; raise it to request a membership change | 0 |
 | `cluster_state_format <1\|2>` | On-disk and wire format this node writes; see [upgrades](#upgrades) | 2 |
+| `cluster_wal_direct_io true` | Use direct synchronous I/O for a new Linux WAL; not an in-place conversion | false |
 | `cluster_qos1_replay_batch true` | Reserve a bounded window of ready MQTT 3.x QoS 1 messages in one commit when a persistent subscriber resumes; see [upgrades](#upgrades) | false |
 | `auto_recover true` | Recover from quorum loss, a lost peer or unusable local state without operator action, giving up consistency; see [automatic recovery](#automatic-recovery). Also applies to a standalone broker | false |
 | `auto_recover_timeout <ms>` | How long a node waits without quorum before it continues alone; requires `auto_recover true` | `cluster_lease_timeout` |
@@ -197,6 +198,8 @@ Use a rolling upgrade only if every running binary can replay every command that
 2. Once every node runs the new binary, roll the setting to the new format, again one node at a time.
 
 Don't change membership in the middle of an upgrade.
+
+The direct-I/O WAL is experimental. `cluster_wal_direct_io true` (`storage.directIO=true` in Helm) selects it for a new WAL on a Linux volume that reports compatible direct-I/O alignment. It does not convert an existing legacy WAL, and turning the flag off does not convert a direct WAL back. This build recognizes an existing direct WAL automatically. Do not delete a WAL to make startup succeed, or use an older binary on a direct-I/O volume. For a mixed-format trial, finish the binary upgrade, take a [cold backup](#cold-backup-and-restore), then [replace one voter at a time](#changing-membership) with a new ID and an empty volume. Test restoration with the matching binary and config before cutover.
 
 Leave `cluster_qos1_replay_batch` off during a rolling upgrade. Enable it at startup (`qos1ReplayBatch.enabled=true` in Helm) only after every voter and learner can read replay-window commands, including binaries used to recover from a backup. Switching it off stops new commands; it does not rewrite the WAL for a downgrade. Take a cold backup before enabling it if you need to return to an older binary.
 

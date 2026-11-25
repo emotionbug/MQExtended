@@ -8,6 +8,7 @@ async fn qos1_workload_loses_no_messages_on_any_broker() {
     let state = tempfile::tempdir().unwrap();
     let options = ComparisonOptions {
         state_dir: PathBuf::from(state.path()),
+        cluster_wal_direct_io: false,
         broker_workers: 2,
     };
     let load = Load {

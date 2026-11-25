@@ -1,9 +1,10 @@
 // The Raft storage integration follows OpenRaft's examples/log-wal (MIT OR Apache-2.0).
 use std::cmp::Ordering;
 use std::fmt::Debug;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::ops::{Bound, RangeBounds};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,11 +24,17 @@ use crate::snapshot::prepare_dir;
 use crate::transport::{decode, invalid_data};
 use crate::version;
 
+#[cfg(target_os = "linux")]
+mod direct;
+
+#[cfg(all(test, target_os = "linux"))]
+mod direct_tests;
+
 type Entry = EntryOf<Types>;
 type Vote = VoteOf<Types>;
 
 /// Metrics for the open WAL, reset when the node restarts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalMetrics {
     /// Entries accepted for append, including Raft control and lease entries.
     pub appended_entries: u64,
@@ -38,25 +45,147 @@ pub struct WalMetrics {
     pub sync_time: Duration,
     /// Longest filesystem-sync phase of a completed batch.
     pub sync_max: Duration,
-    /// Longest file-write phase of a completed batch.
+    /// Longest file-write phase; includes the sync when write and sync are fused.
     pub write_max: Duration,
     /// Longest wait from enqueue to the start of writing, including group wait.
     pub queue_wait_max: Duration,
 }
 
 struct Inner {
-    log: raft_log::RaftLog<WalTypes>,
+    log: Backend,
     pending_commit: Option<LogId>,
     appended_entries: u64,
 }
 
-impl Inner {
-    fn record_commit(&mut self) -> io::Result<()> {
-        if let Some(id) = self.pending_commit.take() {
-            self.log.commit(Packed(id))?;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", derive(Serialize, serde::Deserialize))]
+struct State {
+    vote: Option<Vote>,
+    committed: Option<LogId>,
+    purged: Option<LogId>,
+    last: Option<LogId>,
+}
+
+enum Backend {
+    Legacy(raft_log::RaftLog<WalTypes>),
+    #[cfg(target_os = "linux")]
+    Direct(direct::DirectLog),
+}
+
+impl Backend {
+    fn state(&self) -> State {
+        match self {
+            Self::Legacy(log) => {
+                let state = log.log_state();
+                State {
+                    vote: state.vote().map(|vote| vote.0),
+                    committed: state.committed().map(|id| id.0),
+                    purged: state.purged().map(|id| id.0),
+                    last: state.last().map(|id| id.0),
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Self::Direct(log) => log.state(),
         }
-        Ok(())
     }
+
+    fn entries(&self, start: u64, end: u64, budget: Option<usize>) -> io::Result<Vec<Entry>> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        match self {
+            Self::Legacy(log) => collect_entries(
+                log.read(start, end).map(|item| item.map(|(_, body)| body)),
+                budget,
+            ),
+            #[cfg(target_os = "linux")]
+            Self::Direct(log) => collect_entries(log.read(start, end), budget),
+        }
+    }
+
+    #[cfg(test)]
+    fn stat(&self) -> raft_log::Stat<WalTypes> {
+        match self {
+            Self::Legacy(log) => log.stat(),
+            #[cfg(target_os = "linux")]
+            Self::Direct(_) => unreachable!("legacy WAL test"),
+        }
+    }
+}
+
+fn collect_entries(
+    bodies: impl Iterator<Item = io::Result<EntryBytes>>,
+    budget: Option<usize>,
+) -> io::Result<Vec<Entry>> {
+    let Some(mut bytes) = budget else {
+        return bodies.map(|body| body?.entry()).collect();
+    };
+    let mut entries = Vec::new();
+    for body in bodies {
+        let body = body?;
+        let len = body.0.len();
+        if !entries.is_empty() && len > bytes {
+            break;
+        }
+        entries.push(body.entry()?);
+        bytes = bytes.saturating_sub(len);
+    }
+    Ok(entries)
+}
+
+fn record_commit(log: &mut raft_log::RaftLog<WalTypes>, pending: Option<LogId>) -> io::Result<()> {
+    if let Some(id) = pending {
+        log.commit(Packed(id))?;
+    }
+    Ok(())
+}
+
+const DIRECT_SEGMENT_PREFIX: &[u8; 7] = b"MQX-DIR";
+
+#[cfg(target_os = "linux")]
+fn direct_guard_name() -> String {
+    raft_log::chunked_wal::Config::chunk_file_name(raft_log::ChunkId(u64::MAX))
+}
+
+fn wal_chunk_files(path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let mut files = Vec::new();
+    for entry in path.read_dir()? {
+        let entry = entry?;
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| raft_log::chunked_wal::Config::parse_chunk_file_name(name).ok())
+        {
+            files.push((id, entry.path()));
+        }
+    }
+    files.sort_unstable_by_key(|(id, _)| *id);
+    Ok(files)
+}
+
+fn select_direct(path: &Path, requested: bool) -> io::Result<bool> {
+    let files = wal_chunk_files(path)?;
+    if files.last().is_some_and(|(id, _)| *id == u64::MAX) {
+        return Ok(true);
+    }
+    if let Some((_, first)) = files.first() {
+        // The first segment may have been synced and published just before
+        // the crash that interrupted publication of the format guard.
+        let mut prefix = [0; DIRECT_SEGMENT_PREFIX.len()];
+        match File::open(first)?.read_exact(&mut prefix) {
+            Ok(()) if &prefix == DIRECT_SEGMENT_PREFIX => return Ok(true),
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error),
+        }
+        if requested {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "direct WAL requires an empty WAL directory; existing legacy WAL is unchanged",
+            ));
+        }
+    }
+    Ok(requested)
 }
 
 #[derive(Clone)]
@@ -68,7 +197,17 @@ pub(crate) struct Wal {
 }
 
 impl Wal {
+    #[cfg(test)]
     pub(crate) fn open(path: &Path, max_append_size: usize, format: u16) -> io::Result<Self> {
+        Self::open_with_direct(path, max_append_size, format, false)
+    }
+
+    pub(crate) fn open_with_direct(
+        path: &Path,
+        max_append_size: usize,
+        format: u16,
+        direct: bool,
+    ) -> io::Result<Self> {
         prepare_dir(path, true)?;
         let dir = path
             .to_str()
@@ -84,7 +223,28 @@ impl Wal {
         // IOFlushed callback only once the group is durable.
         config.wal.flush_batch_wait = Some(Duration::from_micros(200));
         config.wal.flush_batch_max_items = Some(64);
-        let log = raft_log::RaftLog::open(Arc::new(config))?;
+        let log = if select_direct(path, direct)? {
+            #[cfg(target_os = "linux")]
+            {
+                Backend::Direct(direct::DirectLog::open(path, &config.wal)?)
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "direct WAL requires Linux",
+            ));
+        } else {
+            match raft_log::RaftLog::open(Arc::new(config)) {
+                Ok(log) => Backend::Legacy(log),
+                Err(error) if select_direct(path, false)? => {
+                    // A concurrent direct initializer won the directory lock.
+                    // The legacy decoder rejected its guard; this is not
+                    // grounds for destructive corruption recovery.
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         Ok(Self {
             inner: Arc::new(RwLock::new(Some(Inner {
                 log,
@@ -100,8 +260,8 @@ impl Wal {
     /// Check for preexisting Raft state on the blocking startup thread.
     pub(crate) fn has_raft_state(&self) -> bool {
         self.inner.blocking_read().as_ref().is_some_and(|inner| {
-            let state = inner.log.log_state();
-            state.vote().is_some() || state.last().is_some() || state.committed().is_some()
+            let state = inner.log.state();
+            state.vote.is_some() || state.last.is_some() || state.committed.is_some()
         })
     }
 
@@ -112,32 +272,60 @@ impl Wal {
 
     pub(crate) async fn metrics(&self) -> io::Result<WalMetrics> {
         let inner = self.read().await?;
-        let flush = inner.log.stat().flush_metrics;
-        Ok(WalMetrics {
-            appended_entries: inner.appended_entries,
-            sync_batches: flush.sync_batch_count,
-            sync_time: Duration::from_micros(flush.sync_us),
-            sync_max: Duration::from_micros(flush.sync_max_us),
-            write_max: Duration::from_micros(flush.write_max_us),
-            queue_wait_max: Duration::from_micros(flush.queued_wait_max_us),
-        })
+        let mut metrics = match &inner.log {
+            Backend::Legacy(log) => {
+                let flush = log.stat().flush_metrics;
+                WalMetrics {
+                    sync_batches: flush.sync_batch_count,
+                    sync_time: Duration::from_micros(flush.sync_us),
+                    sync_max: Duration::from_micros(flush.sync_max_us),
+                    write_max: Duration::from_micros(flush.write_max_us),
+                    queue_wait_max: Duration::from_micros(flush.queued_wait_max_us),
+                    ..WalMetrics::default()
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Direct(log) => log.metrics(),
+        };
+        metrics.appended_entries = inner.appended_entries;
+        Ok(metrics)
     }
 
     pub(crate) async fn close(self) -> io::Result<()> {
-        let inner = self.inner.write().await.take();
-        tokio::task::spawn_blocking(move || {
-            if let Some(mut inner) = inner {
-                // A clean restart can replay up to the last observed commit
-                // without waiting for the next leader to reaffirm it.
-                inner.record_commit()?;
-                let (tx, rx) = oneshot::channel();
-                inner.log.flush(true, Some(Flushed::Await(tx)))?;
-                rx.blocking_recv().map_err(io::Error::other)??;
+        let Some(Inner {
+            log,
+            pending_commit,
+            ..
+        }) = self.inner.write().await.take()
+        else {
+            return Ok(());
+        };
+        // A clean restart can replay up to the last observed commit without
+        // waiting for the next leader to reaffirm it.
+        let (tx, rx) = oneshot::channel();
+        match log {
+            Backend::Legacy(mut log) => tokio::task::spawn_blocking(move || {
+                record_commit(&mut log, pending_commit)?;
+                log.flush(true, Some(Flushed::Await(tx)))?;
+                rx.blocking_recv().map_err(io::Error::other)?
+            })
+            .await
+            .map_err(io::Error::other)?,
+            #[cfg(target_os = "linux")]
+            Backend::Direct(mut log) => {
+                let result = match log
+                    .control(pending_commit, None, Some(Flushed::Await(tx)))
+                    .await
+                {
+                    Ok(()) => rx.await.map_err(io::Error::other).and_then(|result| result),
+                    Err(error) => Err(error),
+                };
+                let shutdown = tokio::task::spawn_blocking(move || log.shutdown())
+                    .await
+                    .map_err(io::Error::other)?;
+                result.and(shutdown)
             }
-            Ok(())
-        })
-        .await
-        .map_err(io::Error::other)?
+        }
     }
 
     async fn read(&self) -> io::Result<RwLockReadGuard<'_, Inner>> {
@@ -166,32 +354,18 @@ impl RaftLogReader<Types> for Wal {
             Bound::Excluded(&n) => n,
             Bound::Unbounded => u64::MAX,
         };
-        self.read()
-            .await?
-            .log
-            .read(start, end)
-            .map(|item| item?.1.entry())
-            .collect()
+        self.read().await?.log.entries(start, end, None)
     }
 
     async fn limited_get_log_entries(&mut self, start: u64, end: u64) -> io::Result<Vec<Entry>> {
-        let log = self.read().await?;
-        let mut remaining = self.append_budget;
-        let mut entries = Vec::new();
-        for item in log.log.read(start, end) {
-            let (_, body) = item?;
-            let len = body.0.len();
-            if !entries.is_empty() && len > remaining {
-                break;
-            }
-            entries.push(body.entry()?);
-            remaining = remaining.saturating_sub(len);
-        }
-        Ok(entries)
+        self.read()
+            .await?
+            .log
+            .entries(start, end, Some(self.append_budget))
     }
 
     async fn read_vote(&mut self) -> io::Result<Option<Vote>> {
-        let vote = self.read().await?.log.log_state().vote().map(|vote| vote.0);
+        let vote = self.read().await?.log.state().vote;
         // A fork has no saved vote. Seed the first election above its snapshot
         // term without granting a vote to any real member (node IDs are positive).
         Ok(vote.or_else(|| self.term_floor.map(|term| Vote::new(term, 0))))
@@ -203,10 +377,10 @@ impl RaftLogStorage<Types> for Wal {
 
     async fn get_log_state(&mut self) -> io::Result<LogState<Types>> {
         let log = self.read().await?;
-        let state = log.log.log_state();
+        let state = log.log.state();
         Ok(LogState {
-            last_purged_log_id: state.purged().map(|id| id.0),
-            last_log_id: state.last().map(|id| id.0),
+            last_purged_log_id: state.purged,
+            last_log_id: state.last,
         })
     }
 
@@ -217,10 +391,21 @@ impl RaftLogStorage<Types> for Wal {
     async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
         {
-            let mut log = self.write().await?;
-            log.record_commit()?;
-            log.log.save_vote(StoredVote(*vote))?;
-            log.log.flush(true, Some(Flushed::Await(tx)))?;
+            let mut inner = self.write().await?;
+            let pending = inner.pending_commit.take();
+            let callback = Some(Flushed::Await(tx));
+            match &mut inner.log {
+                Backend::Legacy(log) => {
+                    record_commit(log, pending)?;
+                    log.save_vote(StoredVote(*vote))?;
+                    log.flush(true, callback)?;
+                }
+                #[cfg(target_os = "linux")]
+                Backend::Direct(log) => {
+                    log.control(pending, Some(direct::Change::Vote(*vote)), callback)
+                        .await?
+                }
+            }
         }
         rx.await.map_err(io::Error::other)?
     }
@@ -228,7 +413,7 @@ impl RaftLogStorage<Types> for Wal {
     async fn save_committed(&mut self, committed: Option<LogId>) -> io::Result<()> {
         if let Some(id) = committed {
             let mut inner = self.write().await?;
-            let persisted = inner.log.log_state().committed().map(|id| id.0);
+            let persisted = inner.log.state().committed;
             if Some(id) > inner.pending_commit.max(persisted) {
                 // Commit progress is recoverable from Raft after a power loss.
                 // Coalesce monotonic markers until the next required sync.
@@ -240,9 +425,7 @@ impl RaftLogStorage<Types> for Wal {
 
     async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
         let inner = self.read().await?;
-        Ok(inner
-            .pending_commit
-            .max(inner.log.log_state().committed().map(|id| id.0)))
+        Ok(inner.pending_commit.max(inner.log.state().committed))
     }
 
     async fn append<I>(&mut self, entries: I, callback: IOFlushed<Types>) -> io::Result<()>
@@ -256,41 +439,70 @@ impl RaftLogStorage<Types> for Wal {
                 Ok((Packed(entry.log_id()), EntryBytes(body)))
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let mut log = self.write().await?;
-        log.record_commit()?;
+        let mut inner = self.write().await?;
+        let pending = inner.pending_commit.take();
         let count = encoded.len() as u64;
-        log.log.append(encoded)?;
-        log.log.flush(true, Some(Flushed::Raft(callback)))?;
-        log.appended_entries += count;
+        let callback = Flushed::Raft(callback);
+        match &mut inner.log {
+            Backend::Legacy(log) => {
+                record_commit(log, pending)?;
+                log.append(encoded)?;
+                log.flush(true, Some(callback))?;
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Direct(log) => log.append(pending, encoded, callback).await?,
+        }
+        inner.appended_entries += count;
         Ok(())
     }
 
     async fn truncate_after(&mut self, last: Option<LogId>) -> io::Result<()> {
         let rx = {
-            let mut log = self.write().await?;
+            let mut inner = self.write().await?;
             let first_removed = last.next_index();
-            if first_removed >= log.log.log_state().last().map(|id| id.0).next_index() {
+            if first_removed >= inner.log.state().last.next_index() {
                 return Ok(());
             }
-            log.record_commit()?;
-            log.log.truncate(first_removed)?;
+            let pending = inner.pending_commit.take();
             // OpenRaft can publish a snapshot after truncating a conflicting
             // suffix, without an intervening append. Persist the truncation
             // before that snapshot can become the recovery point.
             let (tx, rx) = oneshot::channel();
-            log.log.flush(true, Some(Flushed::Await(tx)))?;
+            let callback = Some(Flushed::Await(tx));
+            match &mut inner.log {
+                Backend::Legacy(log) => {
+                    record_commit(log, pending)?;
+                    log.truncate(first_removed)?;
+                    log.flush(true, callback)?;
+                }
+                #[cfg(target_os = "linux")]
+                Backend::Direct(log) => {
+                    log.control(pending, Some(direct::Change::Truncate(last)), callback)
+                        .await?
+                }
+            }
             rx
         };
         rx.await.map_err(io::Error::other)?
     }
 
     async fn purge(&mut self, id: LogId) -> io::Result<()> {
-        let mut log = self.write().await?;
-        if id.index >= log.log.log_state().purged().map(|id| id.0).next_index() {
-            log.record_commit()?;
-            log.log.purge(Packed(id))?;
-            // raft-log only deletes obsolete chunk files after the covering purge is durable.
-            log.log.flush(true, None)?;
+        let mut inner = self.write().await?;
+        if id.index >= inner.log.state().purged.next_index() {
+            let pending = inner.pending_commit.take();
+            match &mut inner.log {
+                Backend::Legacy(log) => {
+                    record_commit(log, pending)?;
+                    log.purge(Packed(id))?;
+                    // raft-log only deletes obsolete chunk files after the covering purge is durable.
+                    log.flush(true, None)?;
+                }
+                #[cfg(target_os = "linux")]
+                Backend::Direct(log) => {
+                    log.control(pending, Some(direct::Change::Purge(id)), None)
+                        .await?
+                }
+            }
         }
         Ok(())
     }
@@ -318,16 +530,23 @@ impl raft_log::Types for WalTypes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EntryBytes(Bytes);
 
-impl EntryBytes {
-    fn payload(&self) -> io::Result<&[u8]> {
-        let (version, payload) = version::split(&self.0, "WAL entry").map_err(invalid_data)?;
-        match version {
-            1 | 2 => Ok(payload),
-            _ => Err(invalid_data(crate::ClusterError::UnsupportedVersion {
+fn entry_payload(body: &[u8]) -> io::Result<&[u8]> {
+    let (version, payload) = version::split(body, "WAL entry").map_err(invalid_data)?;
+    match version {
+        1 | 2 => Ok(payload),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::ClusterError::UnsupportedVersion {
                 kind: "WAL entry",
                 version,
-            })),
-        }
+            },
+        )),
+    }
+}
+
+impl EntryBytes {
+    fn payload(&self) -> io::Result<&[u8]> {
+        entry_payload(&self.0)
     }
 
     fn entry(&self) -> io::Result<Entry> {

@@ -41,6 +41,7 @@ impl fmt::Display for Broker {
 pub struct ComparisonOptions {
     /// Directory on the filesystem to benchmark. Cluster WALs are fresh for every row.
     pub state_dir: PathBuf,
+    pub cluster_wal_direct_io: bool,
     pub broker_workers: usize,
 }
 
@@ -262,6 +263,9 @@ impl Processes {
                     binds[nodes + idx]
                 )
                 .unwrap();
+                if options.cluster_wal_direct_io {
+                    config.push_str("cluster_wal_direct_io true\n");
+                }
                 for (peer_idx, peer) in binds[nodes..].iter().enumerate() {
                     writeln!(config, "cluster_peer {} {peer}", peer_idx + 1).unwrap();
                 }
