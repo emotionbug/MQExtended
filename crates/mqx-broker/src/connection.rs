@@ -1622,9 +1622,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         let mut request = pin!(request);
         let live = &session.live;
         let mut expires = deadline(keep_alive);
-        let mut ready = true;
+        let mut ready = None;
         let mut emitted = None;
         let mut dropped = None;
+        let fits = |packet: &Outbound| {
+            matches!(packet, Outbound::Publish { delivery, id: Some(mid), .. }
+                if delivery.qos == QoS::AtLeastOnce && *mid != id)
+        };
         loop {
             if live.taken.load(Ordering::Acquire) {
                 return Ok((1, Step::End(End::Takeover)));
@@ -1636,7 +1640,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 0
             };
             let idle = self.idle();
-            let can_send = ready
+            let can_send = ready != Some(false)
                 && emitted != Some(false)
                 && dropped.is_none()
                 && idle
@@ -1663,8 +1667,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 _ = live.ready.notified() => {
                     // A snapshot can invalidate this outbox even while a
                     // transport write is already pending.
-                    live.pop_reserved_if(|_| false)?;
-                    ready = true;
+                    ready = Some(live.has_reserved_if(fits)?);
                 }
                 result = self.progress(read), if read != 0 || !idle => {
                     result?;
@@ -1678,6 +1681,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                     }
                 }
                 _ = std::future::ready(()), if can_send => {
+                    // Check the local outbox before taking the replicated state
+                    // lock. A lone ACK usually has no next packet to overlap.
+                    if ready.is_none() && !live.has_reserved_if(fits)? {
+                        ready = Some(false);
+                        continue;
+                    }
                     // Leave queued packets for reauthentication in the outer loop.
                     if session.security.has_changed().unwrap_or(true) {
                         emitted = Some(false);
@@ -1688,11 +1697,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                     }) {
                         continue;
                     }
-                    let packet = live.pop_reserved_if(|packet| {
-                        matches!(packet, Outbound::Publish { delivery, id: Some(mid), .. }
-                            if delivery.qos == QoS::AtLeastOnce && *mid != id)
-                    })?;
-                    ready = packet.is_some();
+                    let packet = live.pop_reserved_if(fits)?;
+                    ready = Some(packet.is_some());
                     if let Some(packet) = packet {
                         // Use the ordinary encoder (alias allocation, packet
                         // size checks, and expiry). If it drops a packet,
@@ -2091,24 +2097,22 @@ mod tests {
             .await
             .unwrap();
         let mid = |id| PacketId::new(id).unwrap();
-        let publications = (1..=3)
-            .map(|id| {
-                Publication::legacy(
-                    Publish {
-                        packet_id: Some(mid(id)),
-                        topic: "mount/queue".into(),
-                        qos: QoS::AtLeastOnce,
-                        dup: false,
-                        retain: false,
-                        payload: Bytes::from_static(b"message"),
-                    },
-                    broker.now(),
-                )
-            })
-            .collect();
+        let publication = |id| {
+            Publication::legacy(
+                Publish {
+                    packet_id: Some(mid(id)),
+                    topic: "mount/queue".into(),
+                    qos: QoS::AtLeastOnce,
+                    dup: false,
+                    retain: false,
+                    payload: Bytes::from_static(b"message"),
+                },
+                broker.now(),
+            )
+        };
         assert_eq!(
             broker
-                .receive_many(&source, publications, false)
+                .receive_many(&source, (1..=3).map(&publication).collect(), false)
                 .await
                 .unwrap(),
             vec![Reply::PublishReason(R::SUCCESS.0); 3]
@@ -2224,13 +2228,40 @@ mod tests {
         .unwrap();
         assert!(matches!(result.unwrap(), (1, Step::Continue)));
 
+        // If the outbox starts empty, a later committed reservation must
+        // wake the transport while the ACK is still outstanding.
+        let (finish, done) = oneshot::channel();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            let ack = async {
+                done.await.unwrap();
+                Ok((1, session.ack(mid(2), Ack::Acknowledged).await?))
+            };
+            let mut waiting =
+                pin!(wire.while_acknowledging(&session, mid(2), mount, 0, &mut shutdown, ack));
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            tokio::join!(waiting, async {
+                assert_eq!(
+                    broker
+                        .receive(&source, publication(4), false)
+                        .await
+                        .unwrap(),
+                    Reply::PublishReason(R::SUCCESS.0),
+                );
+                read_publish(&mut client, "", mid(4)).await;
+                finish.send(()).unwrap();
+            })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result.unwrap(), (1, Step::Continue)));
+
         let extended = Packet5::PubAck(codec5::PublishAck {
-            packet_id: mid(4),
+            packet_id: mid(5),
             reason: R::NOT_AUTHORIZED,
             properties: vec![Property::ReasonString("denied".into())],
         });
         let mut raw = BytesMut::new();
-        for id in [mid(2), mid(3)] {
+        for id in [mid(3), mid(4)] {
             codec5::encode(&Packet5::PubAck(v5::publish_ack(id, R::SUCCESS)), &mut raw).unwrap();
         }
         codec5::encode(&extended, &mut raw).unwrap();

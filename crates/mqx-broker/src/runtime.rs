@@ -10,7 +10,7 @@ pub use telemetry::SocketObservation;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{
-        Arc, Mutex, OnceLock, RwLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -225,22 +225,35 @@ impl Live {
         self.pop_reserved_if(|_| true)
     }
 
+    pub(super) fn has_reserved_if(
+        &self,
+        fits: impl FnOnce(&Outbound) -> bool,
+    ) -> Result<bool, BrokerError> {
+        let outbox = self.reserved_outbox()?;
+        Ok(!self.taken.load(Ordering::Acquire) && outbox.packets.front().is_some_and(fits))
+    }
+
     pub(super) fn pop_reserved_if(
         &self,
         fits: impl FnOnce(&Outbound) -> bool,
     ) -> Result<Option<Outbound>, BrokerError> {
-        let mut outbox = self.outbox.lock().unwrap();
+        let mut outbox = self.reserved_outbox()?;
+        if !self.taken.load(Ordering::Acquire) && outbox.packets.front().is_some_and(fits) {
+            Ok(outbox.packets.pop_front())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn reserved_outbox(&self) -> Result<MutexGuard<'_, Outbox>, BrokerError> {
+        let outbox = self.outbox.lock().unwrap();
         if outbox.interrupted {
             return Err(ClusterError::WriteUncertain(
                 "snapshot skipped outbound send effects".into(),
             )
             .into());
         }
-        if !self.taken.load(Ordering::Acquire) && outbox.packets.front().is_some_and(fits) {
-            Ok(outbox.packets.pop_front())
-        } else {
-            Ok(None)
-        }
+        Ok(outbox)
     }
 
     fn bridge_queued(&self, pending: usize) {
