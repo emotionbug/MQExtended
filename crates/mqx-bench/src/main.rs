@@ -56,9 +56,12 @@ enum Command {
         pattern: Option<Pattern>,
         #[command(flatten)]
         shape: Shape,
-        /// Existing directory on the filesystem to use for cluster WALs.
+        /// Parent directory for fresh broker state. Defaults to the working directory.
         #[arg(long, default_value = ".")]
         state_dir: PathBuf,
+        /// Separate existing state parents for cluster voters 1, 2 and 3.
+        #[arg(long, num_args = 3, value_names = ["NODE1", "NODE2", "NODE3"])]
+        voter_state_dirs: Vec<PathBuf>,
         /// Tokio runtime workers per MQExtended process.
         #[arg(long, default_value_t = 2)]
         broker_workers: usize,
@@ -197,6 +200,7 @@ struct Report<'a> {
     cluster_peer_transport: &'static str,
     broker_workers: usize,
     state_dir: &'a Path,
+    voter_state_dirs: [&'a Path; 3],
     results: &'a [Comparison],
 }
 
@@ -285,11 +289,13 @@ async fn run(command: Command) -> Result<(), Box<dyn error::Error>> {
             pattern,
             shape,
             state_dir,
+            voter_state_dirs,
             broker_workers,
             json,
         } => {
             let options = ComparisonOptions {
                 state_dir,
+                voter_state_dirs,
                 broker_workers,
             };
             let workloads = match pattern {
@@ -301,6 +307,7 @@ async fn run(command: Command) -> Result<(), Box<dyn error::Error>> {
                 cluster_peer_transport: "mtls",
                 broker_workers,
                 state_dir: &options.state_dir,
+                voter_state_dirs: std::array::from_fn(|i| options.voter_state_dir(i)),
                 results: &results,
             };
             write_json(BufWriter::new(File::create(json)?), &report)?;

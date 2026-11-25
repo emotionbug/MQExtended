@@ -17,7 +17,9 @@ target/release/mqx-bench compare --pattern one-to-one --publishers 200 --subscri
     --require-p99-below-ms 50 --json persistent.json
 ```
 
-Run the comparison as an unprivileged user. MQTT clients connect over loopback TCP. Cluster peers use mutual TLS with a fresh CA and distinct node keys per run. The JSON report records the peer transport; older reports without this field used plaintext. `--state-dir` puts the three WALs on a chosen filesystem; use the disk type you will run in production.
+Run the comparison as an unprivileged user. MQTT clients use loopback TCP; the three cluster peers use mutual TLS with fresh credentials. `--state-dir` selects the parent for fresh process directories. To use separate local devices, also pass `--voter-state-dirs /disk1/bench /disk2/bench /disk3/bench` with three existing, writable parents. Each voter keeps its WAL and snapshots in its own private run directory. The report records the three parents, not their physical independence. For separate hosts, run `load` against their endpoints instead.
+
+`compare --persistent` now enables disk persistence with default autosave for both Mosquitto and standalone MQExtended. Clean standalone rows stay in memory. The `storage` field distinguishes `memory`, `autosave` and `raft-quorum`: autosave does **not** mean a synchronous write before PUBACK. Older `compare` reports without `storage` used memory for both standalone rows, even with persistent MQTT sessions.
 
 To compare two revisions without rebuilding locally, use the `mqextended-linux-<full commit SHA>` artifacts from the `linux-bundle` CI job. Extract each bundle into a separate directory, verify it with `sha256sum --check --strict SHA256SUMS` there, and restore the executable bit on `bin/mqextended`. Set `MQEXTENDED_RELEASE_BIN` to that binary's absolute path for each run. Keep the load-generator binary, worker count, storage and Mosquitto binary fixed.
 
@@ -90,6 +92,19 @@ For a standalone reference, both brokers ran with `persistence true` and default
 
 #### Live publishers and subscribers
 
+The 50 ms delivery-p99 gate still fails on one shared NVMe/ext4 device. The following runs used 200 persistent pairs, MQTT 3.1.1 QoS 1, 256-byte payloads, 30 s of traffic, 10 s of drain and the same `2f42bfa` load generator. The standalones had default autosave; both three-voter clusters used mutual TLS and waited for durable quorum. The MQExtended binaries came from verified release bundles (`8847eff` and experimental `361e287`).
+
+| Offered publishes/s | Mosquitto 2.1.4 | Standalone MQExtended | Three voters, default WAL | Three voters, direct synchronous WAL |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.197 ms | 0.721 ms | 1,275–1,946 ms | 1,342–1,879 ms |
+| 1,000 | 0.147 ms | 0.254 ms | 1,946 ms both runs | 130–839 ms |
+
+Each cluster cell covers two runs with fresh state; the repeat reversed the backend order. Each standalone cell is one run. Every sent publication was acknowledged and delivered once after drain (3,000 or 29,999 per cluster run). The direct WAL improved the two high-rate runs, but did not qualify at either rate. It remains on `perf/qualify-direct-wal-v1`, not in the production broker. After killing all three experimental release processes, the restarted cluster retained the partial MQTT ACK window: MIDs 1–3 did not return, 4–11 returned with DUP, and 12–16 were first deliveries.
+
+Moving clients or shortening the heartbeat did not solve the baseline either. In a 32-pair diagnostic at 250/s the release broker measured 159 ms p99 across voters, 168 ms on the leader alone, and 185 ms across voters with a 30 ms heartbeat instead of 100 ms.
+
+A separate 30-second storage control removed MQTT, Raft and networking. Three workers on the same ext4 device continually overwrote aligned 4 KiB blocks in three prewritten files with `O_DIRECT` and `RWF_DSYNC`. For each simulated arrival, we measured time until the **second** worker's next write completion, even counting writes already in flight. At 1,000 arrivals/s, 923 of 30,000 waited at least 50 ms; p99 was 326 ms. This is an optimistic wait for that device trace, not a production prediction or a reason to acknowledge writes before they are durable.
+
 On the same shared-disk setup, `8bd1490` → `8847eff` delivered **159 → 168 ms p99** at 250 publishes/s (32 pairs, 12 s). At 1,000/s (200 pairs, 16 s), the old build measured **2.68 s** and the new one **176 ms and 2.28 s**. One run per case except two final high-rate runs. The new build acknowledged and delivered every publication exactly once after drain; 11 of 3,000 and 94–588 of 16,000 deliveries arrived after the traffic window. The replay changes did **not** solve the 50 ms live target.
 
 Using the checksum-verified `2f42bfa` load generator for all three brokers, the 32-pair run measured **0.180 ms** p99 for Mosquitto 2.1.4, **0.238 ms** for MQExtended standalone and **159 ms** for MQExtended with three voters. Both standalone brokers used `persistence true` with default autosave, not a synchronous WAL quorum. Each broker acknowledged and delivered all 3,000 messages exactly once; only the cluster needed drain time (12 deliveries).
@@ -105,7 +120,7 @@ The 32-pair ranges cover three baseline runs and two final runs. The 200-pair ro
 
 The `6ca8f2d` experiment also preallocated 256 KiB WAL extents on Linux without extending EOF. We dropped this change: on the **same binary** at 250 publishes/s, alternating runs that refused `fallocate` gave **159–193 ms** delivery p99, versus **2.15–3.22 s** with preallocation enabled. All four runs delivered all 3,000 messages. A short filesystem microbenchmark had favored preallocation; it did not predict the broker result.
 
-With `2331d24`, 32 persistent pairs at 250 publishes/s for 8 s on one shared NVMe/ext4 device produced **2,000 PUBACKs and 2,000 unique deliveries** on every broker. The three-voter delivery p99 was **2.68 s** (2.78 s on `982e258`); 29 deliveries completed during drain. Standalone p99 was **0.22 ms**, Mosquitto **0.19 ms**. `compare` sets `persistence false` on both standalone processes; their sessions survive reconnect, not a crash. The cluster still waits for a durable quorum. These are different guarantees, and the cluster has **not** met the 50 ms persistent target on this disk.
+With `2331d24`, 32 persistent pairs at 250 publishes/s for 8 s on one shared NVMe/ext4 device produced **2,000 PUBACKs and 2,000 unique deliveries** on every broker. The three-voter delivery p99 was **2.68 s** (2.78 s on `982e258`); 29 deliveries completed during drain. Standalone p99 was **0.22 ms**, Mosquitto **0.19 ms**. That version of `compare` used `persistence false` on both standalone processes; their sessions survived reconnect, not a crash.
 
 Persistent QoS 1, 200 one-to-one pairs, 256-byte payloads, 30 s of traffic and 10 s configured drain. Release brokers, mutual TLS between the three voters, all three WALs on the same consumer NVMe/ext4 device. These are local measurements under contention, **not a passing release qualification**. Reported latency is the publisher-to-subscriber histogram's p99.
 

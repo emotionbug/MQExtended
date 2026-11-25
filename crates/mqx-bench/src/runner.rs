@@ -39,15 +39,24 @@ impl fmt::Display for Broker {
 
 #[derive(Debug, Clone)]
 pub struct ComparisonOptions {
-    /// Directory on the filesystem to benchmark. Cluster WALs are fresh for every row.
+    /// Default parent for fresh broker state. Existing broker data is never reused.
     pub state_dir: PathBuf,
+    /// Optional cluster-only overrides, in voter order. Empty means `state_dir` for all.
+    pub voter_state_dirs: Vec<PathBuf>,
     pub broker_workers: usize,
+}
+
+impl ComparisonOptions {
+    pub fn voter_state_dir(&self, index: usize) -> &Path {
+        self.voter_state_dirs.get(index).unwrap_or(&self.state_dir)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Comparison {
     pub broker: Broker,
     pub workload: Load,
+    pub storage: &'static str,
     pub result: LoadResult,
 }
 
@@ -59,6 +68,11 @@ pub async fn compare(
     if options.broker_workers == 0 || workloads.is_empty() {
         return Err(Error::Configuration(
             "comparison needs broker workers and workloads",
+        ));
+    }
+    if !matches!(options.voter_state_dirs.len(), 0 | 3) {
+        return Err(Error::Configuration(
+            "supply state parents for all three voters or none",
         ));
     }
     let mosquitto = mosquitto_binary()?;
@@ -87,7 +101,8 @@ pub async fn compare(
             (Broker::Standalone, &mqextended),
             (Broker::Cluster, &mqextended),
         ] {
-            let processes = Processes::start(broker, binary, options).await?;
+            let autosave = !workload.clean_session && !matches!(broker, Broker::Cluster);
+            let processes = Processes::start(broker, binary, options, autosave).await?;
             let result = load(&processes.addresses, workload)
                 .await
                 .map_err(|source| {
@@ -106,6 +121,11 @@ pub async fn compare(
             results.push(Comparison {
                 broker,
                 workload: workload.clone(),
+                storage: match broker {
+                    Broker::Cluster => "raft-quorum",
+                    _ if autosave => "autosave",
+                    _ => "memory",
+                },
                 result,
             });
         }
@@ -182,13 +202,11 @@ impl Drop for Node {
 }
 
 // A fresh CA for each comparison cluster. Its signing key never leaves memory.
-fn cluster_ca(dir: &Path) -> io::Result<CertifiedIssuer<'static, KeyPair>> {
+fn cluster_ca() -> io::Result<CertifiedIssuer<'static, KeyPair>> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let key = KeyPair::generate().map_err(io::Error::other)?;
-    let ca = CertifiedIssuer::self_signed(params, key).map_err(io::Error::other)?;
-    fs::write(dir.join("ca.pem"), ca.pem())?;
-    Ok(ca)
+    CertifiedIssuer::self_signed(params, key).map_err(io::Error::other)
 }
 
 fn node_credentials(dir: &Path, node: usize, ca: &CertifiedIssuer<'_, KeyPair>) -> io::Result<()> {
@@ -210,7 +228,7 @@ struct Processes {
     nodes: Vec<Node>,
     addresses: Vec<SocketAddr>,
     // Declaration order drops the processes before removing their configuration and WALs.
-    _state: TempDir,
+    directories: Vec<TempDir>,
 }
 
 impl Processes {
@@ -218,6 +236,7 @@ impl Processes {
         broker: Broker,
         binary: &Path,
         options: &ComparisonOptions,
+        autosave: bool,
     ) -> Result<Self, Error> {
         let nodes = if matches!(broker, Broker::Cluster) {
             3
@@ -238,27 +257,35 @@ impl Processes {
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(fs::Permissions::from_mode(0o700));
         }
-        let state = builder.tempdir_in(&options.state_dir)?;
-        let ca = (nodes == 3).then(|| cluster_ca(state.path())).transpose()?;
+        let ca = (nodes == 3)
+            .then(cluster_ca)
+            .transpose()?
+            .map(|ca| (ca.pem(), ca));
         let mut processes = Self {
             nodes: Vec::with_capacity(nodes),
             addresses: binds[..nodes].to_vec(),
-            _state: state,
+            directories: Vec::with_capacity(nodes),
         };
         let workers = options.broker_workers.to_string();
         for (idx, address) in processes.addresses.iter().enumerate() {
             let node = idx + 1;
-            let dir = processes._state.path().join(node.to_string());
-            fs::create_dir(&dir)?;
+            let parent = if nodes == 3 {
+                options.voter_state_dir(idx)
+            } else {
+                &options.state_dir
+            };
+            processes.directories.push(builder.tempdir_in(parent)?);
+            let dir = processes.directories[idx].path();
             let mut config = format!(
-                "listener {} 127.0.0.1\nallow_anonymous true\npersistence false\nconnection_messages false\nlog_type warning\nlog_type error\n",
+                "listener {} 127.0.0.1\nallow_anonymous true\npersistence {autosave}\nconnection_messages false\nlog_type warning\nlog_type error\n",
                 address.port()
             );
-            if let Some(ca) = &ca {
-                node_credentials(&dir, node, ca)?;
+            if let Some((pem, ca)) = &ca {
+                fs::write(dir.join("ca.pem"), pem)?;
+                node_credentials(dir, node, ca)?;
                 writeln!(
                     config,
-                    "cluster_node_id {node}\ncluster_bind {}\ncluster_data_dir raft\ncluster_cafile ../ca.pem\ncluster_certfile cert.pem\ncluster_keyfile key.pem",
+                    "cluster_node_id {node}\ncluster_bind {}\ncluster_data_dir raft\ncluster_cafile ca.pem\ncluster_certfile cert.pem\ncluster_keyfile key.pem",
                     binds[nodes + idx]
                 )
                 .unwrap();
@@ -270,8 +297,7 @@ impl Processes {
         }
         drop(sockets);
         for idx in 0..nodes {
-            let node = idx + 1;
-            let dir = processes._state.path().join(node.to_string());
+            let dir = processes.directories[idx].path();
             let log = dir.join("broker.log");
             let output = File::create(&log)?;
             let mut command = Command::new(binary);

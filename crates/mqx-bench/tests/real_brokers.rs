@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use mqx_bench::{ComparisonOptions, Load, Pattern, Quality, compare};
 
@@ -7,7 +7,8 @@ use mqx_bench::{ComparisonOptions, Load, Pattern, Quality, compare};
 async fn qos1_workload_loses_no_messages_on_any_broker() {
     let state = tempfile::tempdir().unwrap();
     let options = ComparisonOptions {
-        state_dir: PathBuf::from(state.path()),
+        state_dir: state.path().to_owned(),
+        voter_state_dirs: Vec::new(),
         broker_workers: 2,
     };
     let load = Load {
