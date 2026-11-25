@@ -423,17 +423,16 @@ impl SecurityHandle {
         }
     }
 
-    /// Replaces policy files loaded by the caller. In cluster mode follow
-    /// this with [`Broker::register_security`] to commit the changed ACL.
-    pub fn replace_text(
+    /// Validate new policy files without notifying connections. Invoke the
+    /// returned operation to install them, then register the ACL in cluster mode.
+    pub fn prepare_replacement(
         &self,
         password: Option<PasswordFile>,
         acl: Option<Vec<u8>>,
         anonymous: Box<[bool]>,
-    ) -> Result<(), AclFileError> {
+    ) -> Result<impl FnOnce() + '_, AclFileError> {
         let (parsed, text) = parse_acl(acl)?;
-        self.replace_inner(password, parsed, text, anonymous);
-        Ok(())
+        Ok(move || self.replace_inner(password, parsed, text, anonymous))
     }
 
     /// Replaces both files together and causes connected clients to reauthenticate.

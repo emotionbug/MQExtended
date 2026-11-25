@@ -770,12 +770,13 @@ async fn serve_broker(
                             }
                             // signals.c: reload configuration before opening credential files.
                             certificates.refresh(Some(&fresh));
-                            security.reload(&fresh)?;
-                            *reload_policies.write().unwrap_or_else(|e| e.into_inner()) =
-                                listener_policies(&fresh);
-                            // Publish the new inventory before revoking clients, so
-                            // a client that sees the revocation also sees it over HTTP.
-                            http_inventory.reload_access(&config, &fresh);
+                            security.reload(&fresh, || {
+                                *reload_policies.write().unwrap_or_else(|e| e.into_inner()) =
+                                    listener_policies(&fresh);
+                                // Updating a credential handle wakes existing connections;
+                                // publish the validated inventory before the first wakeup.
+                                http_inventory.reload_access(&config, &fresh);
+                            })?;
                             if membership.as_ref().is_none_or(|membership| membership.is_serving())
                                 && registered.load(Ordering::Acquire)
                             {
@@ -818,7 +819,7 @@ async fn serve_broker(
                                 logging.reload(&old.log);
                                 // signals.c still calls plugin reload callbacks
                                 // when the configuration reread fails.
-                                has_plugin_files.then(|| security.reload(old)).transpose()
+                                has_plugin_files.then(|| security.reload(old, || {})).transpose()
                             };
                             if reload?.is_some()
                                 && membership.as_ref().is_none_or(|membership| membership.is_serving())

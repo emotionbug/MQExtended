@@ -33,7 +33,7 @@ A `listener <port>` with `protocol http_api` serves Mosquitto's HTTP API (`src/h
 | Path | Content |
 | --- | --- |
 | `/api/v1/version` | Version object, as Mosquitto 2.1.4 |
-| `/api/v1/listeners` | The configured listeners, in config order |
+| `/api/v1/listeners` | The bound listeners, in startup order. SIGHUP publishes their new anonymous-access settings before notifying existing sessions. |
 | `/api/v1/systree` | The current `$SYS` tree as one JSON object |
 | `/api/v1/mqx/cluster` | MQExtended: cluster status, below |
 | `/api/v1/mqx/ready` | MQExtended: `200` if the node is admitting MQTT clients, otherwise `503` |

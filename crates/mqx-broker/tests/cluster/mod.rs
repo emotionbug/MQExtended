@@ -442,9 +442,10 @@ async fn replicated_acl_reload_rechecks_original_retained_source_across_nodes() 
         ..publish("history", b"stored", Q1, 1)
     }))
     .await;
-    security
-        .replace_text(None, Some(b"topic read history\n".to_vec()), Box::default())
+    let install = security
+        .prepare_replacement(None, Some(b"topic read history\n".to_vec()), Box::default())
         .unwrap();
+    install();
     c.register_security(&security).await.unwrap();
     sink.subscribe(&[("history", Q1)], &[Q1]).await;
     sink.ping().await;

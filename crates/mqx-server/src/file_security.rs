@@ -92,20 +92,28 @@ impl SecurityHandles {
         self.groups[group].handle.clone().for_listener(slot)
     }
 
-    pub(super) fn reload(&self, config: &ServerConfig) -> Result<(), ServerError> {
-        let fresh = self
+    pub(super) fn reload(
+        &self,
+        config: &ServerConfig,
+        before_install: impl FnOnce(),
+    ) -> Result<(), ServerError> {
+        let replacements = self
             .groups
             .iter()
-            .map(|group| Credentials::load(config, group.listeners[0]))
+            .map(|group| {
+                let anonymous = group
+                    .listeners
+                    .iter()
+                    .map(|&index| config.allow_anonymous_for(&config.listeners[index]))
+                    .collect();
+                Credentials::load(config, group.listeners[0])?.install(|password, acl| {
+                    group.handle.prepare_replacement(password, acl, anonymous)
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        for (group, credentials) in self.groups.iter().zip(fresh) {
-            let anonymous = group
-                .listeners
-                .iter()
-                .map(|&index| config.allow_anonymous_for(&config.listeners[index]))
-                .collect();
-            credentials
-                .install(|password, acl| group.handle.replace_text(password, acl, anonymous))?;
+        before_install();
+        for install in replacements {
+            install();
         }
         Ok(())
     }
