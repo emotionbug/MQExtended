@@ -94,7 +94,14 @@ For a standalone reference, both brokers ran with `persistence true` and default
 
 The manual [Persistent session latency workflow](../.github/workflows/persistent-latency.yml) measures a successful `main` CI release on two fresh GitHub-hosted VMs. Each VM runs all three voters and both standalone references, reversing the rate order on the second VM. A green result covers the offered load, publisher ACKs, subscriber deliveries and latency on **that filesystem**. Check `environment.txt` alongside the JSON before comparing storage.
 
-For [release `168f30a` on hosted runners](https://github.com/emotionbug/MQExtended/actions/runs/45521650577), the two three-voter runs both measured 3.54 ms p99 at 100/s and 7.34 ms at 1,000/s. All sent messages were acknowledged and delivered exactly once. Both VMs used ext4 with `nobarrier,data=writeback` on a copy-on-write root. The broker still called for synchronous WAL writes; this result does **not** verify power-loss durability or qualify three hosts with independent disks. Do not copy those mount options to a production volume.
+| Hosted release (two runners per row) | Three voters p99 at 100/s | Three voters p99 at 1,000/s |
+| --- | ---: | ---: |
+| [`168f30a`, AWS](https://github.com/emotionbug/MQExtended/actions/runs/45521650577) | 3.54 ms both | 7.34 ms both |
+| [`7429991`, Azure](https://github.com/emotionbug/MQExtended/actions/runs/45523762804) | 4.46–5.24 ms | 8.13–8.91 ms |
+
+Every row passed the 50 ms gate; all sent publications were acknowledged and delivered exactly once after drain. Runner placement changed between releases, so these are not paired measurements of the ACK change. All four VMs used ext4 with `nobarrier,data=writeback`. The broker still requested synchronous WAL writes; this result does **not** verify power-loss durability or qualify three hosts with independent disks. Do not copy those mount options to a production volume.
+
+On the local shared NVMe, skipping the replicated-state read on an empty subscriber outbox (`168f30a` → `7429991`) gave **2,147 → 1,879 ms** p99 at 100/s and **1,409 → 2,080 ms** at 1,000/s. The runs used the same `168f30a` load generator, fresh state and reverse rate order for the second binary. All sent publications got a PUBACK and one delivery. This removes a lock acquisition from the idle ACK path; the two runs do not establish a tail-latency gain.
 
 The 50 ms delivery-p99 gate still fails on one shared NVMe/ext4 device. The following runs used 200 persistent pairs, MQTT 3.1.1 QoS 1, 256-byte payloads, 30 s of traffic, 10 s of drain and the same `2f42bfa` load generator. The standalones had default autosave; both three-voter clusters used mutual TLS and waited for durable quorum. The MQExtended binaries came from verified release bundles (`8847eff` and experimental `361e287`).
 
