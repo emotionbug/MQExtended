@@ -37,6 +37,9 @@ use crate::snapshot::{
     open_private_file, prepare_dir, remove_staged_tempfiles,
 };
 use crate::snapshot_file::SnapshotData;
+use crate::storage::{
+    RESERVE_FILE, STAGED_RESERVE_FILE, Space, Storage, StorageMetrics, read_space,
+};
 use crate::survivor::{
     self, IDENTITY_FILE, IDENTITY_VERSION, Incarnation, JOINED, Probe, ProbeRequest, Record,
     SurvivorEvent, SurvivorReason, Switch,
@@ -95,6 +98,10 @@ pub struct ClusterMetrics {
     pub snapshot_index: Option<u64>,
     /// Size of the current local snapshot file, or zero before the first snapshot.
     pub snapshot_size_bytes: u64,
+    /// Space available to the broker on the data directory's filesystem.
+    pub storage_available_bytes: u64,
+    /// Bytes preallocated for emergencies, or zero while the reserve is released.
+    pub storage_reserve_bytes: u64,
     pub purged_index: Option<u64>,
     pub running: bool,
     pub auto_recover: bool,
@@ -126,6 +133,7 @@ impl<S: StateMachine> Drop for Node<S> {
 struct Core<S: StateMachine> {
     raft: Raft<Types, Store<S>>,
     store: Store<S>,
+    storage: Arc<StorageMetrics>,
     mesh: Mesh,
     requested: watch::Sender<Option<Desired>>,
     serving: watch::Sender<Serving>,
@@ -161,6 +169,14 @@ impl<S: StateMachine> Cluster<S> {
     /// Start listening and recover the latest durable state. This does not wait for a leader.
     /// An empty node initializes only in bootstrap mode; a joiner waits for replication.
     pub async fn start(config: ClusterConfig, state_machine: S) -> Result<Self, ClusterError> {
+        Self::start_with_storage(config, state_machine, read_space).await
+    }
+
+    async fn start_with_storage(
+        config: ClusterConfig,
+        state_machine: S,
+        read_space: impl Fn(&Path) -> io::Result<Space> + Send + 'static,
+    ) -> Result<Self, ClusterError> {
         let raft_config = Arc::new(config.raft_config()?);
         version::check_app::<S>("application write", S::WRITE_VERSION)?;
         if config.state_format == 1 && S::WRITE_VERSION != 1 {
@@ -172,6 +188,7 @@ impl<S: StateMachine> Cluster<S> {
         let ClusterConfig {
             node_id,
             data_dir,
+            storage_reserve,
             security,
             peers,
             join,
@@ -202,7 +219,7 @@ impl<S: StateMachine> Cluster<S> {
             generation: membership_generation,
             peers: peers.clone(),
         });
-        let (endpoint, wal, store, initial, existing, lock) =
+        let (endpoint, wal, store, initial, existing, lock, storage) =
             tokio::task::spawn_blocking(move || {
                 let tls = Tls::load(&security, node_id)?;
                 let limits = Limits {
@@ -211,10 +228,11 @@ impl<S: StateMachine> Cluster<S> {
                     mesh: max_mesh_size,
                 };
                 prepare_dir(&data_dir, false)?;
-                let lock = survivor::lock(&data_dir, auto_recover)?;
-                if lock.is_some() {
-                    Switch::recover(&data_dir, auto_recover.then_some(node_id))?;
-                }
+                // RaftLog acquires its WAL lock and starts writing in one call.
+                // The outer lock also fences plain nodes so we can safely make
+                // space and resolve any switch journal before entering that call.
+                let lock = survivor::lock(&data_dir, true)?;
+                Switch::recover(&data_dir, auto_recover.then_some(node_id))?;
                 match open_private_file(&data_dir.join(RETIRED_FILE)) {
                     Ok(_) => return Err(ClusterError::Removed(node_id)),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -230,8 +248,11 @@ impl<S: StateMachine> Cluster<S> {
                         // temporary file and a WAL without any Raft state.
                         if (name == "wal" && kind.is_dir())
                             || (is_staged_tempfile(&name) && kind.is_file())
-                            || (lock.is_some() && name == survivor::LOCK_FILE && kind.is_file())
-                            || (lock.is_some() && name == survivor::DISCARDED && kind.is_dir())
+                            || (matches!(
+                                name.to_str(),
+                                Some(survivor::LOCK_FILE | RESERVE_FILE | STAGED_RESERVE_FILE)
+                            ) && kind.is_file())
+                            || (name == survivor::DISCARDED && kind.is_dir())
                         {
                             continue;
                         }
@@ -240,6 +261,7 @@ impl<S: StateMachine> Cluster<S> {
                         ));
                     }
                 }
+                let storage = Storage::start(data_dir.clone(), storage_reserve, read_space);
                 let recover = |error| unusable_state(&data_dir, node_id, auto_recover, error);
                 let wal = Wal::open(&data_dir.join("wal"), max_append_size, state_format)
                     .map_err(|error| recover(error.into()))?;
@@ -296,7 +318,15 @@ impl<S: StateMachine> Cluster<S> {
                         .filter(|record| record.event.reason == SurvivorReason::PeerUnreachable)
                         .and_then(|_| store.last_applied().map(|id| id.leader_id.term)),
                 );
-                Ok((Arc::new(endpoint), wal, store, initial, existing, lock))
+                Ok((
+                    Arc::new(endpoint),
+                    wal,
+                    store,
+                    initial,
+                    existing,
+                    lock,
+                    storage,
+                ))
             })
             .await
             .map_err(io::Error::other)??;
@@ -346,6 +376,7 @@ impl<S: StateMachine> Cluster<S> {
         let core = Arc::new(Core {
             raft,
             store,
+            storage: storage.metrics(),
             mesh: Mesh::new(endpoint, request_timeout),
             requested: watch::channel(requested).0,
             serving: watch::channel(Serving::Waiting).0,
@@ -439,7 +470,7 @@ impl<S: StateMachine> Cluster<S> {
             core.raft.runtime_config().elect(false);
         }
         core.raft.run();
-        let driver = tokio::spawn(core.clone().run(listener, wal.clone(), lock));
+        let driver = tokio::spawn(core.clone().run(listener, wal.clone(), lock, storage));
         let cluster = Self(Arc::new(Node {
             core,
             wal,
@@ -701,6 +732,7 @@ impl<S: StateMachine> Cluster<S> {
         let receiver = self.0.core.raft.metrics();
         let m = receiver.borrow_watched();
         let endpoint = &self.0.core.mesh.endpoint;
+        let (storage_available_bytes, storage_reserve_bytes) = self.0.core.storage.bytes();
         ClusterMetrics {
             node_id: m.id,
             current_term: m.current_term,
@@ -710,6 +742,8 @@ impl<S: StateMachine> Cluster<S> {
             applied_index: m.last_applied.map(|id| id.index),
             snapshot_index: m.snapshot.map(|id| id.index),
             snapshot_size_bytes: self.0.core.store.snapshot_size(),
+            storage_available_bytes,
+            storage_reserve_bytes,
             purged_index: m.purged.map(|id| id.index),
             running: !*self.0.core.mesh.stop.borrow() && m.running_state.is_ok(),
             auto_recover: endpoint.recovery_timeout().is_some(),
@@ -1848,25 +1882,32 @@ impl<S: StateMachine> Core<S> {
         listener: TcpListener,
         mut wal: Wal,
         _lock: Option<File>,
+        storage: Storage<impl Fn(&Path) -> io::Result<Space> + Send + 'static>,
     ) -> Result<(), ClusterError> {
         let mut stop = self.mesh.stop.subscribe();
         let recover = self.mesh.endpoint.recovery_timeout().is_some();
         let recovery_timeout = self.mesh.endpoint.recovery_timeout();
-        let (_, change) = tokio::join!(self.serve(listener), async {
-            let result = tokio::select! {
-                _ = stop.wait_for(|stopped| *stopped) => Ok(None),
-                result = self.renew_leases() => result,
-                result = async { self.recover_incarnation(recovery_timeout.expect("recovery enabled")).await }, if recover => result,
-                // A stopped Raft core (for example after a failed WAL write)
-                // never serves again in this process. Stop the node so the
-                // server exits and its supervisor restarts it.
-                result = self.raft_failure() => Err(result),
-                _ = self.expire_leases() => Ok(None),
-                _ = self.reconcile_loop() => Ok(None),
-            };
-            self.mesh.stop.send_replace(true);
-            result
-        });
+        let (_, _, change) = tokio::join!(
+            self.serve(listener),
+            self.monitor_storage(storage),
+            async {
+                let result = tokio::select! {
+                    _ = stop.wait_for(|stopped| *stopped) => Ok(None),
+                    result = self.renew_leases() => result,
+                    result = async { self.recover_incarnation(recovery_timeout.expect("recovery enabled")).await }, if recover => result,
+                    // A stopped Raft core (for example after a failed WAL write)
+                    // never serves again in this process. Stop the node so the
+                    // server exits and its supervisor restarts it.
+                    result = self.raft_failure() => Err(result),
+                    _ = self.expire_leases() => Ok(None),
+                    _ = self.reconcile_loop() => Ok(None),
+                };
+                self.mesh.stop.send_replace(true);
+                result
+            }
+        );
+        // The monitor has joined its blocking job before a switch can archive
+        // data. Startup switches happen before the monitor is started.
         let raft_result = self.raft.try_shutdown().await;
         self.mesh.endpoint.close().await;
         let cleanup = async {
@@ -1900,6 +1941,74 @@ impl<S: StateMachine> Core<S> {
             self.restart.send_replace(true);
         }
         cleanup
+    }
+
+    async fn monitor_storage(
+        &self,
+        mut storage: Storage<impl Fn(&Path) -> io::Result<Space> + Send + 'static>,
+    ) {
+        const POLL: Duration = Duration::from_secs(2);
+        const ARCHIVE_SWEEP: Duration = Duration::from_secs(60 * 60);
+        let mut stop = self.mesh.stop.subscribe();
+        let mut poll = tokio::time::interval_at(Instant::now() + POLL, POLL);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut next_sweep = Instant::now() + ARCHIVE_SWEEP;
+        let mut compact = storage.under_pressure();
+        let mut compact_through = None;
+        let raft_metrics = self.raft.metrics();
+        loop {
+            let (applied, committed, snapshot) = {
+                let current = raft_metrics.borrow_watched();
+                (
+                    current.last_applied,
+                    current.local_committed,
+                    current.snapshot,
+                )
+            };
+            if *stop.borrow() {
+                return;
+            }
+            if compact && let Some(index) = applied.max(committed).map(|id| id.index) {
+                compact_through = Some(index);
+                compact = false;
+            }
+            if let Some(index) = compact_through {
+                let trigger = self.raft.trigger();
+                if let Some(snapshot) = snapshot.filter(|id| id.index >= index) {
+                    // Don't keep the normal catch-up tail during a space
+                    // emergency; lagging replicas can use the snapshot.
+                    let _ = trigger.purge_log(snapshot.index).await;
+                    compact_through = None;
+                } else if applied.is_some_and(|id| id.index >= index) {
+                    let _ = trigger.snapshot().await;
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => return,
+                _ = poll.tick() => {}
+            }
+            let now = Instant::now();
+            let sweep = now >= next_sweep;
+            if sweep {
+                next_sweep = now + ARCHIVE_SWEEP;
+            }
+            match tokio::task::spawn_blocking(move || {
+                let entered_pressure = storage.check(sweep);
+                (storage, entered_pressure)
+            })
+            .await
+            {
+                Ok((new_storage, entered_pressure)) => {
+                    storage = new_storage;
+                    compact |= entered_pressure;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Cluster storage monitor stopped");
+                    return;
+                }
+            }
+        }
     }
 
     async fn raft_failure(&self) -> ClusterError {
@@ -2772,6 +2881,7 @@ mod tests {
                 root.path().join(id.to_string()),
                 ClusterSecurity::InsecurePlaintext,
             );
+            config.storage_reserve = Some(0);
             config.lease_timeout = Duration::from_secs(5);
             Cluster::start(config, Counter::default())
         }))
@@ -2861,6 +2971,7 @@ mod tests {
             root.path().join("data"),
             ClusterSecurity::InsecurePlaintext,
         );
+        config.storage_reserve = Some(0);
         config.auto_recover = true;
         config.auto_recover_timeout = Some(Duration::from_secs(1));
         let original = Cluster::start(config.clone(), Counter::default())
@@ -2932,6 +3043,7 @@ mod tests {
                     root.path().join(id.to_string()),
                     ClusterSecurity::InsecurePlaintext,
                 );
+                config.storage_reserve = Some(0);
                 config.auto_recover = true;
                 config.auto_recover_timeout = Some(Duration::from_secs(6));
                 config.heartbeat_interval = Duration::from_millis(40);
@@ -3014,6 +3126,84 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn low_space_restart_releases_reserve_compacts_and_restores_reserve() {
+        const TARGET: u64 = 16 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let mut config = ClusterConfig::new(
+            1,
+            "127.0.0.1:0".parse().unwrap(),
+            BTreeMap::from([(1, "127.0.0.1:1".parse().unwrap())]),
+            root.path().join("data"),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        config.snapshot_policy = SnapshotPolicy::Never;
+        config.storage_reserve = Some(TARGET);
+        let reserve = config.data_dir.join(RESERVE_FILE);
+        let staging = config.data_dir.join(STAGED_RESERVE_FILE);
+        let available = Arc::new(AtomicU64::new(4 * TARGET));
+        let read_space = |available: Arc<AtomicU64>| {
+            move |_: &Path| {
+                Ok(Space {
+                    available: available.load(Ordering::Relaxed),
+                    target: 2 * TARGET,
+                })
+            }
+        };
+        let node = Cluster::start_with_storage(
+            config.clone(),
+            Counter::default(),
+            read_space(available.clone()),
+        )
+        .await
+        .unwrap();
+        let (before, total) = node.submit(5).await.unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(node.metrics().storage_reserve_bytes, TARGET);
+        assert_eq!(node.metrics().snapshot_index, None);
+        node.shutdown().await.unwrap();
+
+        // Reproduce a restart without actually filling the host's volume.
+        available.store(0, Ordering::Relaxed);
+        std::fs::write(&staging, b"interrupted reserve allocation").unwrap();
+        let node =
+            Cluster::start_with_storage(config, Counter::default(), read_space(available.clone()))
+                .await
+                .unwrap();
+        assert_eq!(node.metrics().storage_reserve_bytes, 0);
+        assert!(!staging.exists());
+        assert!(!reserve.exists());
+        assert_eq!(node.submit(2).await.unwrap().1, 7);
+        node.0
+            .core
+            .raft
+            .wait(Some(Duration::from_secs(8)))
+            .metrics(
+                |m| m.purged.is_some_and(|id| id.index >= before),
+                "early storage-pressure compaction",
+            )
+            .await
+            .unwrap();
+        assert!(node.metrics().snapshot_size_bytes > 0);
+
+        available.store(3 * TARGET + 1, Ordering::Relaxed);
+        timeout(Duration::from_secs(8), async {
+            while (
+                node.metrics().storage_available_bytes,
+                node.metrics().storage_reserve_bytes,
+            ) != (3 * TARGET + 1, TARGET)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(node.metrics().storage_available_bytes, 3 * TARGET + 1);
+        assert_eq!(reserve.metadata().unwrap().len(), TARGET);
+        node.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_join_interrupted_before_writing_identity_can_restart() {
         let root = tempfile::tempdir().unwrap();
@@ -3028,6 +3218,7 @@ mod tests {
             root.path().join("data"),
             ClusterSecurity::InsecurePlaintext,
         );
+        config.storage_reserve = Some(0);
         config.join = true;
         let wal = Wal::open(&config.data_dir.join("wal"), config.max_append_size, 2).unwrap();
         let (_, staged) = crate::snapshot::private_tempfile(&config.data_dir)
@@ -3044,15 +3235,40 @@ mod tests {
         assert!(staged.is_file());
         assert!(legacy.is_file());
         wal.close().await.unwrap();
+        let reserve = config.data_dir.join(RESERVE_FILE);
+        let interrupted_reserve = config.data_dir.join(STAGED_RESERVE_FILE);
+        std::fs::write(&reserve, b"completed reserve").unwrap();
+        std::fs::write(&interrupted_reserve, b"partial reserve").unwrap();
 
         let node = Cluster::start(config.clone(), Counter::default())
             .await
             .unwrap();
         assert!(!staged.exists());
         assert!(!legacy.exists());
+        assert!(!interrupted_reserve.exists());
+        assert!(!reserve.exists());
         assert!(config.data_dir.join(IDENTITY_FILE).is_file());
         assert!(node.members().is_empty());
         node.shutdown().await.unwrap();
+        // Older plain nodes use `enabled = false` and acquire the lock if it
+        // exists. After this node shuts down they can open the same state.
+        let old_lock = survivor::lock(&config.data_dir, false).unwrap().unwrap();
+        let old_wal = Wal::open(&config.data_dir.join("wal"), config.max_append_size, 2).unwrap();
+        assert!(
+            load_identity(
+                &config.data_dir,
+                config.node_id,
+                &config.peers,
+                true,
+                0,
+                &old_wal,
+                false
+            )
+            .unwrap()
+            .2
+        );
+        old_wal.close().await.unwrap();
+        drop(old_lock);
 
         config.data_dir = root.path().join("unidentified");
         let mut wal = Wal::open(&config.data_dir.join("wal"), config.max_append_size, 2).unwrap();
@@ -3085,6 +3301,7 @@ mod tests {
                 root.path().join(id.to_string()),
                 ClusterSecurity::InsecurePlaintext,
             );
+            config.storage_reserve = Some(0);
             config.heartbeat_interval = Duration::from_millis(30);
             config.election_timeout_min = Duration::from_millis(140);
             config.election_timeout_max = Duration::from_millis(260);
@@ -3210,16 +3427,15 @@ mod tests {
             .collect();
         drop(reserves);
         let nodes = futures_util::future::try_join_all(peers.iter().map(|(&id, &addr)| {
-            Cluster::start(
-                ClusterConfig::new(
-                    id,
-                    addr,
-                    peers.clone(),
-                    root.path().join(id.to_string()),
-                    ClusterSecurity::InsecurePlaintext,
-                ),
-                Counter::default(),
-            )
+            let mut config = ClusterConfig::new(
+                id,
+                addr,
+                peers.clone(),
+                root.path().join(id.to_string()),
+                ClusterSecurity::InsecurePlaintext,
+            );
+            config.storage_reserve = Some(0);
+            Cluster::start(config, Counter::default())
         }))
         .await
         .unwrap();
@@ -3292,6 +3508,7 @@ mod tests {
             data.clone(),
             ClusterSecurity::InsecurePlaintext,
         );
+        config.storage_reserve = Some(0);
         config.snapshot_policy = SnapshotPolicy::Never;
         config.lease_interval = Duration::from_secs(60);
         config.lease_timeout = Duration::from_secs(120);
@@ -3376,6 +3593,7 @@ mod tests {
             root.path().join("data"),
             ClusterSecurity::InsecurePlaintext,
         );
+        config.storage_reserve = Some(0);
         config.snapshot_policy = SnapshotPolicy::Never;
         config.lease_interval = Duration::from_secs(60);
         config.lease_timeout = Duration::from_secs(120);

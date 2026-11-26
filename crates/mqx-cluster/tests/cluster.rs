@@ -118,6 +118,7 @@ fn configs(
                 root.path().join(id.to_string()),
                 ClusterSecurity::InsecurePlaintext,
             );
+            config.storage_reserve = Some(0);
             config.heartbeat_interval = Duration::from_millis(35);
             config.election_timeout_min = Duration::from_millis(140);
             config.election_timeout_max = Duration::from_millis(260);
@@ -1014,6 +1015,7 @@ async fn replacement_follower_process() {
         data_dir.into(),
         ClusterSecurity::InsecurePlaintext,
     );
+    config.storage_reserve = Some(0);
     config.lease_interval = Duration::from_millis(70);
     let _node = Node::start(config, Kv::default()).await.unwrap();
     std::future::pending::<()>().await;

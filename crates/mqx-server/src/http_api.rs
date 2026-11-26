@@ -275,6 +275,11 @@ async fn prometheus(broker: &Broker) -> String {
         for (name, value) in [
             ("mqx_cluster_auto_recover", u64::from(metrics.auto_recover)),
             ("mqx_cluster_incarnation", metrics.incarnation),
+            (
+                "mqx_storage_available_bytes",
+                metrics.storage_available_bytes,
+            ),
+            ("mqx_storage_reserve_bytes", metrics.storage_reserve_bytes),
         ] {
             writeln!(body, "# TYPE {name} gauge\n{name} {value}").unwrap();
         }
@@ -482,10 +487,11 @@ mod metrics_tests {
         assert!(body.contains("mqx_connections"));
         assert!(!body.contains("mqx_raft_wal_"));
         assert!(!body.contains("mqx_raft_snapshot_size_bytes"));
+        assert!(!body.contains("mqx_storage_"));
     }
 
     #[tokio::test]
-    async fn cluster_scrape_exposes_snapshot_size_gauge() {
+    async fn cluster_scrape_exposes_storage_gauges() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = mqx_cluster::ClusterConfig::new(
             1,
@@ -503,5 +509,8 @@ mod metrics_tests {
         assert!(body.contains(
             "# TYPE mqx_raft_snapshot_size_bytes gauge\nmqx_raft_snapshot_size_bytes 0\n"
         ));
+        for metric in ["mqx_storage_available_bytes", "mqx_storage_reserve_bytes"] {
+            assert!(body.contains(&format!("# TYPE {metric} gauge\n{metric} ")));
+        }
     }
 }

@@ -11,6 +11,7 @@ mod mux;
 mod node;
 mod snapshot;
 mod snapshot_file;
+mod storage;
 mod survivor;
 mod transport;
 mod version;
@@ -44,6 +45,8 @@ pub const MAX_SNAPSHOT_SIZE: u64 = if usize::BITS <= 32 {
 };
 /// Default maximum snapshot transfer size.
 pub const DEFAULT_MAX_SNAPSHOT_SIZE: u64 = MAX_SNAPSHOT_SIZE;
+/// Largest fixed emergency storage reserve, in bytes.
+pub const MAX_STORAGE_RESERVE: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_COMMAND_SIZE: usize = 2 * 1024 * 1024;
 pub const DEFAULT_MAX_APPEND_SIZE: usize = 9 * 1024 * 1024;
 pub const DEFAULT_MAX_MESH_SIZE: usize = DEFAULT_MAX_COMMAND_SIZE;
@@ -128,6 +131,9 @@ pub struct ClusterConfig {
     /// Defaults to the lease timeout; only valid with automatic recovery enabled.
     pub auto_recover_timeout: Option<Duration>,
     pub data_dir: PathBuf,
+    /// Emergency reserve in bytes. `None` is automatic; `Some(0)` disables
+    /// the reserve and low-space actions but keeps age-based archive expiry.
+    pub storage_reserve: Option<u64>,
     pub security: ClusterSecurity,
     pub heartbeat_interval: Duration,
     pub election_timeout_min: Duration,
@@ -168,6 +174,7 @@ impl ClusterConfig {
             auto_recover: false,
             auto_recover_timeout: None,
             data_dir,
+            storage_reserve: None,
             security,
             heartbeat_interval: Duration::from_millis(100),
             election_timeout_min: Duration::from_millis(400),
@@ -245,8 +252,28 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Validate the fixed reserve before opening the data directory.
+    pub fn validate_storage_reserve(&self) -> Result<(), ClusterError> {
+        if self
+            .storage_reserve
+            .is_some_and(|bytes| bytes > MAX_STORAGE_RESERVE)
+        {
+            return Err(ClusterError::InvalidConfig(format!(
+                "'cluster_storage_reserve' must be between 0 and {MAX_STORAGE_RESERVE} bytes"
+            )));
+        }
+        #[cfg(not(unix))]
+        if self.storage_reserve.is_some_and(|bytes| bytes != 0) {
+            return Err(ClusterError::InvalidConfig(
+                "'cluster_storage_reserve' requires Unix for nonzero values".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn raft_config(&self) -> Result<openraft::Config, ClusterError> {
         self.check_frame_limits()?;
+        self.validate_storage_reserve()?;
         let invalid = ClusterError::InvalidConfig;
         membership::validate_peers(&self.peers)?;
         if !matches!(self.state_format, 1 | 2) {
@@ -369,5 +396,28 @@ mod tests {
                 Err(ClusterError::InvalidConfig(error)) if error.contains("max_snapshot_size")
             ));
         }
+    }
+
+    #[test]
+    fn raft_config_validates_the_storage_reserve() {
+        let address = "127.0.0.1:9001".parse().unwrap();
+        let mut config = ClusterConfig::new(
+            1,
+            address,
+            BTreeMap::from([(1, address)]),
+            PathBuf::from("raft"),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        assert_eq!(config.storage_reserve, None);
+        assert!(config.raft_config().is_ok());
+        config.storage_reserve = Some(0);
+        assert!(config.raft_config().is_ok());
+        config.storage_reserve = Some(MAX_STORAGE_RESERVE);
+        assert_eq!(config.raft_config().is_ok(), cfg!(unix));
+        config.storage_reserve = Some(MAX_STORAGE_RESERVE + 1);
+        assert!(matches!(
+            config.raft_config(),
+            Err(ClusterError::InvalidConfig(error)) if error.contains("cluster_storage_reserve")
+        ));
     }
 }

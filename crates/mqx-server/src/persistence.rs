@@ -17,6 +17,7 @@ pub(super) const RESTORE_FAILED: &str = "Unable to restore persistent database";
 pub(super) const IMPORT_FAILED: &str = "Unable to import Mosquitto persistence database";
 
 const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const ARCHIVE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub(super) struct Persistence {
     config: watch::Sender<PersistenceConfig>,
@@ -45,6 +46,7 @@ impl Persistence {
             return Ok(());
         }
         let native = snapshot_path(&config.persistence);
+        expire_discarded(native.clone()).await;
         let image = match load_database(
             RESTORE_FAILED,
             native.clone(),
@@ -205,6 +207,11 @@ impl Persistence {
                         }
                         _ => {}
                     }
+                    let _writer = self.writer.lock().await;
+                    let current = self.config.borrow().clone();
+                    if current.enabled {
+                        expire_discarded(snapshot_path(&current)).await;
+                    }
                 }
             }
         }
@@ -354,6 +361,44 @@ fn discarded_path(path: &Path) -> PathBuf {
     discarded.into()
 }
 
+async fn expire_discarded(native: PathBuf) {
+    let discarded = discarded_path(&native);
+    if let Err(error) = file_job(
+        "Unable to expire discarded persistence database",
+        discarded.clone(),
+        move || prune_discarded(&native, &discarded),
+    )
+    .await
+    {
+        tracing::warn!("{error}");
+    }
+}
+
+fn prune_discarded(native: &Path, discarded: &Path) -> io::Result<()> {
+    let Some(metadata) = database_metadata(discarded)? else {
+        return Ok(());
+    };
+    // Until a native snapshot exists, the archive also prevents startup
+    // from resurrecting stale data from the original Mosquitto database.
+    if metadata
+        .modified()?
+        .elapsed()
+        .is_ok_and(|age| age > ARCHIVE_RETENTION)
+        && database_metadata(native)?.is_some()
+    {
+        fs::remove_file(discarded)?;
+        #[cfg(unix)]
+        fs::File::open(
+            discarded
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?
+        .sync_all()?;
+    }
+    Ok(())
+}
+
 fn discard_database(path: &Path) -> io::Result<()> {
     if database_metadata(path)?.is_some() {
         let discarded = discarded_path(path);
@@ -421,4 +466,44 @@ fn log_restored(counts: PersistenceCounts) {
 fn log_imported(path: &Path, counts: PersistenceCounts) {
     tracing::info!(target: "mqx::notice", "Imported Mosquitto persistence database from {}.", path.display());
     log_restored(counts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn archive_expires_only_after_native_snapshot_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("mosquitto.db");
+        let native = dir.path().join("mosquitto.db.mqx");
+        let archive = discarded_path(&native);
+        fs::write(&legacy, b"old Mosquitto state").unwrap();
+        fs::write(&archive, b"discarded").unwrap();
+        prune_discarded(&native, &archive).unwrap();
+        assert!(archive.exists());
+
+        fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_modified(SystemTime::now() - ARCHIVE_RETENTION - Duration::from_secs(60))
+            .unwrap();
+        prune_discarded(&native, &archive).unwrap();
+        assert!(
+            archive.exists(),
+            "the old archive still fences legacy import"
+        );
+
+        fs::write(&native, b"new state").unwrap();
+        prune_discarded(&native, &archive).unwrap();
+        assert!(!archive.exists());
+        assert_eq!(fs::read(&native).unwrap(), b"new state");
+        assert_eq!(fs::read(&legacy).unwrap(), b"old Mosquitto state");
+
+        fs::write(&archive, b"discarded again").unwrap();
+        prune_discarded(&native, &archive).unwrap();
+        assert!(archive.exists());
+    }
 }

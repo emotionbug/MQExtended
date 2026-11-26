@@ -715,6 +715,8 @@ fn node_config(
     }
     conf.push_str(concat!(
         "cluster_data_dir raft-data\n",
+        // Parallel scenarios share one disk; a 1 GiB reserve per node would fill it.
+        "cluster_storage_reserve 0\n",
         "cluster_insecure_plaintext true\n",
         "cluster_heartbeat_interval 30\n",
         "cluster_election_timeout 150 300\n",
@@ -846,6 +848,7 @@ mod tests {
                         "cluster_peer 2 127.0.0.1:4022\n",
                         "cluster_peer 3 127.0.0.1:4023\n",
                         "cluster_data_dir raft-data\n",
+                        "cluster_storage_reserve 0\n",
                         "cluster_insecure_plaintext true\n",
                         "cluster_heartbeat_interval 30\n",
                         "cluster_election_timeout 150 300\n",

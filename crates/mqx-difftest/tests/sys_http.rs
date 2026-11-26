@@ -560,7 +560,7 @@ fn start_http_cluster(root: &Path) -> (Vec<NodePorts>, Vec<(Process, PathBuf)>) 
             let id = index + 1;
             let mut config = format!(
                 "allow_anonymous true\nsys_interval 1\nlistener {mqtt} 127.0.0.1\nlistener {http} 127.0.0.1\nprotocol http_api\n\
-                 cluster_node_id {id}\ncluster_bind 127.0.0.1:{local}\ncluster_data_dir raft\ncluster_insecure_plaintext true\n",
+                 cluster_node_id {id}\ncluster_bind 127.0.0.1:{local}\ncluster_data_dir raft\ncluster_storage_reserve 0\ncluster_insecure_plaintext true\n",
             );
             for (peer, [.., port]) in ports.iter().enumerate() {
                 use std::fmt::Write as _;

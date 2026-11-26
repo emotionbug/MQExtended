@@ -2034,18 +2034,20 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
+        let mut cluster = ClusterConfig::new(
+            1,
+            address,
+            BTreeMap::from([(1, address)]),
+            storage.path().join("node"),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        cluster.storage_reserve = Some(0);
         let broker = Broker::clustered(
             BrokerConfig {
                 max_inflight_messages: 3,
                 ..BrokerConfig::default()
             },
-            ClusterConfig::new(
-                1,
-                address,
-                BTreeMap::from([(1, address)]),
-                storage.path().join("node"),
-                ClusterSecurity::InsecurePlaintext,
-            ),
+            cluster,
         )
         .await
         .unwrap();

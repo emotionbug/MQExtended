@@ -14,7 +14,7 @@ use std::{
 };
 
 use mqx_bridge::BridgeConfig;
-use mqx_cluster::{ClusterConfig, ClusterSecurity, MAX_SNAPSHOT_SIZE};
+use mqx_cluster::{ClusterConfig, ClusterSecurity, MAX_SNAPSHOT_SIZE, MAX_STORAGE_RESERVE};
 
 use crate::ServerError;
 
@@ -1276,6 +1276,7 @@ struct ClusterSection {
     keyfile: Option<PathBuf>,
     insecure_plaintext: Option<bool>,
     max_snapshot_size: Option<u64>,
+    storage_reserve: Option<u64>,
 }
 
 impl ClusterSection {
@@ -1318,7 +1319,8 @@ impl ClusterSection {
             | "cluster_lease_timeout"
             | "cluster_request_timeout"
             | "cluster_insecure_plaintext"
-            | "cluster_max_snapshot_size" => 1,
+            | "cluster_max_snapshot_size"
+            | "cluster_storage_reserve" => 1,
             _ => return Err(format!("Unknown configuration variable '{name}'.").into()),
         };
         let mut words = value.words().take_while(|word| !word.starts_with('#'));
@@ -1386,6 +1388,16 @@ impl ClusterSection {
                     .into());
                 }
                 self.max_snapshot_size = Some(size);
+            }
+            "cluster_storage_reserve" if self.storage_reserve.is_none() => {
+                let size = first
+                    .parse()
+                    .ok()
+                    .filter(|size| *size <= MAX_STORAGE_RESERVE)
+                    .ok_or_else(|| {
+                        format!("'{name}' must be between 0 and {MAX_STORAGE_RESERVE} bytes.")
+                    })?;
+                self.storage_reserve = Some(size);
             }
             _ => return Err(duplicate()),
         }
@@ -1475,6 +1487,7 @@ impl ClusterSection {
         if let Some(size) = self.max_snapshot_size {
             config.max_snapshot_size = size;
         }
+        config.storage_reserve = self.storage_reserve;
         Ok(config)
     }
 }

@@ -506,13 +506,14 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let cluster = ClusterConfig::new(
+        let mut cluster = ClusterConfig::new(
             1,
             address,
             BTreeMap::from([(1, address)]),
             storage.path().join("node"),
             mqx_cluster::ClusterSecurity::InsecurePlaintext,
         );
+        cluster.storage_reserve = Some(0);
         let reading = Arc::new(Notify::new());
         let security = |block_read| {
             SecurityHandle::default().with_external(

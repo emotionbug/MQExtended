@@ -2442,19 +2442,21 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
+        let mut cluster = ClusterConfig::new(
+            1,
+            address,
+            BTreeMap::from([(1, address)]),
+            storage.path().join("node"),
+            mqx_cluster::ClusterSecurity::InsecurePlaintext,
+        );
+        cluster.storage_reserve = Some(0);
         let broker = Broker::clustered(
             BrokerConfig {
                 max_inflight_messages: 3,
                 cluster_qos1_replay_batch: true,
                 ..BrokerConfig::default()
             },
-            ClusterConfig::new(
-                1,
-                address,
-                BTreeMap::from([(1, address)]),
-                storage.path().join("node"),
-                mqx_cluster::ClusterSecurity::InsecurePlaintext,
-            ),
+            cluster,
         )
         .await
         .unwrap();
@@ -2595,13 +2597,15 @@ mod tests {
             .zip(sockets.iter().map(|socket| socket.local_addr().unwrap()))
             .collect();
         let config = |node| {
-            ClusterConfig::new(
+            let mut config = ClusterConfig::new(
                 node,
                 peers[&node],
                 peers.clone(),
                 storage.path().join(node.to_string()),
                 mqx_cluster::ClusterSecurity::InsecurePlaintext,
-            )
+            );
+            config.storage_reserve = Some(0);
+            config
         };
         drop(sockets);
         let (origin, remote) = tokio::join!(
@@ -2735,13 +2739,15 @@ mod tests {
             .zip(sockets.iter().map(|socket| socket.local_addr().unwrap()))
             .collect();
         let config = |id| {
-            ClusterConfig::new(
+            let mut config = ClusterConfig::new(
                 id,
                 peers[&id],
                 peers.clone(),
                 storage.path().join(id.to_string()),
                 mqx_cluster::ClusterSecurity::InsecurePlaintext,
-            )
+            );
+            config.storage_reserve = Some(0);
+            config
         };
         let machine = |node| {
             let config = Arc::new(BrokerConfig::default());
@@ -2838,18 +2844,20 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
+        let mut cluster = ClusterConfig::new(
+            1,
+            address,
+            BTreeMap::from([(1, address)]),
+            storage.path().join("node"),
+            mqx_cluster::ClusterSecurity::InsecurePlaintext,
+        );
+        cluster.storage_reserve = Some(0);
         let broker = Broker::clustered(
             BrokerConfig {
                 global_max_clients: 1,
                 ..BrokerConfig::default()
             },
-            ClusterConfig::new(
-                1,
-                address,
-                BTreeMap::from([(1, address)]),
-                storage.path().join("node"),
-                mqx_cluster::ClusterSecurity::InsecurePlaintext,
-            ),
+            cluster,
         )
         .await
         .unwrap();

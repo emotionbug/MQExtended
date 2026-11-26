@@ -1,6 +1,8 @@
 use std::{fs, path::Path, time::Duration};
 
-use mqx_cluster::{ClusterSecurity, DEFAULT_MAX_SNAPSHOT_SIZE, MAX_SNAPSHOT_SIZE};
+use mqx_cluster::{
+    ClusterSecurity, DEFAULT_MAX_SNAPSHOT_SIZE, MAX_SNAPSHOT_SIZE, MAX_STORAGE_RESERVE,
+};
 use mqx_server::{
     ListenerProtocol, LogDestination, LogType, ProxyProtocol, ServerConfig, parse_command_line_port,
 };
@@ -1087,6 +1089,27 @@ fn snapshot_size_limit_matches_the_cluster_storage_bounds() {
         assert!(
             error.contains(&format!(
                 "'cluster_max_snapshot_size' must be between 1 and {MAX_SNAPSHOT_SIZE} bytes."
+            )),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn storage_reserve_is_automatic_unless_configured() {
+    let parse = |extra: &str| ServerConfig::parse(&format!("{CLUSTER}{CLUSTER_TLS}{extra}"));
+    assert_eq!(parse("").unwrap().cluster.unwrap().storage_reserve, None);
+    for size in [0, 4096, MAX_STORAGE_RESERVE] {
+        let config = parse(&format!("cluster_storage_reserve {size}")).unwrap();
+        assert_eq!(config.cluster.unwrap().storage_reserve, Some(size));
+    }
+    for value in [&*(MAX_STORAGE_RESERVE + 1).to_string(), "-1", "1G"] {
+        let error = parse(&format!("cluster_storage_reserve {value}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "'cluster_storage_reserve' must be between 0 and {MAX_STORAGE_RESERVE} bytes."
             )),
             "{error}"
         );

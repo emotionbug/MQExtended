@@ -34,6 +34,7 @@ impl ClusterFixture {
                 storage.path().join(id.to_string()),
                 mqx_cluster::ClusterSecurity::InsecurePlaintext,
             );
+            config.storage_reserve = Some(0);
             config.set_packet_limit(packet_limit).unwrap();
             config.heartbeat_interval = Duration::from_millis(25);
             config.election_timeout_min = Duration::from_millis(100);
