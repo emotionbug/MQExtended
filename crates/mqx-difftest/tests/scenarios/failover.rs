@@ -446,13 +446,11 @@ const STATUS_POLL: Duration = Duration::from_millis(20);
 
 fn recovery_cluster(nodes: usize, enabled: bool) -> Harness {
     let mut conf = format!(
-        "{ANONYMOUS}\ncluster_state_format 2\ncluster_lease_timeout {LEASE_MS}\ncluster_request_timeout {}\n",
+        "{ANONYMOUS}\ncluster_state_format 2\ncluster_lease_timeout {LEASE_MS}\ncluster_request_timeout {}\nauto_recover {enabled}\n",
         REQUEST.as_millis()
     );
     if enabled {
-        conf.push_str(&format!(
-            "auto_recover true\nauto_recover_timeout {RECOVER_MS}\n"
-        ));
+        conf.push_str(&format!("auto_recover_timeout {RECOVER_MS}\n"));
     }
     let h = Harness::start_cluster(
         BrokerConfig {

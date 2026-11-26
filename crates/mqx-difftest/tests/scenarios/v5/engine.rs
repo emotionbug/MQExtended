@@ -341,15 +341,60 @@ fn persistent3(client_id: &str) -> mqx_codec::Connect {
     }
 }
 
-// test/broker/15-persist-client-msg-out-queue-v3-1-1.py with a short queue;
-// src/database.c: db__ready_for_queue counts only QoS 1/2 messages, but a
-// full count also drops queued QoS 0; subs__send has already consumed a
-// packet id for every dropped QoS 1/2 message.
-scenario!(
-    offline_queue_message_limit,
-    config("allow_anonymous true\nmax_queued_messages 2\nqueue_qos0_messages true")
-);
-fn offline_queue_message_limit(h: &mut Harness) {
+mod offline_queue_message_limit {
+    use super::*;
+    use crate::{BrokerKind, Reading, Transcript};
+
+    const CONF: &str = "allow_anonymous true\nmax_queued_messages 2\nqueue_qos0_messages true";
+
+    #[test]
+    #[ignore = "requires real Mosquitto 2.1.4 binaries"]
+    fn mosquitto_self() {
+        let reference = || {
+            crate::run(BrokerKind::Mosquitto, config(CONF), |h| {
+                super::check_offline_queue_message_limit(h, false);
+            })
+        };
+        crate::compare(&reference(), &reference());
+    }
+
+    #[test]
+    #[ignore = "requires real Mosquitto 2.1.4 and standalone and clustered mqextended brokers"]
+    fn mqextended_counts_qos0_alongside_qos1_and_qos2() {
+        let standalone = crate::run(BrokerKind::MqExtended, config(CONF), |h| {
+            super::check_offline_queue_message_limit(h, true);
+        });
+        let mut reference = crate::run(BrokerKind::Mosquitto, config(CONF), |h| {
+            super::check_offline_queue_message_limit(h, false);
+        });
+        remove_mosquitto_only_delivery(&mut reference);
+        crate::compare(&reference, &standalone);
+        let mut cluster = crate::start_cluster(config(CONF));
+        super::check_offline_queue_message_limit(&mut cluster, true);
+        crate::compare(&standalone, &cluster.into_transcript());
+    }
+
+    fn remove_mosquitto_only_delivery(reference: &mut Transcript) {
+        let index = reference
+            .iter()
+            .position(|observation| {
+                matches!(&observation.reading, Reading::Received {
+                    packet: Packet3::Publish(publish), ..
+                } if &*publish.topic == "limit/2")
+            })
+            .expect("Mosquitto queued the additional delivery");
+        assert_eq!(reference[index].connection, reference[index + 1].connection);
+        assert!(matches!(&reference[index + 1].reading, Reading::Received {
+            packet: Packet3::PubRel(mid), ..
+        } if *mid == id(2)));
+        reference.drain(index..index + 2);
+    }
+}
+
+// test/broker/15-persist-client-msg-out-queue-v3-1-1.py with a short queue.
+// Unlike Mosquitto's database.c: db__ready_for_queue, MQExtended charges QoS 0
+// against capacity. In both brokers subs__send consumes a packet id even on drop.
+fn check_offline_queue_message_limit(h: &mut Harness, count_qos0: bool) {
     let settings = persistent3("short-queue");
     let subscriber = crate::connect_with(h, settings.clone(), false);
     crate::subscribe(h, subscriber, 1, &[("limit/#", Q2)]);
@@ -372,7 +417,9 @@ fn offline_queue_message_limit(h: &mut Harness) {
     let subscriber = crate::connect_with(h, settings, true);
     crate::accept_publish(h, subscriber, crate::publish("limit/1", b"queued", Q1, 1));
     crate::accept_publish(h, subscriber, crate::publish("limit/0a", b"queued", Q0, 0));
-    crate::accept_publish(h, subscriber, crate::publish("limit/2", b"queued", Q2, 2));
+    if !count_qos0 {
+        crate::accept_publish(h, subscriber, crate::publish("limit/2", b"queued", Q2, 2));
+    }
     crate::silent(h, subscriber);
     crate::publish_from(h, publisher, crate::publish("limit/5", b"live", Q1, 9));
     crate::accept_publish(h, subscriber, crate::publish("limit/5", b"live", Q1, 5));

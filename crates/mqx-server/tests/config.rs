@@ -8,6 +8,38 @@ use mqx_server::{
 };
 
 #[test]
+fn unattended_broker_limits_default_and_allow_explicit_overrides() {
+    let defaults = ServerConfig::parse("").unwrap().limits;
+    assert_eq!(defaults.max_queued_bytes, 16_777_216);
+    assert_eq!(
+        defaults.persistent_client_expiration,
+        Some(Duration::from_secs(30 * 86400))
+    );
+    assert_eq!(
+        defaults.retain_expiry_interval,
+        Some(Duration::from_secs(3600))
+    );
+
+    let config = "\
+        max_queued_bytes 0\n\
+        persistent_client_expiration 2h\n\
+        persistent_client_expiration never\n\
+        retain_expiry_interval 15\n";
+    let limits = ServerConfig::parse(config).unwrap().limits;
+    assert_eq!(limits.max_queued_bytes, 0);
+    assert_eq!(limits.persistent_client_expiration, None);
+    assert_eq!(
+        limits.retain_expiry_interval,
+        Some(Duration::from_secs(900))
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broker.conf");
+    fs::write(&path, config).unwrap();
+    let limits = ServerConfig::load_for_reload(path).unwrap().limits;
+    assert_eq!(limits.persistent_client_expiration, None);
+}
+
+#[test]
 fn invalid_values_produce_reference_startup_diagnostics() {
     // Cases from Mosquitto v2.1.4 test/broker/16-config-parse-errors-without-tls.py.
     for (input, expected) in [
@@ -844,14 +876,36 @@ fn cluster_replay_window_requires_explicit_opt_in() {
 }
 
 #[test]
-fn automatic_recovery_is_opt_in_and_validates_its_timeout_and_state_format() {
-    assert!(!ServerConfig::default().auto_recover);
-    let standalone = ServerConfig::parse("auto_recover true\nauto_recover_timeout 700\n").unwrap();
+fn automatic_recovery_defaults_by_mode_and_validates_its_timeout_and_state_format() {
+    assert!(ServerConfig::default().auto_recover);
+    assert!(
+        !ServerConfig::parse("auto_recover false")
+            .unwrap()
+            .auto_recover
+    );
+    let standalone = ServerConfig::parse("auto_recover_timeout 700\n").unwrap();
     assert!(standalone.auto_recover);
     assert_eq!(
         standalone.auto_recover_timeout,
         Some(Duration::from_millis(700))
     );
+    let single = CLUSTER.replace("cluster_peer 2 192.0.2.2:9002\n", "");
+    for (input, enabled) in [
+        (format!("{single}{CLUSTER_TLS}"), true),
+        (
+            format!("{CLUSTER}{CLUSTER_TLS}cluster_state_format 2\n"),
+            true,
+        ),
+        (
+            format!("{CLUSTER}{CLUSTER_TLS}cluster_state_format 1\n"),
+            false,
+        ),
+        (format!("{CLUSTER}{CLUSTER_TLS}auto_recover false\n"), false),
+    ] {
+        let config = ServerConfig::parse(&input).unwrap();
+        assert_eq!(config.auto_recover, enabled, "{input}");
+        assert_eq!(config.cluster.unwrap().auto_recover, enabled, "{input}");
+    }
     for extra_peer in ["", "cluster_peer 3 192.0.2.3:9003\n"] {
         let cfg = ServerConfig::parse(&format!(
             "{CLUSTER}{CLUSTER_TLS}{extra_peer}auto_recover true\nauto_recover_timeout 1200\n"
@@ -866,7 +920,7 @@ fn automatic_recovery_is_opt_in_and_validates_its_timeout_and_state_format() {
     }
     let invalid = [
         (
-            "auto_recover_timeout 700\n".to_owned(),
+            "auto_recover false\nauto_recover_timeout 700\n".to_owned(),
             "'auto_recover_timeout' requires 'auto_recover true'",
         ),
         (
@@ -886,20 +940,28 @@ fn automatic_recovery_is_opt_in_and_validates_its_timeout_and_state_format() {
 
 #[test]
 fn membership_generation_can_exclude_the_local_node_but_bootstrap_cannot() {
-    let config = ServerConfig::parse(&format!(
+    let input = format!(
         "cluster_node_id 1\ncluster_bind 127.0.0.1:7001\ncluster_data_dir node1\n\
          cluster_peer 2 127.0.0.1:7002\ncluster_membership_generation 17\n{CLUSTER_TLS}"
-    ))
-    .unwrap()
-    .cluster
-    .unwrap();
+    );
+    let config = ServerConfig::parse(&input).unwrap();
+    assert!(!config.auto_recover);
+    let config = config.cluster.unwrap();
     assert_eq!(config.membership_generation, 17);
     assert!(!config.peers.contains_key(&1));
+    assert!(!config.auto_recover);
+    let explicit = ServerConfig::parse(&format!("{input}auto_recover true\n")).unwrap_err();
+    assert!(
+        explicit
+            .to_string()
+            .contains("'auto_recover true' requires a 'cluster_peer' entry for this node")
+    );
     let join = ServerConfig::parse(&format!("{CLUSTER}{CLUSTER_TLS}cluster_join true\n"))
         .unwrap()
         .cluster
         .unwrap();
     assert!(join.join);
+    assert!(join.auto_recover);
     let error = ServerConfig::parse(&format!(
         "{CLUSTER}{CLUSTER_TLS}cluster_join true\ncluster_state_format 1\n"
     ))

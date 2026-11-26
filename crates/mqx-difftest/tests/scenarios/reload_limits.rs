@@ -173,6 +173,25 @@ fn session_expiry_changes_at_disconnect(h: &mut Harness) {
     connect_on(h, observer, online, false);
 }
 
+#[test]
+#[ignore = "requires standalone and clustered mqextended brokers"]
+fn session_expiry_never_applies_on_reload_at_next_disconnect() {
+    const CONF: &str = "allow_anonymous true\npersistent_client_expiration 1s";
+    let mut standalone = Harness::start(BrokerKind::MqExtended, config(CONF)).unwrap();
+    let mut cluster = start_cluster(config(CONF));
+    for h in [&mut standalone, &mut cluster] {
+        let observer = observer_node(h);
+        let c = connect_on(h, observer, persistent("reload-durable"), false);
+        reload(h, observer, "persistent_client_expiration never");
+        disconnect(h, c);
+    }
+    thread::sleep(Duration::from_secs(3));
+    for h in [&mut standalone, &mut cluster] {
+        let node = observer_node(h);
+        connect_on(h, node, persistent("reload-durable"), true);
+    }
+}
+
 scenario!(client_id_prefix_changes_for_next_connect, config(ANONYMOUS));
 fn client_id_prefix_changes_for_next_connect(h: &mut Harness) {
     let observer = observer_node(h);

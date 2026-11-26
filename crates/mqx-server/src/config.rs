@@ -294,12 +294,15 @@ impl Default for BrokerLimits {
             max_inflight_messages: 20,
             max_inflight_bytes: 0,
             max_queued_messages: 1000,
-            max_queued_bytes: 0,
+            // MQExtended bounds queued payload bytes by default.
+            max_queued_bytes: 16 * 1024 * 1024,
             max_keepalive: 0,
             max_packet_size: 2_000_000,
             message_size_limit: 0,
-            persistent_client_expiration: None,
-            retain_expiry_interval: None,
+            // MQExtended expires abandoned sessions and sweeps retained
+            // message expiry even when neither directive is set.
+            persistent_client_expiration: Some(Duration::from_secs(30 * 86400)),
+            retain_expiry_interval: Some(Duration::from_secs(60 * 60)),
             queue_qos0_messages: false,
             retain_available: true,
             upgrade_outgoing_qos: false,
@@ -511,7 +514,7 @@ impl Default for Parser {
                 persistence: PersistenceConfig::default(),
                 cluster: None,
                 cluster_qos1_replay_batch: false,
-                auto_recover: false,
+                auto_recover: true,
                 auto_recover_timeout: None,
                 notices: Vec::new(),
             },
@@ -533,14 +536,14 @@ impl Parser {
     fn finish(mut self) -> Result<ServerConfig, ServerError> {
         bridge::finish(&mut self.config.bridges)
             .map_err(|error| ServerError::Arguments(format!("Error: {}", error.0)))?;
-        if !self.config.auto_recover && self.config.auto_recover_timeout.is_some() {
-            return Err(ServerError::Arguments(
-                "'auto_recover_timeout' requires 'auto_recover true'.".into(),
-            ));
-        }
         if let Some(((path, line), section)) = self.cluster.take() {
             self.config.cluster_qos1_replay_batch = section.qos1_replay_batch.unwrap_or(false);
             let mut cluster = section.finish().map_err(|error| error.at(&path, line))?;
+            if !self.auto_recover_seen {
+                // A membership change can intentionally omit this node.
+                self.config.auto_recover =
+                    cluster.state_format == 2 && cluster.peers.contains_key(&cluster.node_id);
+            }
             cluster.auto_recover = self.config.auto_recover;
             cluster.auto_recover_timeout = self.config.auto_recover_timeout;
             cluster
@@ -553,6 +556,11 @@ impl Parser {
                         .into(),
                 );
             }
+        }
+        if !self.config.auto_recover && self.config.auto_recover_timeout.is_some() {
+            return Err(ServerError::Arguments(
+                "'auto_recover_timeout' requires 'auto_recover true'.".into(),
+            ));
         }
         // Mosquitto src/conf.c: config__check_bridges validates TLS file pairs
         // for every listener and config__check_proxy checks PROXY v2 separately.
@@ -1041,6 +1049,11 @@ impl Parser {
             }
             "persistent_client_expiration" => {
                 let value = v.word()?;
+                // MQExtended's opt-out restores Mosquitto's no-expiry default.
+                if value == "never" {
+                    self.config.limits.persistent_client_expiration = None;
+                    return Ok(());
+                }
                 let unit = match value.as_bytes().last() {
                     Some(b's') => 1,
                     Some(b'h') => 3600,

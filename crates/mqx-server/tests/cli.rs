@@ -72,22 +72,44 @@ mod raft_clients {
         assert_eq!(&received, &expected[..], "expected {packet:?}");
     }
 
-    pub(super) async fn writer(addr: SocketAddr, session_present: bool) -> TcpStream {
-        timeout(WAIT, async {
-            let mut socket = TcpStream::connect(addr).await.unwrap();
-            socket.write_all(super::PERSISTENT_CONNECT).await.unwrap();
-            expect(
-                &mut socket,
-                &Packet::ConnAck(ConnAck {
-                    session_present,
-                    code: ConnectReturnCode::Accepted,
-                }),
-            )
-            .await;
-            socket
+    pub(super) async fn connect(addr: SocketAddr) -> io::Result<(TcpStream, [u8; 4])> {
+        let mut socket = TcpStream::connect(addr).await?;
+        socket.write_all(super::PERSISTENT_CONNECT).await?;
+        let mut ack = [0; 4];
+        socket.read_exact(&mut ack).await?;
+        Ok((socket, ack))
+    }
+
+    // A listening socket or READY is not an admission lease. Recovery can
+    // also briefly close the listener while a learner rejoins.
+    pub(super) async fn wait_serving(addr: SocketAddr, wait: Duration) -> (TcpStream, [u8; 4]) {
+        timeout(wait, async {
+            loop {
+                match connect(addr).await {
+                    Ok(client) => return client,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("MQTT connect to {addr}: {error}"),
+                }
+            }
         })
         .await
-        .expect("MQTT writer did not connect")
+        .unwrap_or_else(|_| panic!("MQTT listener {addr} never served a CONNECT"))
+    }
+
+    pub(super) async fn writer(addr: SocketAddr, session_present: bool) -> TcpStream {
+        let (socket, ack) = wait_serving(addr, WAIT).await;
+        assert_eq!(ack, [0x20, 2, u8::from(session_present), 0]);
+        socket
     }
 
     pub(super) async fn retained_write(
@@ -350,7 +372,7 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
         &path,
         format!(
             "user root\nlistener {} 127.0.0.1\nallow_anonymous true\nacl_file {}\ncluster_node_id 1\n\
-        cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\ncluster_data_dir {}\n{tls}",
+        cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\ncluster_data_dir {}\ncluster_storage_reserve 0\n{tls}",
             mqtt_addr.port(),
             acl.display(),
             storage.display(),
@@ -414,7 +436,7 @@ async fn fatal_raft_wal_error_exits_nonzero_without_auto_recover() {
             "user root\nlistener {} 127.0.0.1\nallow_anonymous true\n\
              log_dest stdout\nlog_type error\ncluster_node_id 1\n\
              cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\n\
-             cluster_data_dir {}\ncluster_insecure_plaintext true\n",
+             cluster_data_dir {}\ncluster_storage_reserve 0\ncluster_insecure_plaintext true\nauto_recover false\n",
             mqtt_addr.port(),
             directory.path().join("raft").display(),
         ),
@@ -562,7 +584,7 @@ async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
                 "user root\nallow_anonymous true\nlistener {} 127.0.0.1\n\
                  listener {} 127.0.0.1\nprotocol http_api\n\
                  cluster_node_id {id}\ncluster_bind {}\ncluster_peer 1 {}\ncluster_peer 2 {}\n\
-                 cluster_data_dir {}\ncluster_request_timeout 5000\ncluster_lease_interval 100\ncluster_lease_timeout 3000\n{}",
+                 cluster_data_dir {}\ncluster_storage_reserve 0\ncluster_request_timeout 5000\ncluster_lease_interval 100\ncluster_lease_timeout 3000\nauto_recover false\n{}",
                 mqtt[index].port(),
                 http_addr[index].port(),
                 raft[index],
@@ -667,51 +689,19 @@ async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
+    use crate::raft_clients::{connect, wait_serving};
     use nix::{
         sys::signal::{Signal, kill},
         unistd::Pid,
     };
-    use std::{
-        fs,
-        io::ErrorKind,
-        net::{SocketAddr, TcpListener},
-        time::Duration,
-    };
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpStream, UnixDatagram},
-        time::{sleep, timeout},
-    };
-
-    async fn connect(addr: SocketAddr) -> std::io::Result<(TcpStream, [u8; 4])> {
-        let mut socket = TcpStream::connect(addr).await?;
-        socket.write_all(PERSISTENT_CONNECT).await?;
-        let mut ack = [0; 4];
-        socket.read_exact(&mut ack).await?;
-        Ok((socket, ack))
-    }
+    use std::{fs, io::ErrorKind, net::TcpListener, time::Duration};
+    use tokio::{io::AsyncReadExt, net::UnixDatagram, time::timeout};
 
     fn closed(error: &std::io::Error) -> bool {
         matches!(
             error.kind(),
             ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
         )
-    }
-
-    // The process can report READY before a joining voter is promoted and
-    // finishes security registration. Only a complete CONNACK proves MQTT is ready.
-    async fn wait_serving(addr: SocketAddr) -> (TcpStream, [u8; 4]) {
-        timeout(Duration::from_secs(10), async {
-            loop {
-                match connect(addr).await {
-                    Ok(client) => return client,
-                    Err(error) if closed(&error) => sleep(Duration::from_millis(20)).await,
-                    Err(error) => panic!("MQTT connect to {addr}: {error}"),
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("MQTT listener {addr} never served a CONNECT"))
     }
 
     let sockets: [_; 4] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
@@ -723,7 +713,7 @@ async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
         format!(
             "user root\nlistener {} 127.0.0.1\nallow_anonymous true\ncluster_node_id {id}\n\
              cluster_bind {raft}\ncluster_peer 1 {raft1}\ncluster_insecure_plaintext true\n\
-             cluster_data_dir {}\ncluster_lease_interval 100\ncluster_lease_timeout 1000\n",
+             cluster_data_dir {}\ncluster_storage_reserve 0\ncluster_lease_interval 100\ncluster_lease_timeout 1000\nauto_recover false\n",
             mqtt.port(),
             directory.path().join(id.to_string()).display(),
         )
@@ -756,7 +746,7 @@ async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
     let pid = Pid::from_raw(first.id().unwrap().try_into().unwrap());
     let wait = Duration::from_secs(10);
     wait_ready(&first_ready).await;
-    assert_eq!(wait_serving(mqtt1).await.1, [0x20, 2, 0, 0]);
+    assert_eq!(wait_serving(mqtt1, wait).await.1, [0x20, 2, 0, 0]);
     let (mut second, second_ready) = start(&second_config);
     wait_ready(&second_ready).await;
     let unpromoted = timeout(wait, connect(mqtt2))
@@ -771,7 +761,7 @@ async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
     )
     .unwrap();
     kill(pid, Signal::SIGHUP).unwrap();
-    let (mut connected, ack) = wait_serving(mqtt2).await;
+    let (mut connected, ack) = wait_serving(mqtt2, wait).await;
     assert_eq!(ack, [0x20, 2, 1, 0]);
 
     fs::write(
@@ -790,7 +780,7 @@ async fn sighup_promotes_a_joiner_and_then_disconnects_it_on_removal() {
         .expect("retired node did not refuse a new connection")
         .expect_err("retired node served a new MQTT connection");
     assert!(closed(&rejected), "{rejected}");
-    assert_eq!(wait_serving(mqtt1).await.1, [0x20, 2, 1, 0]);
+    assert_eq!(wait_serving(mqtt1, wait).await.1, [0x20, 2, 1, 0]);
 
     for child in [&mut first, &mut second] {
         kill(

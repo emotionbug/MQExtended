@@ -1319,7 +1319,7 @@ async fn corrupt_persistence_database_exits_with_the_reference_status() {
         fs::write(dir.path().join(file), b"garbage-not-a-db").unwrap();
         let output = timeout(
             WAIT,
-            persistence_command(dir.path(), listen_address(), "")
+            persistence_command(dir.path(), listen_address(), "auto_recover false")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .output(),
@@ -1372,13 +1372,9 @@ async fn auto_recover_does_not_reimport_stale_state_after_a_crash() {
     fs::write(&native, invalid).unwrap();
     let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
     let address = listen_address();
-    let mut child = persistence_command(
-        dir.path(),
-        address,
-        "auto_recover true\nautosave_interval 0",
-    )
-    .spawn()
-    .unwrap();
+    let mut child = persistence_command(dir.path(), address, "autosave_interval 0")
+        .spawn()
+        .unwrap();
     ready(&notify).await;
     assert_eq!(fs::read(&discarded).unwrap(), invalid);
     assert!(!native.exists());
@@ -1386,9 +1382,13 @@ async fn auto_recover_does_not_reimport_stale_state_after_a_crash() {
 
     // The restart must stay empty even without auto_recover and before any
     // successful save has written a native snapshot.
-    let mut child = persistence_command(dir.path(), address, "autosave_interval 0")
-        .spawn()
-        .unwrap();
+    let mut child = persistence_command(
+        dir.path(),
+        address,
+        "auto_recover false\nautosave_interval 0",
+    )
+    .spawn()
+    .unwrap();
     ready(&notify).await;
     stop(&mut child).await;
     let fresh = mqx_broker::PersistentState::read_snapshot(&native)

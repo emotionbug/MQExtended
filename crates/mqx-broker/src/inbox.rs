@@ -494,16 +494,17 @@ impl Inbox {
         self.in_flight.push_back(entry);
     }
 
-    // database.c: db__ready_for_queue's online allowance includes an extra
-    // flight window. Offline QoS 0 does not contribute to either counter.
+    // database.c: db__ready_for_queue adds one flight window while online.
+    // Unlike Mosquitto, count all queued traffic, including offline QoS 0.
+    // The existing total counters include QoS 0 in older snapshots too.
     fn queue_available(&self, online: bool, config: &BrokerConfig) -> bool {
         let extra_count = if online { self.send_maximum(config) } else { 0 };
         let extra_bytes = if online { config.max_inflight_bytes } else { 0 };
         below(
-            self.queue_stats.qos_count.saturating_sub(extra_count),
+            self.queue_stats.count.saturating_sub(extra_count),
             config.max_queued_messages,
         ) && below(
-            self.queue_stats.qos_bytes.saturating_sub(extra_bytes),
+            self.queue_stats.bytes.saturating_sub(extra_bytes),
             config.max_queued_bytes,
         )
     }
@@ -1255,5 +1256,92 @@ mod tests {
             assert!(inbox.ack(PacketId::new(id).unwrap(), Ack::Acknowledged, &config));
         }
         assert!(inbox.next_outbound(&config, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn offline_qos0_only_queue_stops_at_the_message_limit_and_drains() {
+        let config = BrokerConfig {
+            max_queued_messages: 2,
+            queue_qos0_messages: true,
+            ..BrokerConfig::default()
+        };
+        let mut inbox = Inbox::default();
+        let message = delivery(b"qos0", QoS::AtMostOnce);
+        for expected in [
+            Offer::Queued,
+            Offer::Queued,
+            Offer::FirstDrop,
+            Offer::Dropped,
+        ] {
+            assert_eq!(
+                inbox.offer(message.clone(), false, QoS::ExactlyOnce, &config),
+                expected
+            );
+        }
+        assert_eq!(inbox.outgoing_count(), 2);
+        for _ in 0..2 {
+            assert!(matches!(
+                inbox.next_outbound(&config, Duration::ZERO),
+                Some(Outbound::Publish { id: None, .. })
+            ));
+        }
+        assert!(inbox.next_outbound(&config, Duration::ZERO).is_none());
+        assert_eq!(inbox.queue_stats, Counters::default());
+        assert_eq!(inbox.flight_stats, Counters::default());
+        assert_eq!(
+            inbox.offer(message, false, QoS::ExactlyOnce, &config),
+            Offer::Queued
+        );
+    }
+
+    #[test]
+    fn queued_qos0_bytes_still_count_after_raft_and_standalone_restore() {
+        let config = BrokerConfig {
+            max_queued_bytes: 6,
+            queue_qos0_messages: true,
+            ..BrokerConfig::default()
+        };
+        let message = delivery(b"four", QoS::AtMostOnce);
+        let mut inbox = Inbox::default();
+        // Admit based on the existing payload bytes, so the second message
+        // can cross the threshold, just as with QoS 1/2.
+        for _ in 0..2 {
+            assert_eq!(
+                inbox.offer(message.clone(), false, QoS::ExactlyOnce, &config),
+                Offer::Queued
+            );
+        }
+        let mut persisted = PersistentSession {
+            publisher: message.message.source.clone(),
+            last_mid: 0,
+            expiry_interval: None,
+            expires: None,
+            bridge: None,
+            subscriptions: Vec::new(),
+            outgoing: Vec::new(),
+            incoming: Vec::new(),
+        };
+        inbox.persist_into(&mut persisted, |_| 0);
+        let restored = Inbox::restore_persisted(
+            &mut persisted,
+            std::slice::from_ref(&message.message),
+            &config,
+            Duration::ZERO,
+        );
+        let snapshot = rmp_serde::to_vec(&inbox).unwrap();
+        let decoded: Inbox = rmp_serde::from_slice(&snapshot).unwrap();
+        let qos1 = delivery(b"next", QoS::AtLeastOnce);
+        for mut inbox in [restored, decoded] {
+            assert_eq!(
+                inbox.offer(qos1.clone(), false, QoS::ExactlyOnce, &config),
+                Offer::FirstDrop
+            );
+            inbox.resume(|_, _| false, &config, Duration::ZERO);
+            assert_eq!(inbox.outgoing_count(), 0);
+            assert_eq!(
+                inbox.offer(qos1.clone(), false, QoS::ExactlyOnce, &config),
+                Offer::Queued
+            );
+        }
     }
 }
