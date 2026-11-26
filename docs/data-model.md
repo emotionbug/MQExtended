@@ -21,7 +21,7 @@ A message to a persistent session is reserved for sending in the same commit tha
 - **Bridge ownership is a claim.** A bridge runs on the node holding the claim on its local client id. A node stops its bridges as soon as it can no longer prove a fresh lease renewal, so it always steps down before a peer can take the bridge over.
 - **Security and `$SYS` state are replicated.** Dynamic-security changes and each `$SYS` sample are log commands, so every node enforces the same rules and serves the same retained `$SYS` tree.
 - **Third-party plugin verdicts are replicated, never computed in apply.** Reusable ACL verdicts from [auth plugins](auth-plugins.md), and the deliveries and wills waiting for a verdict, are state that commands write and Raft snapshots include ([architecture](architecture.md#request-flows)). A standalone `.mqx` file leaves both out: a restart drops the waiting deliveries and asks the plugin again.
-- **Limits follow Mosquitto defaults.** Queue length 1000 (`max_queued_messages`), in-flight window 20 (`max_inflight_messages`), no session expiry, QoS 0 not queued for offline sessions (`queue_qos0_messages false`). See [Mosquitto compatibility](mosquitto-compatibility.md#defaults). The options Mosquitto applies on SIGHUP are replicated state in a cluster: a reload commits them as one log command, so no node routes, queues or expires with a different value ([cluster](cluster.md#configuration)).
+- **Limits bound state by default.** Queue length 1000 (`max_queued_messages`) and 16 MiB (`max_queued_bytes`), in-flight window 20 (`max_inflight_messages`), 30-day session expiry, QoS 0 not queued for offline sessions (`queue_qos0_messages false`). The byte cap and the session expiry differ from Mosquitto; see [Mosquitto compatibility](mosquitto-compatibility.md#defaults). The options Mosquitto applies on SIGHUP are replicated state in a cluster: a reload commits them as one log command, so no node routes, queues or expires with a different value ([cluster](cluster.md#configuration)).
 
 ## Replication semantics
 
@@ -42,9 +42,10 @@ A Raft cluster, including one configured with a single voter, uses the layout be
 ├── wal/            # Raft log entries, vote, commit frontier (raft-log chunk files)
 ├── snapshot.mpk    # Raft snapshot metadata, node leases, application state
 ├── incarnation.mpk # auto_recover only: branch counter, founder, lineage, last recovery event
-└── discarded/      # auto_recover only: the most recently discarded state
+├── reserve.mqx     # preallocated space, released when the volume runs low
+└── discarded/      # auto_recover only: the most recently discarded state, deleted after 7 days
 ```
 
 Entries and votes are fsynced before they are acknowledged. Commit frontiers are coalesced into the next required WAL sync, not synced separately before apply. Restart restores the snapshot and replays the locally recorded committed tail; Raft reestablishes any newer commit frontier. A snapshot is written to a temporary `.mqx-stage-*` file, fsynced, renamed and the directory fsynced before the log is compacted behind it. Snapshots received from a peer are staged the same way. After a crash, the next start removes these files once it holds the WAL lock.
 
-A standalone save writes `<persistence_file>.mqx.new`, then renames it over `<persistence_file>.mqx`, as Mosquitto does with `<db>.new`. A crash leaves at most this one file, and the next save replaces it.
+A standalone save writes `<persistence_file>.mqx.new`, then renames it over `<persistence_file>.mqx`, as Mosquitto does with `<db>.new`. A crash leaves at most this one file, and the next save replaces it. A `<persistence_file>.mqx.discarded` left by automatic recovery is deleted after 7 days, but only once a native `.mqx` exists, since it is what stops a second import of an old `mosquitto.db`.

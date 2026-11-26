@@ -12,6 +12,8 @@ mqextended --test-config -c /etc/mosquitto/mosquitto.conf
 
 It parses `mosquitto.conf` with Mosquitto's rules and fails on any directive it does not implement, naming the directive; the list is in [Mosquitto compatibility](mosquitto-compatibility.md#unsupported-directives). Like Mosquitto's `--test-config`, it does not open `password_file` or `acl_file`; start the broker once to load those. Both files load unchanged.
 
+A file that leaves a setting out gets MQExtended's [defaults](mosquitto-compatibility.md#defaults), which differ from Mosquitto's in a few places so the broker doesn't need cleaning up: a persistent session offline for 30 days expires, each client's offline queue is capped at 16 MiB, and a damaged state file is set aside instead of stopping the broker. If a client relies on Mosquitto's behaviour, for example a device that stays offline for months and expects its subscriptions and queued messages back, add the lines from the last column of that table.
+
 ## 2. Find out what your Mosquitto version is
 
 MQExtended reproduces 2.1.4. If you run an older Mosquitto, compare the defaults that changed for anything your clients rely on. The ones that bite most often:
@@ -59,7 +61,7 @@ With `persistence true`, MQExtended reads Mosquitto's own `mosquitto.db` on its 
 - **Standalone:** stop Mosquitto (it saves the database on a clean stop), then start MQExtended with the same configuration.
 - **Cluster:** give only the node with the lowest id `persistence true` and the Mosquitto `persistence_location`/`persistence_file` on its first start. It imports through the replicated log before it accepts clients, so every node gets the same state. On the other nodes, and after bootstrap, `persistence true` changes nothing; cluster state is always durable. The same node imports `dynamic-security.json` if you use [dynamic security](dynamic-security.md#in-a-cluster).
 
-For standalone brokers, a failed by-changes autosave leaves the changes pending and retries after a one-second delay without waiting for more client traffic. A failed final save is logged and makes the process exit nonzero; do not treat that shutdown as a successful backup. A damaged persistence file stops the broker at startup unless you set `auto_recover true`, which starts with empty state instead ([deviations](mosquitto-compatibility.md#deliberate-deviations)).
+For standalone brokers, a failed by-changes autosave leaves the changes pending and retries after a one-second delay without waiting for more client traffic. A failed final save is logged and makes the process exit nonzero; do not treat that shutdown as a successful backup. A damaged persistence file is moved aside and the broker starts with empty state; with `auto_recover false` it stops the broker at startup instead, as in Mosquitto ([deviations](mosquitto-compatibility.md#deliberate-deviations)).
 
 For a standalone cold backup, stop the broker successfully, then back up its native `.mqx` file, config and referenced credentials together. Restore them with their original permissions on an isolated broker using the same release before reconnecting clients. Leaving out the `.mqx` file may reimport an older `mosquitto.db`. One exception: after automatic recovery, a `.mqx.discarded` file tells the broker not to repeat that import, even if it crashed before its first fresh save. For replicated state, follow the [cluster restore procedure](cluster.md#cold-backup-and-restore) instead.
 

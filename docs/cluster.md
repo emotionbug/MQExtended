@@ -17,6 +17,7 @@ Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExte
 | `cluster_keyfile <path>` | Key for `cluster_certfile` | required unless plaintext |
 | `cluster_insecure_plaintext true` | Run peer traffic without TLS; refused together with a wildcard `cluster_bind` | false |
 | `cluster_max_snapshot_size <bytes>` | Largest snapshot this node can send or receive; see [storage](#storage-and-state-growth) | 4294967295 (2147483647 on 32-bit) |
+| `cluster_storage_reserve <bytes>` | Space this node holds back on its data volume for low-space recovery, at most 1 GiB; `0` turns it off; see [storage](#storage-and-state-growth) | 5% of the volume, 64 MiB to 1 GiB |
 | `cluster_heartbeat_interval <ms>` | Raft leader heartbeat | 100 |
 | `cluster_election_timeout <min> <max>` | Raft election timeout range | 400 800 |
 | `cluster_lease_interval <ms>` | How often a node renews its liveness lease | 1000 |
@@ -26,7 +27,7 @@ Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExte
 | `cluster_membership_generation <n>` | Version of the `cluster_peer` list; raise it to request a membership change | 0 |
 | `cluster_state_format <1\|2>` | On-disk and wire format this node writes; see [upgrades](#upgrades) | 2 |
 | `cluster_qos1_replay_batch true` | Reserve a bounded window of ready MQTT 3.x QoS 1 messages in one commit when a persistent subscriber resumes; see [upgrades](#upgrades) | false |
-| `auto_recover true` | Recover from quorum loss, a lost peer or unusable local state without operator action, giving up consistency; see [automatic recovery](#automatic-recovery). Also applies to a standalone broker | false |
+| `auto_recover <true\|false>` | Recover from quorum loss, a lost peer or unusable local state without operator action, giving up consistency; see [automatic recovery](#automatic-recovery). Also applies to a standalone broker | true, or false with `cluster_state_format 1` or without a `cluster_peer` line for this node |
 | `auto_recover_timeout <ms>` | How long a node waits without quorum before it continues alone; requires `auto_recover true` | `cluster_lease_timeout` |
 
 Example for node 2 of three:
@@ -67,11 +68,11 @@ The [Helm chart](../deploy/helm/mqextended) starts a new cluster without asking 
 | Helm values | MQTT-serving Pods | Total voters | If one voter stops |
 | --- | ---: | ---: | --- |
 | Defaults (`replicaCount=1`) | 1 | 1 | No service until that Pod restarts with its PVC. |
-| `replicaCount=2` | 2 | 2 | No quorum for writes; admission closes after the lease expires. Restart the missing voter with its PVC. With `autoRecover.enabled=true`, the remaining Pod continues alone ([automatic recovery](#automatic-recovery)). |
+| `replicaCount=2` | 2 | 2 | The remaining Pod continues alone after `cluster_lease_timeout` ([automatic recovery](#automatic-recovery)). With `autoRecover.enabled=false`, there is no quorum for writes and admission closes until the missing voter restarts with its PVC. |
 | `replicaCount=2,additionalVoter.enabled=true` | 2 | 3 | The remaining majority serves MQTT. If one serving Pod fails, **one MQTT Pod plus the additional voter** can still commit writes. |
 | `replicaCount=3` | 3 | 3 | The two survivors keep serving; any voter can receive MQTT traffic. |
 
-Add `autoRecover.enabled=true` to any topology to enable [automatic recovery](#automatic-recovery).
+[Automatic recovery](#automatic-recovery) is on in every topology. Set `autoRecover.enabled=false` to wait for quorum instead of giving up writes that only reached the lost side.
 
 The additional voter is a full replica, not a lightweight witness. Give each voter its own schedulable worker and volume. Spread workers and voters across availability zones if you need to survive loss of a zone. An EBS volume can reattach only in its own zone; a singleton cannot fail over across zones.
 
@@ -161,21 +162,23 @@ After a restart or loss of its lease, a follower only admits MQTT clients after 
 
 Each node compacts its own WAL. After 5,000 new log entries it writes a new `snapshot.mpk`, then deletes WAL chunks older than the 1,000 entries it keeps behind the snapshot. Lease renewals add entries even without client traffic, so compaction continues on an idle cluster. A snapshot replacement needs room for the old and the new file, plus up to two snapshots being received from a peer. Temporary files left by a crash are removed at the next start.
 
-A failed WAL or snapshot write (a full or read-only volume, an I/O error) stops the node in every mode: the process logs `Raft node failed: …` and exits with status 3, so systemd or Kubernetes restarts it. While the volume stays full, each start fails again. Alert on free space on the `cluster_data_dir` volume; the restarts don't free any.
+Each node also keeps `reserve.mqx` in `cluster_data_dir`, a preallocated file of 5% of the volume (at least 64 MiB, at most 1 GiB; `cluster_storage_reserve` sets it). When free space on the volume drops below the reserve size, the node logs a warning, deletes `discarded/`, releases the reserve and compacts at once: it writes a snapshot and deletes the WAL up to it, without the usual 1,000-entry tail, so a lagging replica may need that snapshot to catch up. It keeps serving. Once free space is above three times the reserve size again, it recreates the reserve. Unix only; `mqx_storage_available_bytes` and `mqx_storage_reserve_bytes` show both values ([monitoring](monitoring.md#prometheus-metrics)). Several nodes sharing one volume each keep their own reserve; set a smaller one, or `0` for test clusters.
+
+A failed WAL or snapshot write (a full or read-only volume, an I/O error) stops the node in every mode: the process logs `Raft node failed: …` and exits with status 3, so systemd or Kubernetes restarts it. A node that starts with less free space than its reserve size releases the reserve first, so it can compact and serve again. If the replicated state alone no longer fits the volume, the node keeps stopping: enlarge the volume or lower the limits below.
 
 The snapshot holds the replicated broker state, so its size follows client behaviour. A node that is new, replaced, or too far behind catches up from the leader's snapshot. `cluster_max_snapshot_size` limits the snapshots this node sends and receives; the default is the largest size the wire format carries. Older releases default to 64 MiB and accept at most 256 MiB, so keep snapshots within every member's limit during a rolling upgrade; a lagging node cannot catch up from a larger one. A node warns when it builds or installs a snapshot above its own limit, and `mqx_raft_snapshot_size_bytes` reports the current size ([monitoring](monitoring.md#prometheus-metrics)). Budget memory for at least twice the snapshot size while a node builds one and three times while it installs one. A transfer must finish within the snapshot timeout (90 s on the sender, 120 s on the receiver), so a 4 GiB snapshot needs over 45 MiB/s between nodes.
 
-Like Mosquitto, the broker does not bound that state by default:
+The broker bounds that state by default, unlike Mosquitto ([defaults](mosquitto-compatibility.md#defaults)):
 
-- A persistent session whose client never returns is kept forever unless `persistent_client_expiration` is set. Its queue is capped at `max_queued_messages` (1000) messages; set `max_queued_bytes` to cap bytes as well.
-- With `queue_qos0_messages true`, queued QoS 0 messages are not counted against `max_queued_messages` or `max_queued_bytes`.
-- Retained messages have no count or size limit. `retain_expiry_interval` removes expired messages, but leaves their topic levels in place, as Mosquitto does.
+- A persistent session whose client stays away for 30 days is removed (`persistent_client_expiration`). Until then its offline queue holds at most 1,000 messages and 16 MiB (`max_queued_messages`, `max_queued_bytes`); later messages are dropped as for any full queue.
+- With `queue_qos0_messages true`, queued QoS 0 messages count against the same limits.
+- Retained messages whose MQTT 5 expiry has passed are removed every hour (`retain_expiry_interval`). Their topic levels stay, as in Mosquitto. Retained messages without an expiry have no count or size limit: they stay until a client replaces or clears them.
 
-Set these in `mosquitto.conf`, or with `brokerOptions` in the Helm chart, for example `persistent_client_expiration: 14d` and `max_queued_bytes: 104857600`.
+Change these in `mosquitto.conf`, or with `brokerOptions` in the Helm chart.
 
-With `auto_recover true`, `discarded/` keeps the most recently discarded state (one slot, replaced by the next recovery). Delete it once you no longer need it for analysis.
+With automatic recovery, `discarded/` keeps the most recently discarded state, including `discarded/interrupted-switch/`. A node deletes it 7 days after it was written, or immediately when space runs low; delete it sooner if you don't need it.
 
-`log_dest file` is never rotated by the broker. As with Mosquitto, rotate it externally and send SIGHUP to reopen it. The shipped systemd unit and the Helm chart log to the journal and stdout instead.
+`log_dest file` rotates at 64 MiB: the broker renames the file to `<file>.<UTC time>` and keeps the 4 newest such files. The broker user needs write access to the log directory; if a rename fails, the broker keeps writing to the open file, warns and retries. `log_file_max_size <bytes>` changes the size and `0` leaves rotation to an external tool, as in Mosquitto. External rotation (rename and SIGHUP, or copy and truncate) still works and uses names the broker never deletes. The shipped systemd unit and the Helm chart log to the journal and stdout, which journald and the kubelet rotate.
 
 ## Changing membership
 
@@ -194,7 +197,7 @@ To replace a node that died for good, do both in one change: a new id joins as a
 
 ## Automatic recovery
 
-With `auto_recover true` on every node, a survivor can resume service after losing quorum. Once peers can communicate again, they can rejoin without an operator. This requires working storage, a valid configuration and a shared cluster history. The price is consistency: writes that only reached a discarded branch are lost, even ones the client already saw acknowledged. Enable it when restoring service matters more than keeping every message, for example in a two-node cluster that shares load.
+With `auto_recover` on (the default) on every node, a survivor can resume service after losing quorum. Once peers can communicate again, they can rejoin without an operator. This requires working storage, a valid configuration and a shared cluster history. The price is consistency: writes that only reached a discarded branch are lost, even ones the client already saw acknowledged. Set `auto_recover false` on every node when keeping every acknowledged message matters more than staying available, and bring lost voters back by hand.
 
 When every desired voter is live and the local quorum lease has been renewed recently, recovery checks reuse that renewal instead of opening a connection to every peer on every tick. Nodes still compare histories periodically (30 seconds between sweeps in a healthy cluster). A stale renewal, missing voter, learner or joint membership restores the normal probe cadence; the healthy sweep interval is not added to the quorum-loss timeout.
 
@@ -229,7 +232,14 @@ Do not enable `mosquitto_sparkplug_aware` until every node runs a build that sup
 
 Enable `auth-plug` or `go-auth` only once every node runs a build that supports it. Their ACL checks write `Authorize` and `ResolveVerdicts` entries, and the sessions of their clients carry verdicts and waiting deliveries that an older build cannot replay. Every node applies those entries through its own copy of the plugin, so add, remove or reconfigure a plugin with the whole cluster stopped. A node without the plugin would decide differently from the others. Existing log entries are not reinterpreted when you enable one.
 
-Enable `auto_recover` only once every node runs a build that supports it. Its branch identity files use a format an older build refuses to start with. When upgrading from a build that stores unbounded recovery history, finish upgrading every node before the 513th fork of a branch. If already past that point, use a cold upgrade. Do not downgrade a node after its history has been compacted.
+Releases before this one never expire persistent sessions, never cap an offline queue in bytes and never sweep expired retained messages by default; this release does ([defaults](mosquitto-compatibility.md#defaults)). Every node applies those limits to the same log entries, so nodes with different values keep different session state. When upgrading from an earlier release:
+
+1. As each node gets the new binary, add `persistent_client_expiration never`, `max_queued_bytes 0` and `auto_recover false` to its file, unless the file already sets them. The upgraded nodes then decide exactly as the old ones did.
+2. Once every node runs the new binary, remove those lines. Send SIGHUP to one node to commit the new session expiry everywhere at the same log index, then restart the nodes one at a time for the queue limit and automatic recovery.
+
+Only sessions that disconnect after the switch get the 30-day expiry; sessions already offline expire when they next disconnect. Expired retained messages leave a node's memory at different times while the defaults differ; clients see no difference. If `queue_qos0_messages` is on, upgrade with client traffic drained: queued QoS 0 messages now count against the queue limits, and no setting reproduces the earlier accounting.
+
+Keep `auto_recover` off until every node runs a build that supports it (step 1 above). Its branch identity files use a format an older build refuses to start with. When upgrading from a build that stores unbounded recovery history, finish upgrading every node before the 513th fork of a branch. If already past that point, use a cold upgrade. Do not downgrade a node after its history has been compacted.
 
 ## What clients observe when a node fails
 

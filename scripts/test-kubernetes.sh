@@ -127,14 +127,14 @@ grep -Ei 'topology|membership|resize|voter.count' "$work/resize"
 stop_forward; "${h[@]}" uninstall single
 # Existing clients may use plain MQTT with the same password and ACL files.
 use_plain
-install pair 2 false --set listeners.mqtt.enabled=true,listeners.mqtts.enabled=false
+install pair 2 false --set autoRecover.enabled=false,listeners.mqtt.enabled=true,listeners.mqtts.enabled=false
 connect_to pod/pair-node-2-0; read_retained pair
 stop_first pair
 "${k[@]}" wait --for=condition=Ready=false pod/pair-node-2-0 --timeout=60s
 restore_first pair; ready pair 2; connect_to service/pair; read_retained pair
 stop_forward; "${h[@]}" uninstall pair
 use_tls
-install recovery 2 false --set autoRecover.enabled=true
+install recovery 2 false
 connect_to pod/recovery-node-1-0; read_retained recovery
 stop_first recovery
 # Ready can still reflect the old lease, but a fresh subscription needs a

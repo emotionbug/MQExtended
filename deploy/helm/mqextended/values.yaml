@@ -4,16 +4,17 @@ additionalVoter:
   # Valid with replicaCount: 2. Adds a full voter without a client endpoint.
   enabled: false
 autoRecover:
-  # Allows a node to keep serving without quorum; a discarded branch loses its writes.
-  enabled: false
+  # Keep serving without quorum and rejoin without an operator. Writes that
+  # only reached a discarded branch are lost. Set false to wait for quorum.
+  enabled: true
 qos1ReplayBatch:
   # Set only after every voter and learner can replay the new WAL command.
   enabled: false
 # Disable Nagle on accepted TCP connections. Small frames may use more packets.
 setTcpNoDelay: false
-# Mosquitto broker options for the global section of mosquitto.conf. Like
-# Mosquitto, persistent sessions never expire and offline queues have no byte
-# limit by default. Example: {persistent_client_expiration: 14d, max_queued_bytes: 104857600}
+# Broker options for the global section of mosquitto.conf, overriding the
+# broker's defaults. Example: {persistent_client_expiration: never,
+# max_queued_bytes: 0} restores Mosquitto's unbounded sessions and queues.
 brokerOptions: {}
 
 image:

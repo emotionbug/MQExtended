@@ -112,14 +112,21 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 
 ## Defaults
 
-| Setting | Mosquitto default | MQExtended |
-| --- | --- | --- |
-| `max_queued_messages` | 1000 | 1000 |
-| `max_inflight_messages` | 20 | 20 |
-| `queue_qos0_messages` | false | false |
-| `persistent_client_expiration` | never | never |
-| `message_size_limit` | 0 (protocol maximum) | 0 |
-| `allow_anonymous` | false when any listener is configured | same |
+A few defaults differ so that a broker runs without an operator cleaning up after it. A client notices them only after a long absence, a large backlog or a damaged persistence file. To get Mosquitto's behaviour, set the value in the last column; Mosquitto itself rejects `never` and `auto_recover`, so put those lines only in MQExtended's configuration.
+
+| Setting | Mosquitto default | MQExtended default | Mosquitto's behaviour in MQExtended |
+| --- | --- | --- | --- |
+| `max_queued_messages` | 1000 | 1000 | |
+| `max_inflight_messages` | 20 | 20 | |
+| `queue_qos0_messages` | false | false | |
+| `message_size_limit` | 0 (protocol maximum) | 0 | |
+| `allow_anonymous` | false when any listener is configured | same | |
+| `persistent_client_expiration` | never | 30 days: a persistent session offline for longer is removed with its subscriptions and queued messages | `persistent_client_expiration never` |
+| `max_queued_bytes` | 0 (no limit) | 16 MiB per client; further messages are dropped as for a full queue | `max_queued_bytes 0` |
+| `retain_expiry_interval` | off | 60 minutes: retained messages whose MQTT 5 expiry has passed are removed from memory and storage | none; delivery is identical, only `$SYS/broker/retained messages/count` drops sooner |
+| `auto_recover` | (no such option) | true when the configuration allows it (`cluster_state_format 2` and a `cluster_peer` line for this node); see [automatic recovery](cluster.md#automatic-recovery) and the persistence row below | `auto_recover false` |
+
+With `queue_qos0_messages true`, queued QoS 0 messages count against `max_queued_messages` and `max_queued_bytes` like QoS 1 and 2. Mosquitto counts only QoS 1 and 2 (`database.c: db__ready_for_queue`), so an offline client that only receives QoS 0 can queue without limit there.
 
 ## Deliberate deviations
 
@@ -130,9 +137,10 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 | Base64 in a hash field longer than 1024 bytes that is also malformed can decode differently | OpenSSL's base64 BIO reads in 1024-byte chunks; the values Mosquitto writes are never this long |
 | `$SYS/broker/heap/*` is not published | Mosquitto only publishes it in builds with memory tracking, so clients cannot rely on it |
 | Persistence is written to `<persistence_file>.mqx`, not `mosquitto.db` | Clients see the same state after a restart; the Mosquitto file is read once for [migration](migration.md#5-carry-state-over) and left untouched for rollback |
-| A persistence file that is unreadable, a symbolic link, not a regular file, or an empty `.mqx` stops the broker with exit status 1 | By default MQExtended refuses to overwrite the original. A corrupt file exits 1 in both brokers, and an empty `mosquitto.db` starts empty in both. With `auto_recover true`, MQExtended moves a corrupt regular file to `<file>.discarded` and starts empty. It leaves nonregular paths alone and retries a blocked native snapshot on subsequent saves. A valid replacement found there is not overwritten. Filesystem access errors are not evidence of corruption. |
+| A damaged persistence file starts the broker empty instead of exiting | `auto_recover` is on by default, so MQExtended moves a corrupt regular file to `<file>.discarded` and starts with empty state, where Mosquitto exits 1. With `auto_recover false` it refuses to overwrite the original: an unreadable, symbolic-link, nonregular or corrupt file, or an empty `.mqx`, stops the broker with exit status 1, and an empty `mosquitto.db` starts empty in both brokers. Automatic recovery leaves nonregular paths alone and retries a blocked native snapshot on subsequent saves. A valid replacement found there is not overwritten. Filesystem access errors are not evidence of corruption. |
 | A Unix listener refuses a non-socket path or a socket still accepting connections | A typo cannot replace an existing file or disconnect clients from a running listener. A stale socket is still reclaimed. Use a service-owned directory and serialize starts; pathname checks are not a lock against concurrent directory changes. |
 | `log_timestamp_format` is rendered by Chrono, not libc `strftime` | Identical for the standard conversions; only libc-specific extensions differ |
+| `log_dest file` rotates itself at 64 MiB and keeps four `<file>.<UTC time>` archives | Log output only. `log_file_max_size 0` restores Mosquitto's single growing file; external logrotate (rename and SIGHUP, or copytruncate) works either way and its files are never deleted by the broker |
 | `log_dest dlt` logs nothing and `log_dest syslog` has no console fallback | Matches a stock Mosquitto build without DLT; syslog delivery goes to `/dev/log` as Mosquitto's does |
 | An invalid dynamic-security config file stops the broker | Mosquitto would run with an empty policy; refusing to start is the safe reading of the same file ([dynamic security](dynamic-security.md#differences-from-the-c-plugin)) |
 | Bridge reconnect delays follow `restart_timeout` without Mosquitto's event-loop jitter | The remote broker sees the same connect sequence; only the exact retry instants differ |

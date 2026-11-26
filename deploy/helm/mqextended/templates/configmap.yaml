@@ -73,9 +73,7 @@ data:
     cluster_cafile /etc/mqextended/peer/ca.crt
     cluster_certfile /etc/mqextended/peer/tls.crt
     cluster_keyfile /etc/mqextended/peer/tls.key
-    {{- if include "mqextended.autoRecoverEnabled" . }}
-    auto_recover true
-    {{- end }}
+    auto_recover {{ ternary "true" "false" (eq (include "mqextended.autoRecoverEnabled" .) "true") }}
     {{- if (.Values.qos1ReplayBatch).enabled }}
     cluster_qos1_replay_batch true
     {{- end }}

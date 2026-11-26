@@ -10,6 +10,7 @@ You run devices or services built on libmosquitto. Their settings are unknown or
 
 - **Drop-in for clients.** A client that works against Mosquitto 2.1.4 works against MQExtended with the same results: same CONNACK codes, same accepted and rejected topics, same authentication and ACL decisions. See [Mosquitto compatibility](mosquitto-compatibility.md).
 - **Drop-in for operators.** The existing `mosquitto.conf`, `password_file`, `acl_file`, dynamic-security JSON, persistence file and service unit work unchanged; what MQExtended cannot honour makes it refuse to start instead of running without it. See [migration](migration.md).
+- **Runs unattended.** Where Mosquitto's defaults let state, disk use or logs grow until someone cleans up, MQExtended's defaults bound them: abandoned sessions expire, offline queues are capped, damaged state is set aside, a node protects its own volume and rotates its log file. A client sees these only after a long absence or a large backlog, and the documented lines restore Mosquitto's behaviour ([defaults](mosquitto-compatibility.md#defaults)).
 - **Active-active cluster.** Any client can connect to any node. Messages reach subscribers on every node. Reconnecting to another node resumes the session. Losing one node of three loses no session, subscription, retained message or queued message. See [architecture](architecture.md).
 
 ## Non-goals
