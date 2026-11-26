@@ -16,7 +16,7 @@ Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExte
 | `cluster_certfile <path>` | This node's certificate; its Common Name must be `mqx-node-<id>` | required unless plaintext |
 | `cluster_keyfile <path>` | Key for `cluster_certfile` | required unless plaintext |
 | `cluster_insecure_plaintext true` | Run peer traffic without TLS; refused together with a wildcard `cluster_bind` | false |
-| `cluster_max_snapshot_size <bytes>` | Largest snapshot this node can send or receive (at most 256 MiB) | 64 MiB |
+| `cluster_max_snapshot_size <bytes>` | Largest snapshot this node can send or receive; see [storage](#storage-and-state-growth) | 4294967295 (2147483647 on 32-bit) |
 | `cluster_heartbeat_interval <ms>` | Raft leader heartbeat | 100 |
 | `cluster_election_timeout <min> <max>` | Raft election timeout range | 400 800 |
 | `cluster_lease_interval <ms>` | How often a node renews its liveness lease | 1000 |
@@ -157,7 +157,25 @@ After a restart or loss of its lease, a follower only admits MQTT clients after 
 3. Restore the set to an isolated network, with the original cluster stopped or unreachable. Use the same binary version, IDs and configured peer addresses. Restore each directory only to its original ID; do not bootstrap an empty cluster or run a restored voter concurrently with its original.
 4. With client traffic still drained, start the restored nodes. Check that `/api/v1/mqx/cluster` reports the expected voters and leader, and `/api/v1/mqx/ready` returns `200` on each serving node. Check a known retained payload and reconnect a test persistent client with clean start disabled: verify session-present and the expected queued messages before routing production traffic. Changes made after the backup are not recovered.
 
-Keep each node's `snapshot.mpk` below the configured transfer limit with headroom. A larger local snapshot can be written, but a learner or lagging voter that needs it cannot catch up from it. Set an alert on the file size and qualify the expected application state against the limit before deploying.
+## Storage and state growth
+
+Each node compacts its own WAL. After 5,000 new log entries it writes a new `snapshot.mpk`, then deletes WAL chunks older than the 1,000 entries it keeps behind the snapshot. Lease renewals add entries even without client traffic, so compaction continues on an idle cluster. A snapshot replacement needs room for the old and the new file, plus up to two snapshots being received from a peer. Temporary files left by a crash are removed at the next start.
+
+A failed WAL or snapshot write (a full or read-only volume, an I/O error) stops the node in every mode: the process logs `Raft node failed: …` and exits with status 3, so systemd or Kubernetes restarts it. While the volume stays full, each start fails again. Alert on free space on the `cluster_data_dir` volume; the restarts don't free any.
+
+The snapshot holds the replicated broker state, so its size follows client behaviour. A node that is new, replaced, or too far behind catches up from the leader's snapshot. `cluster_max_snapshot_size` limits the snapshots this node sends and receives; the default is the largest size the wire format carries. Older releases default to 64 MiB and accept at most 256 MiB, so keep snapshots within every member's limit during a rolling upgrade; a lagging node cannot catch up from a larger one. A node warns when it builds or installs a snapshot above its own limit, and `mqx_raft_snapshot_size_bytes` reports the current size ([monitoring](monitoring.md#prometheus-metrics)). Budget memory for at least twice the snapshot size while a node builds one and three times while it installs one. A transfer must finish within the snapshot timeout (90 s on the sender, 120 s on the receiver), so a 4 GiB snapshot needs over 45 MiB/s between nodes.
+
+Like Mosquitto, the broker does not bound that state by default:
+
+- A persistent session whose client never returns is kept forever unless `persistent_client_expiration` is set. Its queue is capped at `max_queued_messages` (1000) messages; set `max_queued_bytes` to cap bytes as well.
+- With `queue_qos0_messages true`, queued QoS 0 messages are not counted against `max_queued_messages` or `max_queued_bytes`.
+- Retained messages have no count or size limit. `retain_expiry_interval` removes expired messages, but leaves their topic levels in place, as Mosquitto does.
+
+Set these in `mosquitto.conf`, or with `brokerOptions` in the Helm chart, for example `persistent_client_expiration: 14d` and `max_queued_bytes: 104857600`.
+
+With `auto_recover true`, `discarded/` keeps the most recently discarded state (one slot, replaced by the next recovery). Delete it once you no longer need it for analysis.
+
+`log_dest file` is never rotated by the broker. As with Mosquitto, rotate it externally and send SIGHUP to reopen it. The shipped systemd unit and the Helm chart log to the journal and stdout instead.
 
 ## Changing membership
 

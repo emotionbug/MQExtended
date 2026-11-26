@@ -38,6 +38,9 @@ data:
     {{- if .Values.setTcpNoDelay }}
     set_tcp_nodelay true
     {{- end }}
+    {{- range $name, $value := .Values.brokerOptions }}
+    {{ $name }} {{ ternary (int64 $value) $value (kindIs "float64" $value) }}
+    {{- end }}
     EOF
       {{- range $listeners }}
       cat <<EOF

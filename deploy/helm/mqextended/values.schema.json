@@ -24,6 +24,25 @@
       "properties": { "enabled": { "type": "boolean" } }
     },
     "setTcpNoDelay": { "type": "boolean" },
+    "brokerOptions": {
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "allow_duplicate_messages", "check_retain_source", "cluster_max_snapshot_size",
+          "global_max_clients", "global_max_connections", "max_inflight_bytes", "max_inflight_messages",
+          "max_keepalive", "max_packet_size", "max_queued_bytes", "max_queued_messages", "message_size_limit",
+          "persistent_client_expiration", "queue_qos0_messages", "retain_available", "retain_expiry_interval",
+          "sys_interval", "upgrade_outgoing_qos"
+        ]
+      },
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "boolean" },
+          { "type": "integer", "minimum": 0 },
+          { "type": "string", "pattern": "^[A-Za-z0-9.]+$" }
+        ]
+      }
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,
