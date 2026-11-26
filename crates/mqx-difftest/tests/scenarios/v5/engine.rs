@@ -857,6 +857,76 @@ fn compare_expiry(expected: &Transcript, actual: &Transcript) {
     });
 }
 
+// retain.c: retain__expire starts cleanup at the expired entry's parent.
+// The expired entry is still linked, so the sweep leaves the hierarchy intact.
+scenario!(
+    retained_expiry_sweep_preserves_hierarchy,
+    config("allow_anonymous true\nretain_expiry_interval 1")
+);
+fn retained_expiry_sweep_preserves_hierarchy(h: &mut Harness) {
+    let publisher = client(h, "expiry-sweep-publisher");
+    for (mid, topic, payload, expires) in [
+        (1, "sweep/first/leaf", b"expired".as_slice(), true),
+        (2, "sweep/second", b"sibling".as_slice(), false),
+        (3, "$sweep", b"parent".as_slice(), false),
+        (4, "$sweep/child", b"expired".as_slice(), true),
+    ] {
+        publish_qos1(
+            h,
+            publisher,
+            Publish {
+                retain: true,
+                properties: if expires {
+                    vec![Property::MessageExpiryInterval(1)]
+                } else {
+                    vec![]
+                },
+                ..publication(topic, payload, Q1, mid)
+            },
+            R::NO_MATCHING_SUBSCRIBERS,
+        );
+    }
+    // Mosquitto tests its next sweep with `>` in whole seconds. Let the sweep
+    // run before the first retained replay could expire the entries on visit.
+    std::thread::sleep(Duration::from_secs(4));
+    publish_qos1(
+        h,
+        publisher,
+        Publish {
+            retain: true,
+            ..publication("sweep/first/leaf", b"replacement", Q1, 5)
+        },
+        R::NO_MATCHING_SUBSCRIBERS,
+    );
+
+    let subscriber = client(h, "expiry-sweep-subscriber");
+    subscribe(h, subscriber, 1, "sweep/#", Q0);
+    for (topic, payload) in [
+        ("sweep/first/leaf", b"replacement".as_slice()),
+        ("sweep/second", b"sibling".as_slice()),
+    ] {
+        received(
+            h,
+            subscriber,
+            Packet::Publish(Publish {
+                retain: true,
+                ..publication(topic, payload, Q0, 0)
+            }),
+        );
+    }
+    // The empty child makes the dollar wildcard include the parent.
+    subscribe(h, subscriber, 2, "$sweep/#", Q0);
+    received(
+        h,
+        subscriber,
+        Packet::Publish(Publish {
+            retain: true,
+            ..publication("$sweep", b"parent", Q0, 0)
+        }),
+    );
+    ping(h, subscriber);
+}
+
 // src/handle_subscribe.c and src/handle_unsubscribe.c handle one filter at a
 // time: filters before an invalid one stay installed (or removed) when the
 // packet then closes the connection.
