@@ -1097,6 +1097,40 @@ async fn sighup_rotates_to_the_configured_certificate_and_key_paths() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn listener_certificate_and_key_reload_when_files_are_replaced() {
+    let original = TestPki::new();
+    let rotated = TestPki::new();
+    let broker = ReloadingBroker::start(&original, "").await;
+    assert_eq!(
+        broker.connect(original.client_config(false)).await.unwrap(),
+        ACCEPT
+    );
+
+    let dir = original.dir.path();
+    for name in ["server.pem", "server.key"] {
+        let staged = dir.join(format!("{name}.new"));
+        fs::copy(rotated.dir.path().join(name), &staged).unwrap();
+        fs::rename(staged, dir.join(name)).unwrap();
+    }
+
+    // The renewed certificate is signed by an independent CA, so a
+    // handshake trusted only by that CA cannot succeed with the old leaf.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(ack) = broker.connect(rotated.client_config(false)).await {
+                assert_eq!(ack, ACCEPT);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("the listener did not reload the renewed certificate");
+    broker.stop().await;
+}
+
 /// A broker process on a TLS Unix listener that the test reconfigures.
 #[cfg(unix)]
 struct ReloadingBroker {

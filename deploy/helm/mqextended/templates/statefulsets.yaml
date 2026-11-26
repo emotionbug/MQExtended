@@ -99,8 +99,6 @@ spec:
               mountPath: /var/lib/mqextended
             - name: config
               mountPath: /run/mqextended
-            # subPath gives the broker regular files where its policy reader
-            # rejects symlinks. Recreate each Pod to pick up new credentials.
             - name: bootstrap
               mountPath: /etc/mqextended/bootstrap/start.sh
               subPath: start.sh
@@ -109,13 +107,12 @@ spec:
               mountPath: /etc/mqextended/bootstrap/readiness.acl
               subPath: readiness.acl
               readOnly: true
-            {{- range $file := list "password_file" "acl_file" }}
-            {{- if index $auth (ternary "passwordFile" "aclFile" (eq $file "password_file")) }}
+            {{- if or $auth.passwordFile $auth.aclFile }}
+            # Mount the directory so Secret updates reach the Pod. The broker
+            # reads regular files under ..data, not the top-level symlinks.
             - name: auth
-              mountPath: /etc/mqextended/auth/{{ $file }}
-              subPath: {{ $file }}
+              mountPath: /etc/mqextended/auth
               readOnly: true
-            {{- end }}
             {{- end }}
             {{- if $clientTLS }}
             # A directory mount, so a renewed certificate appears in place.

@@ -1,16 +1,16 @@
 use std::{
     fmt::Display,
+    fs,
     future::{Future, pending},
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 #[cfg(unix)]
 use std::{
-    fs,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::PathBuf,
     sync::Mutex,
@@ -82,6 +82,7 @@ pub struct Connection {
 
 pub struct Server {
     listeners: Vec<BoundListener>,
+    certificate_fingerprints: Vec<CertificateFingerprint>,
     global_limit: Option<Arc<Semaphore>>,
     set_tcp_nodelay: bool,
     connection_messages: bool,
@@ -146,15 +147,66 @@ struct LiveTls {
     proxy: Option<ProxyOptions>,
 }
 
+type CertificateFingerprint = [Option<CertificateFileMetadata>; 5];
+
+#[derive(PartialEq, Eq)]
+struct CertificateFileMetadata {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+fn certificate_fingerprint(tls: &crate::TlsConfig) -> CertificateFingerprint {
+    [
+        tls.certfile.as_deref(),
+        tls.keyfile.as_deref(),
+        tls.cafile.as_deref(),
+        tls.capath.as_deref(),
+        tls.crlfile.as_deref(),
+    ]
+    .map(|path| {
+        let metadata = fs::metadata(path?).ok()?;
+        Some(CertificateFileMetadata {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    })
+}
+
 /// Replaces certificates and per-connection TLS options on bound MQTT
 /// listeners without rebinding sockets.
-pub struct CertificateReloader(Vec<Arc<ListenerOptions>>);
+pub struct CertificateReloader {
+    listeners: Vec<Arc<ListenerOptions>>,
+    fingerprints: Vec<CertificateFingerprint>,
+}
 
 impl CertificateReloader {
+    fn certificate_files_changed(&mut self) -> bool {
+        let mut changed = false;
+        let mut fingerprints = self.fingerprints.iter_mut();
+        for listener in &self.listeners {
+            let live = listener.live.borrow();
+            if live.acceptor.is_some() {
+                let old = fingerprints
+                    .next()
+                    .expect("bound TLS listener has a fingerprint");
+                let new = certificate_fingerprint(&live.tls);
+                if *old != new {
+                    *old = new;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     /// Apply listener TLS settings from a successfully parsed configuration.
     /// With no new configuration, reread the most recently selected paths.
     pub fn refresh(&mut self, fresh: Option<&ServerConfig>) {
-        for listener in &self.0 {
+        for listener in &self.listeners {
             let live = listener.live.borrow().clone();
             let mut tls = (*live.tls).clone();
             let mut proxy = live.proxy;
@@ -209,6 +261,7 @@ impl Server {
     /// Resolves hosts, builds TLS state, and binds all sockets before serving any clients.
     pub async fn bind(config: &ServerConfig) -> Result<Self, ServerError> {
         let mut listeners = Vec::new();
+        let mut certificate_fingerprints = Vec::new();
         let mut first_failure = None;
         if config.local_only {
             tracing::warn!(
@@ -239,6 +292,10 @@ impl Server {
                     packet_buffer_size: config.limits.packet_buffer_size,
                     origins: listener.websockets_origins.clone(),
                 });
+            // Sample before loading TLS material, so a renewal during startup
+            // is not mistaken for the set already loaded in the acceptor.
+            let certificate_fingerprint = (!http && listener.tls.certfile.is_some())
+                .then(|| certificate_fingerprint(&listener.tls));
             // Mosquitto src/listeners.c: listeners__start ignores
             // http_api__start's result, so an HTTP listener that cannot load
             // its certificate, resolve its host or bind is skipped.
@@ -310,6 +367,7 @@ impl Server {
                 }
             }
             if !sockets.is_empty() {
+                certificate_fingerprints.extend(certificate_fingerprint);
                 let (live, _) = watch::channel(LiveTls {
                     acceptor,
                     tls: Arc::new(listener.tls.clone()),
@@ -344,6 +402,7 @@ impl Server {
         }
         Ok(Self {
             listeners,
+            certificate_fingerprints,
             global_limit: (config.limits.global_max_connections > 0)
                 .then(|| Arc::new(Semaphore::new(config.limits.global_max_connections))),
             set_tcp_nodelay: config.set_tcp_nodelay,
@@ -589,11 +648,14 @@ impl Server {
         let (cancel, _) = watch::channel(false);
         let mut serving = JoinSet::new();
         let handler = Arc::new(handler);
-        let mut certificates = CertificateReloader(Vec::new());
+        let mut certificates = CertificateReloader {
+            listeners: Vec::new(),
+            fingerprints: self.certificate_fingerprints,
+        };
         for listener in self.listeners {
             let mqtt = listener.options.config.protocol != ListenerProtocol::HttpApi;
             if mqtt {
-                certificates.0.push(listener.options.clone());
+                certificates.listeners.push(listener.options.clone());
             }
             for socket in listener.sockets {
                 let worker = SocketWorker {
@@ -615,6 +677,15 @@ impl Server {
                 serving.spawn(worker.run(handler.clone(), cancel.subscribe()));
             }
         }
+
+        // MQExtended deviation: Mosquitto src/signals.c calls
+        // listeners__reload_all_certificates only on SIGHUP.
+        let mut certificate_ticks = (!certificates.fingerprints.is_empty()).then(|| {
+            let period = Duration::from_secs(10);
+            let mut ticks = tokio::time::interval_at(Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticks
+        });
 
         tokio::pin!(stop);
         let result = loop {
@@ -642,6 +713,18 @@ impl Server {
                     if let Err(error) = reload(&mut certificates).await {
                         // Mosquitto src/signals.c: signal__flag_check stops on security init failure.
                         break Err(ServerError::SecurityReload(error.to_string()));
+                    }
+                    certificates.certificate_files_changed();
+                }
+                _ = async {
+                    match &mut certificate_ticks {
+                        Some(ticks) => ticks.tick().await,
+                        None => pending().await,
+                    }
+                } => {
+                    if certificates.certificate_files_changed() {
+                        tracing::info!("Listener certificate files changed; reloading certificates.");
+                        certificates.refresh(None);
                     }
                 }
             }
