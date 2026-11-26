@@ -398,6 +398,59 @@ async fn logger_reloads_destinations_and_connection_notices() {
     assert!(log.ends_with(&format!(": {TERMINATING}\n")));
 }
 
+#[tokio::test]
+async fn file_rotation_coexists_with_external_rename_and_sighup() {
+    let dir = tempfile::tempdir().unwrap();
+    let active = dir.path().join("broker.log");
+    let external = dir.path().join("broker.log.1");
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let seed = [b'x'; 4096];
+    fs::write(&active, seed).unwrap();
+    fs::write(
+        dir.path().join("broker.conf"),
+        format!(
+            "{}log_dest file broker.log\nlog_file_max_size 4096\nlog_timestamp false\n",
+            config(listen_address())
+        ),
+    )
+    .unwrap();
+    let mut child = command(BIN, dir.path())
+        .args(["-c", "broker.conf"])
+        .env("NOTIFY_SOCKET", &notify_path)
+        .spawn()
+        .unwrap();
+    ready(&notify).await;
+    let internal = dir
+        .path()
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| {
+            entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"broker.log.")
+        })
+        .expect("the broker rotated the pre-existing full log")
+        .path();
+    assert!(fs::read(&internal).unwrap().starts_with(&seed));
+
+    fs::rename(&active, &external).unwrap();
+    kill(id(&child), Signal::SIGHUP).unwrap();
+    eventually(|| active.exists()).await;
+    assert!(fs::read_to_string(&external).unwrap().contains(RUNNING));
+    stop(&mut child).await;
+
+    assert!(
+        fs::read_to_string(&active)
+            .unwrap()
+            .ends_with(&format!("{TERMINATING}\n"))
+    );
+    assert!(!fs::read_to_string(&external).unwrap().contains(TERMINATING));
+    assert!(internal.exists());
+}
+
 #[cfg(target_os = "linux")]
 fn assert_process_ids(pid: Pid, uid: nix::unistd::Uid, gid: nix::unistd::Gid) {
     let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();

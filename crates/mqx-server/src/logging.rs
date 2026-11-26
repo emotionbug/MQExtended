@@ -1,18 +1,19 @@
 use std::{
     fmt::{self, Write as _},
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU16, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 
-use chrono::{Local, Utc, format::Item, format::StrftimeItems};
+use chrono::{Local, NaiveDateTime, Utc, format::Item, format::StrftimeItems};
 use tokio::sync::mpsc;
 use tracing::{Event, Level, Metadata, Subscriber, subscriber::Interest};
 use tracing_subscriber::{
@@ -72,7 +73,7 @@ impl Logging {
                 None
             }
         }) {
-            sinks.open_file(path, &self.sender);
+            sinks.open_file(path, config.file_max_size, &self.sender);
         }
         self.state
             .enabled
@@ -81,14 +82,25 @@ impl Logging {
 }
 
 impl Sinks {
-    fn open_file(&mut self, path: &Path, sender: &mpsc::Sender<(&'static str, Vec<u8>)>) {
-        match open_log_file(path) {
-            Ok(file) => {
+    fn open_file(
+        &mut self,
+        path: &Path,
+        max_size: u64,
+        sender: &mpsc::Sender<(&'static str, Vec<u8>)>,
+    ) {
+        match open_log_file(path, false) {
+            Ok((file, size)) => {
                 #[cfg(unix)]
                 file_warnings(&file, path, |message| {
                     self.log(LogType::Information, message, sender);
                 });
-                self.file = Some(file);
+                self.file = Some(LogFile {
+                    file,
+                    path: path.to_owned(),
+                    max_size,
+                    size,
+                    retry_at: None,
+                });
             }
             Err(_) => {
                 // Mosquitto src/logging.c: log__init continues with only stderr errors.
@@ -163,7 +175,7 @@ struct Sinks {
     stderr: bool,
     stdout: bool,
     topics: bool,
-    file: Option<File>,
+    file: Option<LogFile>,
     #[cfg(unix)]
     syslog: Option<Syslog>,
 }
@@ -246,24 +258,43 @@ impl Sinks {
         sender: &mpsc::Sender<(&'static str, Vec<u8>)>,
     ) {
         let terminated = line.terminated();
+        self.write_remaining(kind, terminated, sender);
+        if let Some(file) = &mut self.file
+            && let Some(error) = file.write(terminated)
+        {
+            // Don't send rotation diagnostics back into the failing file sink.
+            let mut warning = self.timestamp.line();
+            let _ = write!(
+                warning,
+                "Warning: Unable to rotate log file {}: {error}",
+                file.path.display()
+            );
+            self.write_remaining(LogType::Warning, warning.terminated(), sender);
+        }
+    }
+
+    fn write_remaining(
+        &mut self,
+        kind: LogType,
+        terminated: &[u8],
+        sender: &mpsc::Sender<(&'static str, Vec<u8>)>,
+    ) {
         if self.stdout {
             let _ = io::stdout().lock().write_all(terminated);
         }
         if self.stderr {
             let _ = io::stderr().lock().write_all(terminated);
         }
-        if let Some(file) = &mut self.file {
-            let _ = file.write_all(terminated);
-        }
+        let line = &terminated[..terminated.len() - 1];
         #[cfg(unix)]
         if let Some(syslog) = &mut self.syslog {
-            syslog.write(kind, line.bytes());
+            syslog.write(kind, line);
         }
         if self.topics
             && let Some(topic) = topic(kind)
             && let Ok(permit) = sender.try_reserve()
         {
-            permit.send((topic, line.bytes().to_vec()));
+            permit.send((topic, line.to_vec()));
         }
     }
 }
@@ -455,39 +486,221 @@ fn syslog_packet(
     packet
 }
 
-fn open_log_file(path: &Path) -> io::Result<File> {
+const ROTATION_STAMP: &str = "%Y%m%dT%H%M%S.%9fZ";
+const ROTATION_KEEP: usize = 4;
+const ROTATION_RETRY: Duration = Duration::from_secs(60);
+
+struct LogFile {
+    file: File,
+    path: PathBuf,
+    max_size: u64,
+    size: u64,
+    retry_at: Option<Instant>,
+}
+
+impl LogFile {
+    fn write(&mut self, line: &[u8]) -> Option<io::Error> {
+        let written = self.file.write_all(line);
+        if self.max_size == 0 {
+            return None;
+        }
+        self.size = if written.is_ok() {
+            self.size.saturating_add(line.len() as u64)
+        } else {
+            // A partial write may have crossed the threshold.
+            self.max_size
+        };
+        if self.size < self.max_size || self.retry_at.is_some_and(|retry| Instant::now() < retry) {
+            return None;
+        }
+        match self.rotate_if_full() {
+            Ok(()) => {
+                self.retry_at = None;
+                None
+            }
+            Err(error) => {
+                let warn = self.retry_at.is_none();
+                self.retry_at = Some(Instant::now() + ROTATION_RETRY);
+                warn.then_some(error)
+            }
+        }
+    }
+
+    fn rotate_if_full(&mut self) -> io::Result<()> {
+        let opened = self.file.metadata()?;
+        self.size = opened.len();
+        // No fstat in the normal write path. A copytruncate can only make
+        // the cached length an overestimate; check it before rotating.
+        if self.size < self.max_size {
+            return Ok(());
+        }
+        let active = fs::symlink_metadata(&self.path)?;
+        if !active.is_file() || !same_log_file(&opened, &active) {
+            return Err(io::Error::other(
+                "the active log path no longer names the open file",
+            ));
+        }
+
+        let mut archive = self.path.clone();
+        archive
+            .as_mut_os_string()
+            .push(format!(".{}", Utc::now().format(ROTATION_STAMP)));
+        move_log(&self.path, &archive)?;
+        // main opens logs after drop_privileges. The replacement uses the
+        // running identity and must never open an entry created by someone else.
+        match open_log_file(&self.path, true) {
+            Ok((file, size)) => {
+                self.file = file;
+                self.size = size;
+            }
+            Err(error) => {
+                // Keep the old descriptor even if restoring its path fails.
+                let _ = move_log(&archive, &self.path);
+                return Err(error);
+            }
+        }
+        prune_rotated_logs(&self.path)
+    }
+}
+
+#[cfg(unix)]
+fn same_log_file(opened: &fs::Metadata, active: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    (opened.dev(), opened.ino()) == (active.dev(), active.ino())
+}
+
+#[cfg(not(unix))]
+fn same_log_file(opened: &fs::Metadata, active: &fs::Metadata) -> bool {
+    opened.len() == active.len() && opened.created().ok() == active.created().ok()
+}
+
+fn move_log(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use nix::{
+            errno::Errno,
+            fcntl::{AT_FDCWD, RenameFlags, renameat2},
+        };
+
+        match renameat2(AT_FDCWD, from, AT_FDCWD, to, RenameFlags::RENAME_NOREPLACE) {
+            Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP) => {}
+            result => return result.map_err(io::Error::from),
+        }
+    }
+    // Fallback where NOREPLACE isn't available. Never overwrite a same-stamp
+    // archive (or, on rollback, a replacement for the active file).
+    fs::hard_link(from, to)?;
+    fs::remove_file(from).inspect_err(|_| {
+        let _ = fs::remove_file(to);
+    })
+}
+
+fn prune_rotated_logs(path: &Path) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let basename = path.file_name().expect("open regular file has a basename");
+    let mut newest = Vec::with_capacity(ROTATION_KEEP);
+    let mut failure = Ok(());
+    for entry in directory.read_dir()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !is_rotated_log(basename.as_encoded_bytes(), name.as_encoded_bytes())
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        if newest.len() < ROTATION_KEEP {
+            newest.push(name);
+            continue;
+        }
+        let oldest = newest
+            .iter_mut()
+            .min()
+            .expect("retention keeps at least one log");
+        let stale = if name > *oldest {
+            std::mem::replace(oldest, name)
+        } else {
+            name
+        };
+        if let Err(error) = fs::remove_file(directory.join(stale))
+            && error.kind() != io::ErrorKind::NotFound
+            && failure.is_ok()
+        {
+            failure = Err(error);
+        }
+    }
+    failure
+}
+
+fn is_rotated_log(basename: &[u8], name: &[u8]) -> bool {
+    let Some(stamp) = name
+        .strip_prefix(basename)
+        .and_then(|suffix| suffix.strip_prefix(b"."))
+    else {
+        return false;
+    };
+    stamp.len() == 26
+        && stamp[8] == b'T'
+        && stamp[15] == b'.'
+        && stamp[25] == b'Z'
+        && stamp[..8]
+            .iter()
+            .chain(&stamp[9..15])
+            .chain(&stamp[16..25])
+            .all(u8::is_ascii_digit)
+        && NaiveDateTime::parse_from_str(std::str::from_utf8(stamp).expect("ASCII"), ROTATION_STAMP)
+            .is_ok()
+}
+
+fn open_log_file(path: &Path, create_only: bool) -> io::Result<(File, u64)> {
     let mut options = OpenOptions::new();
     options.append(true);
     #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let allow_symlinks = {
+        use std::os::unix::fs::OpenOptionsExt as _;
 
         // libcommon/file_common.c: mosquitto_fopen restrict_read enables O_NOFOLLOW
         // and creates the file with 0600 (independent of UMASK_SET).
-        let allow_symlinks = std::env::var_os("MOSQUITTO_UNSAFE_ALLOW_SYMLINKS").is_some();
-        if !allow_symlinks {
+        let allow = !create_only && std::env::var_os("MOSQUITTO_UNSAFE_ALLOW_SYMLINKS").is_some();
+        options.mode(0o600);
+        if !allow {
             options.custom_flags(nix::libc::O_NOFOLLOW);
         }
-        match options.create_new(true).mode(0o600).open(path) {
-            Ok(file) => {
-                if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                }
-                file
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => options
-                .create_new(false)
-                .create(allow_symlinks)
-                .open(path)?,
-            Err(error) => return Err(error),
-        }
+        allow
     };
     #[cfg(not(unix))]
-    let file = options.create(true).open(path)?;
-    if !file.metadata()?.is_file() {
+    let allow_symlinks = true;
+
+    let (file, metadata) = match options.create_new(true).open(path) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                if metadata.permissions().mode() & 0o777 != 0o600 {
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            (file, metadata)
+        }
+        Err(error) if !create_only && error.kind() == io::ErrorKind::AlreadyExists => {
+            let file = options
+                .create_new(false)
+                .create(allow_symlinks)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            (file, metadata)
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
         return Err(io::Error::other("not a regular file"));
     }
-    Ok(file)
+    Ok((file, metadata.len()))
 }
 
 #[cfg(unix)]
@@ -549,6 +762,177 @@ mod tests {
             let log = crate::ServerConfig::parse(destinations).unwrap().log;
             assert!(!Sinks::new(&log).enabled(LogType::Error));
         }
+    }
+
+    #[test]
+    fn file_rotation_limit_defaults_to_64_mib_and_accepts_byte_counts() {
+        assert_eq!(LogConfig::default().file_max_size, 64 * 1024 * 1024);
+        for size in [0, 127, u64::MAX] {
+            let log = crate::ServerConfig::parse(&format!("log_file_max_size {size}\n"))
+                .unwrap()
+                .log;
+            assert_eq!(log.file_max_size, size);
+        }
+        assert!(crate::ServerConfig::parse("log_file_max_size -1\n").is_err());
+    }
+
+    fn file_sink(path: &Path, max_size: u64) -> LogFile {
+        let (file, size) = open_log_file(path, false).unwrap();
+        LogFile {
+            file,
+            path: path.to_owned(),
+            max_size,
+            size,
+            retry_at: None,
+        }
+    }
+
+    #[test]
+    fn file_rotation_starts_at_the_threshold_and_keeps_the_newest_four() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.log");
+        let unrelated = [
+            "broker.log.1",
+            "broker.log.1.gz",
+            "broker.log-20000101",
+            "broker.log.20000101T000001.000000000Z.gz",
+            "broker.log.20001301T000001.000000000Z",
+            "another.log.20000101T000001.000000000Z",
+        ];
+        for name in unrelated {
+            fs::write(dir.path().join(name), b"unrelated").unwrap();
+        }
+        let old_archive = dir.path().join("broker.log.20000101T000001.000000000Z");
+        fs::write(&old_archive, b"old archive").unwrap();
+        let mut sink = file_sink(&path, 4);
+
+        assert!(sink.write(b"a\n").is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"a\n");
+        assert!(sink.write(b"b\n").is_none());
+        assert!(
+            fs::read(&path).unwrap().is_empty(),
+            "rotate at exactly 4 bytes"
+        );
+        for line in [b"222\n", b"333\n", b"444\n", b"555\n", b"666\n"] {
+            assert!(sink.write(line).is_none());
+        }
+        assert!(sink.write(b"z\n").is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"z\n");
+
+        let mut archives: Vec<_> = dir
+            .path()
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| is_rotated_log(b"broker.log", entry.file_name().as_encoded_bytes()))
+            .map(|entry| entry.path())
+            .collect();
+        archives.sort_unstable();
+        let contents: Vec<_> = archives
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect();
+        assert_eq!(contents, [b"333\n", b"444\n", b"555\n", b"666\n"]);
+        assert!(!old_archive.exists());
+        for name in unrelated {
+            assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"unrelated");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let current = fs::metadata(&path).unwrap();
+            assert_eq!(current.mode() & 0o777, 0o600);
+            assert_eq!(current.uid(), nix::unistd::geteuid().as_raw());
+        }
+    }
+
+    #[test]
+    fn copytruncate_does_not_trigger_rotation_before_the_new_length_reaches_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.log");
+        let mut sink = file_sink(&path, 4);
+        assert!(sink.write(b"a\n").is_none());
+        fs::copy(&path, dir.path().join("broker.log.1")).unwrap();
+        File::options()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        assert!(sink.write(b"b\n").is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"b\n");
+        assert!(sink.write(b"c\n").is_none());
+        assert!(fs::read(&path).unwrap().is_empty());
+        assert_eq!(fs::read(dir.path().join("broker.log.1")).unwrap(), b"a\n");
+    }
+
+    #[test]
+    fn zero_file_rotation_limit_keeps_appending_to_an_existing_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.log");
+        fs::write(&path, b"old\n").unwrap();
+        let mut sink = file_sink(&path, 0);
+        assert!(sink.write(b"new\n").is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"old\nnew\n");
+        assert_eq!(dir.path().read_dir().unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_log_rename_warns_once_to_other_destinations_and_keeps_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        // The original basename fits NAME_MAX, but not with the appended timestamp.
+        let path = dir.path().join("l".repeat(255));
+        let config = crate::ServerConfig::parse("log_dest topic\nlog_timestamp false\n")
+            .unwrap()
+            .log;
+        let mut sinks = Sinks::new(&config);
+        let (sender, mut receiver) = mpsc::channel(8);
+        sinks.open_file(&path, 2, &sender);
+        for message in ["a", "b", "c"] {
+            sinks.log(LogType::Notice, format_args!("{message}"), &sender);
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"a\nb\nc\n");
+        let warnings: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|(topic, line)| (topic == "$SYS/broker/log/W").then_some(line))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with(b"Warning: Unable to rotate log file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_the_new_log_never_follows_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.log");
+        let target = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            open_log_file(&path, true).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_rotation_retries_after_the_active_path_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("broker.log");
+        let external = dir.path().join("broker.log.1");
+        let mut sink = file_sink(&active, 2);
+        fs::rename(&active, &external).unwrap();
+        fs::write(&active, b"external replacement").unwrap();
+
+        assert!(sink.write(b"a\n").is_some());
+        assert!(sink.write(b"b\n").is_none());
+        assert_eq!(fs::read(&external).unwrap(), b"a\nb\n");
+        assert_eq!(fs::read(&active).unwrap(), b"external replacement");
+
+        fs::rename(&external, &active).unwrap();
+        sink.retry_at = Some(Instant::now());
+        assert!(sink.write(b"c\n").is_none());
+        assert!(fs::read(&active).unwrap().is_empty());
+        assert!(sink.retry_at.is_none());
     }
 
     #[cfg(unix)]

@@ -254,6 +254,8 @@ pub enum TlsVersion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogConfig {
     pub destinations: BTreeSet<LogDestination>,
+    /// Rotate file logs at this size in bytes; zero leaves rotation to the operator.
+    pub file_max_size: u64,
     pub types: BTreeSet<LogType>,
     /// Syslog facility number, before shifting it into the PRI field.
     pub facility: u8,
@@ -363,6 +365,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             destinations: BTreeSet::from([LogDestination::Stderr, LogDestination::Dlt]),
+            file_max_size: 64 * 1024 * 1024, // MQExtended deviation: bound file log growth.
             types: BTreeSet::from([
                 LogType::Error,
                 LogType::Warning,
@@ -1089,6 +1092,10 @@ impl Parser {
                 )? as u16;
             }
             "log_dest" => self.log_dest(v)?,
+            "log_file_max_size" => {
+                let size = v.word()?;
+                self.config.log.file_max_size = size.parse().map_err(|_| invalid(name, size))?;
+            }
             "log_type" => self.log_type(v)?,
             "connection_messages" => self.config.log.connection_messages = v.boolean()?,
             "log_timestamp" => self.config.log.timestamp = v.boolean()?,
