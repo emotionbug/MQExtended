@@ -48,7 +48,7 @@ cluster_certfile /etc/mqextended/node2.pem
 cluster_keyfile /etc/mqextended/node2.key
 ```
 
-Give every node the same `password_file`, `acl_file` and broker limits. Send SIGHUP to every node after updating file credentials or ACLs. A SIGHUP on any node commits that node's `message_size_limit`, `persistent_client_expiration`, `queue_qos0_messages`, `upgrade_outgoing_qos`, `allow_duplicate_messages` and `clientid_prefixes` to the whole cluster, so every node applies them at the same point in the log. Committed values survive restarts and take precedence over a node's file until the next SIGHUP; a node whose file disagrees logs a warning when it starts. Mosquitto applies no other broker limit on reload, so roll the nodes to change the rest.
+Give every node the same `password_file`, `acl_file` and broker limits. Outside Kubernetes, [send SIGHUP](migration.md#4-run-mqextended-in-place-of-mosquitto) to every node after updating file credentials or ACLs. A SIGHUP on any node commits that node's `message_size_limit`, `persistent_client_expiration`, `retain_max_age`, `queue_qos0_messages`, `upgrade_outgoing_qos`, `allow_duplicate_messages` and `clientid_prefixes` to the whole cluster, so every node applies them at the same point in the log. Committed values survive restarts and take precedence over a node's file until the next SIGHUP; a node whose file disagrees logs a warning when it starts. Roll the nodes to change the other broker limits.
 
 Issue node certificates from a CA used only for the cluster, one per node, with Common Name `mqx-node-<id>` matching `cluster_node_id`. Every peer connection is mutually authenticated: a node only accepts a peer whose certificate chains to `cluster_cafile` and whose Common Name matches the node id it claims, and it checks the same when it dials out. Addresses play no part in authentication.
 
@@ -174,7 +174,7 @@ The broker bounds that state by default, unlike Mosquitto ([defaults](mosquitto-
 
 - A persistent session whose client stays away for 30 days is removed (`persistent_client_expiration`). Until then its offline queue holds at most 1,000 messages and 16 MiB (`max_queued_messages`, `max_queued_bytes`); later messages are dropped as for any full queue.
 - With `queue_qos0_messages true`, queued QoS 0 messages count against the same limits.
-- Retained messages whose MQTT 5 expiry has passed are removed every hour (`retain_expiry_interval`). Their topic levels stay, as in Mosquitto. Retained messages without an expiry have no count or size limit: they stay until a client replaces or clears them.
+- The retained sweep removes messages whose MQTT 5 expiry has passed (`retain_expiry_interval`) and applies the [age limit](mosquitto-compatibility.md#defaults) to messages without an expiry (`retain_max_age`). Their topic levels stay, as in Mosquitto.
 
 Change these in `mosquitto.conf`, or with `brokerOptions` in the Helm chart.
 
@@ -234,10 +234,10 @@ Do not enable `mosquitto_sparkplug_aware` until every node runs a build that sup
 
 Enable `auth-plug` or `go-auth` only once every node runs a build that supports it. Their ACL checks write `Authorize` and `ResolveVerdicts` entries, and the sessions of their clients carry verdicts and waiting deliveries that an older build cannot replay. Every node applies those entries through its own copy of the plugin, so add, remove or reconfigure a plugin with the whole cluster stopped. A node without the plugin would decide differently from the others. Existing log entries are not reinterpreted when you enable one.
 
-Releases before this one never expire persistent sessions, never cap an offline queue in bytes and never sweep expired retained messages by default; this release does ([defaults](mosquitto-compatibility.md#defaults)). Every node applies those limits to the same log entries, so nodes with different values keep different session state. When upgrading from an earlier release:
+Releases before this one never expire persistent sessions, cap offline queues in bytes, or sweep retained messages by default; this release does ([defaults](mosquitto-compatibility.md#defaults)). Every node applies those limits to the same log entries, so nodes with different values keep different state. When upgrading from an earlier release:
 
-1. As each node gets the new binary, add `persistent_client_expiration never`, `max_queued_bytes 0` and `auto_recover false` to its file, unless the file already sets them. The upgraded nodes then decide exactly as the old ones did.
-2. Once every node runs the new binary, remove those lines. Send SIGHUP to one node to commit the new session expiry everywhere at the same log index, then restart the nodes one at a time for the queue limit and automatic recovery.
+1. As each node gets the new binary, add `persistent_client_expiration never`, `retain_max_age never`, `max_queued_bytes 0` and `auto_recover false` to its file, unless the file already sets them. The upgraded nodes then decide exactly as the old ones did.
+2. Once every node runs the new binary, remove those lines. Send SIGHUP to one node to commit the new session expiry and retained age limits everywhere at the same log index, then restart the nodes one at a time for the queue limit and automatic recovery.
 
 Only sessions that disconnect after the switch get the 30-day expiry; sessions already offline expire when they next disconnect. Expired retained messages leave a node's memory at different times while the defaults differ; clients see no difference. If `queue_qos0_messages` is on, upgrade with client traffic drained: queued QoS 0 messages now count against the queue limits, and no setting reproduces the earlier accounting.
 

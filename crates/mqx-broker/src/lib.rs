@@ -59,6 +59,7 @@ pub struct BrokerConfig {
     pub message_size_limit: usize,
     pub max_packet_size: usize,
     pub retain_expiry_interval: Option<Duration>,
+    pub retain_max_age: Option<Duration>,
     pub persistent_client_expiration: Option<Duration>,
     pub retain_available: bool,
     pub upgrade_outgoing_qos: bool,
@@ -73,7 +74,8 @@ pub struct BrokerConfig {
     pub sparkplug_aware: bool,
 }
 
-/// Broker options Mosquitto 2.1.4 applies on SIGHUP (conf.c: config__copy).
+/// Broker options Mosquitto 2.1.4 applies on SIGHUP (conf.c: config__copy),
+/// plus MQExtended's retained message age limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReloadableLimits {
     pub message_size_limit: usize,
@@ -82,6 +84,8 @@ pub struct ReloadableLimits {
     pub upgrade_outgoing_qos: bool,
     pub allow_duplicate_messages: bool,
     pub clientid_prefixes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_max_age: Option<Duration>,
 }
 
 impl BrokerConfig {
@@ -94,6 +98,7 @@ impl BrokerConfig {
             upgrade_outgoing_qos: self.upgrade_outgoing_qos,
             allow_duplicate_messages: self.allow_duplicate_messages,
             clientid_prefixes: self.clientid_prefixes.clone(),
+            retain_max_age: self.retain_max_age,
         }
     }
 
@@ -112,6 +117,7 @@ impl BrokerConfig {
             message_size_limit: limits.message_size_limit,
             max_packet_size: self.max_packet_size,
             retain_expiry_interval: self.retain_expiry_interval,
+            retain_max_age: limits.retain_max_age,
             persistent_client_expiration: limits.persistent_client_expiration,
             retain_available: self.retain_available,
             upgrade_outgoing_qos: limits.upgrade_outgoing_qos,
@@ -144,6 +150,7 @@ impl Default for BrokerConfig {
             message_size_limit: 0,
             max_packet_size: 2_000_000,
             retain_expiry_interval: None,
+            retain_max_age: None,
             persistent_client_expiration: None,
             retain_available: true,
             upgrade_outgoing_qos: false,

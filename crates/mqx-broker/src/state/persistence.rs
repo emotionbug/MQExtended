@@ -31,9 +31,10 @@ impl State {
         let Some(now) = finish else {
             return Reply::PersistenceStaged;
         };
-        let Ok(image) = self.pending_import.take().unwrap().decode() else {
+        let Ok(mut image) = self.pending_import.take().unwrap().decode() else {
             return Reply::InvalidPersistence;
         };
+        image.from_mosquitto = true;
         assert!(
             self.restore_persistence(image, now),
             "import was checked for an empty broker"
@@ -53,8 +54,13 @@ impl State {
         };
         // persist_write.c: persist__retain_save omits $SYS retained values
         // but persist__client_messages_save keeps queued $SYS publications.
-        self.retained.for_each(|message| {
+        self.retained.for_each_stored(|message, stored_at| {
             if !message.topic.starts_with("$SYS") {
+                if let Some(stored_at) = stored_at {
+                    output
+                        .retained_store_times
+                        .push((output.retained.len(), stored_at));
+                }
                 output.retained.push(intern(message));
             }
         });
@@ -125,17 +131,18 @@ impl State {
             messages,
             retained,
             sessions,
+            from_mosquitto,
+            retained_store_times,
         } = input;
-        for index in retained {
+        let mut store_times = retained_store_times.into_iter().peekable();
+        for (position, index) in retained.into_iter().enumerate() {
+            let stored_at = store_times
+                .next_if(|&(entry, _)| entry == position)
+                .map(|(_, stored_at)| stored_at)
+                .or(from_mosquitto.then_some(now));
             let message = &messages[index];
             if !message.expired(now) {
-                self.retained.store(&message.topic, message.clone());
-                if message.expires.is_some() && self.retain_sweep.is_none() {
-                    self.retain_sweep = self
-                        .config
-                        .retain_expiry_interval
-                        .map(|ttl| now.saturating_add(ttl));
-                }
+                self.store_retained(message, now, stored_at);
             }
         }
         let mut subscriptions = Vec::new();

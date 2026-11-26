@@ -426,6 +426,10 @@ fn warn_on_committed_limits(broker: &Broker, file: &ReloadableLimits) {
             running.persistent_client_expiration != file.persistent_client_expiration,
         ),
         (
+            "retain_max_age",
+            running.retain_max_age != file.retain_max_age,
+        ),
+        (
             "queue_qos0_messages",
             running.queue_qos0_messages != file.queue_qos0_messages,
         ),
@@ -808,7 +812,7 @@ async fn serve_broker(
                                     _ => tracing::warn!("Changing cluster identity or state format requires a restart"),
                                 }
                             }
-                            // conf.c: config__copy applies these on reload.
+                            // conf.c: config__copy limits and MQExtended's retained age limit.
                             if let Err(error) = broker.reload_limits(reloaded_limits).await {
                                 tracing::warn!("Unable to apply reloaded broker limits: {error}");
                             }
@@ -925,6 +929,7 @@ fn broker_config(config: &ServerConfig) -> BrokerConfig {
         message_size_limit: limits.message_size_limit,
         max_packet_size: limits.max_packet_size,
         retain_expiry_interval: limits.retain_expiry_interval,
+        retain_max_age: limits.retain_max_age,
         persistent_client_expiration: limits.persistent_client_expiration,
         retain_available: limits.retain_available,
         upgrade_outgoing_qos: limits.upgrade_outgoing_qos,

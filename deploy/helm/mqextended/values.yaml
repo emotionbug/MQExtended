@@ -14,7 +14,8 @@ qos1ReplayBatch:
 setTcpNoDelay: false
 # Broker options for the global section of mosquitto.conf, overriding the
 # broker's defaults. Example: {persistent_client_expiration: never,
-# max_queued_bytes: 0} restores Mosquitto's unbounded sessions and queues.
+# max_queued_bytes: 0, retain_max_age: never} restores Mosquitto's behaviour
+# for sessions, queues and retained messages without an expiry.
 brokerOptions: {}
 
 image:

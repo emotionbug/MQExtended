@@ -27,6 +27,12 @@ pub struct PersistentState {
     pub(crate) messages: Vec<Arc<Message>>,
     pub(crate) retained: Vec<usize>,
     pub(crate) sessions: Vec<PersistentSession>,
+    // Import provenance is local; the Raft import command identifies it on replay.
+    #[serde(skip)]
+    pub(crate) from_mosquitto: bool,
+    // Sparse entries keyed by position in `retained`, in position order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) retained_store_times: Vec<(usize, Duration)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +162,9 @@ impl PersistentState {
         let Some(file) = open_database(path)? else {
             return Ok(None);
         };
-        mosquitto::read(BufReader::new(file), security_id).map(Some)
+        let mut state = mosquitto::read(BufReader::new(file), security_id)?;
+        state.from_mosquitto = true;
+        Ok(Some(state))
     }
 
     /// libcommon/file_common.c: mosquitto_write_file preserves the previous
@@ -226,6 +234,17 @@ impl PersistentState {
             })
         {
             return Err(invalid("invalid persisted message reference"));
+        }
+        if self
+            .retained_store_times
+            .last()
+            .is_some_and(|&(position, _)| position >= self.retained.len())
+            || self
+                .retained_store_times
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(invalid("invalid persisted retained store time position"));
         }
         Ok(())
     }

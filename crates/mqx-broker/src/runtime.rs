@@ -398,7 +398,7 @@ impl Broker {
         Ok(broker)
     }
 
-    /// Returns the six reloadable values currently in effect on this node.
+    /// Returns the reloadable values currently in effect on this node.
     pub fn reloadable_limits(&self) -> ReloadableLimits {
         self.0.config.load().reloadable_limits()
     }
@@ -411,11 +411,9 @@ impl Broker {
                 log.submit(Command::ReloadLimits(limits)).await?;
             }
         } else {
-            self.0.runtime.lock().unwrap().apply_local(
-                Command::ReloadLimits(limits),
-                &self.0.config,
-                None,
-            );
+            let mut runtime = self.0.runtime.lock().unwrap();
+            runtime.apply_local(Command::ReloadLimits(limits), &self.0.config, None);
+            self.schedule_local_expiry(&mut runtime);
         }
         Ok(())
     }

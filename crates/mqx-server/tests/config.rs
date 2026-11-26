@@ -19,12 +19,27 @@ fn unattended_broker_limits_default_and_allow_explicit_overrides() {
         defaults.retain_expiry_interval,
         Some(Duration::from_secs(3600))
     );
+    assert_eq!(
+        defaults.retain_max_age,
+        Some(Duration::from_secs(90 * 86400))
+    );
 
     let config = "\
         max_queued_bytes 0\n\
         persistent_client_expiration 2h\n\
         persistent_client_expiration never\n\
         retain_expiry_interval 15\n";
+    for (value, expected) in [
+        ("never", None),
+        ("0", None),
+        ("30d", Some(Duration::from_secs(30 * 86400))),
+    ] {
+        let config = format!("retain_max_age 3d\nretain_max_age {value}");
+        assert_eq!(
+            ServerConfig::parse(&config).unwrap().limits.retain_max_age,
+            expected
+        );
+    }
     let limits = ServerConfig::parse(config).unwrap().limits;
     assert_eq!(limits.max_queued_bytes, 0);
     assert_eq!(limits.persistent_client_expiration, None);

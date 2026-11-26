@@ -124,6 +124,7 @@ pub struct BrokerLimits {
     pub message_size_limit: usize,
     pub persistent_client_expiration: Option<Duration>,
     pub retain_expiry_interval: Option<Duration>,
+    pub retain_max_age: Option<Duration>,
     pub queue_qos0_messages: bool,
     pub retain_available: bool,
     pub upgrade_outgoing_qos: bool,
@@ -301,10 +302,11 @@ impl Default for BrokerLimits {
             max_keepalive: 0,
             max_packet_size: 2_000_000,
             message_size_limit: 0,
-            // MQExtended expires abandoned sessions and sweeps retained
-            // message expiry even when neither directive is set.
+            // MQExtended expires abandoned sessions and retained messages
+            // even when these directives are not set.
             persistent_client_expiration: Some(Duration::from_secs(30 * 86400)),
             retain_expiry_interval: Some(Duration::from_secs(60 * 60)),
+            retain_max_age: Some(Duration::from_secs(90 * 86400)),
             queue_qos0_messages: false,
             retain_available: true,
             upgrade_outgoing_qos: false,
@@ -1050,11 +1052,16 @@ impl Parser {
                 }
                 self.config.limits.message_size_limit = value as usize;
             }
-            "persistent_client_expiration" => {
+            "persistent_client_expiration" | "retain_max_age" => {
                 let value = v.word()?;
-                // MQExtended's opt-out restores Mosquitto's no-expiry default.
-                if value == "never" {
-                    self.config.limits.persistent_client_expiration = None;
+                let limit = if name == "retain_max_age" {
+                    &mut self.config.limits.retain_max_age
+                } else {
+                    &mut self.config.limits.persistent_client_expiration
+                };
+                // MQExtended's opt-outs restore Mosquitto's no-expiry defaults.
+                if value == "never" || (name == "retain_max_age" && value == "0") {
+                    *limit = None;
                     return Ok(());
                 }
                 let unit = match value.as_bytes().last() {
@@ -1072,12 +1079,9 @@ impl Parser {
                     i64::from(atoi(&value[..value.len() - 1])) * unit
                 };
                 if seconds <= 0 {
-                    return Err(
-                        "Invalid 'persistent_client_expiration' duration in configuration.".into(),
-                    );
+                    return Err(format!("Invalid '{name}' duration in configuration.").into());
                 }
-                self.config.limits.persistent_client_expiration =
-                    Some(Duration::from_secs(seconds as u64));
+                *limit = Some(Duration::from_secs(seconds as u64));
             }
             "queue_qos0_messages" => self.config.limits.queue_qos0_messages = v.boolean()?,
             "retain_available" => self.config.limits.retain_available = v.boolean()?,

@@ -636,8 +636,29 @@ impl State {
     }
 
     fn set_limits(&mut self, limits: ReloadableLimits) {
+        let had_max_age = self.config.retain_max_age.is_some();
         self.config = Arc::new(self.startup_config.with_reloadable_limits(&limits));
         self.limits = Some(limits);
+        if self.config.retain_max_age.is_some() {
+            if !had_max_age {
+                self.schedule_untracked_retained_age();
+            }
+        } else if had_max_age {
+            let pending = self
+                .retained
+                .forget_store_times(&mut self.persistence_changes);
+            if !pending || self.config.retain_expiry_interval.is_none() {
+                self.retain_sweep = None;
+            }
+        }
+    }
+
+    fn schedule_untracked_retained_age(&mut self) {
+        if self.retain_sweep.is_none() && self.retained.has_age_candidates() {
+            // Reload limits and snapshots do not supply a clock. Use the
+            // next Expire command's time to start any untracked clocks.
+            self.retain_sweep = Some(Duration::ZERO);
+        }
     }
 
     pub(crate) fn subscription_tree(&self) -> String {
@@ -959,10 +980,23 @@ impl State {
             .filter(|(_, session)| !session.pending.is_empty())
             .map(|(id, _)| id.clone())
             .collect();
-        if let Some(limits) = restored.limits.take() {
-            restored.set_limits(limits);
+        if let Some(limits) = &restored.limits {
+            restored.config = Arc::new(restored.startup_config.with_reloadable_limits(limits));
         } else {
             restored.config = restored.startup_config.clone();
+        }
+        if restored.config.retain_max_age.is_some() {
+            restored.schedule_untracked_retained_age();
+        } else if restored.limits.is_none() {
+            // Without committed limits the startup file can turn max-age off
+            // for a snapshot taken while it was enabled.
+            let mut discarded_clocks = 0;
+            let pending = restored.retained.forget_store_times(&mut discarded_clocks);
+            if discarded_clocks != 0
+                && (!pending || restored.config.retain_expiry_interval.is_none())
+            {
+                restored.retain_sweep = None;
+            }
         }
         for (&id, text) in &restored.acl_text {
             if let Some(text) = text {
@@ -1235,13 +1269,45 @@ impl State {
             }
         }
         if self.retain_sweep.is_some_and(|at| at <= now) {
-            let pending = self.retained.expire(now);
+            let max_age = self.config.retain_max_age;
+            let pending = self.retained.expire(
+                now,
+                self.config.retain_expiry_interval.is_some() || max_age.is_none(),
+                max_age,
+                |id| self.sessions.contains_key(id),
+                &mut self.persistence_changes,
+            );
             self.retain_sweep = self
-                .config
-                .retain_expiry_interval
+                .retained_sweep_interval()
                 .filter(|_| pending)
                 .map(|interval| now.saturating_add(interval));
         }
+    }
+
+    fn retained_sweep_interval(&self) -> Option<Duration> {
+        self.config.retain_expiry_interval.or_else(|| {
+            self.config
+                .retain_max_age
+                .map(|_| Duration::from_secs(3600))
+        })
+    }
+
+    fn store_retained(
+        &mut self,
+        message: &Arc<Message>,
+        now: Duration,
+        stored_at: Option<Duration>,
+    ) {
+        let max_age = self.config.retain_max_age.is_some();
+        if self.retain_sweep.is_none()
+            && !message.payload.is_empty()
+            && (message.expires.is_some() && self.config.retain_expiry_interval.is_some()
+                || max_age && Retained::can_age(message))
+            && let Some(interval) = self.retained_sweep_interval()
+        {
+            self.retain_sweep = Some(now.saturating_add(interval));
+        }
+        self.retained.store(message, stored_at.filter(|_| max_age));
     }
 
     fn take_will(&mut self, id: &Arc<str>) -> Option<PendingWill> {
@@ -2095,14 +2161,7 @@ impl State {
         if message.retain {
             // retain.c: retain__store counts writes and clears outside $SYS.
             self.persistence_changes += u64::from(!topic.starts_with("$SYS"));
-            if message.expires.is_some()
-                && !message.payload.is_empty()
-                && self.retain_sweep.is_none()
-                && let Some(interval) = self.config.retain_expiry_interval
-            {
-                self.retain_sweep = Some(context.now.saturating_add(interval));
-            }
-            self.retained.store(topic, message.clone());
+            self.store_retained(&message, context.now, Some(context.now));
         }
         matched
     }
@@ -2582,6 +2641,75 @@ mod tests {
     }
 
     #[test]
+    fn retained_max_age_uses_the_last_publish_and_keeps_offline_sessions() {
+        let hours = |n: u64| Duration::from_secs(n * 3600);
+        let config = Arc::new(BrokerConfig {
+            retain_expiry_interval: None,
+            retain_max_age: Some(hours(2)),
+            ..BrokerConfig::default()
+        });
+        let mut state = State::new(config.clone());
+        let persistent = Arc::<str>::from("persistent");
+        let Reply::Claimed { lease, .. } = state.apply(claim(persistent.clone(), false)).reply
+        else {
+            panic!("publisher must be claimed");
+        };
+        let source = state.sessions[&persistent].publisher.clone();
+        let publish = |state: &mut State, id, topic: &str, now| {
+            state.publish(
+                Arc::new(Message {
+                    source: Publisher {
+                        id,
+                        ..source.clone()
+                    },
+                    topic: topic.into(),
+                    payload: Bytes::from_static(b"retained"),
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    properties: Vec::new(),
+                    expires: None,
+                }),
+                now,
+                &mut Vec::new(),
+            );
+        };
+        publish(&mut state, "gone".into(), "abandoned", hours(0));
+        publish(&mut state, "gone".into(), "refreshed", hours(0));
+        publish(&mut state, persistent, "owned", hours(0));
+        state.apply(Command::Act(
+            lease,
+            Operation::Disconnect {
+                now: hours(1),
+                graceful: true,
+                expiry: None,
+            },
+        ));
+        assert_eq!(state.next_expiry(), Some(hours(1)));
+        state.apply(Command::Expire(hours(1)));
+        publish(&mut state, "gone".into(), "refreshed", hours(1));
+
+        let image = rmp_serde::to_vec(&state.persistent_snapshot(hours(1))).unwrap();
+        let mut restored = State::new(config);
+        assert!(restored.restore_persistence(rmp_serde::from_slice(&image).unwrap(), hours(1)));
+        for state in [&mut state, &mut restored] {
+            let topics = |state: &State| {
+                let mut names = Vec::new();
+                state
+                    .retained
+                    .for_each(|message| names.push(message.topic.clone()));
+                names
+            };
+            state.apply(Command::Expire(hours(2)));
+            assert_eq!(
+                topics(state),
+                [Box::<str>::from("refreshed"), "owned".into()]
+            );
+            state.apply(Command::Expire(hours(3)));
+            assert_eq!(topics(state), [Box::<str>::from("owned")]);
+        }
+    }
+
+    #[test]
     fn replay_preserves_epochs_qos2_retention_and_inbox_state() {
         let acl = Bytes::from_static(b"topic readwrite topic/#\n");
         let config = Arc::new(BrokerConfig {
@@ -2857,6 +2985,7 @@ mod tests {
             upgrade_outgoing_qos: true,
             allow_duplicate_messages: false,
             clientid_prefixes: None,
+            retain_max_age: Some(Duration::from_secs(60)),
         };
         let encoded = rmp_serde::to_vec(&Command::ReloadLimits(limits.clone())).unwrap();
         state.apply(rmp_serde::from_slice(&encoded).unwrap());
@@ -2985,6 +3114,7 @@ mod tests {
                         upgrade_outgoing_qos: value & 2 != 0,
                         allow_duplicate_messages: value & 4 != 0,
                         clientid_prefixes: (value & 8 != 0).then(|| topic.to_owned()),
+                        retain_max_age: (value & 16 != 0).then(|| Duration::from_secs(u64::from(value % 12) + 1)),
                     }),
                 };
                 let command = match command {
