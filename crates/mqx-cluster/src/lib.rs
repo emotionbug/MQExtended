@@ -36,9 +36,14 @@ pub use transport::Mesh;
 pub use wal::WalMetrics;
 
 /// Largest configurable snapshot transfer, including the encoded metadata.
-pub const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
+/// The wire length is a u32; restore also needs to address the application bytes.
+pub const MAX_SNAPSHOT_SIZE: u64 = if usize::BITS <= 32 {
+    isize::MAX as u64
+} else {
+    u32::MAX as u64
+};
 /// Default maximum snapshot transfer size.
-pub const DEFAULT_MAX_SNAPSHOT_SIZE: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_SNAPSHOT_SIZE: u64 = MAX_SNAPSHOT_SIZE;
 pub const DEFAULT_MAX_COMMAND_SIZE: usize = 2 * 1024 * 1024;
 pub const DEFAULT_MAX_APPEND_SIZE: usize = 9 * 1024 * 1024;
 pub const DEFAULT_MAX_MESH_SIZE: usize = DEFAULT_MAX_COMMAND_SIZE;
@@ -133,7 +138,7 @@ pub struct ClusterConfig {
     pub lease_interval: Duration,
     pub lease_timeout: Duration,
     pub snapshot_timeout: Duration,
-    /// Maximum encoded snapshot transfer size in bytes (default 64 MiB, maximum 256 MiB).
+    /// Maximum encoded snapshot transfer size in bytes (defaults to [`MAX_SNAPSHOT_SIZE`]).
     pub max_snapshot_size: u64,
     /// Maximum MessagePack application command size. Use identical limits on all peers.
     pub max_command_size: usize,
@@ -255,9 +260,9 @@ impl ClusterConfig {
             return Err(invalid("dynamic membership requires state format 2".into()));
         }
         if !(1..=MAX_SNAPSHOT_SIZE).contains(&self.max_snapshot_size) {
-            return Err(invalid(
-                "max_snapshot_size must be between 1 byte and 256 MiB".into(),
-            ));
+            return Err(invalid(format!(
+                "max_snapshot_size must be between 1 and {MAX_SNAPSHOT_SIZE} bytes"
+            )));
         }
         if self.data_dir.as_os_str().is_empty()
             || self.lease_timeout <= self.lease_interval
@@ -336,4 +341,33 @@ pub enum ClusterError {
     MeshHandler(String),
     #[error("application snapshot cannot be restored: {0}")]
     Restore(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raft_config_accepts_snapshot_transfer_limits_in_range() {
+        let address = "127.0.0.1:9001".parse().unwrap();
+        let mut config = ClusterConfig::new(
+            1,
+            address,
+            BTreeMap::from([(1, address)]),
+            PathBuf::from("raft"),
+            ClusterSecurity::InsecurePlaintext,
+        );
+        assert_eq!(config.max_snapshot_size, MAX_SNAPSHOT_SIZE);
+        for size in [1, 256 * 1024 * 1024 + 1, MAX_SNAPSHOT_SIZE] {
+            config.max_snapshot_size = size;
+            assert!(config.raft_config().is_ok(), "{size}");
+        }
+        for size in [0, MAX_SNAPSHOT_SIZE + 1] {
+            config.max_snapshot_size = size;
+            assert!(matches!(
+                config.raft_config(),
+                Err(ClusterError::InvalidConfig(error)) if error.contains("max_snapshot_size")
+            ));
+        }
+    }
 }

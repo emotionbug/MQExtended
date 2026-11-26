@@ -166,9 +166,23 @@ impl PersistentState {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        // A new private inode, never an old .new symlink or hardlink. Tempfile
-        // opens mode 0600 on Unix and removes it on an error before rename.
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        // libcommon/file_common.c: mosquitto_write_file unlinks a fixed
+        // staging name before opening it, since it may alias the live image.
+        // Exclusive creation prevents following a newly appeared symlink.
+        let mut name = path
+            .file_name()
+            .ok_or(io::ErrorKind::InvalidInput)?
+            .to_os_string();
+        name.push(".new");
+        match std::fs::remove_file(parent.join(&name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut temporary = tempfile::Builder::new()
+            .prefix(&name)
+            .rand_bytes(0)
+            .tempfile_in(parent)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -239,4 +253,43 @@ fn open_database(path: &Path) -> io::Result<Option<File>> {
 
 fn invalid(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn snapshot_save_recovers_only_its_fixed_staging_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let native = dir.join("mosquitto.db.mqx");
+        let staged = dir.join("mosquitto.db.mqx.new");
+        fs::write(&staged, b"incomplete image").unwrap();
+        let unrelated = [
+            dir.join("mosquitto.db.new"),
+            dir.join("other.db.mqx.new"),
+            dir.join(".tmpAb12Xy"),
+        ];
+        for path in &unrelated {
+            fs::write(path, b"unrelated file").unwrap();
+        }
+
+        let state = PersistentState::default();
+        state.write_snapshot(&native).unwrap();
+        assert!(PersistentState::read_snapshot(&native).unwrap().is_some());
+        assert!(!staged.exists());
+        for path in &unrelated {
+            assert_eq!(fs::read(path).unwrap(), b"unrelated file");
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&unrelated[0], &staged).unwrap();
+            state.write_snapshot(&native).unwrap();
+            assert!(!staged.is_symlink());
+            assert_eq!(fs::read(&unrelated[0]).unwrap(), b"unrelated file");
+        }
+    }
 }

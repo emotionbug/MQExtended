@@ -33,8 +33,8 @@ use crate::membership::{Desired, MemberRole, MembershipControl, Serving, validat
 use crate::mtls::Tls;
 use crate::mux::{CallError, Response, write_responses};
 use crate::snapshot::{
-    RETIRED_FILE, SNAPSHOT_FILE, Snapshot, SnapshotMeta, Store, TEMP_FILE_PREFIX, atomic_write,
-    open_private_file, prepare_dir,
+    RETIRED_FILE, SNAPSHOT_FILE, Snapshot, SnapshotMeta, Store, atomic_write, is_staged_tempfile,
+    open_private_file, prepare_dir, remove_staged_tempfiles,
 };
 use crate::snapshot_file::SnapshotData;
 use crate::survivor::{
@@ -93,6 +93,8 @@ pub struct ClusterMetrics {
     pub committed_index: Option<u64>,
     pub applied_index: Option<u64>,
     pub snapshot_index: Option<u64>,
+    /// Size of the current local snapshot file, or zero before the first snapshot.
+    pub snapshot_size_bytes: u64,
     pub purged_index: Option<u64>,
     pub running: bool,
     pub auto_recover: bool,
@@ -227,10 +229,8 @@ impl<S: StateMachine> Cluster<S> {
                         // A crash before the node identity's rename can leave its
                         // temporary file and a WAL without any Raft state.
                         if (name == "wal" && kind.is_dir())
-                            || (name
-                                .as_encoded_bytes()
-                                .starts_with(TEMP_FILE_PREFIX.as_bytes())
-                                && kind.is_file())
+                            || (is_staged_tempfile(&name) && kind.is_file())
+                            || (lock.is_some() && name == survivor::LOCK_FILE && kind.is_file())
                             || (lock.is_some() && name == survivor::DISCARDED && kind.is_dir())
                         {
                             continue;
@@ -243,6 +243,10 @@ impl<S: StateMachine> Cluster<S> {
                 let recover = |error| unusable_state(&data_dir, node_id, auto_recover, error);
                 let wal = Wal::open(&data_dir.join("wal"), max_append_size, state_format)
                     .map_err(|error| recover(error.into()))?;
+                // The WAL lock fences both recovery-enabled and plain nodes.
+                // Unlink only uncommitted staging files and never archive live
+                // state if cleanup itself fails.
+                remove_staged_tempfiles(&data_dir)?;
                 let loaded = (|| {
                     let (initial, digest, existing, record) = load_identity(
                         &data_dir,
@@ -297,6 +301,7 @@ impl<S: StateMachine> Cluster<S> {
             .await
             .map_err(io::Error::other)??;
         let mut wal = wal;
+        let store = store.with_snapshot_limit(max_snapshot_size);
         let raft = match Raft::build(
             node_id,
             raft_config,
@@ -704,6 +709,7 @@ impl<S: StateMachine> Cluster<S> {
             committed_index: m.local_committed.map(|id| id.index),
             applied_index: m.last_applied.map(|id| id.index),
             snapshot_index: m.snapshot.map(|id| id.index),
+            snapshot_size_bytes: self.0.core.store.snapshot_size(),
             purged_index: m.purged.map(|id| id.index),
             running: !*self.0.core.mesh.stop.borrow() && m.running_state.is_ok(),
             auto_recover: endpoint.recovery_timeout().is_some(),
@@ -3023,19 +3029,27 @@ mod tests {
             ClusterSecurity::InsecurePlaintext,
         );
         config.join = true;
-        Wal::open(&config.data_dir.join("wal"), config.max_append_size, 2)
-            .unwrap()
-            .close()
-            .await
-            .unwrap();
-        crate::snapshot::private_tempfile(&config.data_dir)
+        let wal = Wal::open(&config.data_dir.join("wal"), config.max_append_size, 2).unwrap();
+        let (_, staged) = crate::snapshot::private_tempfile(&config.data_dir)
             .unwrap()
             .keep()
             .unwrap();
+        let legacy = config.data_dir.join(".mqx-Ab12Xy");
+        std::fs::write(&legacy, b"partial identity").unwrap();
+        let locked = Cluster::start(config.clone(), Counter::default()).await;
+        assert!(matches!(
+            locked,
+            Err(ClusterError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert!(staged.is_file());
+        assert!(legacy.is_file());
+        wal.close().await.unwrap();
 
         let node = Cluster::start(config.clone(), Counter::default())
             .await
             .unwrap();
+        assert!(!staged.exists());
+        assert!(!legacy.exists());
         assert!(config.data_dir.join(IDENTITY_FILE).is_file());
         assert!(node.members().is_empty());
         node.shutdown().await.unwrap();

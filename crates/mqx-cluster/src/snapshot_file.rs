@@ -36,6 +36,10 @@ struct Staged {
 }
 
 impl SnapshotData {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
     pub(crate) fn open(mut file: File) -> io::Result<(SnapshotMeta, Self)> {
         let size = file.metadata()?.len();
         file.rewind()?;
@@ -159,10 +163,16 @@ impl SnapshotData {
     }
 
     pub(crate) async fn send(&self, stream: &mut Connection, max: u64) -> io::Result<()> {
-        if self.size > max {
-            return Err(invalid_data("cluster snapshot exceeds the size limit"));
-        }
-        stream.write_u32(self.size as u32).await?;
+        let len = u32::try_from(self.size)
+            .ok()
+            .filter(|_| self.size <= max)
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "cluster snapshot of {} bytes exceeds the transfer limit of {max} bytes",
+                    self.size
+                ))
+            })?;
+        stream.write_u32(len).await?;
         let mut buffer = vec![0; CHUNK.min(self.size as usize)];
         let mut offset = 0;
         while offset < self.size {
@@ -187,6 +197,10 @@ impl SnapshotData {
         file.seek(SeekFrom::Start(self.app_start))?;
         let len = self.size - self.app_start;
         let mut body = Vec::new();
+        // The file length was validated in open. Avoid growing and copying a
+        // potentially multi-gigabyte buffer while restoring it.
+        body.try_reserve_exact(usize::try_from(len).map_err(io::Error::other)?)
+            .map_err(io::Error::other)?;
         if (&mut *file).take(len).read_to_end(&mut body)? as u64 != len {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
@@ -220,7 +234,7 @@ fn lease_limit(format: u16) -> u64 {
         MAX_CONTROL_FRAME as u64
     } else {
         // This section includes the permanent retired IDs as well as live leases.
-        crate::MAX_SNAPSHOT_SIZE
+        256 * 1024 * 1024
     }
 }
 
@@ -254,6 +268,24 @@ mod tests {
         let result = SnapshotData::receive(&mut input, root.path().to_path_buf(), 1024).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert_eq!(root.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn default_snapshot_transfer_limit_accepts_largest_frame() {
+        let largest = if usize::BITS <= 32 {
+            isize::MAX as u32
+        } else {
+            u32::MAX
+        };
+        let len = largest.to_be_bytes();
+        assert_eq!(
+            read_length(&mut len.as_slice(), crate::DEFAULT_MAX_SNAPSHOT_SIZE)
+                .await
+                .unwrap(),
+            largest
+        );
+        assert_eq!(lease_limit(1), 64 * 1024);
+        assert_eq!(lease_limit(2), 256 * 1024 * 1024);
     }
 
     #[test]

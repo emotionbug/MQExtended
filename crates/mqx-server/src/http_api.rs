@@ -301,6 +301,13 @@ async fn prometheus(broker: &Broker) -> String {
                 .unwrap();
             }
         }
+        let name = "mqx_raft_snapshot_size_bytes";
+        writeln!(
+            body,
+            "# TYPE {name} gauge\n{name} {}",
+            metrics.snapshot_size_bytes
+        )
+        .unwrap();
     }
     if let Some(metrics) = broker.wal_metrics().await {
         write_wal_metrics(&mut body, metrics);
@@ -469,10 +476,32 @@ mod metrics_tests {
     }
 
     #[tokio::test]
-    async fn standalone_scrape_has_no_wal_metrics() {
+    async fn standalone_scrape_has_no_raft_storage_metrics() {
         let broker = Broker::new(mqx_broker::BrokerConfig::default());
         let body = prometheus(&broker).await;
         assert!(body.contains("mqx_connections"));
         assert!(!body.contains("mqx_raft_wal_"));
+        assert!(!body.contains("mqx_raft_snapshot_size_bytes"));
+    }
+
+    #[tokio::test]
+    async fn cluster_scrape_exposes_snapshot_size_gauge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = mqx_cluster::ClusterConfig::new(
+            1,
+            "127.0.0.1:0".parse().unwrap(),
+            [(1, "127.0.0.1:9001".parse().unwrap())].into(),
+            dir.path().to_path_buf(),
+            mqx_cluster::ClusterSecurity::InsecurePlaintext,
+        );
+        config.snapshot_policy = mqx_cluster::SnapshotPolicy::Never;
+        let broker = Broker::clustered(mqx_broker::BrokerConfig::default(), config)
+            .await
+            .unwrap();
+        let body = prometheus(&broker).await;
+        broker.shutdown_cluster().await.unwrap();
+        assert!(body.contains(
+            "# TYPE mqx_raft_snapshot_size_bytes gauge\nmqx_raft_snapshot_size_bytes 0\n"
+        ));
     }
 }

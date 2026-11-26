@@ -1378,8 +1378,8 @@ impl ClusterSection {
                 self.insecure_plaintext = Some(value.boolean()?);
             }
             "cluster_max_snapshot_size" if self.max_snapshot_size.is_none() => {
-                let size = positive(first)?;
-                if size > MAX_SNAPSHOT_SIZE {
+                let size = first.parse().map_err(|_| invalid(name, first))?;
+                if !(1..=MAX_SNAPSHOT_SIZE).contains(&size) {
                     return Err(format!(
                         "'{name}' must be between 1 and {MAX_SNAPSHOT_SIZE} bytes."
                     )

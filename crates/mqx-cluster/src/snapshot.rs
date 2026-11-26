@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 
 #[cfg(unix)]
@@ -27,7 +29,8 @@ use crate::{NodeEvent, StateMachine, version};
 
 pub(crate) const SNAPSHOT_FILE: &str = "snapshot.mpk";
 pub(crate) const RETIRED_FILE: &str = "removed";
-pub(crate) const TEMP_FILE_PREFIX: &str = ".mqx-";
+const TEMP_FILE_PREFIX: &str = ".mqx-stage-";
+const TEMP_FILE_RANDOM_LEN: usize = 6;
 
 pub(crate) type Snapshot = SnapshotOf<Types, SnapshotData>;
 pub(crate) type SnapshotMeta = SnapshotMetaOf<Types>;
@@ -53,6 +56,8 @@ pub(crate) struct Applied<S> {
 pub(crate) struct Store<S> {
     pub(crate) state: Arc<RwLock<Applied<S>>>,
     snapshot: Arc<Mutex<Option<Snapshot>>>,
+    snapshot_size: Arc<AtomicU64>,
+    snapshot_limit: u64,
     dir: Arc<Path>,
     disk_open: Arc<SyncMutex<bool>>,
     pub(crate) events: broadcast::Sender<NodeEvent>,
@@ -65,6 +70,8 @@ impl<S> Clone for Store<S> {
         Self {
             state: self.state.clone(),
             snapshot: self.snapshot.clone(),
+            snapshot_size: self.snapshot_size.clone(),
+            snapshot_limit: self.snapshot_limit,
             dir: self.dir.clone(),
             disk_open: self.disk_open.clone(),
             events: self.events.clone(),
@@ -109,9 +116,12 @@ impl<S: StateMachine> Store<S> {
         }
         let (events, _) = broadcast::channel(256);
         let (status, _) = watch::channel(state.membership_status()?);
+        let snapshot_size = snapshot.as_ref().map_or(0, |s| s.snapshot.size());
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             snapshot: Arc::new(Mutex::new(snapshot)),
+            snapshot_size: Arc::new(AtomicU64::new(snapshot_size)),
+            snapshot_limit: crate::DEFAULT_MAX_SNAPSHOT_SIZE,
             dir: dir.into(),
             disk_open: Arc::new(SyncMutex::new(true)),
             events,
@@ -422,7 +432,9 @@ impl<S: StateMachine> RaftStateMachine<Types> for Store<S> {
                 .read()
                 .unwrap()
                 .publish_membership(&store.status)?;
+            let size = snapshot.size();
             *current = Some(Snapshot { meta, snapshot });
+            store.record_snapshot_size(size);
             Ok(())
         })
         .await
@@ -485,6 +497,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
             )?;
             let snapshot = Snapshot { meta, snapshot };
             *current = Some(snapshot.clone());
+            store.record_snapshot_size(snapshot.snapshot.size());
             Ok(snapshot)
         })
         .await
@@ -493,6 +506,26 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
 }
 
 impl<S> Store<S> {
+    pub(crate) fn with_snapshot_limit(mut self, limit: u64) -> Self {
+        self.snapshot_limit = limit;
+        self
+    }
+
+    pub(crate) fn snapshot_size(&self) -> u64 {
+        self.snapshot_size.load(Ordering::Relaxed)
+    }
+
+    fn record_snapshot_size(&self, size: u64) {
+        self.snapshot_size.store(size, Ordering::Relaxed);
+        if size > self.snapshot_limit {
+            tracing::warn!(
+                snapshot_size_bytes = size,
+                limit_bytes = self.snapshot_limit,
+                "new Raft snapshot exceeds the configured transfer limit"
+            );
+        }
+    }
+
     fn lock_disk(&self) -> io::Result<std::sync::MutexGuard<'_, bool>> {
         // OpenRaft snapshot jobs can outlive RaftCore. Shutdown fences the disk
         // before releasing the WAL directory lock to a successor process.
@@ -506,10 +539,37 @@ impl<S> Store<S> {
 
 pub(crate) fn private_tempfile(dir: &Path) -> io::Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix(TEMP_FILE_PREFIX);
+    builder
+        .prefix(TEMP_FILE_PREFIX)
+        .rand_bytes(TEMP_FILE_RANDOM_LEN);
     #[cfg(unix)]
     builder.permissions(fs::Permissions::from_mode(0o600));
     builder.tempfile_in(dir)
+}
+
+pub(crate) fn is_staged_tempfile(name: &OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    // Older builds used tempfile's default six random characters and .mqx-.
+    name.strip_prefix(TEMP_FILE_PREFIX.as_bytes())
+        .or_else(|| name.strip_prefix(b".mqx-"))
+        .is_some_and(|suffix| {
+            suffix.len() == TEMP_FILE_RANDOM_LEN && suffix.iter().all(u8::is_ascii_alphanumeric)
+        })
+}
+
+pub(crate) fn remove_staged_tempfiles(dir: &Path) -> io::Result<()> {
+    let mut removed = false;
+    for entry in dir.read_dir()? {
+        let entry = entry?;
+        if is_staged_tempfile(&entry.file_name()) && entry.file_type()?.is_file() {
+            fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn open_private_file(path: &Path) -> io::Result<File> {
@@ -590,6 +650,57 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    #[test]
+    fn staging_cleanup_removes_only_exact_regular_tempfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let (_, staged) = private_tempfile(dir).unwrap().keep().unwrap();
+        let legacy = dir.join(".mqx-Ab12Xy");
+        fs::write(&legacy, b"partial snapshot").unwrap();
+
+        let unrelated = [
+            ".mqx-Ab12X",
+            ".mqx-Ab12XyZ",
+            ".mqx-Ab12-y",
+            ".mqx-stage-Ab12Xy~",
+            crate::survivor::LOCK_FILE,
+            crate::survivor::IDENTITY_FILE,
+            crate::survivor::RECORD_FILE,
+            SNAPSHOT_FILE,
+            RETIRED_FILE,
+        ];
+        for name in unrelated {
+            fs::write(dir.join(name), name.as_bytes()).unwrap();
+        }
+        let subdirs = [".mqx-D1rABC", "wal", crate::survivor::DISCARDED];
+        for name in subdirs {
+            let nested = dir.join(name);
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join(".mqx-A1b2C3"), b"nested state").unwrap();
+        }
+        #[cfg(unix)]
+        let symlink = {
+            let link = dir.join(".mqx-stage-SymlnK");
+            std::os::unix::fs::symlink(dir.join(SNAPSHOT_FILE), &link).unwrap();
+            link
+        };
+
+        remove_staged_tempfiles(dir).unwrap();
+        assert!(!staged.exists());
+        assert!(!legacy.exists());
+        for name in unrelated {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), name.as_bytes());
+        }
+        for name in subdirs {
+            assert_eq!(
+                fs::read(dir.join(name).join(".mqx-A1b2C3")).unwrap(),
+                b"nested state"
+            );
+        }
+        #[cfg(unix)]
+        assert!(symlink.is_symlink());
+    }
+
     struct PausedEncoder {
         entered: Arc<tokio::sync::Notify>,
         release: SyncMutex<mpsc::Receiver<()>>,
@@ -627,6 +738,7 @@ mod tests {
             2,
         )
         .unwrap();
+        assert_eq!(store.snapshot_size(), 0);
         let mut builder = store.clone();
         let job = tokio::spawn(async move { builder.build_snapshot().await });
         // This task must still run on a single worker while encoding is paused.
@@ -638,6 +750,7 @@ mod tests {
         let (meta, disk) =
             SnapshotData::open(File::open(dir.path().join(SNAPSHOT_FILE)).unwrap()).unwrap();
         assert_eq!(cached.meta, meta);
+        assert_eq!(store.snapshot_size(), disk.size());
         assert_eq!(cached.snapshot.application().unwrap(), [42]);
         assert_eq!(disk.application().unwrap(), [42]);
     }

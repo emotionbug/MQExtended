@@ -45,4 +45,6 @@ A Raft cluster, including one configured with a single voter, uses the layout be
 └── discarded/      # auto_recover only: the most recently discarded state
 ```
 
-Entries and votes are fsynced before they are acknowledged. Commit frontiers are coalesced into the next required WAL sync, not synced separately before apply. Restart restores the snapshot and replays the locally recorded committed tail; Raft reestablishes any newer commit frontier. A snapshot is written to a temporary file, fsynced, renamed and the directory fsynced before the log is compacted behind it.
+Entries and votes are fsynced before they are acknowledged. Commit frontiers are coalesced into the next required WAL sync, not synced separately before apply. Restart restores the snapshot and replays the locally recorded committed tail; Raft reestablishes any newer commit frontier. A snapshot is written to a temporary `.mqx-stage-*` file, fsynced, renamed and the directory fsynced before the log is compacted behind it. Snapshots received from a peer are staged the same way. After a crash, the next start removes these files once it holds the WAL lock.
+
+A standalone save writes `<persistence_file>.mqx.new`, then renames it over `<persistence_file>.mqx`, as Mosquitto does with `<db>.new`. A crash leaves at most this one file, and the next save replaces it.

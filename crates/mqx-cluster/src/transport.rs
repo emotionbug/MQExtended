@@ -781,7 +781,9 @@ pub(crate) async fn read_length(
 ) -> io::Result<u32> {
     let len = stream.read_u32().await?;
     if u64::from(len) > max {
-        return Err(invalid_data("cluster frame exceeds the size limit"));
+        return Err(invalid_data(format!(
+            "cluster frame of {len} bytes exceeds the size limit of {max} bytes"
+        )));
     }
     Ok(len)
 }

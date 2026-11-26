@@ -1065,7 +1065,12 @@ fn cluster_configuration_requires_explicit_transport_security() {
 
 #[test]
 fn snapshot_size_limit_matches_the_cluster_storage_bounds() {
-    for size in [1, MAX_SNAPSHOT_SIZE] {
+    for size in [
+        1,
+        64 * 1024 * 1024 + 1,
+        256 * 1024 * 1024 + 1,
+        MAX_SNAPSHOT_SIZE,
+    ] {
         let input = format!("{CLUSTER}{CLUSTER_TLS}cluster_max_snapshot_size {size}");
         assert_eq!(
             ServerConfig::parse(&input)
@@ -1079,7 +1084,12 @@ fn snapshot_size_limit_matches_the_cluster_storage_bounds() {
     for size in [0, MAX_SNAPSHOT_SIZE + 1] {
         let input = format!("{CLUSTER}{CLUSTER_TLS}cluster_max_snapshot_size {size}");
         let error = ServerConfig::parse(&input).unwrap_err().to_string();
-        assert!(error.contains("cluster_max_snapshot_size"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "'cluster_max_snapshot_size' must be between 1 and {MAX_SNAPSHOT_SIZE} bytes."
+            )),
+            "{error}"
+        );
     }
 }
 
