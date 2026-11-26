@@ -265,6 +265,10 @@ impl ShutdownLog {
             match result {
                 // auth-plug log.c: _fatal calls exit(1) after its own lines.
                 Err(ServerError::PluginAbort) => return,
+                // A recovery switch re-execs; it is not a failure.
+                Err(ServerError::Cluster(mqx_broker::BrokerError::Cluster(
+                    ClusterError::Restart,
+                ))) => {}
                 Err(error) => tracing::error!("{error}"),
                 Ok(()) => {}
             }
@@ -865,12 +869,14 @@ async fn serve_broker(
         ;
     let result = tokio::select! {
         result = serve => result,
+        // The node stopped itself: report its failure, or the recovery switch
+        // that `start` re-execs for.
         () = async {
             match &membership {
                 Some(membership) => membership.wait_restart().await,
                 None => std::future::pending().await,
             }
-        }, if deferred => Ok(()),
+        } => broker.shutdown_cluster().await.map_err(ServerError::Cluster),
     };
     shutdown.finish(&result);
     stop_autosave.send_replace(true);

@@ -394,6 +394,75 @@ async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_sessi
 
 #[cfg(unix)]
 #[tokio::test]
+async fn fatal_raft_wal_error_exits_nonzero_without_auto_recover() {
+    use raft_clients::{WAIT, commit, retained_write, writer};
+    use std::{fs, net::TcpListener, process::Stdio};
+    use tokio::{net::UnixDatagram, time::timeout};
+
+    static PAYLOAD: [u8; 256 * 1024] = [b'x'; 256 * 1024];
+    let mqtt = TcpListener::bind("127.0.0.1:0").unwrap();
+    let raft = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mqtt_addr = mqtt.local_addr().unwrap();
+    let raft_addr = raft.local_addr().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("broker.conf");
+    let notify_path = directory.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "user root\nlistener {} 127.0.0.1\nallow_anonymous true\n\
+             log_dest stdout\nlog_type error\ncluster_node_id 1\n\
+             cluster_bind {raft_addr}\ncluster_peer 1 {raft_addr}\n\
+             cluster_data_dir {}\ncluster_insecure_plaintext true\n",
+            mqtt_addr.port(),
+            directory.path().join("raft").display(),
+        ),
+    )
+    .unwrap();
+    drop((mqtt, raft));
+
+    // Ignore SIGXFSZ so the WAL writer gets EFBIG rather than the kernel killing
+    // the broker. A pipe keeps log writes outside the regular-file size limit.
+    let child = tokio::process::Command::new("sh")
+        .args([
+            "-ec",
+            "trap '' XFSZ; ulimit -f 64; exec \"$@\"",
+            "--",
+            BIN,
+            "-c",
+        ])
+        .arg(&path)
+        .env("NOTIFY_SOCKET", &notify_path)
+        .env("TOKIO_WORKER_THREADS", "2")
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_ready(&notify).await;
+    let mut publisher = writer(mqtt_addr, false).await;
+    commit(&mut publisher, b"before storage failure").await;
+    timeout(WAIT, retained_write(&mut publisher, "a/fatal", &PAYLOAD))
+        .await
+        .unwrap()
+        .unwrap();
+    let output = timeout(WAIT, child.wait_with_output())
+        .await
+        .expect("broker kept running after its Raft WAL write failed")
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("Raft node failed:") && line.contains("File too large"))
+            .count(),
+        1,
+        "{log}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn two_voters_lose_quorum_and_recover_retained_state_after_restart() {
     use raft_clients::{WAIT, assert_retained, commit, retained_write, tls_configs, writer};
     use std::{

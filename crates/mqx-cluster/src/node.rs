@@ -128,7 +128,9 @@ struct Core<S: StateMachine> {
     requested: watch::Sender<Option<Desired>>,
     serving: watch::Sender<Serving>,
     safe_until: watch::Sender<Option<Instant>>,
-    restart: Option<watch::Sender<bool>>,
+    /// Set when this node stopped itself: a failure the process must exit for,
+    /// or a recovery switch that needs a re-exec.
+    restart: watch::Sender<bool>,
     repair: AtomicBool,
     replication_source: AtomicU64,
     #[cfg(test)]
@@ -343,7 +345,7 @@ impl<S: StateMachine> Cluster<S> {
             requested: watch::channel(requested).0,
             serving: watch::channel(Serving::Waiting).0,
             safe_until: watch::channel(None).0,
-            restart: auto_recover.then(|| watch::channel(false).0),
+            restart: watch::channel(false).0,
             repair: AtomicBool::new(repair),
             replication_source: AtomicU64::new(0),
             #[cfg(test)]
@@ -679,7 +681,7 @@ impl<S: StateMachine> Cluster<S> {
             serving: core.serving.subscribe(),
             safe_until: core.safe_until.subscribe(),
             stop: core.mesh.stop.subscribe(),
-            restart: core.restart.as_ref().map(watch::Sender::subscribe),
+            restart: core.restart.subscribe(),
             leader: Arc::new(move || weak.upgrade().and_then(|core| core.current_leader())),
             dynamic: core.store.format == 2,
         }
@@ -1849,7 +1851,10 @@ impl<S: StateMachine> Core<S> {
                 _ = stop.wait_for(|stopped| *stopped) => Ok(None),
                 result = self.renew_leases() => result,
                 result = async { self.recover_incarnation(recovery_timeout.expect("recovery enabled")).await }, if recover => result,
-                result = self.raft_failure(), if recover => Err(result),
+                // A stopped Raft core (for example after a failed WAL write)
+                // never serves again in this process. Stop the node so the
+                // server exits and its supervisor restarts it.
+                result = self.raft_failure() => Err(result),
                 _ = self.expire_leases() => Ok(None),
                 _ = self.reconcile_loop() => Ok(None),
             };
@@ -1867,7 +1872,11 @@ impl<S: StateMachine> Core<S> {
                 Ok(Some(change)) => Some(self.prepare_switch(change, &mut wal).await?),
                 Ok(None) => None,
                 Err(error) => {
-                    wal.close().await?;
+                    // Report the failure that stopped the node. Its WAL may be
+                    // the part that failed, so closing it can fail as well.
+                    if let Err(close) = wal.close().await {
+                        tracing::warn!(error = %close, "Unable to close the cluster WAL");
+                    }
                     return Err(error);
                 }
             };
@@ -1881,10 +1890,8 @@ impl<S: StateMachine> Core<S> {
             raft_result.map_err(|error| ClusterError::Raft(error.to_string()))
         }
         .await;
-        if cleanup.is_err()
-            && let Some(restart) = &self.restart
-        {
-            restart.send_replace(true);
+        if cleanup.is_err() {
+            self.restart.send_replace(true);
         }
         cleanup
     }
