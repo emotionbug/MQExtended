@@ -279,6 +279,35 @@ impl BrokerProcess {
         }
     }
 
+    /// A node with `auto_recover` registers security only after the cluster
+    /// serves, and refuses MQTT clients until then. Wait for the endpoint a
+    /// readiness probe uses.
+    fn wait_until_ready(
+        &mut self,
+        kind: BrokerKind,
+        index: usize,
+        deadline: Instant,
+    ) -> Result<(), Error> {
+        let Some(Readiness::HttpStatus(addr)) = self.readiness else {
+            return Ok(());
+        };
+        loop {
+            self.check_child(kind, index)?;
+            let status = probe_http(addr, "/api/v1/mqx/ready", deadline, |code, _| Some(code));
+            if status == Some(200) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(self.startup_error(
+                    kind,
+                    index,
+                    format!("/api/v1/mqx/ready did not report ready (last status: {status:?})"),
+                ));
+            }
+            thread::sleep(POLL_INTERVAL.min(time_left(deadline)));
+        }
+    }
+
     fn check_child(&mut self, kind: BrokerKind, index: usize) -> Result<(), Error> {
         if let Some(status) = self
             .child
@@ -442,6 +471,9 @@ impl Brokers {
         }
         if cluster.is_some_and(|config| config.readiness == ClusterReadiness::HttpStatus) {
             brokers.wait_for_leader(time_left(deadline))?;
+            for (offset, node) in brokers.nodes.iter_mut().enumerate() {
+                node.wait_until_ready(kind, offset + 1, deadline)?;
+            }
         }
         Ok(brokers)
     }
