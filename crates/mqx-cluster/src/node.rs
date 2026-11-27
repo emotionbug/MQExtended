@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -86,7 +87,38 @@ impl fmt::Debug for Command {
     }
 }
 
-openraft::declare_raft_types!(pub(crate) Types: D = Command, R = WriteResponse);
+openraft::declare_raft_types!(pub(crate) Types: D = Command, R = WriteResponse, ErrorSource = RaftErrorSource);
+
+// OpenRaft's default source retains the error text but not the I/O kind. Keep
+// the classification only for local startup; leave serialized RPC errors unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{inner}")]
+#[serde(transparent)]
+pub(crate) struct RaftErrorSource {
+    inner: openraft::impls::BoxedErrorSource,
+    #[serde(skip)]
+    unusable_on_load: bool,
+}
+
+impl openraft::errors::ErrorSource for RaftErrorSource {
+    fn from_error<E: Error + 'static>(error: &E) -> Self {
+        Self {
+            inner: openraft::impls::BoxedErrorSource::from_error(error),
+            unusable_on_load: (error as &dyn Error)
+                .downcast_ref::<io::Error>()
+                .is_some_and(damaged_data),
+        }
+    }
+
+    fn from_string(message: impl ToString) -> Self {
+        Self {
+            inner: openraft::impls::BoxedErrorSource::from_string(message),
+            // OpenRaft 0.10.1 StorageHelper uses string errors for inconsistent
+            // log ranges or missing entries; storage operations use from_error.
+            unusable_on_load: true,
+        }
+    }
+}
 
 /// Local Raft progress. Log indexes are inclusive.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,17 +384,17 @@ impl<S: StateMachine> Cluster<S> {
         {
             Ok(raft) => raft,
             Err(error) => {
-                if auto_recover {
-                    let _ = store.close().await;
-                    let _ = wal.close().await;
+                if auto_recover
+                    && error
+                        .source()
+                        .and_then(|source| source.downcast_ref::<RaftErrorSource>())
+                        .is_some_and(|source| source.unusable_on_load)
+                {
+                    store.close().await?;
+                    wal.close().await?;
                     let dir = store.dir().to_path_buf();
                     return Err(tokio::task::spawn_blocking(move || {
-                        unusable_state(
-                            &dir,
-                            node_id,
-                            auto_recover,
-                            ClusterError::Raft(error.to_string()),
-                        )
+                        discard_unusable_state(&dir, node_id, &error)
                     })
                     .await
                     .map_err(io::Error::other)?);
@@ -1961,7 +1993,7 @@ impl<S: StateMachine> Core<S> {
         let mut poll = tokio::time::interval_at(Instant::now() + POLL, POLL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut next_sweep = Instant::now() + ARCHIVE_SWEEP;
-        let mut compact = storage.reserve_released();
+        let mut compact = storage.take_startup_compaction();
         let mut compact_through = None;
         let raft_metrics = self.raft.metrics();
         loop {
@@ -2006,14 +2038,14 @@ impl<S: StateMachine> Core<S> {
             }
             let snapshot_size = self.store.snapshot_size();
             match tokio::task::spawn_blocking(move || {
-                let entered_pressure = storage.check(sweep, snapshot_size);
-                (storage, entered_pressure)
+                let request_compaction = storage.check(sweep, snapshot_size);
+                (storage, request_compaction)
             })
             .await
             {
-                Ok((new_storage, entered_pressure)) => {
+                Ok((new_storage, request_compaction)) => {
                     storage = new_storage;
-                    compact |= entered_pressure;
+                    compact |= request_compaction;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "Cluster storage monitor stopped");
@@ -2577,20 +2609,26 @@ impl<S: StateMachine> Core<S> {
 type Peers = BTreeMap<u64, SocketAddr>;
 type NodeIdentity = (Option<Peers>, Option<[u8; 32]>, bool, Option<Record>);
 
+fn damaged_data(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn unusable_state(dir: &Path, node: u64, enabled: bool, error: ClusterError) -> ClusterError {
     let recoverable = match &error {
-        ClusterError::Io(error) => matches!(
-            error.kind(),
-            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::Other
-        ),
-        ClusterError::UnusableIdentity(_)
-        | ClusterError::UnsupportedVersion { .. }
-        | ClusterError::Raft(_) => true,
+        ClusterError::Io(error) => damaged_data(error),
+        ClusterError::UnusableIdentity(_) | ClusterError::UnsupportedVersion { .. } => true,
         _ => false,
     };
     if !enabled || !recoverable {
         return error;
     }
+    discard_unusable_state(dir, node, &error)
+}
+
+fn discard_unusable_state(dir: &Path, node: u64, error: &dyn fmt::Display) -> ClusterError {
     tracing::warn!(node, %error, "Unusable local cluster state; discarding it and rejoining with empty state");
     let record = Record::new(None, SurvivorReason::UnusableState, None);
     match Switch::prepare(dir, node, record).and_then(Switch::commit) {

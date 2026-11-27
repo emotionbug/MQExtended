@@ -75,7 +75,8 @@ pub(crate) struct Storage<F> {
     reserve_target: Option<u64>,
     read_space: F,
     metrics: Arc<StorageMetrics>,
-    reserve_released: bool,
+    startup_compaction: bool,
+    compaction_requested: bool,
 }
 
 impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
@@ -85,7 +86,8 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
             reserve_target,
             read_space,
             metrics: Arc::default(),
-            reserve_released: false,
+            startup_compaction: false,
+            compaction_requested: false,
         };
         // A crash during preallocation can leave all the space in the staging
         // file instead. Remove it before statvfs and before the WAL opens.
@@ -110,7 +112,7 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
             .report(regular(&storage.dir.join(SNAPSHOT_FILE)))
             .flatten()
             .map_or(0, |metadata| metadata.len());
-        storage.check(true, snapshot_size);
+        storage.startup_compaction = storage.check(true, snapshot_size);
         storage
     }
 
@@ -118,11 +120,11 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
         self.metrics.clone()
     }
 
-    pub(crate) fn reserve_released(&self) -> bool {
-        self.reserve_released
+    pub(crate) fn take_startup_compaction(&mut self) -> bool {
+        std::mem::take(&mut self.startup_compaction)
     }
 
-    /// Return true on entry to a pressure episode, when Raft should compact early.
+    /// Request emergency compaction once per low-space episode when the reserve is enabled.
     pub(crate) fn check(&mut self, sweep_archive: bool, snapshot_size: u64) -> bool {
         let Some(Space { available, target }) = self.report((self.read_space)(&self.dir)) else {
             if sweep_archive {
@@ -132,57 +134,61 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
         };
         let target = self.reserve_target.unwrap_or(target);
         let headroom = target.saturating_add(snapshot_size);
-        let low = target != 0 && available < headroom;
-        let entered = low && !self.reserve_released;
-        if entered {
+        let low = available < headroom;
+        // With no reserve, snapshot headroom still protects admission but
+        // doesn't authorize emergency compaction or early archive deletion.
+        let reclaim = target != 0 && low;
+        let was_under_pressure = self.metrics.under_pressure();
+        let request_compaction = reclaim && !self.compaction_requested;
+        if request_compaction {
             tracing::warn!(path = %self.dir.display(), available_bytes = available, reserve_target_bytes = target,
                 "Cluster data volume is low on space; releasing the reserve and discarding recovery archives");
-            self.reserve_released = true;
         }
-        let mut changed = false;
-        if low
+        let mut refresh = false;
+        if reclaim
             && self.metrics.reserve.load(Ordering::Relaxed) != 0
             && let Some(removed) = self.report(remove_regular(&self.dir.join(RESERVE_FILE)))
         {
             self.metrics.reserve.store(0, Ordering::Relaxed);
-            changed |= removed;
+            refresh |= removed;
             if removed {
                 let _ = self.report(self.sync_dir());
             }
         }
-        if low || sweep_archive {
-            changed |= self.report(self.expire_archive(low)).unwrap_or(false);
+        if reclaim || sweep_archive {
+            // A failed recursive deletion can still have freed space.
+            refresh |= self.report(self.expire_archive(reclaim)).unwrap_or(true);
         }
         // Allocating the reserve must leave room for both normal operation
         // and a replacement snapshot, even when the snapshot dwarfs the reserve.
-        if target != 0 && available.saturating_sub(target) > headroom.saturating_mul(2) {
-            if self.metrics.reserve.load(Ordering::Relaxed) != target
-                && self.report(self.create_reserve(target)).is_some()
-            {
+        if target != 0
+            && available.saturating_sub(target) > headroom.saturating_mul(2)
+            && self.metrics.reserve.load(Ordering::Relaxed) != target
+        {
+            refresh = true;
+            if self.report(self.create_reserve(target)).is_some() {
                 self.metrics.reserve.store(target, Ordering::Relaxed);
-                changed = true;
                 let _ = self.report(self.sync_dir());
             }
-            if self.reserve_released && self.metrics.reserve.load(Ordering::Relaxed) == target {
-                self.reserve_released = false;
-                tracing::info!(path = %self.dir.display(), reserve_bytes = target,
-                    "Cluster data volume recovered; storage reserve restored");
-            }
         }
-        let available = if changed {
+        let available = if refresh {
             self.report((self.read_space)(&self.dir))
                 .map_or(available, |space| space.available)
         } else {
             available
         };
         self.metrics.available.store(available, Ordering::Relaxed);
-        if cfg!(unix) {
-            self.metrics.pressure.store(
-                under_pressure(self.metrics.under_pressure() || low, available, headroom),
-                Ordering::Relaxed,
-            );
+        let pressure = cfg!(unix) && under_pressure(was_under_pressure || low, available, headroom);
+        self.metrics.pressure.store(pressure, Ordering::Relaxed);
+        // A refresh can detect pressure before the next poll attempts
+        // reclamation. Re-arm when measured pressure clears, not when the
+        // reserve is finally restored.
+        self.compaction_requested = pressure && (self.compaction_requested || request_compaction);
+        if target != 0 && was_under_pressure && !pressure {
+            tracing::info!(path = %self.dir.display(), available_bytes = available,
+                "Cluster data volume recovered from storage pressure");
         }
-        entered
+        request_compaction
     }
 
     fn expire_archive(&self, pressure: bool) -> io::Result<bool> {
@@ -200,7 +206,7 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
                 .is_ok_and(|age| age > ARCHIVE_RETENTION)
         {
             fs::remove_dir_all(path)?;
-            self.sync_dir()?;
+            let _ = self.report(self.sync_dir());
             return Ok(true);
         }
         Ok(false)
@@ -357,9 +363,26 @@ mod tests {
             "only one compaction request per episode"
         );
 
+        unreserved.set(4 * TARGET - 1);
+        assert!(!storage.check(false, TARGET));
+        assert!(storage.metrics.under_pressure());
+        unreserved.set(4 * TARGET);
+        assert!(!storage.check(false, TARGET));
+        assert!(!storage.metrics.under_pressure());
+        assert!(!reserve.exists());
+
+        unreserved.set(2 * TARGET - 1);
+        assert!(
+            storage.check(false, TARGET),
+            "a new episode must request compaction before the reserve is restored"
+        );
+        assert!(storage.metrics.under_pressure());
+        assert!(!storage.check(false, TARGET));
+
         unreserved.set(5 * TARGET);
         assert!(!storage.check(false, TARGET));
         assert!(!reserve.exists());
+        assert!(!storage.metrics.under_pressure());
         unreserved.set(5 * TARGET + 1);
         assert!(!storage.check(false, TARGET));
         assert!(reserve.metadata().unwrap().blocks() * 512 >= TARGET);
@@ -368,6 +391,75 @@ mod tests {
         for name in live {
             assert_eq!(fs::read(root.join(name)).unwrap(), name.as_bytes());
         }
+    }
+
+    #[test]
+    fn startup_archive_reclamation_clears_pressure_without_losing_compaction() {
+        const TARGET: u64 = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let reserve = root.join(RESERVE_FILE);
+        let archive = root.join(DISCARDED);
+        File::create(&reserve).unwrap().set_len(TARGET).unwrap();
+        File::create(root.join(SNAPSHOT_FILE))
+            .unwrap()
+            .set_len(TARGET)
+            .unwrap();
+        fs::create_dir(&archive).unwrap();
+        let unreserved = Cell::new(4 * TARGET);
+        let mut storage = Storage::start(root.to_path_buf(), Some(TARGET), |_| {
+            let archive_bytes = if archive.is_dir() { 2 * TARGET } else { 0 };
+            Ok(Space {
+                available: unreserved.get()
+                    - archive_bytes
+                    - reserve.metadata().map_or(0, |m| m.len()),
+                target: TARGET,
+            })
+        });
+
+        assert!(!reserve.exists());
+        assert!(!archive.exists());
+        assert_eq!(storage.metrics.bytes(), (4 * TARGET, 0));
+        assert!(!storage.metrics.under_pressure());
+        assert!(storage.take_startup_compaction());
+        assert!(!storage.take_startup_compaction());
+        assert!(!storage.check(false, TARGET));
+
+        unreserved.set(2 * TARGET - 1);
+        assert!(storage.check(false, TARGET));
+        assert!(storage.metrics.under_pressure());
+        assert!(!storage.check(false, TARGET));
+    }
+
+    #[test]
+    fn pressure_detected_after_reserve_allocation_still_requests_compaction() {
+        const TARGET: u64 = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let reserve = root.join(RESERVE_FILE);
+        let unreserved = Cell::new(2 * TARGET);
+        let mut storage = Storage::start(root.to_path_buf(), Some(TARGET), |_| {
+            // Model another writer consuming space by the time allocation finishes.
+            let available = if reserve.is_file() {
+                TARGET - 1
+            } else {
+                unreserved.get()
+            };
+            Ok(Space {
+                available,
+                target: TARGET,
+            })
+        });
+        unreserved.set(4 * TARGET);
+        assert!(!storage.check(false, 0));
+        assert_eq!(storage.metrics.bytes(), (TARGET - 1, TARGET));
+        assert!(storage.metrics.under_pressure());
+
+        unreserved.set(2 * TARGET - 1);
+        assert!(storage.check(false, 0));
+        assert_eq!(storage.metrics.bytes(), (2 * TARGET - 1, 0));
+        assert!(storage.metrics.under_pressure());
+        assert!(!storage.check(false, 0));
     }
 
     #[test]
@@ -384,9 +476,10 @@ mod tests {
         populate();
         let reserve = root.join(RESERVE_FILE);
         fs::write(&reserve, b"old reserve").unwrap();
+        let available = Cell::new(0);
         let mut storage = Storage::start(root.to_path_buf(), Some(0), |_| {
             Ok(Space {
-                available: 0,
+                available: available.get(),
                 target: 4096,
             })
         });
@@ -394,17 +487,26 @@ mod tests {
         assert!(!reserve.exists());
         assert_eq!(storage.metrics.bytes(), (0, 0));
         fs::create_dir(&archive).unwrap();
-        assert!(!storage.check(false, 0));
+        assert!(!storage.check(false, 4096));
+        assert!(storage.metrics.under_pressure());
         assert!(
             archive.is_dir(),
             "disabled reserve must not discard on pressure"
         );
         fs::remove_dir(&archive).unwrap();
         populate();
-        storage.check(false, 0);
+        assert!(!storage.check(false, 4096));
         assert!(archive.exists());
-        storage.check(true, 0);
+        assert!(!storage.check(true, 4096));
         assert!(!archive.exists());
+        assert!(storage.metrics.under_pressure());
+
+        available.set(8191);
+        assert!(!storage.check(false, 4096));
+        assert!(storage.metrics.under_pressure());
+        available.set(8192);
+        assert!(!storage.check(false, 4096));
+        assert!(!storage.metrics.under_pressure());
 
         let other = root.join("other");
         fs::create_dir(&other).unwrap();

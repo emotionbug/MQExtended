@@ -343,7 +343,7 @@ async fn versioned_reader_restores_legacy_snapshot_and_versioned_wal_tail() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn automatic_recovery_keeps_state_on_an_unsupported_wal_path() {
+async fn automatic_recovery_keeps_state_on_unsupported_storage_paths() {
     use std::ffi::OsStr;
     use std::os::unix::{ffi::OsStrExt, fs::symlink};
 
@@ -354,20 +354,29 @@ async fn automatic_recovery_keeps_state_on_an_unsupported_wal_path() {
     put(&node, "saved", "before relocation").await;
     node.shutdown().await.unwrap();
 
-    let wal = cfg.data_dir.join("wal");
-    let moved = root.path().join("relocated-wal");
-    std::fs::rename(&wal, &moved).unwrap();
-    symlink(&moved, &wal).unwrap();
+    let archive = cfg.data_dir.join("discarded");
+    std::fs::create_dir(&archive).unwrap();
+    std::fs::write(archive.join("prior"), b"previous recovery").unwrap();
     let try_start = |cfg| async move {
         let result = Cluster::start(cfg, Kv::default()).await;
         assert!(
             matches!(result, Err(ClusterError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidInput)
         );
     };
+    for name in ["wal", "node.mpk"] {
+        let path = cfg.data_dir.join(name);
+        let moved = root.path().join(name);
+        std::fs::rename(&path, &moved).unwrap();
+        symlink(&moved, &path).unwrap();
+        try_start(cfg.clone()).await;
+        assert_eq!(std::fs::read_link(&path).unwrap(), moved);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(moved, path).unwrap();
+    }
+    let snapshot = cfg.data_dir.join("snapshot.mpk");
+    std::fs::create_dir(&snapshot).unwrap();
     try_start(cfg.clone()).await;
-    assert_eq!(std::fs::read_link(&wal).unwrap(), moved);
-    std::fs::remove_file(&wal).unwrap();
-    std::fs::rename(moved, &wal).unwrap();
+    std::fs::remove_dir(snapshot).unwrap();
 
     let original = cfg.data_dir.clone();
     cfg.data_dir = root.path().join(OsStr::from_bytes(b"state-\xff"));
@@ -375,6 +384,10 @@ async fn automatic_recovery_keeps_state_on_an_unsupported_wal_path() {
     try_start(cfg.clone()).await;
     std::fs::rename(&cfg.data_dir, &original).unwrap();
     cfg.data_dir = original;
+    assert_eq!(
+        std::fs::read(archive.join("prior")).unwrap(),
+        b"previous recovery"
+    );
     let node = Cluster::start(cfg, Kv::default()).await.unwrap();
     assert_eq!(
         put(&node, "saved", "after restart")
@@ -1344,6 +1357,56 @@ impl StateMachine for NextSchema {
     fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
         self.0.restore(bytes)
     }
+}
+
+#[tokio::test]
+async fn automatic_recovery_distinguishes_replay_io_from_invalid_wal_data() {
+    struct UnavailableDecoder(Kv);
+
+    impl StateMachine for UnavailableDecoder {
+        type Command = Insert;
+        type Response = Reply;
+
+        fn decode_command(_: u16, _: &[u8]) -> Result<Insert, ClusterError> {
+            Err(std::io::Error::other("application storage unavailable").into())
+        }
+
+        fn apply(&mut self, index: u64, command: Insert) -> Reply {
+            self.0.apply(index, command)
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.0.snapshot()
+        }
+
+        fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
+            self.0.restore(bytes)
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = configs(&root, 1, SnapshotPolicy::Never).remove(&1).unwrap();
+    cfg.auto_recover = true;
+    let writer = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
+    put(&writer, "key", "committed").await;
+    writer.shutdown().await.unwrap();
+    let result = Cluster::start(cfg.clone(), UnavailableDecoder(Kv::default())).await;
+    assert!(matches!(result, Err(ClusterError::Raft(_))));
+    assert!(!cfg.data_dir.join("discarded").exists());
+
+    let writer = Cluster::start(cfg.clone(), NextSchema(Kv::default()))
+        .await
+        .unwrap();
+    let reply = writer
+        .submit(Insert("key".into(), "schema 2".into()))
+        .await
+        .unwrap();
+    assert_eq!(reply.previous.as_deref(), Some("committed"));
+    writer.shutdown().await.unwrap();
+    // This time replay detects a payload the application really cannot read.
+    let result = Cluster::start(cfg.clone(), Kv::default()).await;
+    assert!(matches!(result, Err(ClusterError::Restart)));
+    assert!(cfg.data_dir.join("discarded/wal").is_dir());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

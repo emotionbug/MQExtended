@@ -251,6 +251,16 @@ impl<S: StateMachine> Store<S> {
     }
 }
 
+fn application_data_error(error: crate::ClusterError) -> io::Error {
+    match error {
+        crate::ClusterError::Io(error) => error,
+        crate::ClusterError::Restore(_) | crate::ClusterError::UnsupportedVersion { .. } => {
+            invalid_data(error)
+        }
+        _ => io::Error::other(error),
+    }
+}
+
 fn decode_membership<S: StateMachine>(snapshot: &SnapshotData) -> io::Result<MembershipState> {
     version::check_app::<S>("application snapshot", snapshot.app_version).map_err(invalid_data)?;
     if snapshot.format == 1 {
@@ -314,7 +324,7 @@ impl<S: StateMachine> Applied<S> {
     ) -> io::Result<()> {
         self.app
             .restore_versioned(version, app)
-            .map_err(invalid_data)?;
+            .map_err(application_data_error)?;
         self.leases = control.leases;
         self.desired = control.desired;
         self.retired = control.retired;
@@ -354,7 +364,7 @@ impl<S: StateMachine> Applied<S> {
                 Ok(None)
             }
             EntryPayload::Normal(Command::App(body)) => {
-                let command = version::command::<S>(&body).map_err(invalid_data)?;
+                let command = version::command::<S>(&body).map_err(application_data_error)?;
                 let response = self
                     .app
                     .apply_with_retired(log_id.index, command, &self.retired);
@@ -612,7 +622,13 @@ pub(crate) fn remove_staged_tempfiles(dir: &Path) -> io::Result<()> {
 pub(crate) fn open_private_file(path: &Path) -> io::Result<File> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() {
-        return Err(invalid_data("cluster state path is not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cluster state path is not a regular file: {}",
+                path.display()
+            ),
+        ));
     }
     let file = File::open(path)?;
     #[cfg(unix)]
