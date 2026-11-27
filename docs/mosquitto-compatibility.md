@@ -129,6 +129,8 @@ A few defaults differ so that a broker runs without an operator cleaning up afte
 
 The retained sweep removes a message without an MQTT 5 expiry once 90 days have passed since its last publish and the publisher has no session: no connected client and no stored persistent session with that client id. Topics starting with `$SYS` are unaffected. The sweep runs hourly by default. Set `retain_max_age` to a duration such as `30d`, using the same units as `persistent_client_expiration`, or to `never` (also `0`) to turn the age limit off.
 
+For a one-time configuration publish that should outlive those 90 days, set its own MQTT 5 expiry instead of disabling cleanup for the whole broker. For example, `mosquitto_pub -V 5 -r -t devices/defaults -m enabled -D publish message-expiry-interval 31536000` keeps that value for one year unless replaced or cleared. A publish through MQTT 3 has no per-message expiry.
+
 With `queue_qos0_messages true`, queued QoS 0 messages count against `max_queued_messages` and `max_queued_bytes` like QoS 1 and 2. Mosquitto counts only QoS 1 and 2 (`database.c: db__ready_for_queue`), so an offline client that only receives QoS 0 can queue without limit there.
 
 ## Deliberate deviations
