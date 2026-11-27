@@ -31,11 +31,25 @@ Use `--require-p99-below-ms` with a target `--rate` for release qualification. `
 
 ## Current numbers
 
+### Memory per device, subscription and fan-out burst
+
+Added broker RSS on Linux relative to the same process before each workload. One fresh standalone release process per case and revision; two Tokio workers, loopback MQTT 3.1.1, TCP_NODELAY on, persistence and `$SYS` sampling off.
+
+| Workload | Before (`4f79315`) | After |
+| --- | ---: | ---: |
+| 12,000 disconnected persistent sessions, no Wills or subscriptions | 14.60 MiB | 12.54 MiB |
+| 40,000 exact device filters on one client (`subs/device-{id}/state/current`) | 46.40 MiB | 24.23 MiB |
+| 48 connected subscribers after a 1 MiB QoS 1 fan-out and eight PING exchanges each | 49.32 MiB | 1.07 MiB |
+
+The first case includes the session-expiry index. In the second, subscribing in batches of 100 through the last SUBACK took 175 → 146 ms; all 16,000 subsequent test publishes reached their selected topics in order. These are single runs, not a sustained throughput comparison.
+
+The fan-out result is **after** the burst, not peak memory. The broker keeps large send buffers for repeated large writes and reclaims them only after eight consecutive writes using at most one eighth of their capacity. A silent connection does not trigger reclamation. Both revisions delivered the first and a subsequent 1 MiB publish intact to all 48 subscribers.
+
 ### Sparse device subscriptions and retained metrics
 
 One standalone Linux release process per revision, two Tokio workers, loopback MQTT 3.1.1, persistence and periodic `$SYS` publishing disabled. One clean client subscribed to 40,000 exact filters (`subs/device-{id}/state/current`, 100 per SUBSCRIBE). RSS growth is measured from the connected, empty broker to the last SUBACK, before any retained publishes. The same client then published 40,000 disjoint retained topics with 32-byte payloads. HTTP timings cover the entire `/metrics` response on a persistent connection: 10 warmups, then 50 measured requests.
 
-| Measurement | Before (`cf2b981`) | After |
+| Measurement | Before (`cf2b981`) | After (`4f79315`) |
 | --- | ---: | ---: |
 | RSS growth from subscriptions | 88.52 MiB | 46.43 MiB |
 | `/metrics` median | 2.486 ms | 0.123 ms |

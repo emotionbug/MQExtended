@@ -535,6 +535,8 @@ impl QueueExpiry {
     }
 }
 
+// B-tree slots reserve a full Session even when there is no Will or bridge.
+// Box these optional values without adding indirection to the inbox hot path.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Session {
     publisher: Publisher,
@@ -544,14 +546,14 @@ struct Session {
     max_qos: QoS,
     inbox: Option<Inbox>,
     filters: BTreeMap<Arc<str>, IndexedSubscription>,
-    will: Option<LastWill>,
+    will: Option<Box<LastWill>>,
     expires: Option<Duration>,
     #[serde(default)]
     v5: Option<SessionSettings>,
     #[serde(default)]
     will_at: Option<Duration>,
     #[serde(default)]
-    internal_bridge: Option<BridgeState>,
+    internal_bridge: Option<Box<BridgeState>>,
     #[serde(skip)]
     clean_start: bool,
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
@@ -1503,7 +1505,7 @@ impl State {
             });
             PendingWill {
                 source: session.publisher.clone(),
-                packet,
+                packet: *packet,
                 properties,
                 expiry,
                 internal_bridge: session.internal_bridge.is_some(),
@@ -1674,7 +1676,7 @@ impl State {
         session.publisher = claim.publisher;
         session.epoch = epoch;
         session.owner = Some(owner);
-        session.will = claim.will;
+        session.will = claim.will.map(Box::new);
         session.v5 = claim.v5;
         session.bridge = claim.bridge;
         session.max_qos = claim.max_qos;
@@ -1686,7 +1688,7 @@ impl State {
             }
             self.bridges.insert(bridge.name.clone(), id.clone());
         }
-        session.internal_bridge = claim.internal_bridge.map(|bridge| *bridge);
+        session.internal_bridge = claim.internal_bridge;
         session.clean_start = claim.clean_start;
         if let Some(inbox) = &mut session.inbox {
             inbox.receive_maximum = session
@@ -1833,7 +1835,7 @@ impl State {
                 session.max_qos = max_qos;
                 session.will = will.map(|mut will| {
                     will.retain &= self.config.retain_available;
-                    will
+                    Box::new(will)
                 });
                 if receive_maximum.is_none() {
                     session.v5 = None;
@@ -2974,6 +2976,56 @@ mod tests {
                 assert!(restarted.restore_persistence(image, deadline));
                 assert!(!restarted.sessions.contains_key(&id));
             }
+        }
+    }
+
+    #[test]
+    fn session_snapshot_keeps_legacy_will_and_bridge_layout() {
+        let mut state = State::new(Arc::new(BrokerConfig::default()));
+        for (id, optional_state) in [("plain", false), ("bridge", true)] {
+            let id: Arc<str> = id.into();
+            let will = optional_state.then(|| LastWill {
+                topic: "device/status".into(),
+                payload: Bytes::from_static(b"offline"),
+                qos: QoS::AtLeastOnce,
+                retain: true,
+            });
+            let bridge = optional_state.then(|| BridgeState {
+                name: "upstream".into(),
+                remote_clientid: "remote".into(),
+                reuse_remote_clientid: false,
+                reuse_local_clientid: false,
+                local_clean: false,
+                lazy: true,
+                online: true,
+            });
+            let mut connect = make_claim(Owner::LOCAL, [0; 16], id.clone(), false, will.clone());
+            let Command::Claim { request, .. } = &mut connect else {
+                unreachable!();
+            };
+            request.bridge = bridge.is_some();
+            request.internal_bridge = bridge.clone().map(Box::new);
+            assert!(matches!(state.apply(connect).reply, Reply::Claimed { .. }));
+
+            let session = &state.sessions[&id];
+            // Raft's compact array before boxing, with an empty pending queue omitted.
+            let legacy = rmp_serde::to_vec(&(
+                &session.publisher,
+                session.epoch,
+                session.owner,
+                session.bridge,
+                session.max_qos,
+                &session.inbox,
+                &session.filters,
+                will,
+                session.expires,
+                &session.v5,
+                session.will_at,
+                bridge,
+            ))
+            .unwrap();
+            assert_eq!(rmp_serde::to_vec(session).unwrap(), legacy);
+            assert_eq!(&rmp_serde::from_slice::<Session>(&legacy).unwrap(), session);
         }
     }
 

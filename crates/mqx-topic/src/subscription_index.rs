@@ -12,8 +12,7 @@ pub struct SubscriptionIndex<K, V> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Branch<K, V> {
-    // Sparse literal paths shouldn't reserve space for full branches in unused B-tree slots.
-    children: BTreeMap<Box<str>, Box<Self>>,
+    children: LiteralChildren<K, V>,
     // Literal-only routing needs one map lookup per level, not a lookup
     // for each possible wildcard too.
     plus: Option<Box<Self>>,
@@ -21,10 +20,19 @@ struct Branch<K, V> {
     entries: Vec<(K, V)>,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+enum LiteralChildren<K, V> {
+    #[default]
+    Empty,
+    // Keep the edge inline so a single literal doesn't allocate a B-tree node.
+    Single(Box<str>, Box<Branch<K, V>>),
+    Many(BTreeMap<Box<str>, Box<Branch<K, V>>>),
+}
+
 impl<K, V> Default for Branch<K, V> {
     fn default() -> Self {
         Self {
-            children: BTreeMap::new(),
+            children: LiteralChildren::Empty,
             plus: None,
             hash: None,
             entries: Vec::new(),
@@ -46,27 +54,7 @@ impl<K: Eq, V> SubscriptionIndex<K, V> {
     pub fn insert(&mut self, filter: &str, key: K, value: V) -> Result<Option<V>, TopicError> {
         validate_topic_filter(filter)?;
         let filter = c_str(filter);
-        let mut branch = self.root_mut(filter);
-        for level in filter.split('/') {
-            let child = match level {
-                "+" => branch.plus.get_or_insert_with(Box::default),
-                "#" => branch.hash.get_or_insert_with(Box::default),
-                _ => {
-                    if branch.children.contains_key(level) {
-                        branch.children.get_mut(level).unwrap()
-                    } else {
-                        branch.children.entry(level.into()).or_default()
-                    }
-                }
-            };
-            branch = child.as_mut();
-        }
-        if let Some((_, previous)) = branch.entries.iter_mut().find(|(entry, _)| *entry == key) {
-            Ok(Some(std::mem::replace(previous, value)))
-        } else {
-            branch.entries.push((key, value));
-            Ok(None)
-        }
+        Ok(self.root_mut(filter).insert(filter.split('/'), key, value))
     }
 
     /// Removes an entry and prunes branches with no remaining subscriptions.
@@ -101,6 +89,30 @@ impl<K: Eq, V> SubscriptionIndex<K, V> {
 }
 
 impl<K: Eq, V> Branch<K, V> {
+    fn insert(&mut self, mut levels: Split<'_, char>, key: K, value: V) -> Option<V> {
+        match levels.next() {
+            Some("+") => self
+                .plus
+                .get_or_insert_with(Box::default)
+                .insert(levels, key, value),
+            Some("#") => self
+                .hash
+                .get_or_insert_with(Box::default)
+                .insert(levels, key, value),
+            Some(level) => self.children.insert(level, levels, key, value),
+            None => {
+                if let Some((_, previous)) =
+                    self.entries.iter_mut().find(|(entry, _)| *entry == key)
+                {
+                    Some(std::mem::replace(previous, value))
+                } else {
+                    self.entries.push((key, value));
+                    None
+                }
+            }
+        }
+    }
+
     fn remove(&mut self, mut levels: Split<'_, char>, key: &K) -> Option<V> {
         let Some(level) = levels.next() else {
             let index = self.entries.iter().position(|(entry, _)| entry == key)?;
@@ -119,18 +131,13 @@ impl<K: Eq, V> Branch<K, V> {
             }
             Some(value)
         } else {
-            let child = self.children.get_mut(level)?;
-            let value = child.remove(levels, key)?;
-            if child.is_empty() {
-                self.children.remove(level);
-            }
-            Some(value)
+            self.children.remove(level, levels, key)
         }
     }
 
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
-            && self.children.is_empty()
+            && matches!(self.children, LiteralChildren::Empty)
             && self.plus.is_none()
             && self.hash.is_none()
     }
@@ -155,6 +162,80 @@ impl<K: Eq, V> Branch<K, V> {
         if level.is_none() {
             for (key, value) in &self.entries {
                 visit(key, value);
+            }
+        }
+    }
+}
+
+impl<K: Eq, V> LiteralChildren<K, V> {
+    fn get(&self, level: &str) -> Option<&Branch<K, V>> {
+        match self {
+            Self::Empty => None,
+            Self::Single(existing, child) => (existing.as_ref() == level).then_some(child),
+            Self::Many(children) => children.get(level).map(Box::as_ref),
+        }
+    }
+
+    fn insert(&mut self, level: &str, levels: Split<'_, char>, key: K, value: V) -> Option<V> {
+        match self {
+            Self::Single(existing, child) if existing.as_ref() == level => {
+                child.insert(levels, key, value)
+            }
+            Self::Many(children) => {
+                // Borrow the lookup key so inserting under an existing edge needs
+                // only one search and no key allocation.
+                if let Some(child) = children.get_mut(level) {
+                    child.insert(levels, key, value)
+                } else {
+                    children
+                        .entry(level.into())
+                        .or_default()
+                        .insert(levels, key, value)
+                }
+            }
+            _ => {
+                let mut child = Box::<Branch<K, V>>::default();
+                let previous = child.insert(levels, key, value);
+                let level = level.into();
+                *self = match std::mem::take(self) {
+                    Self::Empty => Self::Single(level, child),
+                    Self::Single(existing, sibling) => {
+                        let mut children = BTreeMap::new();
+                        children.insert(existing, sibling);
+                        children.insert(level, child);
+                        Self::Many(children)
+                    }
+                    Self::Many(_) => unreachable!(),
+                };
+                previous
+            }
+        }
+    }
+
+    fn remove(&mut self, level: &str, levels: Split<'_, char>, key: &K) -> Option<V> {
+        match self {
+            Self::Empty => None,
+            Self::Single(existing, child) => {
+                if existing.as_ref() != level {
+                    return None;
+                }
+                let value = child.remove(levels, key)?;
+                if child.is_empty() {
+                    *self = Self::Empty;
+                }
+                Some(value)
+            }
+            Self::Many(children) => {
+                let child = children.get_mut(level)?;
+                let value = child.remove(levels, key)?;
+                if child.is_empty() {
+                    children.remove(level);
+                    if children.len() == 1 {
+                        let (level, child) = children.pop_first().unwrap();
+                        *self = Self::Single(level, child);
+                    }
+                }
+                Some(value)
             }
         }
     }
@@ -249,21 +330,31 @@ mod tests {
     #[test]
     fn removing_literal_path_prunes_only_unused_branches() {
         let mut index = SubscriptionIndex::default();
-        for (filter, id) in [
-            ("devices/a", 1),
-            ("devices/a/events/current", 2),
-            ("devices/b/events/current", 3),
-        ] {
-            index.insert(filter, id, id).unwrap();
-        }
+        let a = "devices/a/events/current";
+        let b = "devices/b/events/current";
+        index.insert("devices/a", 1, 1).unwrap();
+        index.insert(a, 2, 2).unwrap();
+        let matching = |index: &SubscriptionIndex<_, _>, topic| {
+            let mut values = Vec::new();
+            index
+                .for_each_match(topic, |_, &value| values.push(value))
+                .unwrap();
+            values
+        };
 
-        assert_eq!(index.remove("devices/a/events/current", &2), Some(2));
-        let devices = &index.ordinary.children["devices"];
-        assert!(devices.children["a"].children.is_empty());
-        assert!(devices.children.contains_key("b"));
+        assert_eq!(matching(&index, a), [2]);
+        assert_eq!(index.insert(b, 3, 3).unwrap(), None);
+        assert_eq!(index.insert(b, 3, 4).unwrap(), Some(3));
+        assert_eq!(matching(&index, a), [2]);
+        assert_eq!(matching(&index, b), [4]);
 
+        assert_eq!(index.remove(a, &2), Some(2));
+        assert!(matching(&index, a).is_empty());
+        assert_eq!(matching(&index, "devices/a"), [1]);
         assert_eq!(index.remove("devices/a", &1), Some(1));
-        assert_eq!(index.remove("devices/b/events/current", &3), Some(3));
+        assert!(matching(&index, "devices/a").is_empty());
+        assert_eq!(matching(&index, b), [4]);
+        assert_eq!(index.remove(b, &3), Some(4));
         assert_eq!(index, SubscriptionIndex::default());
     }
 }

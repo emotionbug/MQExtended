@@ -82,7 +82,7 @@ impl State {
             if expiry_interval == Some(0) {
                 continue;
             }
-            let mut bridge = session.internal_bridge.clone();
+            let mut bridge = session.internal_bridge.as_deref().cloned();
             if let Some(bridge) = &mut bridge {
                 bridge.online = false;
             }
@@ -217,7 +217,7 @@ impl State {
                         will_properties: Vec::new(),
                     }),
                     will_at: None,
-                    internal_bridge: entry.bridge,
+                    internal_bridge: entry.bridge.map(Box::new),
                     clean_start: false,
                     pending: VecDeque::new(),
                 },
