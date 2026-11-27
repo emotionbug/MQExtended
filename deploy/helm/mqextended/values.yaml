@@ -7,6 +7,9 @@ autoRecover:
   # Keep serving without quorum and rejoin without an operator. Writes that
   # only reached a discarded branch are lost. Set false to wait for quorum.
   enabled: true
+rollout:
+  # Let each voter replace its own outdated Pod when every voter is healthy.
+  automatic: true
 qos1ReplayBatch:
   # Set only after every voter and learner can replay the new WAL command.
   enabled: false

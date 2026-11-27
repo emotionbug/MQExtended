@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["replicaCount", "additionalVoter", "autoRecover", "image", "storage", "listeners", "auth", "mqttTLS", "service", "resources"],
+  "required": ["replicaCount", "additionalVoter", "autoRecover", "rollout", "image", "storage", "listeners", "auth", "mqttTLS", "service", "resources"],
   "properties": {
     "replicaCount": { "type": "integer", "enum": [1, 2, 3] },
     "additionalVoter": {
@@ -16,6 +16,12 @@
       "additionalProperties": false,
       "required": ["enabled"],
       "properties": { "enabled": { "type": "boolean" } }
+    },
+    "rollout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automatic"],
+      "properties": { "automatic": { "type": "boolean" } }
     },
     "qos1ReplayBatch": {
       "type": "object",

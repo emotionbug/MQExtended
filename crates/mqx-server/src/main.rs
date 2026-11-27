@@ -25,7 +25,7 @@ use mqx_codec::QoS;
 use mqx_server::{
     BrokerSignal, CertificateReloader, HttpApi, ListenerConfig, ListenerProtocol, LogConfig,
     LogTopics, Logging, SecurityConfig, Server, ServerConfig, ServerError, connect_bridge_tls,
-    init_logging, parse_command_line_port, startup_log,
+    init_logging, parse_command_line_port, run_kubernetes_rollout, startup_log,
 };
 
 use file_security::{PolicyWatch, SecurityHandles};
@@ -712,6 +712,16 @@ async fn serve_broker(
         broker.register_control_api(server.control_inventory(&config));
     }
     let log_topics = tokio::spawn(log_topics.serve(broker.clone()));
+    let rollout = match (
+        config.cluster_kubernetes_rollout.take(),
+        &membership,
+        cluster_identity,
+    ) {
+        (Some(sets), Some(membership), Some((node_id, _))) => Some(tokio::spawn(
+            run_kubernetes_rollout(node_id, sets, membership.clone()),
+        )),
+        _ => None,
+    };
     let serving = broker.clone();
     let http = Arc::new(HttpApi::new(&config, &server));
     let http_inventory = http.clone();
@@ -911,6 +921,9 @@ async fn serve_broker(
             }
         } => broker.shutdown_cluster().await.map_err(ServerError::Cluster),
     };
+    if let Some(task) = rollout {
+        task.abort();
+    }
     shutdown.finish(&result);
     stop_autosave.send_replace(true);
     if let Some(task) = autosave {

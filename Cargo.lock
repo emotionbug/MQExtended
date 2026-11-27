@@ -2467,6 +2467,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "serde",
  "serde_json",
  "socket2",
  "tempfile",

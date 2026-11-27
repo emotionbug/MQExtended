@@ -16,7 +16,7 @@ use std::{
 use mqx_bridge::BridgeConfig;
 use mqx_cluster::{ClusterConfig, ClusterSecurity, MAX_SNAPSHOT_SIZE, MAX_STORAGE_RESERVE};
 
-use crate::ServerError;
+use crate::{ServerError, kubernetes::valid_dns_label};
 
 const DEFAULT_PORT: u16 = 1883;
 pub(crate) const CMD_PORT_LIMIT: usize = 10;
@@ -46,6 +46,7 @@ pub struct ServerConfig {
     pub persistence: PersistenceConfig,
     pub cluster: Option<ClusterConfig>,
     pub cluster_qos1_replay_batch: bool,
+    pub cluster_kubernetes_rollout: Option<BTreeMap<u64, String>>,
     pub auto_recover: bool,
     pub auto_recover_timeout: Option<Duration>,
     /// Parse-time operator notices, emitted after the logging destinations are configured.
@@ -519,6 +520,7 @@ impl Default for Parser {
                 persistence: PersistenceConfig::default(),
                 cluster: None,
                 cluster_qos1_replay_batch: false,
+                cluster_kubernetes_rollout: None,
                 auto_recover: true,
                 auto_recover_timeout: None,
                 notices: Vec::new(),
@@ -541,9 +543,22 @@ impl Parser {
     fn finish(mut self) -> Result<ServerConfig, ServerError> {
         bridge::finish(&mut self.config.bridges)
             .map_err(|error| ServerError::Arguments(format!("Error: {}", error.0)))?;
-        if let Some(((path, line), section)) = self.cluster.take() {
+        if let Some(((path, line), mut section)) = self.cluster.take() {
             self.config.cluster_qos1_replay_batch = section.qos1_replay_batch.unwrap_or(false);
+            let rollout = section.kubernetes_rollout.take();
             let mut cluster = section.finish().map_err(|error| error.at(&path, line))?;
+            if let Some(names) = rollout {
+                if names.len() != cluster.peers.len()
+                    || !cluster.peers.contains_key(&cluster.node_id)
+                {
+                    return Err(ParseError(
+                        "'cluster_kubernetes_rollout' requires one StatefulSet per configured voter, including this node.".into(),
+                    )
+                    .at(&path, line));
+                }
+                self.config.cluster_kubernetes_rollout =
+                    Some(cluster.peers.keys().copied().zip(names).collect());
+            }
             if !self.auto_recover_seen {
                 // A membership change can intentionally omit this node.
                 self.config.auto_recover =
@@ -1289,6 +1304,7 @@ struct ClusterSection {
     membership_generation: Option<u64>,
     state_format: Option<u16>,
     qos1_replay_batch: Option<bool>,
+    kubernetes_rollout: Option<Vec<String>>,
     data_dir: Option<PathBuf>,
     heartbeat: Option<Duration>,
     election: Option<(Duration, Duration)>,
@@ -1328,6 +1344,28 @@ impl ClusterSection {
         };
         if let Some(path) = path {
             *path = Some(PathBuf::from(value.unique_string(path.is_some())?));
+            return Ok(());
+        }
+        if name == "cluster_kubernetes_rollout" {
+            if self.kubernetes_rollout.is_some() {
+                return Err(format!("Duplicate '{name}' value in configuration.").into());
+            }
+            let mut unique = BTreeSet::new();
+            let names = value
+                .words()
+                .take_while(|word| !word.starts_with('#'))
+                .map(|word| {
+                    // Leave room for the "-0" Pod suffix.
+                    if !valid_dns_label(word, 61) || !unique.insert(word) {
+                        return Err(invalid(name, word));
+                    }
+                    Ok(word.to_owned())
+                })
+                .collect::<ParseResult<Vec<_>>>()?;
+            if names.is_empty() {
+                return Err(empty(name));
+            }
+            self.kubernetes_rollout = Some(names);
             return Ok(());
         }
         let count = match name {

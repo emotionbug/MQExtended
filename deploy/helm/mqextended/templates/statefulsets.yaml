@@ -13,6 +13,10 @@ metadata:
   labels:
     {{- include "mqextended.selectorLabels" $ | nindent 4 }}
     mqextended.io/node-id: {{ $id | quote }}
+  {{- if $.Values.rollout.automatic }}
+  annotations:
+    mqextended.io/rollout-generation: {{ $.Release.Revision | quote }}
+  {{- end }}
 spec:
   serviceName: {{ $.Release.Name }}-headless
   replicas: 1
@@ -33,6 +37,9 @@ spec:
         checksum/bootstrap: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
     spec:
       automountServiceAccountToken: false
+      {{- if $.Values.rollout.automatic }}
+      serviceAccountName: {{ $name }}
+      {{- end }}
       enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
@@ -123,12 +130,36 @@ spec:
             - name: peer-tls
               mountPath: /etc/mqextended/peer
               readOnly: true
+            {{- if $.Values.rollout.automatic }}
+            - name: rollout-api
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           emptyDir: {}
         - name: bootstrap
           configMap:
             name: {{ $.Release.Name }}-bootstrap
+        {{- if $.Values.rollout.automatic }}
+        - name: rollout-api
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        {{- end }}
         {{- if or $auth.passwordFile $auth.aclFile }}
         - name: auth
           secret:

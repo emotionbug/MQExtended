@@ -41,6 +41,55 @@ ready() {
     "${k[@]}" wait --for=create "pod/$pod" --timeout=90s
     "${k[@]}" wait --for=condition=Ready "pod/$pod" --timeout=180s
 }
+upgrade_voters() {
+    local release=$1 count=$2 i name rev condition deleting snapshot
+    shift 2
+    local -A previous=() target=() current=() healthy=()
+    local selector="app.kubernetes.io/instance=$release"
+    local sets='{range .items[*]}{.metadata.name}{"|"}{.status.updateRevision}{"\n"}{end}'
+    snapshot=$("${k[@]}" get statefulsets -l "$selector" -o "jsonpath=$sets")
+    while IFS='|' read -r name rev; do
+        [[ -z $name ]] || previous[$name]=$rev
+    done <<< "$snapshot"
+    for ((i=1; i<=count; i++)); do
+        if [[ -z ${previous[$release-node-$i]:-} ]]; then
+            printf 'Missing pre-upgrade revision for %s-node-%s\n' "$release" "$i" >&2
+            return 1
+        fi
+    done
+    "${h[@]}" upgrade "$release" "$chart" "${values[@]}" "$@" --set brokerOptions.sys_interval=11
+    local rows='{range .items[*]}{.metadata.name}{"|"}{.metadata.labels.controller-revision-hash}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.metadata.deletionTimestamp}{"\n"}{end}'
+    local end=$((SECONDS+600)) unavailable updated pod
+    while ((SECONDS < end)); do
+        target=(); current=(); healthy=()
+        snapshot=$("${k[@]}" --request-timeout=10s get statefulsets -l "$selector" -o "jsonpath=$sets")
+        while IFS='|' read -r name rev; do
+            [[ -z $name ]] || target[$name]=$rev
+        done <<< "$snapshot"
+        snapshot=$("${k[@]}" --request-timeout=10s get pods -l "$selector" -o "jsonpath=$rows")
+        while IFS='|' read -r name rev condition deleting; do
+            [[ -n $name ]] || continue
+            current[$name]=$rev
+            if [[ $condition == True && -z $deleting ]]; then healthy[$name]=true; fi
+        done <<< "$snapshot"
+        unavailable=0; updated=0
+        for ((i=1; i<=count; i++)); do
+            name=$release-node-$i; pod=$name-0
+            [[ ${healthy[$pod]:-} == true ]] || unavailable=$((unavailable+1))
+            if [[ -n ${target[$name]:-} && ${target[$name]} != "${previous[$name]}" && ${current[$pod]:-} == "${target[$name]}" ]]; then
+                updated=$((updated+1))
+            fi
+        done
+        if ((unavailable > 1)); then
+            printf 'More than one voter unavailable during %s rollout:\n%s\n' "$release" "$snapshot" >&2
+            return 1
+        fi
+        if ((unavailable == 0 && updated == count)); then return; fi
+        sleep 2
+    done
+    printf 'Voter rollout did not finish for %s:\n%s\n' "$release" "$snapshot" >&2
+    return 1
+}
 # Client transport for the current release: TLS on 8883 or plain MQTT on 1883.
 port=8883
 transport=(-h 127.0.0.1 -p 29883 --cafile "$work/ca.crt")
@@ -147,6 +196,7 @@ restore_first recovery
 wait_retained pod/recovery-node-1-0 recovered-while-alone 30
 stop_forward; "${h[@]}" uninstall recovery
 install ha 2 true
+upgrade_voters ha 3 --set replicaCount=2,additionalVoter.enabled=true
 # When the first broker is down, the MQTT Service must contain only the second,
 # not the additional voter. Pod #2 and voter #3 must still commit writes.
 stop_first ha

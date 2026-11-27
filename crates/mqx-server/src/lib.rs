@@ -1,5 +1,6 @@
 mod config;
 mod http_api;
+mod kubernetes;
 mod listener;
 mod logging;
 mod tls;
@@ -13,6 +14,7 @@ pub use config::{
     SecurityConfig, ServerConfig, SocketDomain, TlsConfig, TlsVersion, parse_command_line_port,
 };
 pub use http_api::HttpApi;
+pub use kubernetes::run_kubernetes_rollout;
 pub use listener::{BrokerSignal, CertIdentity, CertificateReloader, Connection, Server};
 pub use logging::{LogTopics, Logging, init_logging, startup_log};
 pub use tls::connect_bridge_tls;
