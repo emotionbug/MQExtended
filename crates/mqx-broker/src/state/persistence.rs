@@ -68,9 +68,9 @@ impl State {
             let Some(inbox) = &session.inbox else {
                 continue;
             };
-            let mut bridge = session.internal_bridge.clone();
             // persist_write.c: persist__client_save and persist__subs_save.
-            if bridge
+            if session
+                .internal_bridge
                 .as_ref()
                 .map_or(session.clean_start, |b| b.local_clean)
             {
@@ -80,16 +80,24 @@ impl State {
             if expiry_interval == Some(0) {
                 continue;
             }
+            let mut bridge = session.internal_bridge.clone();
             if let Some(bridge) = &mut bridge {
                 bridge.online = false;
             }
             let expires = session.expires.or_else(|| {
-                // persist_write.c: persist__client_save starts a finite
-                // connected client's expiry clock at the time of the save.
-                expiry_interval.filter(|&ttl| ttl != u32::MAX).map(|ttl| {
-                    Duration::from_secs(now.as_secs())
-                        .saturating_add(Duration::from_secs(u64::from(ttl) + 1))
-                })
+                // persist_write.c: persist__client_save starts a connected
+                // client's expiry clock at save time. Native snapshots also
+                // apply the server cap, as on disconnect, without changing
+                // expiry for sessions already offline or for local bridges.
+                if session.owner.is_some() && bridge.is_none() {
+                    session_expiry_deadline(
+                        now,
+                        expiry_interval,
+                        self.config.persistent_client_expiration,
+                    )
+                } else {
+                    None
+                }
             });
             let mut entry = PersistentSession {
                 publisher: session.publisher.clone(),
@@ -147,8 +155,13 @@ impl State {
         }
         let mut subscriptions = Vec::new();
         for mut entry in sessions {
-            // session_expiry.c: session_expiry__add_from_persistence preserves stored deadlines.
+            // Native snapshots record the save/disconnect deadline or no
+            // expiry. Only Mosquitto imports can start a new clock on restore
+            // (session_expiry.c: session_expiry__add_from_persistence).
             let expires = entry.expires.or_else(|| {
+                if !from_mosquitto || entry.bridge.is_some() {
+                    return None;
+                }
                 let interval = entry
                     .expiry_interval
                     .filter(|&ttl| ttl != u32::MAX)
@@ -157,9 +170,6 @@ impl State {
                     .config
                     .persistent_client_expiration
                     .map(|ttl| ttl.as_secs());
-                if entry.bridge.is_some() {
-                    return None;
-                }
                 [interval, cap].into_iter().flatten().min().map(|ttl| {
                     Duration::from_secs(now.as_secs())
                         .saturating_add(Duration::from_secs(ttl.saturating_add(1)))

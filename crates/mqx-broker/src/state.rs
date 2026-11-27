@@ -540,6 +540,29 @@ impl Session {
     }
 }
 
+// session_expiry.c: session_expiry__add applies the nonzero server cap;
+// session_expiry__check expires at the first second strictly past it.
+fn session_expiry_deadline(
+    now: Duration,
+    expiry_interval: Option<u32>,
+    cap: Option<Duration>,
+) -> Option<Duration> {
+    let cap = cap
+        .filter(|ttl| !ttl.is_zero())
+        .map(|ttl| ttl.min(Duration::from_secs(u64::from(u32::MAX))));
+    let requested = expiry_interval
+        .filter(|&ttl| ttl != u32::MAX)
+        .map(|ttl| Duration::from_secs(u64::from(ttl)));
+    let ttl = [requested, cap].into_iter().flatten().min()?;
+    Some(if expiry_interval.is_some() {
+        Duration::from_secs(now.as_secs())
+            .saturating_add(ttl)
+            .saturating_add(Duration::from_secs(1))
+    } else {
+        now.saturating_add(ttl)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BridgeState {
     pub(crate) name: Arc<str>,
@@ -1404,25 +1427,10 @@ impl State {
             bridge.online = false;
             return;
         }
-        // session_expiry.c: session_expiry__add applies the nonzero server cap;
-        // session_expiry__check expires at the first second strictly past it.
-        let cap = self
-            .config
-            .persistent_client_expiration
-            .filter(|ttl| !ttl.is_zero())
-            .map(|ttl| ttl.min(Duration::from_secs(u64::from(u32::MAX))));
-        let requested = expiry
-            .filter(|&ttl| ttl != u32::MAX)
-            .map(|ttl| Duration::from_secs(u64::from(ttl)));
         let pending_id = (!session.pending.is_empty()).then(|| id.clone());
-        if let Some(ttl) = [requested, cap].into_iter().flatten().min() {
-            let at = if expiry.is_some() {
-                Duration::from_secs(now.as_secs())
-                    .saturating_add(ttl)
-                    .saturating_add(Duration::from_secs(1))
-            } else {
-                now.saturating_add(ttl)
-            };
+        if let Some(at) =
+            session_expiry_deadline(now, expiry, self.config.persistent_client_expiration)
+        {
             session.expires = Some(at);
             self.expirations.insert((at, session.epoch), id);
         }
@@ -2595,6 +2603,134 @@ mod tests {
                 verdicts: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn standalone_persistence_anchors_online_expiry_at_save() {
+        let seconds = Duration::from_secs;
+        let saved_at = Duration::from_millis(100_250);
+        let config = Arc::new(BrokerConfig {
+            persistent_client_expiration: Some(seconds(20)),
+            ..BrokerConfig::default()
+        });
+        let snapshot =
+            |state: &State, now| rmp_serde::to_vec(&state.persistent_snapshot(now)).unwrap();
+        for (interval, clean_start, deadline) in [
+            (None, false, Some(saved_at + seconds(20))),
+            (Some(u32::MAX), false, Some(seconds(121))),
+            (Some(60), false, Some(seconds(121))),
+            (Some(5), false, Some(seconds(106))),
+            (Some(0), false, None),
+            (Some(60), true, None), // Mosquitto's file writer checks Clean Start separately.
+        ] {
+            let mut state = State::new(config.clone());
+            let id: Arc<str> = "client".into();
+            let mut connect = claim(id.clone(), clean_start);
+            let Command::Claim { request, .. } = &mut connect else {
+                unreachable!();
+            };
+            request.v5 = interval.map(|session_expiry| SessionSettings {
+                session_expiry,
+                receive_maximum: None,
+                will_delay: 0,
+                will_expiry: 0,
+                will_properties: Vec::new(),
+            });
+            assert!(matches!(state.apply(connect).reply, Reply::Claimed { .. }));
+            let saved = snapshot(&state, saved_at);
+            let mut restored = State::new(config.clone());
+            let image = rmp_serde::from_slice(&saved).unwrap();
+            assert!(restored.restore_persistence(image, seconds(101)));
+            let Some(deadline) = deadline else {
+                assert!(!restored.sessions.contains_key(&id));
+                continue;
+            };
+            assert_eq!(restored.sessions[&id].expires, Some(deadline));
+            let saved_again = snapshot(&restored, seconds(102));
+            // Whether the first restart saved or not, neither restart grants
+            // another full interval or extends the deadline by the downtime.
+            for image in [&saved, &saved_again] {
+                let mut restarted = State::new(config.clone());
+                let image = rmp_serde::from_slice(image).unwrap();
+                assert!(restarted.restore_persistence(image, deadline));
+                assert!(!restarted.sessions.contains_key(&id));
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_persistence_keeps_offline_and_bridge_expiry_on_reload() {
+        let seconds = Duration::from_secs;
+        let mut state = State::new(Arc::new(BrokerConfig::default()));
+        for (id, cap) in [
+            ("offline-unlimited", None),
+            ("offline-capped", Some(seconds(50))),
+        ] {
+            state.apply(Command::ReloadLimits(ReloadableLimits {
+                persistent_client_expiration: cap,
+                ..state.config().reloadable_limits()
+            }));
+            let Reply::Claimed { lease, .. } = state.apply(claim(id.into(), false)).reply else {
+                panic!("claim failed");
+            };
+            state.apply(Command::Act(
+                lease,
+                Operation::Disconnect {
+                    now: seconds(70),
+                    graceful: true,
+                    expiry: None,
+                },
+            ));
+        }
+        for (id, local_clean) in [("bridge", false), ("clean-bridge", true)] {
+            let mut connect = claim(id.into(), false);
+            let Command::Claim { request, .. } = &mut connect else {
+                unreachable!();
+            };
+            request.bridge = true;
+            request.internal_bridge = Some(Box::new(BridgeState {
+                name: id.into(),
+                remote_clientid: id.into(),
+                reuse_remote_clientid: false,
+                reuse_local_clientid: false,
+                local_clean,
+                lazy: false,
+                online: true,
+            }));
+            assert!(matches!(state.apply(connect).reply, Reply::Claimed { .. }));
+        }
+        state.apply(Command::ReloadLimits(ReloadableLimits {
+            persistent_client_expiration: Some(seconds(5)),
+            ..state.config().reloadable_limits()
+        }));
+        let image = state.persistent_snapshot(seconds(100));
+        let bytes = rmp_serde::to_vec(&image).unwrap();
+        let mut restored = State::new(state.config().clone());
+        assert!(restored.restore_persistence(rmp_serde::from_slice(&bytes).unwrap(), seconds(110)));
+        assert_eq!(
+            restored.sessions["offline-capped"].expires,
+            Some(seconds(120))
+        );
+        assert_eq!(restored.sessions["offline-unlimited"].expires, None);
+        let bridge = &restored.sessions["bridge"];
+        assert_eq!(bridge.expires, None);
+        assert!(!bridge.internal_bridge.as_ref().unwrap().online);
+        assert!(!restored.sessions.contains_key("clean-bridge"));
+
+        // A Mosquitto record with no timestamp still starts a clock on import.
+        let mut mosquitto = image;
+        mosquitto.sessions.retain(|entry| entry.bridge.is_none());
+        mosquitto.from_mosquitto = true;
+        let mut imported = State::new(state.config().clone());
+        assert!(imported.restore_persistence(mosquitto, seconds(110)));
+        assert_eq!(
+            imported.sessions["offline-unlimited"].expires,
+            Some(seconds(116))
+        );
+        assert_eq!(
+            imported.sessions["offline-capped"].expires,
+            Some(seconds(120))
+        );
     }
 
     #[test]
