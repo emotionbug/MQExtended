@@ -131,7 +131,8 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
             return false;
         };
         let target = self.reserve_target.unwrap_or(target);
-        let low = target != 0 && available < target;
+        let headroom = target.saturating_add(snapshot_size);
+        let low = target != 0 && available < headroom;
         let entered = low && !self.reserve_released;
         if entered {
             tracing::warn!(path = %self.dir.display(), available_bytes = available, reserve_target_bytes = target,
@@ -152,9 +153,9 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
         if low || sweep_archive {
             changed |= self.report(self.expire_archive(low)).unwrap_or(false);
         }
-        // Leave room for Raft to keep writing while the reserve is allocated,
-        // and avoid oscillating when normal use moves around the low threshold.
-        if target != 0 && available > 3 * target {
+        // Allocating the reserve must leave room for both normal operation
+        // and a replacement snapshot, even when the snapshot dwarfs the reserve.
+        if target != 0 && available.saturating_sub(target) > headroom.saturating_mul(2) {
             if self.metrics.reserve.load(Ordering::Relaxed) != target
                 && self.report(self.create_reserve(target)).is_some()
             {
@@ -177,12 +178,7 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
         self.metrics.available.store(available, Ordering::Relaxed);
         if cfg!(unix) {
             self.metrics.pressure.store(
-                under_pressure(
-                    self.metrics.under_pressure(),
-                    available,
-                    target,
-                    snapshot_size,
-                ),
+                under_pressure(self.metrics.under_pressure() || low, available, headroom),
                 Ordering::Relaxed,
             );
         }
@@ -242,8 +238,7 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
     }
 }
 
-fn under_pressure(active: bool, available: u64, reserve: u64, snapshot: u64) -> bool {
-    let headroom = reserve.saturating_add(snapshot);
+fn under_pressure(active: bool, available: u64, headroom: u64) -> bool {
     let threshold = if active {
         headroom.saturating_mul(2)
     } else {
@@ -307,16 +302,6 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
-    fn snapshot_headroom_controls_pressure_with_hysteresis() {
-        let (reserve, snapshot) = (20, 30);
-        assert!(!under_pressure(false, 50, reserve, snapshot));
-        assert!(under_pressure(false, 49, reserve, snapshot));
-        assert!(under_pressure(true, 99, reserve, snapshot));
-        assert!(!under_pressure(true, 100, reserve, snapshot));
-        assert!(!under_pressure(false, 0, 0, 0));
-    }
-
-    #[test]
     fn reserve_target_is_five_percent_of_volume_clamped() {
         const MIB: u64 = 1024 * 1024;
         assert_eq!(Space::for_volume(0, 100 * MIB).target, 64 * MIB);
@@ -329,7 +314,7 @@ mod tests {
         const TARGET: u64 = 16 * 1024;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let available = Cell::new(4 * TARGET);
+        let unreserved = Cell::new(5 * TARGET);
         let reserve = root.join(RESERVE_FILE);
         let archive = root.join(DISCARDED);
         let interrupted = archive.join("interrupted-switch");
@@ -348,7 +333,7 @@ mod tests {
         }
         let mut storage = Storage::start(root.to_path_buf(), None, |_| {
             Ok(Space {
-                available: available.get(),
+                available: unreserved.get() - reserve.metadata().map_or(0, |m| m.len()),
                 target: TARGET,
             })
         });
@@ -356,26 +341,30 @@ mod tests {
         assert_eq!(storage.metrics.bytes(), (4 * TARGET, TARGET));
         assert!(reserve.metadata().unwrap().blocks() * 512 >= TARGET);
 
-        available.set(TARGET);
-        assert!(!storage.check(false, 0));
+        // A replacement snapshot needs another TARGET of headroom. Waiting
+        // until less than the reserve remains would risk ENOSPC during compaction.
+        unreserved.set(3 * TARGET);
+        assert!(!storage.check(false, TARGET));
         assert!(reserve.is_file());
-        available.set(TARGET - 1);
-        assert!(storage.check(false, 0));
+        unreserved.set(3 * TARGET - 1);
+        assert!(storage.check(false, TARGET));
         assert!(!reserve.exists());
         assert!(!archive.exists());
-        assert_eq!(storage.metrics.bytes(), (TARGET - 1, 0));
+        assert_eq!(storage.metrics.bytes(), (3 * TARGET - 1, 0));
+        assert!(storage.metrics.under_pressure());
         assert!(
-            !storage.check(false, 0),
+            !storage.check(false, TARGET),
             "only one compaction request per episode"
         );
 
-        available.set(3 * TARGET);
-        assert!(!storage.check(false, 0));
+        unreserved.set(5 * TARGET);
+        assert!(!storage.check(false, TARGET));
         assert!(!reserve.exists());
-        available.set(3 * TARGET + 1);
-        assert!(!storage.check(false, 0));
+        unreserved.set(5 * TARGET + 1);
+        assert!(!storage.check(false, TARGET));
         assert!(reserve.metadata().unwrap().blocks() * 512 >= TARGET);
-        assert_eq!(storage.metrics.bytes(), (3 * TARGET + 1, TARGET));
+        assert_eq!(storage.metrics.bytes(), (4 * TARGET + 1, TARGET));
+        assert!(!storage.metrics.under_pressure());
         for name in live {
             assert_eq!(fs::read(root.join(name)).unwrap(), name.as_bytes());
         }

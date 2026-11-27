@@ -3191,19 +3191,20 @@ mod tests {
             .unwrap();
         assert!(node.metrics().snapshot_size_bytes > 0);
 
-        available.store(3 * TARGET + 1, Ordering::Relaxed);
+        let recovered = 3 * TARGET + 2 * node.metrics().snapshot_size_bytes + 1;
+        available.store(recovered, Ordering::Relaxed);
         timeout(Duration::from_secs(8), async {
             while (
                 node.metrics().storage_available_bytes,
                 node.metrics().storage_reserve_bytes,
-            ) != (3 * TARGET + 1, TARGET)
+            ) != (recovered, TARGET)
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(node.metrics().storage_available_bytes, 3 * TARGET + 1);
+        assert_eq!(node.metrics().storage_available_bytes, recovered);
         assert_eq!(reserve.metadata().unwrap().len(), TARGET);
         node.shutdown().await.unwrap();
     }
