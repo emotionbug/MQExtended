@@ -1,9 +1,9 @@
-//! Native implementations of third-party Mosquitto auth plugins.
+//! Built-in implementations of authentication plugins.
 //!
 //! A configuration that names one of these libraries in `auth_plugin`,
 //! `plugin` or `global_plugin` runs the Rust implementation here; nothing at
-//! the library path is opened. Each implementation follows the original C
-//! plugin as Mosquitto 2.1.4 loads it through its v4 wrapper
+//! the library path is opened. The third-party ports follow the original
+//! plugins as Mosquitto 2.1.4 loads them through its v4 wrapper
 //! (`src/plugin_v4.c`). The broker side of the contract is
 //! [`mqx_auth::external`].
 
@@ -11,6 +11,7 @@ mod authplug;
 mod backend;
 mod backends;
 mod goauth;
+mod kms;
 mod net;
 
 use std::sync::Arc;
@@ -19,13 +20,15 @@ use mqx_auth::external::ExternalSecurity;
 
 pub use backend::LoadError;
 
-/// A third-party plugin library implemented by this crate.
+/// A plugin library implemented by this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Library {
     /// jpmens/mosquitto-auth-plug, built as `auth-plug.so`.
     AuthPlug,
     /// iegomez/mosquitto-go-auth, built as `go-auth.so`.
     GoAuth,
+    /// MQExtended's KMS-signed CONNECT authentication, named `mqext_kms.so`.
+    Kms,
 }
 
 impl Library {
@@ -35,6 +38,7 @@ impl Library {
         match basename.rsplit_once('.') {
             Some(("auth-plug", "so" | "dylib" | "dll")) => Some(Self::AuthPlug),
             Some(("go-auth", "so" | "dylib" | "dll")) => Some(Self::GoAuth),
+            Some(("mqext_kms", "so")) => Some(Self::Kms),
             _ => None,
         }
     }
@@ -44,6 +48,7 @@ impl Library {
         match self {
             Self::AuthPlug => "auth-plug",
             Self::GoAuth => "go-auth",
+            Self::Kms => "mqext-kms",
         }
     }
 }
@@ -53,7 +58,7 @@ pub fn announce(library: Library) {
     match library {
         Library::AuthPlug => authplug::announce(),
         // auth-plugin.c: mosquitto_auth_plugin_version silently returns 4.
-        Library::GoAuth => {}
+        Library::GoAuth | Library::Kms => {}
     }
 }
 
@@ -69,5 +74,6 @@ pub async fn load(
     match library {
         Library::AuthPlug => authplug::load(options, deny_special_chars).await,
         Library::GoAuth => goauth::load(options, deny_special_chars).await,
+        Library::Kms => kms::load(options),
     }
 }

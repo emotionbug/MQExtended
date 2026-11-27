@@ -332,8 +332,11 @@ async fn load_external_plugins(
     for plugin in &config.external_plugins {
         tracing::info!("Loading plugin: {}", plugin.path);
         mqx_extauth::announce(plugin.library);
+        let connect_only = plugin.library == mqx_extauth::Library::Kms;
         tracing::info!(" ├── Username/password checking enabled.");
-        tracing::info!(" ├── TLS-PSK checking enabled.");
+        if !connect_only {
+            tracing::info!(" ├── TLS-PSK checking enabled.");
+        }
         tracing::info!(" └── Extended authentication not enabled.");
         let security = mqx_extauth::load(
             plugin.library,
@@ -341,8 +344,18 @@ async fn load_external_plugins(
             plugin.deny_special_chars,
         )
         .await
-        .map_err(|_| ServerError::PluginAbort)?;
-        for event in ["reload", "basic-auth", "acl-check", "psk-key"] {
+        .map_err(|error| {
+            if connect_only {
+                tracing::error!("{error}");
+            }
+            ServerError::PluginAbort
+        })?;
+        let events: &[_] = if connect_only {
+            &["basic-auth"]
+        } else {
+            &["reload", "basic-auth", "acl-check", "psk-key"]
+        };
+        for event in events {
             tracing::info!("Plugin has registered to receive '{event}' events.");
         }
         loaded.push(security);

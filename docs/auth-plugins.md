@@ -1,4 +1,4 @@
-# Third-party auth plugins
+# Authentication plugins
 
 MQExtended has two widely deployed third-party Mosquitto auth plugins built in. A deployment that authenticates and authorizes clients through one of them keeps working unchanged:
 
@@ -7,9 +7,11 @@ MQExtended has two widely deployed third-party Mosquitto auth plugins built in. 
 
 Both are Rust ports of the plugin as Mosquitto 2.1.4 runs it through its legacy-plugin wrapper (`plugin_v4.c`), not the libraries themselves: nothing is loaded from the configured path. Other servers' authentication systems, such as EMQX's authentication chains, VerneMQ's `vmq_diversity` or HiveMQ extensions, are not configured through `mosquitto.conf` and are out of scope.
 
+MQExtended also provides [`mqext_kms.so`](#kms-signed-connect), an opt-in plugin for self-hosted brokers. It is not a Mosquitto compatibility plugin.
+
 ## Enabling a plugin
 
-Keep the plugin lines in your `mosquitto.conf`:
+For a compatibility plugin, keep the plugin lines in your `mosquitto.conf`:
 
 ```text
 auth_plugin /usr/lib/mosquitto/auth-plug.so
@@ -20,15 +22,15 @@ auth_opt_http_superuser_uri /superuser
 auth_opt_http_aclcheck_uri /acl
 ```
 
-- MQExtended recognizes each plugin by its file name (`auth-plug` or `go-auth`, with `.so`, `.dylib` or `.dll`) in `auth_plugin`, `plugin`, `global_plugin` or `plugin_load`. It doesn't open the file.
+- MQExtended recognizes the two compatibility plugins by file name (`auth-plug` or `go-auth`, with `.so`, `.dylib` or `.dll`) in `auth_plugin`, `plugin`, `global_plugin` or `plugin_load`. It doesn't open the file.
 - `auth_opt_*` and `plugin_opt_*` take the plugin's own option names.
 - `auth_plugin_deny_special_chars` works as in Mosquitto. While it is `true` (the default), a client whose username or client id contains `+`, `#` or `/` is denied every ACL check before the plugin is asked.
 - A back-end that can't initialize stops the broker with exit status 1 and the plugin's own fatal log line, as the original plugin does.
-- SIGHUP doesn't reread the plugin options, because Mosquitto skips plugin configuration on reload. Connected clients are authenticated again through the plugin, as Mosquitto does.
+- SIGHUP doesn't reread the plugin options. The two compatibility plugins authenticate connected clients again, as Mosquitto does; `mqext_kms.so` doesn't.
 
 ## Combining a plugin with other security
 
-On one listener, a plugin can run alone or before the `password_file` and `acl_file` options. The plugin answers first, and the files decide whatever it leaves open.
+On one listener, a compatibility plugin can run alone or before the `password_file` and `acl_file` options. The plugin answers first, and the files decide whatever it leaves open.
 
 MQExtended refuses these combinations at startup:
 
@@ -118,8 +120,40 @@ The port keeps what clients observe through Mosquitto's wrapper, including the q
 - A Redis command follows one cluster redirection, and connection reuse and retry timing differ from go-redis.
 - Error messages in the log come from different drivers.
 
+## KMS-signed CONNECT
+
+Use `mqext_kms.so` to let a client with AWS IAM permission to sign with an asymmetric KMS key log in to **your MQExtended broker**. It does not use AWS IoT Core or validate AWS access keys. The broker verifies signatures locally with pinned public keys and makes no AWS calls. For example:
+
+```text
+listener 8883
+certfile /etc/mqextended/tls/server.pem
+keyfile /etc/mqextended/tls/server-key.pem
+allow_anonymous false
+allow_zero_length_clientid false
+acl_file /etc/mqextended/clients.acl
+
+plugin mqext_kms.so
+plugin_opt_audience mqtt.example.com
+plugin_opt_public_key_sensor /etc/mqextended/keys/sensor.pem
+```
+
+The library name selects built-in code; you don't install a `.so`. For a named listener attachment, use `plugin_load kms mqext_kms.so` and `plugin_use kms`, and make sure the security settings above apply to that listener. The broker requires TLS on the MQTT or WebSocket listener itself, a native `acl_file` directive, and an explicit client ID in CONNECT. The listener cannot allow anonymous access or use `use_username_as_clientid`, `use_identity_as_username`, `use_subject_as_username`, `password_file` or another authentication plugin. You can require a TLS client certificate without using it as the MQTT username. The `auth_plugin_deny_special_chars` option does not apply.
+
+Use a separate asymmetric RSA `SIGN_VERIFY` KMS key per MQTT principal. Pin one `-----BEGIN PUBLIC KEY-----` PEM file per username, using the SubjectPublicKeyInfo returned by KMS `GetPublicKey` (base64-encoded DER in AWS CLI output). Protect the pin files from changes by untrusted users. Anyone who can call KMS `Sign` with a pinned key and `RSASSA_PKCS1_V1_5_SHA_256` can log in as its configured username. Configure a different audience for deployments that must not accept each other's tokens.
+
+On every CONNECT, send the case-sensitive username unchanged and a compact JWS as the MQTT password. The protected header contains only `alg: RS256` and `typ: JWT`. The payload contains only:
+
+- `aud`: the exact configured audience, a nonempty printable ASCII string of at most 255 bytes.
+- `sub`: the exact MQTT username, matching `[A-Za-z0-9_-]{1,64}`.
+- `client_id`: the actual MQTT client ID, in the form `<username>.<suffix>` with suffix matching `[A-Za-z0-9_-]{1,128}`.
+- `iat` and `exp`: integer Unix seconds, with `1 <= exp - iat <= 60`. The broker allows `iat` up to five seconds in the future and refuses the token at `exp`. Keep broker and signer clocks synchronized.
+
+Use TLS with server certificate and hostname verification. The token is replayable for that username and client ID until it expires, so don't log it or pass it over plaintext connections. Expiry only limits login: it does not end an established connection. SIGHUP and automatic ACL reload update authorization without checking an already accepted token again. Restart to change the audience or to replace or revoke pins; disabling KMS signing alone doesn't invalidate already issued tokens or disconnect existing MQTT clients.
+
+The native ACL determines publish and delivery permissions, including checks for wills and retained messages. For example, `pattern readwrite sensors/%u/#` confines traffic to the authenticated user's topic subtree. A successful SUBACK does not grant delivery. MQTT client IDs and sessions are shared across listeners and cluster nodes: do not mix untrusted identity domains in the same broker or cluster. In particular, a non-KMS listener that accepts arbitrary IDs can claim a KMS client's session.
+
 ## In a cluster
 
-- Give every node the same plugin lines and options, and let every node reach the back-ends. Add, remove or reconfigure a plugin only with the whole cluster stopped, after every node runs a build that supports it ([upgrades](cluster.md#upgrades)). The node serving a client authenticates it.
-- Each ACL check is made by one node. Its verdict goes through the replicated log, so every node applies the same decision at the same point. A delivery or will that is waiting for a verdict is replicated state. If the node asking the back-end fails, the leader asks again.
+- Give every node the same plugin lines and options. For `mqext_kms.so`, use the same pinned public keys and ACL policy on all nodes. For compatibility plugins, let every node reach the back-ends. Add, remove or reconfigure a plugin only with the whole cluster stopped, after every node runs a build that supports it ([upgrades](cluster.md#upgrades)). The node serving a client authenticates it.
+- For plugins that answer ACL checks, one node obtains the verdict and commits it through the replicated log so each node applies the same decision at the same point. A delivery or will that is waiting for a verdict is replicated state. If the node asking the back-end fails, the leader asks again.
 - A reusable verdict (auth-plug `acl_cacheseconds` above 0, go-auth's memory cache) is shared by all nodes until it expires. The plugins cache per process, so a cluster asks the back-end less often than separate brokers would. Authentication caches stay per node.

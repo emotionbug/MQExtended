@@ -88,11 +88,18 @@ pub struct Authorization {
     pub reuse_for: Duration,
 }
 
-/// A natively implemented third-party auth plugin.
+/// A natively implemented auth plugin.
 pub trait ExternalSecurity: Send + Sync + 'static {
     /// The plugin's `auth_plugin_deny_special_chars` setting, which the broker
     /// applies before every ACL callback (`plugin_acl_check.c: acl__pre_check`).
     fn deny_special_chars(&self) -> bool;
+
+    /// This plugin verifies credentials only on CONNECT and must return a
+    /// decisive verdict. Established connections keep the identity admitted
+    /// at CONNECT on file-policy reload; their credentials are not retained.
+    fn connect_only_authentication(&self) -> bool {
+        false
+    }
 
     /// `MOSQ_EVT_BASIC_AUTH`. `password` holds the bytes of the CONNECT
     /// password; a C plugin sees them up to the first NUL.

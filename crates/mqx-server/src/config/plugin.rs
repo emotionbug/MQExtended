@@ -1,6 +1,6 @@
 use super::{
-    DynamicSecurityConfig, ExternalPluginConfig, ListenerConfig, ParseResult, Parser, Path,
-    PathBuf, ServerConfig, ServerError, Value, empty, require_listener, unsupported,
+    DynamicSecurityConfig, ExternalPluginConfig, ListenerConfig, ListenerProtocol, ParseResult,
+    Parser, Path, PathBuf, ServerConfig, ServerError, Value, empty, require_listener, unsupported,
 };
 
 /// Startup-only file callbacks declared through the plugin directives.
@@ -53,10 +53,10 @@ impl ServerConfig {
             fresh.external_plugin = bound.external_plugin;
             fresh.sparkplug_aware = bound.sparkplug_aware;
         }
-        self.validate_file_plugins()
+        self.validate_plugins()
     }
 
-    fn validate_file_plugins(&self) -> Result<(), ServerError> {
+    fn validate_plugins(&self) -> Result<(), ServerError> {
         let global = &self.security.file_plugins;
         for listener in &self.listeners {
             let local = &listener.security.file_plugins;
@@ -81,6 +81,39 @@ impl ServerConfig {
                 )));
             }
             let builtin = self.security_for(listener);
+            if listener
+                .external_plugin
+                .is_some_and(|id| self.external_plugins[id].library == mqx_extauth::Library::Kms)
+            {
+                let tls = &listener.tls;
+                let problem = if listener.protocol == ListenerProtocol::HttpApi
+                    || tls.certfile.is_none()
+                    || tls.keyfile.is_none()
+                {
+                    Some("requires an MQTT or WebSocket listener with certfile and keyfile")
+                } else if builtin.acl_file.is_none() {
+                    Some("requires an explicit acl_file")
+                } else if builtin.password_file.is_some() {
+                    Some("cannot be combined with password_file")
+                } else if self.allow_anonymous_for(listener) {
+                    Some("requires anonymous access to be disabled")
+                } else if builtin.allow_zero_length_clientid {
+                    Some("requires allow_zero_length_clientid false")
+                } else if listener.use_username_as_clientid
+                    || tls.use_identity_as_username
+                    || tls.use_subject_as_username
+                {
+                    Some("cannot be combined with username or client ID rewriting")
+                } else {
+                    None
+                };
+                if let Some(problem) = problem {
+                    return Err(ServerError::Arguments(format!(
+                        "mqext-kms on listener {} {problem}.",
+                        listener.port,
+                    )));
+                }
+            }
             check_paths(
                 "password_file",
                 [
@@ -258,6 +291,9 @@ impl Parser {
                 // plugin_acl_check.c: acl__pre_check applies it to v2-v4 plugins
                 // only; v5 callbacks ignore it.
                 if let Kind::External(plugin) = &mut self.plugins[index].kind {
+                    if plugin.library == mqx_extauth::Library::Kms {
+                        return Err("mqext-kms does not accept auth_plugin_deny_special_chars; use acl_file for topic authorization.".into());
+                    }
                     plugin.deny_special_chars = deny;
                 }
             }
@@ -467,6 +503,6 @@ impl Parser {
             // v5 plugins do not set pid->listener, even for a listener attachment.
             config.plugin_inventory.push(label);
         }
-        config.validate_file_plugins()
+        config.validate_plugins()
     }
 }

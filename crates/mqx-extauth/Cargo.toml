@@ -1,6 +1,6 @@
 [package]
 name = "mqx-extauth"
-description = "Native implementations of third-party Mosquitto auth plugins"
+description = "Built-in implementations of authentication plugins"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -33,7 +33,7 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11.0"
 sha2 = "0.11.1"

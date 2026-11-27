@@ -238,6 +238,9 @@ impl Security {
             if verdict != Verdict::Defer {
                 return (verdict, credentials);
             }
+            if plugin.connect_only_authentication() {
+                return (Verdict::Deny, credentials);
+            }
             credentials
         } else {
             false
@@ -414,6 +417,12 @@ impl SecurityHandle {
     pub fn with_external(mut self, id: u32, plugin: Arc<dyn ExternalSecurity>) -> Self {
         self.3 = Some((id, plugin));
         self
+    }
+
+    fn connect_only_authentication(&self) -> bool {
+        self.3
+            .as_ref()
+            .is_some_and(|(_, plugin)| plugin.connect_only_authentication())
     }
 
     /// Select this listener's anonymous setting when sharing a credential store.

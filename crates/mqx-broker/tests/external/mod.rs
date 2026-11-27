@@ -23,6 +23,7 @@ type BasicCall = (String, Option<String>, Option<Bytes>);
 
 pub(super) struct Scripted {
     deny_special_chars: bool,
+    connect_only: bool,
     basic: Mutex<HashMap<String, Verdict>>,
     basic_calls: Mutex<Vec<BasicCall>>,
     acl: Mutex<HashMap<AclCall, Rule>>,
@@ -31,8 +32,13 @@ pub(super) struct Scripted {
 
 impl Scripted {
     pub(super) fn new() -> Arc<Self> {
+        Self::with_connect_only(false)
+    }
+
+    fn with_connect_only(connect_only: bool) -> Arc<Self> {
         Arc::new(Self {
             deny_special_chars: true,
+            connect_only,
             basic: Mutex::default(),
             basic_calls: Mutex::default(),
             acl: Mutex::default(),
@@ -104,6 +110,10 @@ impl ExternalSecurity for Scripted {
         self.deny_special_chars
     }
 
+    fn connect_only_authentication(&self) -> bool {
+        self.connect_only
+    }
+
     fn authenticate<'a>(
         &'a self,
         client_id: &'a str,
@@ -126,6 +136,9 @@ impl ExternalSecurity for Scripted {
     }
 
     fn acl_identity(&self, subject: Subject<'_>) -> Option<AclIdentity> {
+        if self.connect_only {
+            return None;
+        }
         Some(AclIdentity {
             client_id: Some(if subject.binding.synthetic {
                 format!("synthetic:{}", subject.client_id).into()
@@ -247,6 +260,45 @@ fn subscribe_packet(filters: &[&str]) -> Packet {
             .map(|filter| ((*filter).into(), Q1))
             .collect(),
     })
+}
+
+#[tokio::test]
+async fn connect_only_authentication_keeps_clients_and_reloads_native_acl() {
+    let broker = broker(BrokerConfig::default());
+    let plugin = Scripted::with_connect_only(true);
+    let acl = |text: &[u8]| Some(AclFile::parse(text).unwrap());
+    let security = SecurityHandle::new(None, acl(b"user sensor\ntopic read sensor/old\n"))
+        .with_external(PLUGIN_ID, plugin.clone());
+    broker.register_security(&security).await.unwrap();
+    let (mut sink, _) = Client::spawn(&broker, listener(security.clone()));
+    plugin.basic("sensor.unit", Verdict::Allow);
+    sink.connect(
+        Connect {
+            username: Some("sensor".into()),
+            password: Some(Bytes::from_static(b"short-lived")),
+            ..request("sensor.unit", true)
+        },
+        Code::Accepted,
+        false,
+    )
+    .await;
+    sink.subscribe(&[("sensor/#", Q0)], &[Q0]).await;
+    let mut source = connected(&broker, "source", true, false).await;
+    send_qos1(&mut source, "sensor/new", b"blocked", 1).await;
+    send_qos1(&mut source, "sensor/old", b"allowed", 2).await;
+    sink.expect(Packet::Publish(publish("sensor/old", b"allowed", Q0, 0)))
+        .await;
+
+    // The token would now fail authentication; a new ACL takes effect anyway.
+    plugin.basic("sensor.unit", Verdict::Deny);
+    security.replace(None, acl(b"user sensor\ntopic read sensor/new\n"));
+    sink.ping().await;
+    send_qos1(&mut source, "sensor/old", b"blocked", 3).await;
+    send_qos1(&mut source, "sensor/new", b"allowed", 4).await;
+    sink.expect(Packet::Publish(publish("sensor/new", b"allowed", Q0, 0)))
+        .await;
+    assert_eq!(plugin.basic_calls.lock().unwrap().len(), 1);
+    assert_eq!(plugin.total(), 0);
 }
 
 // plugin_basic_auth.c: mosquitto_basic_auth; handle_connect.c: handle__connect.

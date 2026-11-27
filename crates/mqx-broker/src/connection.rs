@@ -121,7 +121,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         &mut connect,
         options.as_ref(),
     )?;
-    let identity = match preparation {
+    let mut identity = match preparation {
         Preparation::Accepted(identity) => identity,
         Preparation::Refused(code, reason, refusal) => {
             log_refusal(broker, &peer, &connect.client_id, refusal);
@@ -176,6 +176,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             return refuse_v5(&mut wire, &mut shutdown, config, &info, R::NOT_AUTHORIZED).await;
         }
         return refuse(&mut wire, &mut shutdown, Code::NotAuthorized).await;
+    }
+    if listener.security.connect_only_authentication() {
+        identity.password = None;
     }
     drop(dynamic);
     if *shutdown.borrow() {
@@ -617,7 +620,14 @@ impl Identity {
         dynamic: Option<&(bool, Arc<DynamicSecurity>)>,
     ) -> (Verdict, bool) {
         if self.certificate_username {
-            return (Verdict::Allow, false);
+            return (
+                if security.connect_only_authentication() {
+                    Verdict::Deny
+                } else {
+                    Verdict::Allow
+                },
+                false,
+            );
         }
         let anonymous = security.anonymous(&snapshot, self.allow_anonymous);
         snapshot
@@ -643,6 +653,9 @@ impl Identity {
         // consulting callbacks when anonymous access has been disabled.
         if self.username.is_none() && !security.anonymous(&snapshot, self.allow_anonymous) {
             return false;
+        }
+        if security.connect_only_authentication() {
+            return true;
         }
         let dynamic = security.1.zip(
             broker

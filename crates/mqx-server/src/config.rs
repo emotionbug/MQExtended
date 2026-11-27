@@ -61,8 +61,7 @@ pub struct DynamicSecurityConfig {
     pub before_file: bool,
 }
 
-/// A third-party auth plugin (`auth_plugin`/`plugin` naming a library that
-/// `mqx_extauth` implements) and its options.
+/// A built-in auth plugin selected by its library filename, and its options.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalPluginConfig {
     pub path: String,
