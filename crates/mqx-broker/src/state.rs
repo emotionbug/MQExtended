@@ -307,8 +307,8 @@ pub(crate) enum Operation {
     // binaries cannot decode this command.
     ReceivedInFlight(PacketId),
     Authorize(Vec<ResolvedVerdict>),
-    // Only proposed after an operator enables the upgraded command. Never
-    // reinterpret old single reservations, including those in EagerBatch.
+    // Not readable by older binaries. Never reinterpret old single
+    // reservations, including those in EagerBatch.
     ReserveOutboundPrefix(OutboundPrefix),
 }
 

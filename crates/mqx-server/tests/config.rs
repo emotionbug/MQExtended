@@ -869,24 +869,36 @@ fn cluster_membership_and_default_deadlines_reach_the_raft_config() {
 }
 
 #[test]
-fn cluster_replay_window_requires_explicit_opt_in() {
+fn cluster_replay_window_defaults_on_with_state_format_2() {
+    assert!(!ServerConfig::parse("").unwrap().cluster_qos1_replay_batch);
     let base = format!("{CLUSTER}{CLUSTER_TLS}");
-    assert!(
-        !ServerConfig::parse(&base)
-            .unwrap()
-            .cluster_qos1_replay_batch
-    );
-    let enabled = format!("{base}cluster_qos1_replay_batch true\n");
-    assert!(
-        ServerConfig::parse(&enabled)
-            .unwrap()
-            .cluster_qos1_replay_batch
-    );
+    for (extra, enabled) in [
+        ("", true),
+        ("cluster_state_format 2\n", true),
+        ("cluster_qos1_replay_batch true\n", true),
+        ("cluster_qos1_replay_batch false\n", false),
+        ("cluster_state_format 1\n", false),
+        (
+            "cluster_state_format 1\ncluster_qos1_replay_batch true\n",
+            true,
+        ),
+        (
+            "cluster_state_format 1\ncluster_qos1_replay_batch false\n",
+            false,
+        ),
+    ] {
+        let config = ServerConfig::parse(&format!("{base}{extra}")).unwrap();
+        assert_eq!(config.cluster_qos1_replay_batch, enabled, "{extra}");
+    }
+}
+
+#[test]
+fn cluster_replay_window_rejects_invalid_or_duplicate_values() {
     for extra in [
         "cluster_qos1_replay_batch twice\n",
-        "cluster_qos1_replay_batch false\n",
+        "cluster_qos1_replay_batch true\ncluster_qos1_replay_batch false\n",
     ] {
-        assert!(ServerConfig::parse(&format!("{enabled}{extra}")).is_err());
+        assert!(ServerConfig::parse(&format!("{CLUSTER}{CLUSTER_TLS}{extra}")).is_err());
     }
 }
 

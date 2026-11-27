@@ -544,9 +544,13 @@ impl Parser {
         bridge::finish(&mut self.config.bridges)
             .map_err(|error| ServerError::Arguments(format!("Error: {}", error.0)))?;
         if let Some(((path, line), mut section)) = self.cluster.take() {
-            self.config.cluster_qos1_replay_batch = section.qos1_replay_batch.unwrap_or(false);
+            let replay_batch = section.qos1_replay_batch;
             let rollout = section.kubernetes_rollout.take();
             let mut cluster = section.finish().map_err(|error| error.at(&path, line))?;
+            // Keep legacy replay by default in format 1. Format 2 alone does
+            // not prove that the other voters and learners support batching.
+            self.config.cluster_qos1_replay_batch =
+                replay_batch.unwrap_or(cluster.state_format == 2);
             if let Some(names) = rollout {
                 if names.len() != cluster.peers.len()
                     || !cluster.peers.contains_key(&cluster.node_id)

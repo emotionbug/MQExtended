@@ -73,7 +73,7 @@ The current release comparison (`8bd1490` → `8847eff`) used three mTLS voters 
 | MQTT 5 / 16 compact PUBACKs per write | Old → new, default config | 6.20–6.70 s → 1.88–1.94 s | 1,514–1,522 → 159–165 |
 | MQTT 3.1.1 / immediate PUBACK | New, replay window off → on | 6.59–8.25 s → 0.52–0.96 s | 1,470–1,474 → 159–161 |
 
-Each range covers two runs. On the new binary, the first 16 packets reached the socket in **179–183 ms** with the window off and **10–12 ms** with it on, before the client sent its first ACK. The window is [opt-in for upgrade compatibility](cluster.md#upgrades). It is not faster in every run: with 16 PUBACKs per write and the window on, legacy drains ranged from 0.58 to 2.02 s.
+Each range covers two runs. On the new binary, the first 16 packets reached the socket in **179–183 ms** with the window off and **10–12 ms** with it on, before the client sent its first ACK. The window is now [on by default in state format 2](cluster.md#upgrades). It is not faster in every run: with 16 PUBACKs per write and the window on, legacy drains ranged from 0.58 to 2.02 s.
 
 If clients send PUBACKs in bursts, also try `set_tcp_nodelay true` (`setTcpNoDelay=true` in Helm). With 16 PUBACKs per write on loopback and standalone disk persistence enabled, MQExtended **and** Mosquitto 2.1.4 took 1.19 s at the default and 7.7 ms with Nagle disabled. The same change on three voters with the replay window on took 0.58 → 0.34 s in one paired run. It can send more small TCP packets; it did not improve live 250/s cluster p99 (168 ms either way).
 

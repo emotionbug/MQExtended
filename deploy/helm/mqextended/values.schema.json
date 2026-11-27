@@ -26,7 +26,6 @@
     "qos1ReplayBatch": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled"],
       "properties": { "enabled": { "type": "boolean" } }
     },
     "setTcpNoDelay": { "type": "boolean" },

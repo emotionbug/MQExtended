@@ -61,9 +61,7 @@ fn persistent_inbox_resumes_on_different_node_after_kill() {
 #[test]
 #[ignore = "requires cluster-enabled mqextended"]
 fn partial_ack_of_a_replay_window_survives_owner_loss() {
-    let mut cluster = start_cluster(config(
-        "allow_anonymous true\nmax_inflight_messages 8\ncluster_qos1_replay_batch true",
-    ));
+    let mut cluster = start_cluster(config("allow_anonymous true\nmax_inflight_messages 8"));
     let h = &mut cluster;
     let settings = persistent("window");
     let topic = "failover/window";

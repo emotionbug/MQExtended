@@ -75,8 +75,10 @@ data:
     cluster_certfile /etc/mqextended/peer/tls.crt
     cluster_keyfile /etc/mqextended/peer/tls.key
     auto_recover {{ ternary "true" "false" (eq (include "mqextended.autoRecoverEnabled" .) "true") }}
-    {{- if (.Values.qos1ReplayBatch).enabled }}
-    cluster_qos1_replay_batch true
+    {{- with .Values.qos1ReplayBatch }}
+    {{- if hasKey . "enabled" }}
+    cluster_qos1_replay_batch {{ .enabled }}
+    {{- end }}
     {{- end }}
     {{- if .Values.rollout.automatic }}
     cluster_kubernetes_rollout{{ range $id := $voterIds }} {{ include "mqextended.voterName" (list $.Release.Name $id) }}{{ end }}

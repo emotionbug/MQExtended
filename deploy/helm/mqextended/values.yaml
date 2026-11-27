@@ -10,9 +10,9 @@ autoRecover:
 rollout:
   # Let each voter replace its own outdated Pod when every voter is healthy.
   automatic: true
-qos1ReplayBatch:
-  # Set only after every voter and learner can replay the new WAL command.
-  enabled: false
+# Omit enabled to use the broker default. Set enabled: false during a
+# mixed-version upgrade until every voter and learner can read replay commands.
+qos1ReplayBatch: {}
 # Disable Nagle on accepted TCP connections. Small frames may use more packets.
 setTcpNoDelay: false
 # Broker options for the global section of mosquitto.conf, overriding the

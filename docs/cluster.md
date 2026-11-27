@@ -26,7 +26,7 @@ Cluster settings live in `mosquitto.conf`. The `cluster_*` directives are MQExte
 | `cluster_join true` | Start an empty node as a new member of a running cluster instead of bootstrapping one | false |
 | `cluster_membership_generation <n>` | Version of the `cluster_peer` list; raise it to request a membership change | 0 |
 | `cluster_state_format <1\|2>` | On-disk and wire format this node writes; see [upgrades](#upgrades) | 2 |
-| `cluster_qos1_replay_batch true` | Reserve a bounded window of ready MQTT 3.x QoS 1 messages in one commit when a persistent subscriber resumes; see [upgrades](#upgrades) | false |
+| `cluster_qos1_replay_batch <true\|false>` | Reserve a bounded window of ready MQTT 3.x QoS 1 messages in one commit when a persistent subscriber resumes; see [upgrades](#upgrades) | true in state format 2; false in format 1 |
 | `cluster_kubernetes_rollout <statefulset>...` | Enable [automatic Kubernetes rollout](#restart-and-upgrade). Give one StatefulSet name per `cluster_peer`, in ascending node ID order; the broker reads the namespace and credentials from the projected service account volume | off; set by the Helm chart |
 | `auto_recover <true\|false>` | Recover from quorum loss, a lost peer or unusable local state without operator action, giving up consistency; see [automatic recovery](#automatic-recovery). Also applies to a standalone broker | true, or false with `cluster_state_format 1` or without a `cluster_peer` line for this node |
 | `auto_recover_timeout <ms>` | How long a node waits without quorum before it continues alone; requires `auto_recover true` | `cluster_lease_timeout` |
@@ -227,7 +227,7 @@ Use a rolling upgrade only if every running binary can replay every command that
 
 Don't change membership in the middle of an upgrade.
 
-Leave `cluster_qos1_replay_batch` off during a rolling upgrade. Enable it at startup (`qos1ReplayBatch.enabled=true` in Helm) only after every voter and learner can read replay-window commands, including binaries used to recover from a backup. Switching it off stops new commands; it does not rewrite the WAL for a downgrade. Take a cold backup before enabling it if you need to return to an older binary.
+Set `cluster_qos1_replay_batch false` in the new configuration (`--set qos1ReplayBatch.enabled=false` in Helm) before the first upgraded node starts during a mixed-version rollout. State format 2 predates replay-window commands: regardless of format, keep batching off until every voter and learner can read them. Then remove the override or set it to `true` and restart each node in turn. Disabling batching stops new replay-window commands; it does not rewrite the WAL. To downgrade to a binary that cannot read them, restore a [cold backup](#cold-backup-and-restore) taken before batching was enabled.
 
 The replay window covers at most 16 eligible packets and 16 KiB. If the owner dies between committing a window and finishing its socket writes, the replacement retries unacknowledged packets with the same IDs and `DUP` set. `DUP` marks a possible earlier delivery; the client need not have seen that packet before the crash.
 
