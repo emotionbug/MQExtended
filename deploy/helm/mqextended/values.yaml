@@ -1,5 +1,5 @@
-# Number of client-facing Raft voters. Use 3 to tolerate one voter failure.
-replicaCount: 1
+# Three workers, one voting broker and PVC per worker. Set 1 for a single worker.
+replicaCount: 3
 additionalVoter:
   # Valid with replicaCount: 2. Adds a full voter without a client endpoint.
   enabled: false

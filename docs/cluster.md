@@ -68,10 +68,10 @@ The [Helm chart](../deploy/helm/mqextended) starts a new cluster without asking 
 
 | Helm values | MQTT-serving Pods | Total voters | If one voter stops |
 | --- | ---: | ---: | --- |
-| Defaults (`replicaCount=1`) | 1 | 1 | No service until that Pod restarts with its PVC. |
+| `replicaCount=1` | 1 | 1 | No service until that Pod restarts with its PVC. |
 | `replicaCount=2` | 2 | 2 | The remaining Pod continues alone after `cluster_lease_timeout` ([automatic recovery](#automatic-recovery)). With `autoRecover.enabled=false`, there is no quorum for writes and admission closes until the missing voter restarts with its PVC. |
 | `replicaCount=2,additionalVoter.enabled=true` | 2 | 3 | The remaining majority serves MQTT. If one serving Pod fails, **one MQTT Pod plus the additional voter** can still commit writes. |
-| `replicaCount=3` | 3 | 3 | The two survivors keep serving; any voter can receive MQTT traffic. |
+| Default (`replicaCount=3`) | 3 | 3 | The two survivors keep serving; any voter can receive MQTT traffic. |
 
 [Automatic recovery](#automatic-recovery) is on in every topology. Set `autoRecover.enabled=false` to wait for quorum instead of giving up writes that only reached the lost side.
 
@@ -111,7 +111,7 @@ Use an IPv4 EKS cluster with Helm 3, [cert-manager](https://cert-manager.io/docs
    kubectl -n mqtt create secret tls mqtt-listener --cert=server-chain.pem --key=server.key
    ```
 
-3. Install from the repository root. This starts a **single durable voter**. For two client-facing brokers that must survive one broker failure, append `--set replicaCount=2,additionalVoter.enabled=true` on this first install.
+3. Install from the repository root. The default needs **three schedulable workers and three PVCs** so a rolling restart preserves a majority. For a single worker, append `--set replicaCount=1` on first install. For two client-facing brokers and a third voter, use `--set replicaCount=2,additionalVoter.enabled=true`.
 
    ```sh
    helm upgrade --install mqtt ./deploy/helm/mqextended -n mqtt \
@@ -138,7 +138,7 @@ Each voter gets a numbered StatefulSet, a stable peer Service IP, a PVC and its 
 
 Keep the namespace, release name, peer Services, CA and PVCs. Restart a Pod, **not** its Service: a numeric peer IP is part of committed membership. `helm uninstall` removes Services; retained PVCs alone do not make a new install a safe restore. Use the [cold restore procedure](#cold-backup-and-restore) for a lost installation.
 
-Do not use an HPA, `kubectl scale`, or a change to Helm replica counts to resize an existing cluster. The chart manages fixed topologies and rejects ordinary topology-changing upgrades. To move an existing installation, plan a [membership change](#changing-membership) separately.
+Do not use an HPA, `kubectl scale`, or a change to Helm replica counts to resize an existing cluster. The chart rejects topology-changing upgrades. When upgrading an installation made with the old singleton default, keep `replicaCount=1` in the release values. To resize, plan a [membership change](#changing-membership) separately.
 
 StatefulSets use `OnDelete` so their independent controllers cannot restart all voters together. After a chart upgrade changes the Pod template, the brokers check the Kubernetes API every 30 seconds. Once the StatefulSet controllers have caught up with the same Helm release revision, only the lowest-ID voter running an outdated Pod replaces itself. It waits for every voter Pod to exist and be Ready without terminating, for every voter to be Alive in its membership view, and for its own serving lease to be valid. Missing information or an API error pauses the rollout. Look for `Kubernetes voter rollout` in the broker logs. Wait for all Pods to reach their StatefulSets' update revisions and become Ready before starting another upgrade.
 

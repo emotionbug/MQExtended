@@ -3,13 +3,13 @@
 A clustered MQTT broker in Rust that replaces Mosquitto without changing clients.
 
 - **Mosquitto 2.1.4 compatibility.** Differential tests compare real MQTT 3.1, 3.1.1 and 5 client exchanges against Mosquitto. MQExtended reads Mosquitto password, ACL, dynamic-security and persistence files. Check [unsupported configuration directives](docs/mosquitto-compatibility.md#unsupported-directives) before migration; they are startup errors, not ignored settings.
-- **Active-active cluster.** Any client can connect to any node behind one load-balanced address. Sessions, subscriptions, retained messages and persistent queues are replicated with Raft; losing one node of three loses none of them, and the lost node's wills are published once. Nodes can be added, removed and replaced while the cluster serves traffic. Opt-in [automatic recovery](docs/cluster.md#automatic-recovery) keeps any cluster, two nodes included, serving through node loss without operator action, at the cost of losing unreplicated writes.
+- **Active-active cluster.** Any client can connect to any node behind one load-balanced address. Sessions, subscriptions, retained messages and persistent queues are replicated with Raft; losing one node of three loses none of them, and the lost node's wills are published once. Nodes can be added, removed and replaced while the cluster serves traffic. [Automatic recovery](docs/cluster.md#automatic-recovery) is enabled by default: after quorum loss a survivor can keep serving, at the cost of losing writes that only reached a discarded branch.
 - **Mosquitto's feature set.** TCP, TLS, WebSocket, Unix socket and PROXY protocol listeners; bridges (one owner per bridge in a cluster); persistence; built-in dynamic security with `mosquitto_ctrl`; built-in [mosquitto-auth-plug and mosquitto-go-auth](docs/auth-plugins.md) with their file, database, HTTP, JWT, LDAP and gRPC back-ends; `$SYS` topics and the HTTP API; systemd readiness, privilege drop and signals as the `mosquitto` process.
 - **Operations.** Mutual TLS between nodes, separate cluster status and MQTT readiness endpoints, Prometheus metrics, and a [cold restore procedure](docs/cluster.md#cold-backup-and-restore). Qualify persistent QoS latency on the target storage before production cutover; see [measured results and acceptance criteria](docs/performance.md).
 
 ## Quick start
 
-**EKS:** [Install with Helm](docs/cluster.md#quick-start-on-eks). Start with one durable broker on one worker, or choose a multi-voter topology. The chart supplies node IDs, stable peer addresses, per-voter mTLS and PVCs.
+**EKS:** [Install with Helm](docs/cluster.md#quick-start-on-eks). The default is three voting brokers on three workers, each with its own PVC. On a single worker, set `replicaCount=1` at install; MQTT will be unavailable during that Pod's restart.
 
 Build a [Linux bundle](docs/development.md#linux-broker-build) into a fresh directory. This does not install or start a service.
 
