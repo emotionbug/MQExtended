@@ -2,11 +2,12 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
 use crate::MAX_STORAGE_RESERVE;
+use crate::snapshot::SNAPSHOT_FILE;
 use crate::survivor::DISCARDED;
 
 pub(crate) const RESERVE_FILE: &str = "reserve.mqx";
@@ -53,6 +54,7 @@ pub(crate) fn read_space(_dir: &Path) -> io::Result<Space> {
 pub(crate) struct StorageMetrics {
     available: AtomicU64,
     reserve: AtomicU64,
+    pressure: AtomicBool,
 }
 
 impl StorageMetrics {
@@ -62,6 +64,10 @@ impl StorageMetrics {
             self.reserve.load(Ordering::Relaxed),
         )
     }
+
+    pub(crate) fn under_pressure(&self) -> bool {
+        self.pressure.load(Ordering::Relaxed)
+    }
 }
 
 pub(crate) struct Storage<F> {
@@ -69,7 +75,7 @@ pub(crate) struct Storage<F> {
     reserve_target: Option<u64>,
     read_space: F,
     metrics: Arc<StorageMetrics>,
-    pressure: bool,
+    reserve_released: bool,
 }
 
 impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
@@ -79,7 +85,7 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
             reserve_target,
             read_space,
             metrics: Arc::default(),
-            pressure: false,
+            reserve_released: false,
         };
         // A crash during preallocation can leave all the space in the staging
         // file instead. Remove it before statvfs and before the WAL opens.
@@ -100,7 +106,11 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
                 storage.metrics.reserve.store(bytes, Ordering::Relaxed);
             }
         }
-        storage.check(true);
+        let snapshot_size = storage
+            .report(regular(&storage.dir.join(SNAPSHOT_FILE)))
+            .flatten()
+            .map_or(0, |metadata| metadata.len());
+        storage.check(true, snapshot_size);
         storage
     }
 
@@ -108,12 +118,12 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
         self.metrics.clone()
     }
 
-    pub(crate) fn under_pressure(&self) -> bool {
-        self.pressure
+    pub(crate) fn reserve_released(&self) -> bool {
+        self.reserve_released
     }
 
     /// Return true on entry to a pressure episode, when Raft should compact early.
-    pub(crate) fn check(&mut self, sweep_archive: bool) -> bool {
+    pub(crate) fn check(&mut self, sweep_archive: bool, snapshot_size: u64) -> bool {
         let Some(Space { available, target }) = self.report((self.read_space)(&self.dir)) else {
             if sweep_archive {
                 let _ = self.report(self.expire_archive(false));
@@ -122,11 +132,11 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
         };
         let target = self.reserve_target.unwrap_or(target);
         let low = target != 0 && available < target;
-        let entered = low && !self.pressure;
+        let entered = low && !self.reserve_released;
         if entered {
             tracing::warn!(path = %self.dir.display(), available_bytes = available, reserve_target_bytes = target,
                 "Cluster data volume is low on space; releasing the reserve and discarding recovery archives");
-            self.pressure = true;
+            self.reserve_released = true;
         }
         let mut changed = false;
         if low
@@ -152,8 +162,8 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
                 changed = true;
                 let _ = self.report(self.sync_dir());
             }
-            if self.pressure && self.metrics.reserve.load(Ordering::Relaxed) == target {
-                self.pressure = false;
+            if self.reserve_released && self.metrics.reserve.load(Ordering::Relaxed) == target {
+                self.reserve_released = false;
                 tracing::info!(path = %self.dir.display(), reserve_bytes = target,
                     "Cluster data volume recovered; storage reserve restored");
             }
@@ -165,6 +175,17 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
             available
         };
         self.metrics.available.store(available, Ordering::Relaxed);
+        if cfg!(unix) {
+            self.metrics.pressure.store(
+                under_pressure(
+                    self.metrics.under_pressure(),
+                    available,
+                    target,
+                    snapshot_size,
+                ),
+                Ordering::Relaxed,
+            );
+        }
         entered
     }
 
@@ -219,6 +240,16 @@ impl<F: Fn(&Path) -> io::Result<Space>> Storage<F> {
             .inspect_err(|error| tracing::warn!(path = %self.dir.display(), %error, "Cluster storage maintenance failed"))
             .ok()
     }
+}
+
+fn under_pressure(active: bool, available: u64, reserve: u64, snapshot: u64) -> bool {
+    let headroom = reserve.saturating_add(snapshot);
+    let threshold = if active {
+        headroom.saturating_mul(2)
+    } else {
+        headroom
+    };
+    available < threshold
 }
 
 fn regular(path: &Path) -> io::Result<Option<fs::Metadata>> {
@@ -276,6 +307,16 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
+    fn snapshot_headroom_controls_pressure_with_hysteresis() {
+        let (reserve, snapshot) = (20, 30);
+        assert!(!under_pressure(false, 50, reserve, snapshot));
+        assert!(under_pressure(false, 49, reserve, snapshot));
+        assert!(under_pressure(true, 99, reserve, snapshot));
+        assert!(!under_pressure(true, 100, reserve, snapshot));
+        assert!(!under_pressure(false, 0, 0, 0));
+    }
+
+    #[test]
     fn reserve_target_is_five_percent_of_volume_clamped() {
         const MIB: u64 = 1024 * 1024;
         assert_eq!(Space::for_volume(0, 100 * MIB).target, 64 * MIB);
@@ -316,23 +357,23 @@ mod tests {
         assert!(reserve.metadata().unwrap().blocks() * 512 >= TARGET);
 
         available.set(TARGET);
-        assert!(!storage.check(false));
+        assert!(!storage.check(false, 0));
         assert!(reserve.is_file());
         available.set(TARGET - 1);
-        assert!(storage.check(false));
+        assert!(storage.check(false, 0));
         assert!(!reserve.exists());
         assert!(!archive.exists());
         assert_eq!(storage.metrics.bytes(), (TARGET - 1, 0));
         assert!(
-            !storage.check(false),
+            !storage.check(false, 0),
             "only one compaction request per episode"
         );
 
         available.set(3 * TARGET);
-        assert!(!storage.check(false));
+        assert!(!storage.check(false, 0));
         assert!(!reserve.exists());
         available.set(3 * TARGET + 1);
-        assert!(!storage.check(false));
+        assert!(!storage.check(false, 0));
         assert!(reserve.metadata().unwrap().blocks() * 512 >= TARGET);
         assert_eq!(storage.metrics.bytes(), (3 * TARGET + 1, TARGET));
         for name in live {
@@ -364,16 +405,16 @@ mod tests {
         assert!(!reserve.exists());
         assert_eq!(storage.metrics.bytes(), (0, 0));
         fs::create_dir(&archive).unwrap();
-        assert!(!storage.check(false));
+        assert!(!storage.check(false, 0));
         assert!(
             archive.is_dir(),
             "disabled reserve must not discard on pressure"
         );
         fs::remove_dir(&archive).unwrap();
         populate();
-        storage.check(false);
+        storage.check(false, 0);
         assert!(archive.exists());
-        storage.check(true);
+        storage.check(true, 0);
         assert!(!archive.exists());
 
         let other = root.join("other");

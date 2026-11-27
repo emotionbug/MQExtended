@@ -133,7 +133,7 @@ With `queue_qos0_messages true`, queued QoS 0 messages count against `max_queued
 
 ## Deliberate deviations
 
-| Deviation | Why it is invisible to clients |
+| Deviation | What you see |
 | --- | --- |
 | `$argon2id$` hashes are rejected | Mosquitto 2.1.4 builds without `WITH_ARGON2` by default and rejects them too |
 | Non-UTF-8 entries in `password_file` / `acl_file` are kept or dropped instead of matched byte-wise | MQTT usernames and topics are validated UTF-8, so such entries can never match |
@@ -141,6 +141,7 @@ With `queue_qos0_messages true`, queued QoS 0 messages count against `max_queued
 | `$SYS/broker/heap/*` is not published | Mosquitto only publishes it in builds with memory tracking, so clients cannot rely on it |
 | Persistence is written to `<persistence_file>.mqx`, not `mosquitto.db` | Clients see the same state after a restart; the Mosquitto file is read once for [migration](migration.md#5-carry-state-over) and left untouched for rollback |
 | A damaged persistence file starts the broker empty instead of exiting | `auto_recover` is on by default, so MQExtended moves a corrupt regular file to `<file>.discarded` and starts with empty state, where Mosquitto exits 1. With `auto_recover false` it refuses to overwrite the original: an unreadable, symbolic-link, nonregular or corrupt file, or an empty `.mqx`, stops the broker with exit status 1, and an empty `mosquitto.db` starts empty in both brokers. Automatic recovery leaves nonregular paths alone and retries a blocked native snapshot on subsequent saves. A valid replacement found there is not overwritten. Filesystem access errors are not evidence of corruption. |
+| [Cluster storage pressure](cluster.md#storage-and-state-growth) limits new durable state | Mosquitto keeps accepting new state while persistence writes fail. MQExtended keeps serving live traffic but stops storing nonempty retained publishes, drops new offline deliveries, and refuses new persistent sessions until space recovers. |
 | MQTT listener certificates reload when their configured files change, checked every 10 seconds, not only on SIGHUP | New TLS connections use the renewed certificate; existing connections stay open. SIGHUP still reloads certificates immediately |
 | A Unix listener refuses a non-socket path or a socket still accepting connections | A typo cannot replace an existing file or disconnect clients from a running listener. A stale socket is still reclaimed. Use a service-owned directory and serialize starts; pathname checks are not a lock against concurrent directory changes. |
 | `log_timestamp_format` is rendered by Chrono, not libc `strftime` | Identical for the standard conversions; only libc-specific extensions differ |

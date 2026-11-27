@@ -130,7 +130,10 @@ impl Broker {
                     detached: false,
                 }))
             }
-            ClaimResult::Stale | ClaimResult::Full | ClaimResult::Unauthorized => Ok(None),
+            ClaimResult::Stale
+            | ClaimResult::Full
+            | ClaimResult::Unauthorized
+            | ClaimResult::StoragePressure => Ok(None),
         }
     }
 

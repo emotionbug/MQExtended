@@ -102,6 +102,8 @@ pub struct ClusterMetrics {
     pub storage_available_bytes: u64,
     /// Bytes preallocated for emergencies, or zero while the reserve is released.
     pub storage_reserve_bytes: u64,
+    /// Free space is below the local headroom needed for another snapshot.
+    pub storage_pressure: bool,
     pub purged_index: Option<u64>,
     pub running: bool,
     pub auto_recover: bool,
@@ -744,6 +746,7 @@ impl<S: StateMachine> Cluster<S> {
             snapshot_size_bytes: self.0.core.store.snapshot_size(),
             storage_available_bytes,
             storage_reserve_bytes,
+            storage_pressure: self.0.core.storage.under_pressure(),
             purged_index: m.purged.map(|id| id.index),
             running: !*self.0.core.mesh.stop.borrow() && m.running_state.is_ok(),
             auto_recover: endpoint.recovery_timeout().is_some(),
@@ -1953,7 +1956,7 @@ impl<S: StateMachine> Core<S> {
         let mut poll = tokio::time::interval_at(Instant::now() + POLL, POLL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut next_sweep = Instant::now() + ARCHIVE_SWEEP;
-        let mut compact = storage.under_pressure();
+        let mut compact = storage.reserve_released();
         let mut compact_through = None;
         let raft_metrics = self.raft.metrics();
         loop {
@@ -1993,8 +1996,9 @@ impl<S: StateMachine> Core<S> {
             if sweep {
                 next_sweep = now + ARCHIVE_SWEEP;
             }
+            let snapshot_size = self.store.snapshot_size();
             match tokio::task::spawn_blocking(move || {
-                let entered_pressure = storage.check(sweep);
+                let entered_pressure = storage.check(sweep, snapshot_size);
                 (storage, entered_pressure)
             })
             .await

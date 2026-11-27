@@ -8,7 +8,7 @@ pub use bridge::{BridgeAck, BridgeIdentity, BridgeSession};
 pub use telemetry::SocketObservation;
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -164,6 +164,7 @@ struct Outbox {
 pub(super) enum ClaimResult {
     Accepted(Arc<Live>, bool),
     Full,
+    StoragePressure,
     Unauthorized,
     Stale,
 }
@@ -628,6 +629,16 @@ impl Broker {
         }
     }
 
+    /// Node IDs reporting storage pressure in this replica's applied state.
+    pub fn storage_pressure_nodes(&self) -> Vec<u64> {
+        match &self.0.log {
+            Log::Local { .. } => Vec::new(),
+            Log::Replicated(log) => log
+                .cluster
+                .read(|machine| machine.state.storage_pressure.iter().copied().collect()),
+        }
+    }
+
     // net.c: net__socket_accept checks accepted sockets, before MQTT CONNECT.
     fn admit(&self, info: &ConnectionInfo, peer: &connection::Address) -> Option<Permit<'_>> {
         if *self.0.shutdown.borrow() {
@@ -702,6 +713,7 @@ impl Broker {
                 let (lease, present) = match reply {
                     Reply::Claimed { lease, present } => (lease, present),
                     Reply::Full => return Ok(ClaimResult::Full),
+                    Reply::StoragePressure => return Ok(ClaimResult::StoragePressure),
                     Reply::Stale => return Ok(ClaimResult::Stale),
                     Reply::DynamicSecurityChanged => return Ok(ClaimResult::Unauthorized),
                     _ => unreachable!(),
@@ -779,6 +791,10 @@ impl Broker {
                     Reply::Full => {
                         pending.take();
                         return Ok(ClaimResult::Full);
+                    }
+                    Reply::StoragePressure => {
+                        pending.take();
+                        return Ok(ClaimResult::StoragePressure);
                     }
                     Reply::DynamicSecurityChanged => {
                         pending.take();
@@ -1578,6 +1594,7 @@ impl ReplicatedLog {
             Command::SetAcl { .. }
             | Command::InitDynamicSecurity(_)
             | Command::ReloadLimits(_)
+            | Command::StoragePressure { .. }
             | Command::ImportPersistence {
                 finish: Some(_), ..
             } => true,
@@ -1886,6 +1903,30 @@ impl StateMachine for Machine {
         }
     }
 
+    fn apply_with_retired(
+        &mut self,
+        index: u64,
+        command: Command,
+        retired: &BTreeSet<u64>,
+    ) -> Applied {
+        // A pressure report sent just before removal can be ordered after it.
+        let command = match command {
+            Command::StoragePressure { node, active } => Command::StoragePressure {
+                node,
+                active: active && !retired.contains(&node),
+            },
+            command => command,
+        };
+        self.apply(index, command)
+    }
+
+    fn on_members_removed(&mut self, index: u64, retired: &BTreeSet<u64>) {
+        if self.state.remove_retired_storage_pressure(retired) {
+            self.state.applied = index;
+            self.applied.send_replace(index);
+        }
+    }
+
     fn on_node_event(&mut self, event: NodeEvent) {
         let effects = self.state.node_event(event);
         self.emit(effects, false);
@@ -1897,6 +1938,11 @@ impl StateMachine for Machine {
 
     fn restore(&mut self, bytes: &[u8]) -> Result<(), ClusterError> {
         let previous = self.state.restore(bytes)?;
+        if previous.storage_pressure.is_empty() && !self.state.storage_pressure.is_empty() {
+            tracing::warn!(nodes = ?self.state.storage_pressure, "Cluster storage pressure is active");
+        } else if !previous.storage_pressure.is_empty() && self.state.storage_pressure.is_empty() {
+            tracing::warn!(nodes = ?previous.storage_pressure, "Cluster storage pressure has cleared");
+        }
         let previous_dynamic = previous.dynamic_policy().map(|(revision, _)| revision);
         let skipped = self.state.applied > previous.applied;
         let mut runtime = self.runtime.lock().unwrap();
@@ -2286,6 +2332,15 @@ async fn cluster_maintenance(
                     if let Err(error) = log.ensure_boot().await {
                         tracing::debug!(%error, "could not commit local broker incarnation");
                     }
+                }
+                let node = log.owner.node;
+                let active = metrics.storage_pressure;
+                if leader.is_some()
+                    && log.boot.get().is_some()
+                    && log.cluster.read(|machine| machine.state.storage_pressure.contains(&node)) != active
+                    && let Err(error) = log.submit(Command::StoragePressure { node, active }).await
+                {
+                    tracing::debug!(%error, node, active, "could not commit local storage pressure");
                 }
                 if leader == Some(log.owner.node) {
                     let now = wall_now();

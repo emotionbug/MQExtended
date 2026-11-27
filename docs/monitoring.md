@@ -44,7 +44,7 @@ Access works as in Mosquitto: only `GET`; HTTP Basic credentials are checked aga
 
 ## Cluster status
 
-`/api/v1/mqx/cluster` returns this node's view as JSON: the MQExtended version, the applied membership (generation, desired and current members with their role and liveness, retired ids, and the reason for a refused change) and Raft progress (term, leader, last log, committed and applied indexes). A standalone broker answers `{"mode":"standalone", ...}`. Use it to watch a [membership change](cluster.md#changing-membership) converge; a removed node keeps serving it.
+`/api/v1/mqx/cluster` returns this node's view as JSON: the MQExtended version, the applied membership (generation, desired and current members with their role and liveness, retired ids, and the reason for a refused change), `storage_pressure` (member IDs reporting pressure in the applied state), and Raft progress (term, leader, last log, committed and applied indexes). A standalone broker answers `{"mode":"standalone", ...}`. Use it to watch a [membership change](cluster.md#changing-membership) converge; a removed node keeps serving it.
 
 ## Prometheus metrics
 
@@ -52,4 +52,4 @@ Access works as in Mosquitto: only `GET`; HTTP Basic credentials are checked aga
 
 On cluster nodes, `mqx_raft_wal_appended_entries_total` and `mqx_raft_wal_sync_batches_total` show how many entries share a WAL sync batch. `mqx_raft_wal_sync_seconds_total` records time spent syncing WAL files. Compare `mqx_raft_wal_sync_max_seconds`, `mqx_raft_wal_write_max_seconds` and `mqx_raft_wal_queue_wait_max_seconds` with proposal latency to separate long filesystem syncs from writes or time spent waiting for the WAL worker. The maxima are for completed work since node startup, not a scrape interval.
 
-`mqx_raft_snapshot_size_bytes` is the size of this node's current `snapshot.mpk`, or 0 before its first snapshot. Alert well before it reaches the smallest `cluster_max_snapshot_size` among the members. `mqx_storage_available_bytes` is the free space on the `cluster_data_dir` volume and `mqx_storage_reserve_bytes` the space the node holds back for itself, 0 while it has released it because the volume is low; see [storage and state growth](cluster.md#storage-and-state-growth). A reserve of 0 means the node is already protecting itself and the volume needs more room.
+`mqx_raft_snapshot_size_bytes` is the size of this node's current `snapshot.mpk`, or 0 before its first snapshot. Alert well before it reaches the smallest `cluster_max_snapshot_size` among the members. `mqx_storage_available_bytes` is the free space on the `cluster_data_dir` volume, and `mqx_storage_reserve_bytes` is the number of bytes the node has preallocated as a reserve. Alert when `mqx_storage_pressure` is 1 on any node (0 means that node is not under pressure). See [storage and state growth](cluster.md#storage-and-state-growth) for what clients see.

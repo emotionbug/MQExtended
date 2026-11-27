@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BrokerConfig, ReloadableLimits,
     inbox::{
-        Ack, Delivery, Inbox, Message, Offer, Outbound, OutboundPrefix, PublishProperty, Publisher,
-        Receive,
+        Ack, Delivery, Inbox, Message, Offer, OfflineQueue, Outbound, OutboundPrefix,
+        PublishProperty, Publisher, Receive,
     },
     persistence::PendingImport,
     retained::Retained,
@@ -104,6 +104,10 @@ pub(crate) enum Command {
         now: Duration,
         target: VerdictTarget,
         verdicts: Vec<ResolvedVerdict>,
+    },
+    StoragePressure {
+        node: u64,
+        active: bool,
     },
 }
 
@@ -391,6 +395,7 @@ pub(crate) enum Reply {
     ControlAccepted { changed: bool },
     ExternalAclError,
     RetainedAclError,
+    StoragePressure,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,12 +480,15 @@ pub(crate) struct State {
     limits: Option<ReloadableLimits>,
     #[serde(default)]
     verdicts: VerdictCache,
-    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    // A MessagePack array cannot omit this field before storage_pressure.
+    #[serde(default)]
     pending_wills: VecDeque<PendingWill>,
     #[serde(skip)]
     pending_sessions: BTreeSet<Arc<str>>,
     #[serde(skip)]
     external_plugins: ExternalPlugins,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) storage_pressure: BTreeSet<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +519,14 @@ impl Session {
         self.v5
             .as_ref()
             .map_or(self.inbox.is_some(), |v5| v5.session_expiry != 0)
+    }
+
+    fn delivery_online(&self) -> bool {
+        self.owner.is_some()
+            && self
+                .internal_bridge
+                .as_ref()
+                .is_none_or(|bridge| bridge.online)
     }
 
     fn can_batch_outbound(&self) -> bool {
@@ -633,6 +649,36 @@ impl State {
 
     pub(crate) fn config(&self) -> &Arc<BrokerConfig> {
         &self.config
+    }
+
+    fn set_storage_pressure(&mut self, node: u64, active: bool) {
+        if active {
+            let was_empty = self.storage_pressure.is_empty();
+            self.storage_pressure.insert(node);
+            if was_empty {
+                tracing::warn!(nodes = ?self.storage_pressure, "Cluster storage pressure is active");
+            }
+        } else if self.storage_pressure.remove(&node) && self.storage_pressure.is_empty() {
+            tracing::warn!(nodes = ?[node], "Cluster storage pressure has cleared");
+        }
+    }
+
+    pub(crate) fn remove_retired_storage_pressure(&mut self, retired: &BTreeSet<u64>) -> bool {
+        let previous = self.storage_pressure.len();
+        if previous == 0 {
+            return false;
+        }
+        if self
+            .storage_pressure
+            .iter()
+            .all(|node| retired.contains(node))
+        {
+            tracing::warn!(nodes = ?self.storage_pressure, "Cluster storage pressure has cleared");
+            self.storage_pressure.clear();
+        } else {
+            self.storage_pressure.retain(|node| !retired.contains(node));
+        }
+        self.storage_pressure.len() != previous
     }
 
     fn set_limits(&mut self, limits: ReloadableLimits) {
@@ -1049,6 +1095,10 @@ impl State {
                 self.set_limits(limits);
                 Reply::NoChange
             }
+            Command::StoragePressure { node, active } => {
+                self.set_storage_pressure(node, active);
+                Reply::NoChange
+            }
             Command::SetAcl {
                 security,
                 text,
@@ -1439,6 +1489,20 @@ impl State {
             return Reply::Stale;
         }
         let id = claim.publisher.id.clone();
+        // MQExtended refuses new persistent MQTT sessions under storage pressure.
+        if !self.storage_pressure.is_empty()
+            && claim.internal_bridge.is_none()
+            && claim
+                .v5
+                .as_ref()
+                .map_or(!claim.clean_start, |v5| v5.session_expiry != 0)
+            && self
+                .sessions
+                .get(&id)
+                .is_none_or(|session| session.expires.is_some_and(|at| at <= claim.now))
+        {
+            return Reply::StoragePressure;
+        }
         if claim.internal_bridge.is_none() && !self.has_capacity_for(&id) {
             return Reply::Full;
         }
@@ -1965,6 +2029,7 @@ impl State {
             effects,
             counters: &mut self.sys_counters,
             persistence_changes: &mut self.persistence_changes,
+            storage_pressure: !self.storage_pressure.is_empty(),
         };
         let session = self.sessions.get_mut(id).unwrap();
         let mut codes = Vec::with_capacity(filters.len());
@@ -2122,6 +2187,7 @@ impl State {
         effects: &mut Vec<Effect>,
     ) -> bool {
         let topic = &message.topic;
+        let storage_pressure = !self.storage_pressure.is_empty();
         self.last_message += 1;
         let mut router = Router {
             sessions: &mut self.sessions,
@@ -2141,6 +2207,7 @@ impl State {
                 effects,
                 counters: &mut self.sys_counters,
                 persistence_changes: &mut self.persistence_changes,
+                storage_pressure,
             },
         };
         // subs.c: sub__messages_queue searches the normal tree before shared.
@@ -2158,10 +2225,16 @@ impl State {
             });
         }
         let matched = router.matched;
-        if message.retain {
+        // MQExtended still routes retained publications live under pressure.
+        if message.retain && (!storage_pressure || message.payload.is_empty()) {
             // retain.c: retain__store counts writes and clears outside $SYS.
             self.persistence_changes += u64::from(!topic.starts_with("$SYS"));
-            self.store_retained(&message, context.now, Some(context.now));
+            if !storage_pressure {
+                self.store_retained(&message, context.now, Some(context.now));
+            } else {
+                // Under pressure a tombstone must not create a topic path.
+                self.retained.clear_existing(&message);
+            }
         }
         matched
     }
@@ -2249,6 +2322,7 @@ struct DeliverySink<'a> {
     effects: &'a mut Vec<Effect>,
     counters: &'a mut Values,
     persistence_changes: &'a mut u64,
+    storage_pressure: bool,
 }
 
 impl DeliverySink<'_> {
@@ -2259,22 +2333,17 @@ impl DeliverySink<'_> {
         decision: AclDecision,
         check: PendingCheck,
     ) {
+        let drop_offline = self.storage_pressure && !session.delivery_online();
         match decision {
-            AclDecision::Allow if session.pending.is_empty() => {
-                deliver(
-                    session,
-                    packet,
-                    self.config,
-                    self.effects,
-                    self.counters,
-                    self.persistence_changes,
-                );
-            }
+            AclDecision::Allow if session.pending.is_empty() || drop_offline => {}
+            // Do not create an offline backlog of unresolved ACL checks either.
+            AclDecision::Missing(_) if drop_offline => {}
             AclDecision::Allow => {
                 session.pending.push_back(PendingDelivery {
                     packet,
                     check: PendingCheck::Allowed,
                 });
+                return;
             }
             AclDecision::Missing(key) => {
                 if session.pending.is_empty() {
@@ -2285,9 +2354,19 @@ impl DeliverySink<'_> {
                     });
                 }
                 session.pending.push_back(PendingDelivery { packet, check });
+                return;
             }
-            AclDecision::Deny | AclDecision::Error => {}
+            AclDecision::Deny | AclDecision::Error => return,
         }
+        deliver(
+            session,
+            packet,
+            self.config,
+            self.effects,
+            self.counters,
+            self.persistence_changes,
+            self.storage_pressure,
+        );
     }
 }
 
@@ -2298,25 +2377,17 @@ fn deliver(
     effects: &mut Vec<Effect>,
     counters: &mut Values,
     persistence_changes: &mut u64,
+    storage_pressure: bool,
 ) {
+    let online = session.delivery_online();
     if let Some(inbox) = &mut session.inbox {
-        let (online, queue_qos0, clean_offline) = if let Some(bridge) = &session.internal_bridge {
-            (
-                session.owner.is_some() && bridge.online,
-                bridge.lazy,
-                bridge.local_clean,
-            )
-        } else {
-            (session.owner.is_some(), false, false)
+        let bridge = session.internal_bridge.as_ref();
+        let queue = OfflineQueue {
+            queue_qos0: bridge.is_some_and(|bridge| bridge.lazy),
+            clean: bridge.is_some_and(|bridge| bridge.local_clean),
+            pressure: storage_pressure,
         };
-        match inbox.offer_with_offline(
-            packet,
-            online,
-            session.max_qos,
-            config,
-            queue_qos0,
-            clean_offline,
-        ) {
+        match inbox.offer_with_offline(packet, online, session.max_qos, config, queue) {
             Offer::Ready => effects.push(Effect::Ready(Lease {
                 id: session.publisher.id.clone(),
                 epoch: session.epoch,
@@ -2331,7 +2402,7 @@ fn deliver(
                 *persistence_changes += 1;
                 // database.c: db__message_insert_outgoing arms a lazy bridge
                 // only for a new insertion while its transport is offline.
-                if !online && queue_qos0 && session.owner.is_some() {
+                if !online && queue.queue_qos0 && session.owner.is_some() {
                     effects.push(Effect::BridgeQueued {
                         owner: session.epoch,
                         pending: inbox.outgoing_count(),
@@ -2524,6 +2595,137 @@ mod tests {
                 verdicts: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn storage_pressure_sheds_new_durable_state_until_cleared() {
+        let mut state = State::new(Arc::new(BrokerConfig::default()));
+        let offline = Arc::<str>::from("offline");
+        let live = Arc::<str>::from("live");
+        for (id, transient) in [(&offline, false), (&live, true)] {
+            let Reply::Claimed { lease, .. } = state.apply(claim(id.clone(), transient)).reply
+            else {
+                panic!("claim failed");
+            };
+            state.apply(Command::Act(
+                lease.clone(),
+                Operation::Subscribe(
+                    vec![SubscriptionRequest::legacy((
+                        "topic".into(),
+                        QoS::AtLeastOnce,
+                    ))],
+                    Duration::ZERO,
+                ),
+            ));
+            if !transient {
+                state.apply(Command::Act(
+                    lease,
+                    Operation::Disconnect {
+                        now: Duration::ZERO,
+                        graceful: true,
+                        expiry: None,
+                    },
+                ));
+            }
+        }
+        let source = state.sessions[&live].publisher.clone();
+        let publish = |state: &mut State, payload: &'static [u8]| {
+            let mut effects = Vec::new();
+            state.publish(
+                Arc::new(Message {
+                    source: source.clone(),
+                    topic: "topic".into(),
+                    payload: Bytes::from_static(payload),
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    properties: Vec::new(),
+                    expires: None,
+                }),
+                Duration::ZERO,
+                &mut effects,
+            );
+            effects
+        };
+        let queued = |state: &State| {
+            state.sessions[&offline]
+                .inbox
+                .as_ref()
+                .unwrap()
+                .outgoing_count()
+        };
+        publish(&mut state, b"kept");
+        assert_eq!(queued(&state), 1);
+        state.apply(Command::StoragePressure {
+            node: 1,
+            active: true,
+        });
+        let mut restored = State::new(Arc::new(BrokerConfig::default()));
+        restored.restore(&state.snapshot()).unwrap();
+        assert_eq!(restored.storage_pressure, BTreeSet::from([1]));
+
+        let effects = publish(&mut state, b"live only");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Deliver { packet, .. } if packet.message.payload == b"live only"[..]
+        )));
+        assert!(effects.contains(&Effect::QueueFull(offline.clone())));
+        assert_eq!(state.sys_counters.get(Metric::Dropped), 1);
+        assert_eq!(queued(&state), 1);
+        state
+            .retained
+            .for_each(|message| assert_eq!(message.payload, b"kept"[..]));
+        assert_eq!(state.retained.count(), 1);
+        publish(&mut state, b"");
+        assert_eq!(state.retained.count(), 0);
+
+        let new = Arc::<str>::from("new");
+        assert_eq!(
+            state.apply(claim(new.clone(), false)).reply,
+            Reply::StoragePressure
+        );
+        let mut v5_claim = claim(new.clone(), true);
+        let Command::Claim { request, .. } = &mut v5_claim else {
+            unreachable!()
+        };
+        request.v5 = Some(SessionSettings {
+            session_expiry: 60,
+            receive_maximum: None,
+            will_delay: 0,
+            will_expiry: 0,
+            will_properties: Vec::new(),
+        });
+        assert_eq!(state.apply(v5_claim).reply, Reply::StoragePressure);
+        assert!(matches!(
+            state.apply(claim(Arc::from("clean"), true)).reply,
+            Reply::Claimed { present: false, .. }
+        ));
+        let Reply::Claimed {
+            lease,
+            present: true,
+        } = state.apply(claim(offline.clone(), false)).reply
+        else {
+            panic!("existing session must resume");
+        };
+        state.apply(Command::Act(
+            lease,
+            Operation::Disconnect {
+                now: Duration::ZERO,
+                graceful: true,
+                expiry: None,
+            },
+        ));
+
+        state.apply(Command::StoragePressure {
+            node: 1,
+            active: false,
+        });
+        publish(&mut state, b"stored again");
+        assert_eq!(queued(&state), 2);
+        assert_eq!(state.retained.count(), 1);
+        assert!(matches!(
+            state.apply(claim(new, false)).reply,
+            Reply::Claimed { .. }
+        ));
     }
 
     #[test]

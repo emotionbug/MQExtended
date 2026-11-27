@@ -17,7 +17,7 @@ mod transport;
 mod version;
 mod wal;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
@@ -93,6 +93,19 @@ pub trait StateMachine: Send + Sync + 'static {
     /// snapshot; installing a snapshot does not re-apply entries it already covers.
     /// Process-local effects are the application's responsibility.
     fn apply(&mut self, index: u64, command: Self::Command) -> Self::Response;
+
+    /// Apply a command with the permanent removals committed before it.
+    fn apply_with_retired(
+        &mut self,
+        index: u64,
+        command: Self::Command,
+        _retired: &BTreeSet<u64>,
+    ) -> Self::Response {
+        self.apply(index, command)
+    }
+
+    /// Forget application state tied to members removed at this log index.
+    fn on_members_removed(&mut self, _index: u64, _retired: &BTreeSet<u64>) {}
 
     /// Handle a replicated liveness transition in the same state machine and at the same
     /// index on every replica. Change replicated state here, not in a broadcast consumer.

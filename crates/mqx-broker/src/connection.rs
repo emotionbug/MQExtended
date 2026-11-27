@@ -226,6 +226,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         ClaimResult::Full if options.is_some() => {
             return refuse_v5(&mut wire, &mut shutdown, config, &info, R::SERVER_BUSY).await;
         }
+        ClaimResult::StoragePressure => {
+            if options.is_some() {
+                return refuse_v5(&mut wire, &mut shutdown, config, &info, R::QUOTA_EXCEEDED).await;
+            }
+            return refuse(&mut wire, &mut shutdown, Code::ServerUnavailable).await;
+        }
         ClaimResult::Unauthorized => {
             log_refusal(
                 broker,

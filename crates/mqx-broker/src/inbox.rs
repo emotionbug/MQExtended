@@ -246,6 +246,13 @@ pub(crate) enum Offer {
     Suppressed,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OfflineQueue {
+    pub(crate) queue_qos0: bool,
+    pub(crate) clean: bool,
+    pub(crate) pressure: bool,
+}
+
 pub(crate) enum Receive {
     Accepted,
     Quota,
@@ -373,7 +380,7 @@ impl Inbox {
         max_qos: QoS,
         config: &BrokerConfig,
     ) -> Offer {
-        self.offer_with_offline(delivery, online, max_qos, config, false, false)
+        self.offer_with_offline(delivery, online, max_qos, config, OfflineQueue::default())
     }
 
     pub(crate) fn allocate_mid(&mut self) -> PacketId {
@@ -397,8 +404,7 @@ impl Inbox {
         online: bool,
         max_qos: QoS,
         config: &BrokerConfig,
-        queue_qos0: bool,
-        clean_offline: bool,
+        queue: OfflineQueue,
     ) -> Offer {
         let id = if delivery.qos == QoS::AtMostOnce {
             None
@@ -410,14 +416,16 @@ impl Inbox {
         }
         // database.c: db__message_insert_outgoing checks QoS 0 admission per insertion.
         if !online
-            && (clean_offline
-                || delivery.qos == QoS::AtMostOnce && !(config.queue_qos0_messages || queue_qos0))
+            && (queue.clean
+                || delivery.qos == QoS::AtMostOnce
+                    && !(config.queue_qos0_messages || queue.queue_qos0))
         {
             return Offer::Suppressed;
         }
         let ready = online && self.flight_available(delivery.qos, config);
         if !ready
             && ((online && delivery.qos == QoS::AtMostOnce)
+                || (!online && queue.pressure)
                 || !self.queue_available(online, config))
         {
             return if std::mem::replace(&mut self.dropped, true) {

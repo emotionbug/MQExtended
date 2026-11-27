@@ -38,13 +38,27 @@ impl Retained {
     // retain.c: retain__store creates hierarchy entries before processing a
     // tombstone. Only clearing an existing retained message prunes its path.
     pub(crate) fn store(&mut self, message: &Arc<Message>, stored_at: Option<Duration>) {
+        self.store_inner(message, stored_at, true);
+    }
+
+    pub(crate) fn clear_existing(&mut self, message: &Arc<Message>) {
+        debug_assert!(message.payload.is_empty());
+        self.store_inner(message, None, false);
+    }
+
+    fn store_inner(
+        &mut self,
+        message: &Arc<Message>,
+        stored_at: Option<Duration>,
+        create_path: bool,
+    ) {
         let topic = &message.topic;
         let root = if topic.starts_with('$') {
             &mut self.dollar
         } else {
             &mut self.ordinary
         };
-        root.store(topic.split('/'), message, stored_at);
+        root.store(topic.split('/'), message, stored_at, create_path);
     }
 
     pub(crate) fn visit(
@@ -162,6 +176,7 @@ impl Branch {
         mut levels: Split<'_, char>,
         message: &Arc<Message>,
         stored_at: Option<Duration>,
+        create_path: bool,
     ) -> bool {
         let Some(level) = levels.next() else {
             if message.payload.is_empty() {
@@ -174,10 +189,12 @@ impl Branch {
         };
         let child = if let Some(index) = self.children.get_index_of(level) {
             self.children.get_index_mut(index).unwrap().1
-        } else {
+        } else if create_path {
             self.children.entry(level.into()).or_default()
+        } else {
+            return false;
         };
-        if child.store(levels, message, stored_at) {
+        if child.store(levels, message, stored_at, create_path) {
             self.children.shift_remove(level);
             return self.children.is_empty() && self.message.is_none();
         }

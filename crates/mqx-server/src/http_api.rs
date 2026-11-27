@@ -234,6 +234,7 @@ fn cluster_status(broker: &Broker) -> serde_json::Value {
         "mode": "cluster",
         "mqx_version": env!("CARGO_PKG_VERSION"),
         "membership": membership,
+        "storage_pressure": broker.storage_pressure_nodes(),
         "auto_recover": metrics.auto_recover,
         "incarnation": metrics.incarnation,
         "last_survivor_event": metrics.last_survivor_event,
@@ -280,6 +281,7 @@ async fn prometheus(broker: &Broker) -> String {
                 metrics.storage_available_bytes,
             ),
             ("mqx_storage_reserve_bytes", metrics.storage_reserve_bytes),
+            ("mqx_storage_pressure", u64::from(metrics.storage_pressure)),
         ] {
             writeln!(body, "# TYPE {name} gauge\n{name} {value}").unwrap();
         }

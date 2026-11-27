@@ -143,6 +143,7 @@ impl State {
                         effects,
                         counters: &mut self.sys_counters,
                         persistence_changes: &mut self.persistence_changes,
+                        storage_pressure: !self.storage_pressure.is_empty(),
                     }
                     .send(
                         session,

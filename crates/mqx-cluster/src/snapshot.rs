@@ -318,11 +318,15 @@ impl<S: StateMachine> Applied<S> {
             EntryPayloadOf::<Types>::Blank => Ok(None),
             EntryPayload::Membership(membership) => {
                 let previous = std::mem::take(&mut self.membership);
+                let retired_count = self.retired.len();
                 self.retired.extend(
                     previous
                         .nodes()
                         .filter_map(|(&id, _)| membership.get_node(&id).is_none().then_some(id)),
                 );
+                if self.retired.len() != retired_count {
+                    self.app.on_members_removed(log_id.index, &self.retired);
+                }
                 for (&id, _) in membership.nodes() {
                     self.leases.ensure(id);
                 }
@@ -332,7 +336,9 @@ impl<S: StateMachine> Applied<S> {
             }
             EntryPayload::Normal(Command::App(body)) => {
                 let command = version::command::<S>(&body).map_err(invalid_data)?;
-                let response = self.app.apply(log_id.index, command);
+                let response = self
+                    .app
+                    .apply_with_retired(log_id.index, command, &self.retired);
                 if respond {
                     encode(&response)
                         .map(|bytes| Some(bytes.into()))

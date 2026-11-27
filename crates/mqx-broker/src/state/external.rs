@@ -687,6 +687,7 @@ impl State {
                         effects,
                         &mut self.sys_counters,
                         &mut self.persistence_changes,
+                        !self.storage_pressure.is_empty(),
                     );
                 }
             }
