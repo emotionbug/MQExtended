@@ -12,7 +12,8 @@ pub struct SubscriptionIndex<K, V> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Branch<K, V> {
-    children: BTreeMap<Box<str>, Self>,
+    // Sparse literal paths shouldn't reserve space for full branches in unused B-tree slots.
+    children: BTreeMap<Box<str>, Box<Self>>,
     // Literal-only routing needs one map lookup per level, not a lookup
     // for each possible wildcard too.
     plus: Option<Box<Self>>,
@@ -47,7 +48,7 @@ impl<K: Eq, V> SubscriptionIndex<K, V> {
         let filter = c_str(filter);
         let mut branch = self.root_mut(filter);
         for level in filter.split('/') {
-            branch = match level {
+            let child = match level {
                 "+" => branch.plus.get_or_insert_with(Box::default),
                 "#" => branch.hash.get_or_insert_with(Box::default),
                 _ => {
@@ -58,6 +59,7 @@ impl<K: Eq, V> SubscriptionIndex<K, V> {
                     }
                 }
             };
+            branch = child.as_mut();
         }
         if let Some((_, previous)) = branch.entries.iter_mut().find(|(entry, _)| *entry == key) {
             Ok(Some(std::mem::replace(previous, value)))
@@ -242,5 +244,26 @@ mod tests {
         assert_eq!(matching(&index, "$d/"), [4]);
         index.insert("a/+", 6, 6).unwrap();
         assert_eq!(matching(&index, "a/"), [3, 6]);
+    }
+
+    #[test]
+    fn removing_literal_path_prunes_only_unused_branches() {
+        let mut index = SubscriptionIndex::default();
+        for (filter, id) in [
+            ("devices/a", 1),
+            ("devices/a/events/current", 2),
+            ("devices/b/events/current", 3),
+        ] {
+            index.insert(filter, id, id).unwrap();
+        }
+
+        assert_eq!(index.remove("devices/a/events/current", &2), Some(2));
+        let devices = &index.ordinary.children["devices"];
+        assert!(devices.children["a"].children.is_empty());
+        assert!(devices.children.contains_key("b"));
+
+        assert_eq!(index.remove("devices/a", &1), Some(1));
+        assert_eq!(index.remove("devices/b/events/current", &3), Some(3));
+        assert_eq!(index, SubscriptionIndex::default());
     }
 }

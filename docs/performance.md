@@ -31,6 +31,18 @@ Use `--require-p99-below-ms` with a target `--rate` for release qualification. `
 
 ## Current numbers
 
+### Sparse device subscriptions and retained metrics
+
+One standalone Linux release process per revision, two Tokio workers, loopback MQTT 3.1.1, persistence and periodic `$SYS` publishing disabled. One clean client subscribed to 40,000 exact filters (`subs/device-{id}/state/current`, 100 per SUBSCRIBE). RSS growth is measured from the connected, empty broker to the last SUBACK, before any retained publishes. The same client then published 40,000 disjoint retained topics with 32-byte payloads. HTTP timings cover the entire `/metrics` response on a persistent connection: 10 warmups, then 50 measured requests.
+
+| Measurement | Before (`cf2b981`) | After |
+| --- | ---: | ---: |
+| RSS growth from subscriptions | 88.52 MiB | 46.43 MiB |
+| `/metrics` median | 2.486 ms | 0.123 ms |
+| `/metrics` p95 | 2.605 ms | 0.150 ms |
+
+The subscription index no longer reserves space for an entire child branch in each literal map slot. The retained gauge uses a maintained count rather than walking the retained tree on every scrape. These results describe a sparse topic layout, not a general throughput or cluster benchmark. A subsequent QoS 1 check on each populated process (eight one-to-one pairs, 2,000 publishes/s offered for three seconds) finished with every publish acknowledged and no lost or duplicate deliveries.
+
 ### Clean sessions: optimized Mosquitto vs. optimized MQExtended
 
 Linux, Ryzen 5 2600X (6 cores / 12 threads), loopback MQTT, 64 one-to-one QoS 1 pairs, 256-byte payloads, 20 outstanding handshakes per publisher. Mosquitto 2.1.4 ran as one process; MQExtended had two Tokio workers **per process**, three processes and mTLS between voters for the cluster. These are deployment throughput comparisons on one host, not equal-CPU efficiency measurements. Both MQExtended revisions were checksum-verified CI release builds. Broker processes and connections were fresh for each run.

@@ -18,6 +18,19 @@ impl Store {
         }
     }
 
+    fn totals_with_retained(&self, retained: &Retained) -> (i64, i64) {
+        let (mut count, mut bytes) = (self.count(), self.bytes());
+        // Each message has one retained slot. Only references already seen
+        // outside the tree can overlap.
+        retained.for_each(|message| {
+            if !self.seen.contains(&Arc::as_ptr(message)) {
+                count += 1;
+                bytes += message.payload.len() as i64;
+            }
+        });
+        (count, bytes)
+    }
+
     pub(crate) fn count(&self) -> i64 {
         self.seen.len() as i64
     }
@@ -41,8 +54,7 @@ impl State {
         values.set(Metric::Retained, self.retained.count());
     }
 
-    fn visit_store(&self, store: &mut Store) {
-        self.retained.for_each(|message| store.visit(message));
+    fn visit_persistent_store(&self, store: &mut Store) {
         for inbox in self
             .sessions
             .values()
@@ -57,8 +69,8 @@ impl State {
         // Only the leader counts base records; deterministic apply uses that
         // observation rather than independently relying on pointer identity.
         let mut store = Store::default();
-        self.visit_store(&mut store);
-        let (mut count, mut bytes) = (store.count(), store.bytes());
+        self.visit_persistent_store(&mut store);
+        let (mut count, mut bytes) = store.totals_with_retained(&self.retained);
         if self.config.retain_available {
             let startup = startup && self.sys.wall.is_none();
             let uptime = if startup { 0 } else { self.sys.uptime(now) };
@@ -66,14 +78,16 @@ impl State {
                 count += 1;
                 bytes += VERSION_PAYLOAD.len() as i64;
             }
-            let mut previous = None;
-            self.retained.for_each(|message| {
-                if message.topic.as_ref() == UPTIME_TOPIC && Arc::strong_count(message) == 1 {
-                    previous = Some(message.payload.len() as i64);
-                }
-            });
-            count += i64::from(previous.is_none());
-            bytes += format!("{uptime} seconds").len() as i64 - previous.unwrap_or(0);
+            if let Some(previous) = self
+                .retained
+                .get(UPTIME_TOPIC)
+                .filter(|message| Arc::strong_count(message) == 1)
+            {
+                bytes -= previous.payload.len() as i64;
+            } else {
+                count += 1;
+            }
+            bytes += i64::from(uptime.checked_ilog10().unwrap_or(0)) + "0 seconds".len() as i64;
         }
         (count, bytes)
     }
@@ -127,7 +141,7 @@ impl State {
         self.gauges(&mut values);
         let (stored, bytes) = cluster_store.unwrap_or_else(|| {
             let mut store = Store::default();
-            self.visit_store(&mut store);
+            self.visit_persistent_store(&mut store);
             transient_store(&mut store);
             // With retain_available false, uptime may be queued only for
             // transient subscribers; its base record is live until dispatch.
@@ -136,7 +150,7 @@ impl State {
                     store.visit(&packet.message);
                 }
             }
-            (store.count(), store.bytes())
+            store.totals_with_retained(&self.retained)
         });
         values.set(Metric::Stored, stored);
         values.set(Metric::StoredBytes, bytes);
@@ -177,5 +191,109 @@ impl State {
             now,
             effects,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::{PersistentOutgoing, PersistentSession, PersistentState};
+
+    #[test]
+    fn standalone_store_deduplicates_retained_and_deliveries() {
+        let mut state = State::default();
+        let mut effects = Vec::new();
+        for (topic, payload) in [("shared", b"abc".as_slice()), ("retained-only", b"other")] {
+            state.publish_system(
+                topic,
+                Bytes::from_static(payload),
+                Duration::ZERO,
+                None,
+                &mut effects,
+            );
+        }
+        let shared = state.retained.get("shared").unwrap().clone();
+        for message in [shared.clone(), Arc::new((*shared).clone())] {
+            effects.push(Effect::Deliver {
+                owner: 1,
+                packet: Delivery {
+                    message,
+                    qos: QoS::ExactlyOnce,
+                    retain: false,
+                    dedup_id: None,
+                    subscription_identifier: 0,
+                },
+            });
+        }
+        state.sample_sys(
+            Tick {
+                wall: 1,
+                now: 1,
+                startup: false,
+                nodes: BTreeMap::new(),
+                cluster_store: None,
+            },
+            &mut effects,
+            |store| {
+                store.visit(&shared);
+                store.visit(&shared);
+            },
+        );
+        let tree = state.sys.snapshot(1);
+        let sample = |key| {
+            tree.entries()
+                .find(|&(topic, _)| topic == key)
+                .map(|(_, n)| n)
+        };
+        assert_eq!(sample("$SYS/broker/messages/stored"), Some(4));
+        assert_eq!(sample("$SYS/broker/store/messages/bytes"), Some(20));
+    }
+
+    #[test]
+    fn cluster_store_projects_uptime_replacement_from_sampled_references() {
+        let mut state = State::default();
+        state.publish_system(
+            UPTIME_TOPIC,
+            Bytes::from_static(b"old"),
+            Duration::ZERO,
+            None,
+            &mut Vec::new(),
+        );
+        assert_eq!(state.cluster_store(0, false), (1, 9));
+        let uptime = state.retained.get(UPTIME_TOPIC).unwrap().clone();
+
+        let mut restored = State::default();
+        assert!(restored.restore_persistence(
+            PersistentState {
+                sessions: vec![PersistentSession {
+                    publisher: Publisher {
+                        id: "subscriber".into(),
+                        ..uptime.source.clone()
+                    },
+                    last_mid: 0,
+                    expiry_interval: None,
+                    expires: None,
+                    bridge: None,
+                    subscriptions: Vec::new(),
+                    outgoing: vec![PersistentOutgoing {
+                        message: Some(0),
+                        id: None,
+                        qos: QoS::ExactlyOnce,
+                        retain: false,
+                        dup: false,
+                        release: false,
+                        queued: true,
+                        identifier: 0,
+                    }],
+                    incoming: Vec::new(),
+                }],
+                messages: vec![uptime],
+                retained: vec![0],
+                ..PersistentState::default()
+            },
+            Duration::ZERO,
+        ));
+        assert_eq!(restored.retained.count(), 1);
+        assert_eq!(restored.cluster_store(10, false), (2, 13));
     }
 }

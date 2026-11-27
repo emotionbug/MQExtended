@@ -6,11 +6,32 @@ use serde::{Deserialize, Serialize};
 use crate::inbox::{MAX_MESSAGE_AGE, Message};
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RetainedTree")]
 pub(crate) struct Retained {
     ordinary: Branch,
     dollar: Branch,
     #[serde(skip)]
+    count: i64,
+    #[serde(skip)]
     legacy_undated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "Retained")]
+struct RetainedTree {
+    ordinary: Branch,
+    dollar: Branch,
+}
+
+impl From<RetainedTree> for Retained {
+    fn from(RetainedTree { ordinary, dollar }: RetainedTree) -> Self {
+        Self {
+            count: ordinary.count() + dollar.count(),
+            ordinary,
+            dollar,
+            legacy_undated: false,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,9 +53,24 @@ impl Retained {
     }
 
     pub(crate) fn count(&self) -> i64 {
-        let mut count = 0;
-        self.for_each(|_| count += 1);
-        count
+        self.count
+    }
+
+    // An exact lookup of the stored slot, without replay or expiry handling.
+    pub(crate) fn get(&self, topic: &str) -> Option<&Arc<Message>> {
+        let mut branch = self.root(topic);
+        for level in topic.split('/') {
+            branch = branch.children.get(level)?;
+        }
+        branch.message.as_ref()
+    }
+
+    fn root(&self, topic: &str) -> &Branch {
+        if topic.starts_with('$') {
+            &self.dollar
+        } else {
+            &self.ordinary
+        }
     }
 
     // retain.c: retain__store creates hierarchy entries before processing a
@@ -67,7 +103,13 @@ impl Retained {
         } else {
             &mut self.ordinary
         };
-        root.store(topic.split('/'), message, stored_at, create_path);
+        root.store(
+            topic.split('/'),
+            message,
+            stored_at,
+            create_path,
+            &mut self.count,
+        );
     }
 
     pub(crate) fn visit(
@@ -98,8 +140,7 @@ impl Retained {
             for level in message.topic.split('/') {
                 root = root.children.get_mut(level).unwrap();
             }
-            root.message = None;
-            root.stored_at = None;
+            root.clear_message(&mut self.count);
         }
         complete
     }
@@ -132,12 +173,7 @@ impl Retained {
                 .get(levels.next().unwrap())
                 .is_none_or(|branch| branch.search(levels, false, &mut visit))
         } else {
-            let root = if filter.starts_with('$') {
-                &self.dollar
-            } else {
-                &self.ordinary
-            };
-            root.search(levels, true, &mut visit)
+            self.root(filter).search(levels, true, &mut visit)
         }
     }
 
@@ -161,7 +197,7 @@ impl Retained {
     }
 
     pub(crate) fn has_messages(&self) -> bool {
-        !self.ordinary.visit_tree(&mut |_, _| false) || !self.dollar.visit_tree(&mut |_, _| false)
+        self.count != 0
     }
 
     pub(crate) fn restore_age(&mut self) -> bool {
@@ -183,8 +219,11 @@ impl Retained {
         persistence_changes: &mut u64,
     ) -> bool {
         self.seed_legacy_age(now);
-        self.ordinary.expire(now, max_age, persistence_changes)
-            | self.dollar.expire(now, max_age, persistence_changes)
+        self.ordinary
+            .expire(now, max_age, persistence_changes, &mut self.count)
+            | self
+                .dollar
+                .expire(now, max_age, persistence_changes, &mut self.count)
     }
 }
 
@@ -198,20 +237,31 @@ impl Branch {
         }
     }
 
+    fn count(&self) -> i64 {
+        i64::from(self.message.is_some()) + self.children.values().map(Self::count).sum::<i64>()
+    }
+
+    fn clear_message(&mut self, count: &mut i64) -> bool {
+        self.stored_at = None;
+        let removed = self.message.take().is_some();
+        *count -= i64::from(removed);
+        removed
+    }
+
     fn store(
         &mut self,
         mut levels: Split<'_, char>,
         message: &Arc<Message>,
         stored_at: Option<Duration>,
         create_path: bool,
+        count: &mut i64,
     ) -> bool {
         let Some(level) = levels.next() else {
             if message.payload.is_empty() {
-                self.stored_at = None;
-                return self.message.take().is_some() && self.children.is_empty();
+                return self.clear_message(count) && self.children.is_empty();
             }
             self.stored_at = stored_at;
-            self.message = Some(message.clone());
+            *count += i64::from(self.message.replace(message.clone()).is_none());
             return false;
         };
         let child = if let Some(index) = self.children.get_index_of(level) {
@@ -221,7 +271,7 @@ impl Branch {
         } else {
             return false;
         };
-        if child.store(levels, message, stored_at, create_path) {
+        if child.store(levels, message, stored_at, create_path, count) {
             self.children.shift_remove(level);
             return self.children.is_empty() && self.message.is_none();
         }
@@ -290,10 +340,11 @@ impl Branch {
         now: Duration,
         max_age: Option<Duration>,
         persistence_changes: &mut u64,
+        count: &mut i64,
     ) -> bool {
         let mut pending = false;
         for child in self.children.values_mut() {
-            pending |= child.expire(now, max_age, persistence_changes);
+            pending |= child.expire(now, max_age, persistence_changes, count);
         }
         let Some(message) = &self.message else {
             return pending;
@@ -302,8 +353,7 @@ impl Branch {
         if Retained::expired(message, self.stored_at, now, max_age) {
             // Native persistence omits $SYS, but the expiry policy includes it.
             *persistence_changes += u64::from(!message.topic.starts_with("$SYS"));
-            self.message = None;
-            self.stored_at = None;
+            self.clear_message(count);
         } else {
             pending = true;
         }
@@ -315,6 +365,61 @@ impl Branch {
 mod tests {
     use super::*;
     use crate::{BrokerConfig, ReloadableLimits, inbox::Publisher, persistence::PersistentState};
+
+    fn message(topic: &str, payload: &'static [u8], expires: Option<Duration>) -> Arc<Message> {
+        Arc::new(Message {
+            source: Publisher {
+                id: "source".into(),
+                username: None,
+                security: 0,
+                dynamic_security: None,
+                external: None,
+            },
+            topic: topic.into(),
+            payload: bytes::Bytes::from_static(payload),
+            qos: mqx_codec::QoS::AtLeastOnce,
+            retain: true,
+            properties: Vec::new(),
+            expires,
+            broker_expires: None,
+        })
+    }
+
+    #[test]
+    fn retained_count_follows_slot_lifetime() {
+        let mut tree = Retained::default();
+        let now = Duration::from_secs(1);
+        tree.store(&message("root", b"first", None), None);
+        tree.store(&message("root", b"replacement", None), None);
+        let child = message("root/child", b"child", Some(now));
+        tree.store(&child, None);
+        tree.store(&message("swept", b"value", Some(now)), None);
+        tree.store(&message("$SYS/swept", b"value", Some(now)), None);
+        assert_eq!(tree.count(), 4);
+
+        let root = message("root", b"", None);
+        tree.store(&root, None);
+        tree.store(&root, None);
+        tree.clear_existing(&message("missing/child", b"", None));
+        assert_eq!(tree.count(), 3);
+
+        tree.store(&message("$SYS/cleared", b"value", None), None);
+        tree.clear_existing(&message("$SYS/cleared", b"", None));
+        assert_eq!(tree.count(), 3);
+
+        assert!(Arc::ptr_eq(tree.get("root/child").unwrap(), &child));
+        assert!(tree.visit("root/#", now, false, None, |_| {
+            panic!("expired retained message must not be replayed")
+        }));
+        assert!(tree.get("root/child").is_none());
+        assert_eq!(tree.count(), 2);
+
+        let mut persistence_changes = 0;
+        assert!(!tree.expire(now, None, &mut persistence_changes));
+        assert_eq!(persistence_changes, 1);
+        assert_eq!(tree.count(), 0);
+        assert!(!tree.has_messages());
+    }
 
     #[test]
     fn disabled_max_age_keeps_legacy_messagepack_shapes() {
@@ -354,22 +459,7 @@ mod tests {
             message: Option<Arc<Message>>,
         }
 
-        let message = Arc::new(Message {
-            source: Publisher {
-                id: "source".into(),
-                username: None,
-                security: 0,
-                dynamic_security: None,
-                external: None,
-            },
-            topic: "retained".into(),
-            payload: bytes::Bytes::from_static(b"retained payload"),
-            qos: mqx_codec::QoS::AtLeastOnce,
-            retain: true,
-            properties: Vec::new(),
-            expires: None,
-            broker_expires: None,
-        });
+        let message = message("retained", b"retained payload", None);
         let mut tree = Retained::default();
         tree.store(&message, None);
         let ordinary = OldBranch {
@@ -384,7 +474,9 @@ mod tests {
         };
         let encoded = rmp_serde::to_vec(&(ordinary, OldBranch::default())).unwrap();
         assert_eq!(rmp_serde::to_vec(&tree).unwrap(), encoded);
-        assert_eq!(rmp_serde::from_slice::<Retained>(&encoded).unwrap(), tree);
+        let restored = rmp_serde::from_slice::<Retained>(&encoded).unwrap();
+        assert_eq!(restored.count(), 1);
+        assert_eq!(restored, tree);
 
         let image = PersistentState {
             messages: vec![message],
