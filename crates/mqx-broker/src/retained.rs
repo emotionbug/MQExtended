@@ -3,12 +3,14 @@ use std::{str::Split, sync::Arc, time::Duration};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::inbox::Message;
+use crate::inbox::{MAX_MESSAGE_AGE, Message};
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Retained {
     ordinary: Branch,
     dollar: Branch,
+    #[serde(skip)]
+    legacy_undated: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +40,13 @@ impl Retained {
     // retain.c: retain__store creates hierarchy entries before processing a
     // tombstone. Only clearing an existing retained message prunes its path.
     pub(crate) fn store(&mut self, message: &Arc<Message>, stored_at: Option<Duration>) {
+        // New messages already carry their publish time in the hard deadline.
+        // Keep a side timestamp only if it contributes older legacy information.
+        let stored_at = stored_at.filter(|at| {
+            message
+                .broker_expires
+                .is_none_or(|deadline| at.saturating_add(MAX_MESSAGE_AGE) < deadline)
+        });
         self.store_inner(message, stored_at, true);
     }
 
@@ -66,13 +75,13 @@ impl Retained {
         filter: &str,
         now: Duration,
         dollar_root: bool,
+        max_age: Option<Duration>,
         mut visit: impl FnMut(&Arc<Message>) -> bool,
     ) -> bool {
-        // The max-age policy only runs at the sweep; unlike MQTT expiry, it
-        // does not need to make messages invisible at an exact deadline.
+        self.seed_legacy_age(now);
         let mut expired = Vec::new();
-        let complete = self.search(filter, dollar_root, |message| {
-            if message.expires.is_some_and(|at| at <= now) {
+        let complete = self.search(filter, dollar_root, |message, stored_at| {
+            if Self::expired(message, stored_at, now, max_age) {
                 expired.push(message.clone());
                 true
             } else {
@@ -100,10 +109,11 @@ impl Retained {
         filter: &str,
         now: Duration,
         dollar_root: bool,
+        max_age: Option<Duration>,
         mut visit: impl FnMut(&Arc<Message>) -> bool,
     ) -> bool {
-        self.search(filter, dollar_root, |message| {
-            message.expires.is_some_and(|at| at <= now) || visit(message)
+        self.search(filter, dollar_root, |message, stored_at| {
+            Self::expired(message, stored_at, now, max_age) || visit(message)
         })
     }
 
@@ -111,7 +121,7 @@ impl Retained {
         &self,
         filter: &str,
         dollar_root: bool,
-        mut visit: impl FnMut(&Arc<Message>) -> bool,
+        mut visit: impl FnMut(&Arc<Message>, Option<Duration>) -> bool,
     ) -> bool {
         let mut levels = filter.split('/');
         if dollar_root && filter.starts_with('$') {
@@ -131,33 +141,50 @@ impl Retained {
         }
     }
 
-    pub(crate) fn can_age(message: &Message) -> bool {
-        message.expires.is_none() && !message.topic.starts_with("$SYS")
+    fn published_at(message: &Message, stored_at: Duration) -> Duration {
+        // QoS 2 release may store the retained value after the original PUBLISH.
+        message.broker_expires.map_or(stored_at, |deadline| {
+            stored_at.min(deadline.saturating_sub(MAX_MESSAGE_AGE))
+        })
     }
 
-    pub(crate) fn has_age_candidates(&self) -> bool {
-        let mut ineligible = |message: &Arc<Message>| !Self::can_age(message);
-        !self.ordinary.visit_tree(&mut ineligible) || !self.dollar.visit_tree(&mut ineligible)
+    pub(crate) fn expired(
+        message: &Message,
+        stored_at: Option<Duration>,
+        now: Duration,
+        max_age: Option<Duration>,
+    ) -> bool {
+        let max_age = max_age.unwrap_or(MAX_MESSAGE_AGE).min(MAX_MESSAGE_AGE);
+        message.expires.is_some_and(|at| at <= now)
+            || message.broker_expired(now)
+            || now >= Self::published_at(message, stored_at.unwrap_or(now)).saturating_add(max_age)
     }
 
-    pub(crate) fn forget_store_times(&mut self, persistence_changes: &mut u64) -> bool {
-        self.ordinary.forget_store_times(persistence_changes)
-            | self.dollar.forget_store_times(persistence_changes)
+    pub(crate) fn has_messages(&self) -> bool {
+        !self.ordinary.visit_tree(&mut |_, _| false) || !self.dollar.visit_tree(&mut |_, _| false)
+    }
+
+    pub(crate) fn restore_age(&mut self) -> bool {
+        self.legacy_undated = self.ordinary.initialize_age(None) | self.dollar.initialize_age(None);
+        self.legacy_undated
+    }
+
+    fn seed_legacy_age(&mut self, now: Duration) {
+        if std::mem::take(&mut self.legacy_undated) {
+            self.ordinary.initialize_age(Some(now));
+            self.dollar.initialize_age(Some(now));
+        }
     }
 
     pub(crate) fn expire(
         &mut self,
         now: Duration,
-        mqtt_expiry: bool,
         max_age: Option<Duration>,
-        has_session: impl Fn(&str) -> bool,
         persistence_changes: &mut u64,
     ) -> bool {
-        self.ordinary
-            .expire(now, mqtt_expiry, max_age, &has_session, persistence_changes)
-            | self
-                .dollar
-                .expire(now, mqtt_expiry, max_age, &has_session, persistence_changes)
+        self.seed_legacy_age(now);
+        self.ordinary.expire(now, max_age, persistence_changes)
+            | self.dollar.expire(now, max_age, persistence_changes)
     }
 }
 
@@ -183,7 +210,7 @@ impl Branch {
                 self.stored_at = None;
                 return self.message.take().is_some() && self.children.is_empty();
             }
-            self.stored_at = stored_at.filter(|_| message.expires.is_none());
+            self.stored_at = stored_at;
             self.message = Some(message.clone());
             return false;
         };
@@ -207,14 +234,14 @@ impl Branch {
         &self,
         mut levels: Split<'_, char>,
         include_leaf_for_hash: bool,
-        visit: &mut impl FnMut(&Arc<Message>) -> bool,
+        visit: &mut impl FnMut(&Arc<Message>, Option<Duration>) -> bool,
     ) -> bool {
         match levels.next() {
-            None => self.message.as_ref().is_none_or(visit),
+            None => self.visit_message(visit),
             Some("#") => {
                 self.children.values().all(|child| child.visit_tree(visit))
                     && ((!include_leaf_for_hash && self.children.is_empty())
-                        || self.message.as_ref().is_none_or(visit))
+                        || self.visit_message(visit))
             }
             Some("+") => self
                 .children
@@ -227,60 +254,58 @@ impl Branch {
         }
     }
 
-    fn visit_tree(&self, visit: &mut impl FnMut(&Arc<Message>) -> bool) -> bool {
-        self.message.as_ref().is_none_or(&mut *visit)
-            && self.children.values().all(|child| child.visit_tree(visit))
+    fn visit_message(
+        &self,
+        visit: &mut impl FnMut(&Arc<Message>, Option<Duration>) -> bool,
+    ) -> bool {
+        self.message
+            .as_ref()
+            .is_none_or(|message| visit(message, self.stored_at))
     }
 
-    fn forget_store_times(&mut self, persistence_changes: &mut u64) -> bool {
-        let mut pending = false;
+    fn visit_tree(&self, visit: &mut impl FnMut(&Arc<Message>, Option<Duration>) -> bool) -> bool {
+        self.visit_message(visit) && self.children.values().all(|child| child.visit_tree(visit))
+    }
+
+    fn initialize_age(&mut self, now: Option<Duration>) -> bool {
+        let mut undated = false;
+        if let Some(message) = &mut self.message
+            && message.broker_expires.is_none()
+        {
+            if let Some(stored_at) = self.stored_at.take().or(now) {
+                // A subsequent retained replay must carry the same broker deadline.
+                Arc::make_mut(message).cap_age(stored_at);
+            } else {
+                undated = true;
+            }
+        }
         for child in self.children.values_mut() {
-            pending |= child.forget_store_times(persistence_changes);
+            undated |= child.initialize_age(now);
         }
-        let stored_at = self.stored_at.take();
-        if let Some(message) = &self.message {
-            *persistence_changes += u64::from(stored_at.is_some() && Retained::can_age(message));
-            pending |= message.expires.is_some();
-        }
-        pending
+        undated
     }
 
     fn expire(
         &mut self,
         now: Duration,
-        mqtt_expiry: bool,
         max_age: Option<Duration>,
-        has_session: &impl Fn(&str) -> bool,
         persistence_changes: &mut u64,
     ) -> bool {
         let mut pending = false;
         for child in self.children.values_mut() {
-            pending |= child.expire(now, mqtt_expiry, max_age, has_session, persistence_changes);
+            pending |= child.expire(now, max_age, persistence_changes);
         }
         let Some(message) = &self.message else {
             return pending;
         };
         // retain.c: retain__expire drops the message and keeps the branch.
-        if let Some(at) = message.expires {
-            if mqtt_expiry && at <= now {
-                self.message = None;
-                self.stored_at = None;
-            } else {
-                pending |= mqtt_expiry;
-            }
-        } else if let Some(max_age) = max_age.filter(|_| Retained::can_age(message)) {
-            let Some(stored_at) = self.stored_at else {
-                self.stored_at = Some(now);
-                *persistence_changes += 1;
-                return true;
-            };
-            if now.saturating_sub(stored_at) >= max_age && !has_session(&message.source.id) {
-                self.message = None;
-                self.stored_at = None;
-                *persistence_changes += 1;
-            } else {
-                pending = true;
-            }
+        if Retained::expired(message, self.stored_at, now, max_age) {
+            // Native persistence omits $SYS, but the expiry policy includes it.
+            *persistence_changes += u64::from(!message.topic.starts_with("$SYS"));
+            self.message = None;
+            self.stored_at = None;
+        } else {
+            pending = true;
         }
         pending
     }
@@ -343,6 +368,7 @@ mod tests {
             retain: true,
             properties: Vec::new(),
             expires: None,
+            broker_expires: None,
         });
         let mut tree = Retained::default();
         tree.store(&message, None);

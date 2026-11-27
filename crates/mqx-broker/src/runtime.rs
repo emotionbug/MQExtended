@@ -133,6 +133,7 @@ struct Runtime {
     transient_drops: i64,
     dynamic_security_path: Option<std::path::PathBuf>,
     verdict_resolver: Option<external::Resolver>,
+    queue_expiry_running: bool,
 }
 
 struct Pending {
@@ -159,6 +160,20 @@ pub(super) struct Live {
 struct Outbox {
     packets: VecDeque<Outbound>,
     interrupted: bool,
+}
+
+impl Outbox {
+    fn expire(&mut self, now: Duration) {
+        for packet in &mut self.packets {
+            if let Outbound::Publish { delivery, id, .. } = packet
+                && delivery.message.expired(now)
+            {
+                // The reservation still owes the socket a result, but no
+                // longer needs to retain its payload or MQTT properties.
+                *packet = Outbound::Expired(*id);
+            }
+        }
+    }
 }
 
 pub(super) enum ClaimResult {
@@ -680,6 +695,16 @@ impl Broker {
         peer_address: Option<Arc<str>>,
     ) -> Result<ClaimResult, BrokerError> {
         self.install_external(security);
+        {
+            let mut runtime = self.0.runtime.lock().unwrap();
+            if !runtime.queue_expiry_running {
+                runtime.queue_expiry_running = true;
+                tokio::spawn(expire_live_queues(
+                    Arc::downgrade(&self.0),
+                    self.0.shutdown.subscribe(),
+                ));
+            }
+        }
         let transient = claim.local_inbox();
         let receive_maximum = claim
             .v5
@@ -2252,6 +2277,40 @@ impl Drop for Permit<'_> {
     }
 }
 
+// Transient inboxes and send effects belong to this node, not the Raft
+// state machine. Sweep them even if all their sockets are stalled.
+async fn expire_live_queues(inner: Weak<Inner>, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let broker = Broker(inner);
+        let now = broker.now();
+        let runtime = broker.0.runtime.lock().unwrap();
+        let config = broker.0.config.startup();
+        for live in runtime.live.values() {
+            if let Some(inbox) = &live.inbox {
+                let mut inbox = inbox.lock().unwrap();
+                if inbox
+                    .next_expiry()
+                    .is_some_and(|time| time.saturating_sub(Duration::from_secs(3600)) <= now)
+                    && inbox.expire(now) != 0
+                {
+                    if inbox.has_outbound(config) {
+                        live.ready.notify_one();
+                    }
+                    live.drained.notify_waiters();
+                }
+            }
+            live.outbox.lock().unwrap().expire(now);
+        }
+    }
+}
+
 async fn expire_local(inner: Weak<Inner>, mut changed: watch::Receiver<()>) {
     loop {
         let deadline = {
@@ -2364,6 +2423,46 @@ mod tests {
 
     use super::*;
     use crate::{inbox::Publisher, state::SessionSettings};
+
+    #[test]
+    fn reserved_send_effect_releases_payload_but_preserves_its_reply_slot() {
+        let message = Publication::legacy(
+            mqx_codec::Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: "queue".into(),
+                packet_id: PacketId::new(1),
+                payload: Bytes::from_static(b"held"),
+            },
+            Duration::ZERO,
+        )
+        .into_message(Publisher {
+            id: "publisher".into(),
+            username: None,
+            security: 0,
+            dynamic_security: None,
+            external: None,
+        });
+        let payload = Arc::downgrade(&message);
+        let id = PacketId::new(1);
+        let mut outbox = Outbox::default();
+        outbox.packets.push_back(Outbound::Publish {
+            delivery: Delivery {
+                message,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                dedup_id: None,
+                subscription_identifier: 0,
+            },
+            id,
+            dup: false,
+        });
+
+        outbox.expire(crate::inbox::MAX_MESSAGE_AGE);
+        assert!(payload.upgrade().is_none());
+        assert_eq!(outbox.packets.pop_front(), Some(Outbound::Expired(id)));
+    }
 
     #[test]
     fn enabling_change_autosave_includes_prior_clean_session_acks() {

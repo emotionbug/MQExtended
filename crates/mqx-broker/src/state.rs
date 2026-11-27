@@ -33,7 +33,7 @@ use crate::{
     BrokerConfig, ReloadableLimits,
     inbox::{
         Ack, Delivery, Inbox, Message, Offer, OfflineQueue, Outbound, OutboundPrefix,
-        PublishProperty, Publisher, Receive,
+        PublishProperty, Publisher, Receive, expire_queued_message, schedule_queue_expiry,
     },
     persistence::PendingImport,
     retained::Retained,
@@ -228,7 +228,7 @@ impl Publication {
     }
 
     pub(crate) fn into_message(self, source: Publisher) -> Arc<Message> {
-        Arc::new(Message {
+        Message {
             source,
             topic: self.packet.topic.into_boxed_str(),
             payload: self.packet.payload,
@@ -236,7 +236,9 @@ impl Publication {
             retain: self.packet.retain,
             properties: self.properties,
             expires: self.expires,
-        })
+            broker_expires: None,
+        }
+        .published(self.now)
     }
 }
 
@@ -484,11 +486,53 @@ pub(crate) struct State {
     #[serde(default)]
     pending_wills: VecDeque<PendingWill>,
     #[serde(skip)]
+    pending_will_expiry: Option<Duration>,
+    #[serde(skip)]
     pending_sessions: BTreeSet<Arc<str>>,
     #[serde(skip)]
     external_plugins: ExternalPlugins,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     pub(crate) storage_pressure: BTreeSet<u64>,
+    #[serde(default)]
+    queue_expiry: QueueExpiry,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct QueueExpiry {
+    #[serde(skip)]
+    sessions: BTreeSet<Arc<str>>,
+    at: Option<Duration>,
+}
+
+impl QueueExpiry {
+    fn track(&mut self, id: &Arc<str>, at: Duration) {
+        if !self.sessions.contains(id) {
+            self.sessions.insert(id.clone());
+        }
+        self.at = Some(self.at.map_or(at, |previous| previous.min(at)));
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.sessions.remove(id);
+        if self.sessions.is_empty() {
+            self.at = None;
+        }
+    }
+
+    fn update(&mut self, session: &Session) {
+        if let Some(at) = session.inbox.as_ref().and_then(Inbox::next_expiry) {
+            self.track(&session.publisher.id, at);
+        } else if session.pending.is_empty() {
+            self.remove(&session.publisher.id);
+        }
+    }
+
+    fn track_pending(&mut self, session: &Session, message: &Message) {
+        schedule_queue_expiry(&mut self.at, message);
+        if !self.sessions.contains(&session.publisher.id) {
+            self.sessions.insert(session.publisher.id.clone());
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,29 +749,8 @@ impl State {
     }
 
     fn set_limits(&mut self, limits: ReloadableLimits) {
-        let had_max_age = self.config.retain_max_age.is_some();
         self.config = Arc::new(self.startup_config.with_reloadable_limits(&limits));
         self.limits = Some(limits);
-        if self.config.retain_max_age.is_some() {
-            if !had_max_age {
-                self.schedule_untracked_retained_age();
-            }
-        } else if had_max_age {
-            let pending = self
-                .retained
-                .forget_store_times(&mut self.persistence_changes);
-            if !pending || self.config.retain_expiry_interval.is_none() {
-                self.retain_sweep = None;
-            }
-        }
-    }
-
-    fn schedule_untracked_retained_age(&mut self) {
-        if self.retain_sweep.is_none() && self.retained.has_age_candidates() {
-            // Reload limits and snapshots do not supply a clock. Use the
-            // next Expire command's time to start any untracked clocks.
-            self.retain_sweep = Some(Duration::ZERO);
-        }
     }
 
     pub(crate) fn subscription_tree(&self) -> String {
@@ -771,6 +794,8 @@ impl State {
             self.next_session_expiry(),
             self.wills.first_key_value().map(|(&(time, _), _)| time),
             self.retain_sweep,
+            self.queue_expiry.at,
+            self.pending_will_expiry,
             self.verdicts.next_expiry(),
         ]
         .into_iter()
@@ -986,16 +1011,16 @@ impl State {
     ) -> Option<Operation> {
         let session = self.claimed_session(lease)?;
         let inbox = session.inbox.as_ref()?;
-        if batch
-            && session.can_batch_outbound()
-            && let Some(prefix) = inbox.outbound_prefix()
-        {
-            return Some(Operation::ReserveOutboundPrefix(prefix));
-        }
         if !inbox.has_outbound(&self.config) {
             return None;
         }
         let now = clock();
+        if batch
+            && session.can_batch_outbound()
+            && let Some(prefix) = inbox.outbound_prefix(now)
+        {
+            return Some(Operation::ReserveOutboundPrefix(prefix));
+        }
         let operation = if session.internal_bridge.is_none() && inbox.expired_before_qos0(now) {
             Operation::ReserveOutboundWithQos0Expiry(now)
         } else {
@@ -1043,29 +1068,27 @@ impl State {
         restored.startup_config = self.startup_config.clone();
         restored.external_plugins = self.external_plugins.clone();
         restored.verdicts.rebuild_deadlines();
+        restored.pending_will_expiry = restored
+            .pending_wills
+            .iter()
+            .map(PendingWill::deadline)
+            .min();
         restored.pending_sessions = restored
             .sessions
             .iter()
             .filter(|(_, session)| !session.pending.is_empty())
             .map(|(id, _)| id.clone())
             .collect();
+        restored.rebuild_queue_expiry();
         if let Some(limits) = &restored.limits {
             restored.config = Arc::new(restored.startup_config.with_reloadable_limits(limits));
         } else {
             restored.config = restored.startup_config.clone();
         }
-        if restored.config.retain_max_age.is_some() {
-            restored.schedule_untracked_retained_age();
-        } else if restored.limits.is_none() {
-            // Without committed limits the startup file can turn max-age off
-            // for a snapshot taken while it was enabled.
-            let mut discarded_clocks = 0;
-            let pending = restored.retained.forget_store_times(&mut discarded_clocks);
-            if discarded_clocks != 0
-                && (!pending || restored.config.retain_expiry_interval.is_none())
-            {
-                restored.retain_sweep = None;
-            }
+        let undated_retained = restored.retained.restore_age();
+        if undated_retained || restored.retain_sweep.is_none() && restored.retained.has_messages() {
+            // Use the first committed expiry/visit time for undated legacy values.
+            restored.retain_sweep = Some(Duration::ZERO);
         }
         for (&id, text) in &restored.acl_text {
             if let Some(text) = text {
@@ -1244,10 +1267,11 @@ impl State {
                             let mut replies = Vec::with_capacity(operations.len());
                             for operation in operations {
                                 let first_effect = effects.len();
+                                let now = operation.verdict_time().unwrap_or_default();
                                 let reply =
                                     self.act(&entry.lease, operation, pins.as_ref(), effects);
                                 if eager {
-                                    self.reserve_ready(&mut effects[first_effect..]);
+                                    self.reserve_ready(now, &mut effects[first_effect..]);
                                 }
                                 let stop = matches!(
                                     reply,
@@ -1270,14 +1294,20 @@ impl State {
     // db__message_write_inflight_out_latest for newly admitted online messages.
     // Queue the transport's send and persist its DUP transition in the same
     // entry; messages outside the in-flight window are still unattempted.
-    fn reserve_ready(&mut self, effects: &mut [Effect]) {
+    // ACKs have no command time; the transport still checks the current
+    // deadline even when an eager reservation was made without a clock.
+    fn reserve_ready(&mut self, now: Duration, effects: &mut [Effect]) {
         for effect in effects {
             let Effect::Ready(lease) = effect else {
                 continue;
             };
             let session = self.sessions.get_mut(&lease.id).unwrap();
             if session.owner.is_some_and(|owner| owner != Owner::LOCAL)
-                && let Some(packet) = session.inbox.as_mut().unwrap().reserve_ready_qos1(|_| true)
+                && let Some(packet) = session
+                    .inbox
+                    .as_mut()
+                    .unwrap()
+                    .reserve_ready_qos1(now, |_| true)
             {
                 *effect = Effect::ReservedOutbound {
                     owner: lease.epoch,
@@ -1317,6 +1347,12 @@ impl State {
 
     fn expire(&mut self, now: Duration, effects: &mut Vec<Effect>) {
         self.verdicts.expire(now);
+        if self.queue_expiry.at.is_some_and(|at| at <= now) {
+            self.expire_queues(now, effects);
+        }
+        if self.pending_will_expiry.is_some_and(|at| at <= now) {
+            self.expire_parked_wills(now, effects);
+        }
         // will_delay.c: will_delay__check publishes even when the session
         // itself does not expire. Session expiry cancels a later Will timer.
         while let Some((&(at, _), id)) = self.expirations.first_key_value() {
@@ -1342,27 +1378,106 @@ impl State {
             }
         }
         if self.retain_sweep.is_some_and(|at| at <= now) {
-            let max_age = self.config.retain_max_age;
             let pending = self.retained.expire(
                 now,
-                self.config.retain_expiry_interval.is_some() || max_age.is_none(),
-                max_age,
-                |id| self.sessions.contains_key(id),
+                self.config.retain_max_age,
                 &mut self.persistence_changes,
             );
-            self.retain_sweep = self
-                .retained_sweep_interval()
-                .filter(|_| pending)
-                .map(|interval| now.saturating_add(interval));
+            self.retain_sweep = pending.then(|| now.saturating_add(self.retained_sweep_interval()));
         }
     }
 
-    fn retained_sweep_interval(&self) -> Option<Duration> {
-        self.config.retain_expiry_interval.or_else(|| {
-            self.config
-                .retain_max_age
-                .map(|_| Duration::from_secs(3600))
-        })
+    fn rebuild_queue_expiry(&mut self) {
+        let saved_deadline = self.queue_expiry.at;
+        self.queue_expiry = QueueExpiry::default();
+        for session in self.sessions.values_mut() {
+            if let Some(inbox) = &mut session.inbox {
+                inbox.restore_expiry();
+            }
+            self.queue_expiry.update(session);
+            for pending in &session.pending {
+                self.queue_expiry
+                    .track_pending(session, &pending.packet.message);
+            }
+        }
+        if !self.queue_expiry.sessions.is_empty() {
+            // A cached deadline can still name an already-drained payload.
+            // Keep that tick across Raft restore so application is identical.
+            self.queue_expiry.at = saved_deadline.or(self.queue_expiry.at);
+        }
+    }
+
+    fn expire_queues(&mut self, now: Duration, effects: &mut Vec<Effect>) {
+        let mut queue_expiry = std::mem::take(&mut self.queue_expiry);
+        queue_expiry.at = None;
+        queue_expiry.sessions.retain(|id| {
+            let session = self.sessions.get_mut(id).unwrap();
+            if let Some(inbox) = &mut session.inbox {
+                if inbox.next_expiry().is_some_and(|at| at <= now) {
+                    let expired = inbox.expire(now);
+                    self.persistence_changes += expired;
+                    if expired != 0
+                        && session.owner.is_some()
+                        && session
+                            .internal_bridge
+                            .as_ref()
+                            .is_none_or(|bridge| bridge.online)
+                        && inbox.has_outbound(&self.config)
+                    {
+                        effects.push(Effect::Ready(Lease {
+                            id: id.clone(),
+                            epoch: session.epoch,
+                        }));
+                    }
+                }
+                if let Some(at) = inbox.next_expiry() {
+                    queue_expiry.at = Some(queue_expiry.at.map_or(at, |previous| previous.min(at)));
+                }
+            }
+            let mut first = true;
+            let mut first_expired = false;
+            session.pending.retain_mut(|pending| {
+                let expired = expire_queued_message(&mut pending.packet.message, now);
+                if std::mem::take(&mut first) {
+                    first_expired = expired;
+                }
+                if !expired {
+                    schedule_queue_expiry(&mut queue_expiry.at, &pending.packet.message);
+                }
+                !expired
+            });
+            // A newly exposed front may already be allowed or need another
+            // verdict. The resolver advances the queue even with no keys.
+            if first_expired && let Some(pending) = session.pending.front() {
+                let acl = Acls::new(
+                    &self.acls,
+                    self.dynamic_security.as_ref(),
+                    &self.external_plugins,
+                    &self.verdicts,
+                    VerdictContext::new(now),
+                );
+                effects.push(Effect::NeedVerdicts {
+                    target: VerdictTarget::Session(session.owner),
+                    keys: pending.needed(acl, session, &self.config),
+                });
+            }
+            if session.pending.is_empty() {
+                self.pending_sessions.remove(id);
+            }
+            !session.pending.is_empty()
+                || session
+                    .inbox
+                    .as_ref()
+                    .and_then(Inbox::next_expiry)
+                    .is_some()
+        });
+        self.queue_expiry = queue_expiry;
+    }
+
+    fn retained_sweep_interval(&self) -> Duration {
+        self.config
+            .retain_expiry_interval
+            .unwrap_or(Duration::from_secs(3600))
     }
 
     fn store_retained(
@@ -1371,16 +1486,10 @@ impl State {
         now: Duration,
         stored_at: Option<Duration>,
     ) {
-        let max_age = self.config.retain_max_age.is_some();
-        if self.retain_sweep.is_none()
-            && !message.payload.is_empty()
-            && (message.expires.is_some() && self.config.retain_expiry_interval.is_some()
-                || max_age && Retained::can_age(message))
-            && let Some(interval) = self.retained_sweep_interval()
-        {
-            self.retain_sweep = Some(now.saturating_add(interval));
+        if self.retain_sweep.is_none() && !message.payload.is_empty() {
+            self.retain_sweep = Some(now.saturating_add(self.retained_sweep_interval()));
         }
-        self.retained.store(message, stored_at.filter(|_| max_age));
+        self.retained.store(message, Some(stored_at.unwrap_or(now)));
     }
 
     fn take_will(&mut self, id: &Arc<str>) -> Option<PendingWill> {
@@ -1398,6 +1507,7 @@ impl State {
                 properties,
                 expiry,
                 internal_bridge: session.internal_bridge.is_some(),
+                published_at: None,
             }
         })
     }
@@ -1614,6 +1724,7 @@ impl State {
                 &self.config,
                 claim.now,
             );
+            self.queue_expiry.update(session);
         }
         let lease = Lease { id, epoch };
         if owner != Owner::LOCAL {
@@ -1630,6 +1741,36 @@ impl State {
     }
 
     fn act(
+        &mut self,
+        lease: &Lease,
+        operation: Operation,
+        pinned: Option<&PinnedVerdicts<'_>>,
+        effects: &mut Vec<Effect>,
+    ) -> Reply {
+        let inbox_changed = match &operation {
+            Operation::Receive(publication)
+            | Operation::ReceiveAdmitted(publication)
+            | Operation::ReceiveBirth { publication, .. } => publication.packet.packet_id.is_some(),
+            Operation::Ack(..)
+            | Operation::Release(..)
+            | Operation::NextOutbound(_)
+            | Operation::ReserveOutbound(_)
+            | Operation::ReserveOutboundWithQos0Expiry(_)
+            | Operation::BridgePrepare { .. }
+            | Operation::BridgeOnline { .. } => true,
+            _ => false,
+        };
+        let reply = self.act_inner(lease, operation, pinned, effects);
+        if inbox_changed
+            && !matches!(reply, Reply::Stale)
+            && let Some(session) = self.sessions.get(&lease.id)
+        {
+            self.queue_expiry.update(session);
+        }
+        reply
+    }
+
+    fn act_inner(
         &mut self,
         lease: &Lease,
         operation: Operation,
@@ -1993,6 +2134,7 @@ impl State {
 
     fn remove_session(&mut self, id: &Arc<str>) {
         let session = self.sessions.remove(id).unwrap();
+        self.queue_expiry.remove(id);
         if !session.pending.is_empty() {
             self.pending_sessions.remove(id);
         }
@@ -2033,6 +2175,7 @@ impl State {
         );
         let mut deliveries = DeliverySink {
             config: &self.config,
+            queue_expiry: &mut self.queue_expiry,
             pending_sessions: &mut self.pending_sessions,
             effects,
             counters: &mut self.sys_counters,
@@ -2109,37 +2252,42 @@ impl State {
                 if retain_handling == 0
                     || retain_handling == 1 && !session.filters.contains_key(filter.as_str())
                 {
-                    retained_complete =
-                        self.retained
-                            .visit(path, context.now, check_root_leaf, |message| {
-                                let read = acl.session_check(session, &message.topic, Access::Read);
-                                let (decision, check) = if read == AclDecision::Allow {
-                                    (
-                                        acl.retained_source(&self.config, message, None),
-                                        PendingCheck::RetainedSource,
-                                    )
-                                } else {
-                                    (read, PendingCheck::RetainedRead)
-                                };
-                                match decision {
-                                    AclDecision::Error => return false,
-                                    AclDecision::Deny => return true,
-                                    _ => {}
-                                }
-                                deliveries.send(
-                                    session,
-                                    Delivery {
-                                        message: message.clone(),
-                                        qos: outgoing_qos(message.qos, qos, &self.config),
-                                        retain: true,
-                                        dedup_id: None,
-                                        subscription_identifier: identifier,
-                                    },
-                                    decision,
-                                    check,
-                                );
-                                true
-                            });
+                    let max_age = self.config.retain_max_age;
+                    retained_complete = self.retained.visit(
+                        path,
+                        context.now,
+                        check_root_leaf,
+                        max_age,
+                        |message| {
+                            let read = acl.session_check(session, &message.topic, Access::Read);
+                            let (decision, check) = if read == AclDecision::Allow {
+                                (
+                                    acl.retained_source(&self.config, message, None),
+                                    PendingCheck::RetainedSource,
+                                )
+                            } else {
+                                (read, PendingCheck::RetainedRead)
+                            };
+                            match decision {
+                                AclDecision::Error => return false,
+                                AclDecision::Deny => return true,
+                                _ => {}
+                            }
+                            deliveries.send(
+                                session,
+                                Delivery {
+                                    message: message.clone(),
+                                    qos: outgoing_qos(message.qos, qos, &self.config),
+                                    retain: true,
+                                    dedup_id: None,
+                                    subscription_identifier: identifier,
+                                },
+                                decision,
+                                check,
+                            );
+                            true
+                        },
+                    );
                 }
             }
             if let Some(entry) = session.filters.get_mut(filter.as_str()) {
@@ -2165,7 +2313,7 @@ impl State {
     }
 
     // context.c: context__send_will checks ACL write at publication time.
-    fn publish_will(&mut self, will: PendingWill, now: Duration, effects: &mut Vec<Effect>) {
+    fn publish_will(&mut self, mut will: PendingWill, now: Duration, effects: &mut Vec<Effect>) {
         let decision = will.check(self.acl_at(VerdictContext::new(now)));
         match decision {
             AclDecision::Allow => {
@@ -2178,6 +2326,10 @@ impl State {
                         keys: vec![key],
                     });
                 }
+                will.published_at = Some(now);
+                let at = will.deadline();
+                self.pending_will_expiry =
+                    Some(self.pending_will_expiry.map_or(at, |old| old.min(at)));
                 self.pending_wills.push_back(will);
             }
             AclDecision::Deny | AclDecision::Error => {}
@@ -2190,10 +2342,17 @@ impl State {
 
     fn publish_with_verdicts(
         &mut self,
-        message: Arc<Message>,
+        mut message: Arc<Message>,
         context: VerdictContext<'_>,
         effects: &mut Vec<Effect>,
     ) -> bool {
+        // Old log entries can forward a Message directly rather than a Publication.
+        if message.broker_expires.is_none() {
+            Arc::make_mut(&mut message).cap_age(context.now);
+        }
+        if message.expired(context.now) {
+            return false;
+        }
         let topic = &message.topic;
         let storage_pressure = !self.storage_pressure.is_empty();
         self.last_message += 1;
@@ -2211,6 +2370,7 @@ impl State {
             matched: false,
             deliveries: DeliverySink {
                 config: &self.config,
+                queue_expiry: &mut self.queue_expiry,
                 pending_sessions: &mut self.pending_sessions,
                 effects,
                 counters: &mut self.sys_counters,
@@ -2255,11 +2415,28 @@ struct PendingWill {
     properties: Vec<PublishProperty>,
     expiry: u32,
     internal_bridge: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<Duration>,
 }
 
 impl PendingWill {
+    fn deadline(&self) -> Duration {
+        let Some(start) = self.published_at else {
+            return Duration::ZERO;
+        };
+        let cap = start.saturating_add(crate::inbox::MAX_MESSAGE_AGE);
+        Message::expiry(Duration::from_secs(start.as_secs()), self.expiry)
+            .map_or(cap, |at| cap.min(at.saturating_add(Duration::from_secs(1))))
+    }
+
+    fn expired(&self, now: Duration) -> bool {
+        self.published_at.is_some() && self.deadline() <= now
+    }
+
     fn check(&self, acl: Acls<'_>) -> AclDecision {
-        if self.internal_bridge {
+        if self.expired(acl.context.now) {
+            AclDecision::Deny
+        } else if self.internal_bridge {
             AclDecision::Allow
         } else {
             acl.check(&self.source, &self.packet.topic, Access::Write, false, None)
@@ -2267,7 +2444,8 @@ impl PendingWill {
     }
 
     fn into_message(self, now: Duration) -> Arc<Message> {
-        Arc::new(Message {
+        let now = self.published_at.unwrap_or(now);
+        Message {
             source: self.source,
             topic: self.packet.topic.into_boxed_str(),
             payload: self.packet.payload,
@@ -2275,7 +2453,9 @@ impl PendingWill {
             retain: self.packet.retain,
             properties: self.properties,
             expires: Message::expiry(Duration::from_secs(now.as_secs()), self.expiry),
-        })
+            broker_expires: None,
+        }
+        .published(now)
     }
 }
 
@@ -2326,6 +2506,7 @@ impl Router<'_> {
 
 struct DeliverySink<'a> {
     config: &'a BrokerConfig,
+    queue_expiry: &'a mut QueueExpiry,
     pending_sessions: &'a mut BTreeSet<Arc<str>>,
     effects: &'a mut Vec<Effect>,
     counters: &'a mut Values,
@@ -2347,6 +2528,7 @@ impl DeliverySink<'_> {
             // Do not create an offline backlog of unresolved ACL checks either.
             AclDecision::Missing(_) if drop_offline => {}
             AclDecision::Allow => {
+                self.queue_expiry.track_pending(session, &packet.message);
                 session.pending.push_back(PendingDelivery {
                     packet,
                     check: PendingCheck::Allowed,
@@ -2361,6 +2543,7 @@ impl DeliverySink<'_> {
                         keys: vec![key],
                     });
                 }
+                self.queue_expiry.track_pending(session, &packet.message);
                 session.pending.push_back(PendingDelivery { packet, check });
                 return;
             }
@@ -2375,6 +2558,9 @@ impl DeliverySink<'_> {
             self.persistence_changes,
             self.storage_pressure,
         );
+        if let Some(at) = session.inbox.as_ref().and_then(Inbox::next_expiry) {
+            self.queue_expiry.track(&session.publisher.id, at);
+        }
     }
 }
 
@@ -2606,6 +2792,139 @@ mod tests {
     }
 
     #[test]
+    fn queue_expiry_sweeps_active_offline_and_incoming_without_traffic() {
+        let mut state = State::new(Arc::new(BrokerConfig {
+            max_inflight_messages: 2,
+            persistent_client_expiration: None,
+            ..BrokerConfig::default()
+        }));
+        let claim_client =
+            |state: &mut State, id: &str| match state.apply(claim(id.into(), false)).reply {
+                Reply::Claimed { lease, .. } => lease,
+                reply => panic!("expected claim, got {reply:?}"),
+            };
+        let active = claim_client(&mut state, "active");
+        let offline = claim_client(&mut state, "offline");
+        let publisher = claim_client(&mut state, "publisher");
+        for lease in [&active, &offline] {
+            state.apply(Command::Act(
+                lease.clone(),
+                Operation::Subscribe(
+                    vec![SubscriptionRequest::legacy((
+                        "queue".into(),
+                        QoS::AtLeastOnce,
+                    ))],
+                    Duration::ZERO,
+                ),
+            ));
+        }
+        state.apply(Command::Act(
+            offline.clone(),
+            Operation::Disconnect {
+                now: Duration::ZERO,
+                graceful: true,
+                expiry: None,
+            },
+        ));
+        let publish = |state: &mut State, topic: &str, qos, id, payload, now| {
+            state.apply(Command::Act(
+                publisher.clone(),
+                Operation::Receive(Publication::legacy(
+                    Publish {
+                        dup: false,
+                        qos,
+                        retain: false,
+                        topic: topic.into(),
+                        packet_id: PacketId::new(id),
+                        payload: Bytes::from_static(payload),
+                    },
+                    now,
+                )),
+            ));
+        };
+        let cutoff = crate::inbox::MAX_MESSAGE_AGE;
+        assert_eq!(state.next_expiry(), None);
+        for id in 1..=3 {
+            publish(
+                &mut state,
+                "queue",
+                QoS::AtLeastOnce,
+                id,
+                b"old",
+                Duration::ZERO,
+            );
+        }
+        let reserved = state.apply(Command::Act(
+            active.clone(),
+            Operation::NextOutbound(Duration::ZERO),
+        ));
+        assert!(matches!(
+            reserved.reply,
+            Reply::Outbound(Some(Outbound::Publish { id: Some(id), .. })) if id.get() == 1
+        ));
+        publish(
+            &mut state,
+            "incoming",
+            QoS::ExactlyOnce,
+            99,
+            b"old",
+            Duration::ZERO,
+        );
+        let one_hour = Duration::from_secs(3600);
+        publish(&mut state, "queue", QoS::AtLeastOnce, 4, b"fresh", one_hour);
+        assert_eq!(state.next_expiry(), Some(cutoff));
+
+        let expired = state.apply(Command::Expire(cutoff));
+        assert!(expired.effects.contains(&Effect::Ready(active.clone())));
+        for lease in [&active, &offline, &publisher] {
+            let mut payloads = Vec::new();
+            state.sessions[&lease.id]
+                .inbox
+                .as_ref()
+                .unwrap()
+                .visit_messages(|message| payloads.push(message.payload.clone()));
+            if lease == &publisher {
+                assert!(payloads.is_empty());
+            } else {
+                assert_eq!(payloads, [Bytes::from_static(b"fresh")]);
+            }
+        }
+        let held = PacketId::new(1).unwrap();
+        assert!(
+            state.sessions[&active.id]
+                .inbox
+                .as_ref()
+                .unwrap()
+                .in_flight(held)
+        );
+        assert_eq!(
+            state
+                .apply(Command::Act(
+                    publisher,
+                    Operation::Release(PacketId::new(99).unwrap(), cutoff),
+                ))
+                .reply,
+            Reply::NoChange
+        );
+        let next = state.apply(Command::Act(
+            active.clone(),
+            Operation::NextOutbound(cutoff),
+        ));
+        assert!(matches!(
+            next.reply,
+            Reply::Outbound(Some(Outbound::Publish { id: Some(id), .. })) if id.get() == 4
+        ));
+        assert_eq!(
+            state
+                .apply(Command::Act(active, Operation::Ack(held, Ack::Expired)))
+                .reply,
+            Reply::NoChange
+        );
+        state.apply(Command::Expire(cutoff + one_hour));
+        assert_eq!(state.next_expiry(), None);
+    }
+
+    #[test]
     fn standalone_persistence_anchors_online_expiry_at_save() {
         let seconds = Duration::from_secs;
         let saved_at = Duration::from_millis(100_250);
@@ -2776,6 +3095,7 @@ mod tests {
                     retain: true,
                     properties: Vec::new(),
                     expires: None,
+                    broker_expires: None,
                 }),
                 Duration::ZERO,
                 &mut effects,
@@ -2924,6 +3244,7 @@ mod tests {
             retain: false,
             properties: Vec::new(),
             expires: None,
+            broker_expires: None,
         });
         for _ in 0..2 {
             state.publish(packet.clone(), Duration::ZERO, &mut Vec::new());
@@ -2978,72 +3299,186 @@ mod tests {
         assert_reserved(outcome, &resumed, true);
     }
 
+    fn retained_test_message(topic: &str, expires: Option<Duration>) -> Message {
+        Message {
+            source: Publisher {
+                id: "publisher".into(),
+                username: None,
+                security: 1,
+                dynamic_security: None,
+                external: None,
+            },
+            topic: topic.into(),
+            payload: Bytes::from_static(b"retained"),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            properties: Vec::new(),
+            expires,
+            broker_expires: None,
+        }
+    }
+
     #[test]
-    fn retained_max_age_uses_the_last_publish_and_keeps_offline_sessions() {
+    fn retained_hard_deadline_includes_active_publishers_and_system_topics() {
+        use crate::inbox::MAX_MESSAGE_AGE;
+
+        let mut state = State::new(Arc::new(BrokerConfig::default()));
+        let publisher: Arc<str> = "publisher".into();
+        assert!(matches!(
+            state.apply(claim(publisher.clone(), false)).reply,
+            Reply::Claimed { .. }
+        ));
+        let published_at = Duration::from_secs(7);
+        let deadline = published_at + MAX_MESSAGE_AGE;
+        let topics = ["ordinary", "$SYS/test"];
+        for topic in topics {
+            state.publish(
+                retained_test_message(topic, None).published(published_at),
+                published_at,
+                &mut Vec::new(),
+            );
+        }
+
+        assert_eq!(
+            state.next_expiry(),
+            Some(published_at + Duration::from_secs(3600))
+        );
+        let before = deadline - Duration::from_secs(1);
+        state.apply(Command::Expire(before));
+        let next_sweep = state.next_expiry().unwrap();
+        assert!(next_sweep > deadline);
+        for topic in topics {
+            let visible = |now| !state.retained.inspect(topic, now, false, None, |_| false);
+            assert!(visible(before));
+            assert!(!visible(deadline));
+        }
+        assert_eq!(state.retained.count(), 2);
+        assert!(
+            state
+                .retained
+                .visit("ordinary", deadline, false, None, |_| {
+                    panic!("the hard deadline must prevent retained replay even before a sweep")
+                })
+        );
+        assert_eq!(state.retained.count(), 1);
+        state.apply(Command::Expire(next_sweep));
+        assert_eq!(state.retained.count(), 0);
+        assert!(state.sessions[&publisher].owner.is_some());
+    }
+
+    #[test]
+    fn retained_max_age_uses_publish_time_without_shortening_ordinary_deliveries() {
         let hours = |n: u64| Duration::from_secs(n * 3600);
         let config = Arc::new(BrokerConfig {
-            retain_expiry_interval: None,
             retain_max_age: Some(hours(2)),
             ..BrokerConfig::default()
         });
         let mut state = State::new(config.clone());
-        let persistent = Arc::<str>::from("persistent");
-        let Reply::Claimed { lease, .. } = state.apply(claim(persistent.clone(), false)).reply
+        let Reply::Claimed { lease, .. } = state.apply(claim("subscriber".into(), false)).reply
         else {
-            panic!("publisher must be claimed");
+            panic!("subscriber must be claimed");
         };
-        let source = state.sessions[&persistent].publisher.clone();
-        let publish = |state: &mut State, id, topic: &str, now| {
+        state.apply(Command::Act(
+            lease.clone(),
+            Operation::Subscribe(
+                vec![SubscriptionRequest::legacy((
+                    "delayed".into(),
+                    QoS::AtLeastOnce,
+                ))],
+                hours(0),
+            ),
+        ));
+
+        let publish = |state: &mut State, topic, published_at, stored_at, expires| {
             state.publish(
-                Arc::new(Message {
-                    source: Publisher {
-                        id,
-                        ..source.clone()
-                    },
-                    topic: topic.into(),
-                    payload: Bytes::from_static(b"retained"),
-                    qos: QoS::AtLeastOnce,
-                    retain: true,
-                    properties: Vec::new(),
-                    expires: None,
-                }),
-                now,
+                retained_test_message(topic, expires).published(published_at),
+                stored_at,
                 &mut Vec::new(),
             );
         };
-        publish(&mut state, "gone".into(), "abandoned", hours(0));
-        publish(&mut state, "gone".into(), "refreshed", hours(0));
-        publish(&mut state, persistent, "owned", hours(0));
-        state.apply(Command::Act(
-            lease,
-            Operation::Disconnect {
-                now: hours(1),
-                graceful: true,
-                expiry: None,
-            },
-        ));
-        assert_eq!(state.next_expiry(), Some(hours(1)));
-        state.apply(Command::Expire(hours(1)));
-        publish(&mut state, "gone".into(), "refreshed", hours(1));
-
-        let image = rmp_serde::to_vec(&state.persistent_snapshot(hours(1))).unwrap();
-        let mut restored = State::new(config);
-        assert!(restored.restore_persistence(rmp_serde::from_slice(&image).unwrap(), hours(1)));
-        for state in [&mut state, &mut restored] {
-            let topics = |state: &State| {
-                let mut names = Vec::new();
-                state
+        publish(&mut state, "refreshed", hours(0), hours(0), None);
+        publish(&mut state, "refreshed", hours(1), hours(1), None);
+        // As with QoS 2 release, retention can happen later than the ingress.
+        publish(&mut state, "delayed", hours(0), hours(1), Some(hours(4)));
+        publish(&mut state, "mqtt-ttl", hours(1), hours(1), Some(hours(2)));
+        for topic in ["delayed", "mqtt-ttl"] {
+            let visible = |now| {
+                !state
                     .retained
-                    .for_each(|message| names.push(message.topic.clone()));
-                names
+                    .inspect(topic, now, false, config.retain_max_age, |_| false)
             };
+            assert!(visible(hours(2) - Duration::from_secs(1)));
+            assert!(!visible(hours(2)));
+        }
+
+        let image = state.persistent_snapshot(hours(1));
+        let mut restored = State::new(config);
+        assert!(restored.restore_persistence(image, hours(1)));
+        for state in [&mut state, &mut restored] {
             state.apply(Command::Expire(hours(2)));
-            assert_eq!(
-                topics(state),
-                [Box::<str>::from("refreshed"), "owned".into()]
-            );
+            let mut topics = Vec::new();
+            state
+                .retained
+                .for_each(|message| topics.push(message.topic.clone()));
+            assert_eq!(topics, [Box::<str>::from("refreshed")]);
             state.apply(Command::Expire(hours(3)));
-            assert_eq!(topics(state), [Box::<str>::from("owned")]);
+            assert_eq!(state.retained.count(), 0);
+        }
+        assert!(matches!(
+            state
+                .apply(Command::Act(lease, Operation::NextOutbound(hours(3))))
+                .reply,
+            Reply::Outbound(Some(Outbound::Publish { .. }))
+        ));
+    }
+
+    #[test]
+    fn raft_legacy_retained_uses_saved_dates_and_only_seeds_undated_values_once() {
+        use crate::inbox::MAX_MESSAGE_AGE;
+
+        let config = Arc::new(BrokerConfig::default());
+        let saved_at = Duration::from_secs(13);
+        let mut legacy = State::new(config.clone());
+        legacy.retained.store(
+            &Arc::new(retained_test_message("dated", None)),
+            Some(saved_at),
+        );
+        legacy
+            .retained
+            .store(&Arc::new(retained_test_message("undated", None)), None);
+
+        let mut state = State::new(config.clone());
+        state.restore(&legacy.snapshot()).unwrap();
+        let first_expire = saved_at + MAX_MESSAGE_AGE;
+        assert_eq!(state.next_expiry(), Some(Duration::ZERO));
+        assert!(
+            !state
+                .retained
+                .inspect("dated", saved_at, false, None, |message| {
+                    assert_eq!(message.broker_expires, Some(first_expire));
+                    false
+                })
+        );
+        assert!(
+            state
+                .retained
+                .inspect("dated", first_expire, false, None, |_| {
+                    panic!("dated legacy values must use the saved clock before the first sweep")
+                })
+        );
+        state.apply(Command::Expire(first_expire));
+
+        let mut restored = State::new(config);
+        restored.restore(&state.snapshot()).unwrap();
+        for state in [&mut state, &mut restored] {
+            let deadline = first_expire + MAX_MESSAGE_AGE;
+            assert_eq!(state.retained.count(), 1);
+            state.retained.for_each(|message| {
+                assert_eq!(message.topic.as_ref(), "undated");
+                assert_eq!(message.broker_expires, Some(deadline));
+            });
+            state.apply(Command::Expire(deadline));
+            assert_eq!(state.retained.count(), 0);
         }
     }
 
@@ -3173,6 +3608,7 @@ mod tests {
             retain: false,
             properties: Vec::new(),
             expires: None,
+            broker_expires: None,
         });
         let act = |operation| Command::Act(subscriber.clone(), operation);
         for (pubrec, resent) in [

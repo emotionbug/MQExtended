@@ -112,7 +112,7 @@ Use at most one Sparkplug-aware instance per listener. A certificate is not emit
 
 ## Defaults
 
-A few defaults differ so that a broker runs without an operator cleaning up after it. A client notices them only after a long absence, a large backlog or a damaged persistence file. To get Mosquitto's behaviour, set the value in the last column. Mosquitto rejects `never`, `retain_max_age` and `auto_recover`, so put those lines only in MQExtended's configuration.
+MQExtended limits how much state an unattended broker keeps. The last column lists Mosquitto-compatible settings where available. Mosquitto rejects `never`, `retain_max_age` and `auto_recover`; put those lines only in MQExtended's configuration.
 
 | Setting | Mosquitto default | MQExtended default | Mosquitto's behaviour in MQExtended |
 | --- | --- | --- | --- |
@@ -124,14 +124,15 @@ A few defaults differ so that a broker runs without an operator cleaning up afte
 | `persistent_client_expiration` | never | 30 days: a persistent session offline for longer is removed with its subscriptions and queued messages | `persistent_client_expiration never` |
 | `max_queued_bytes` | 0 (no limit) | 16 MiB per client; further messages are dropped as for a full queue | `max_queued_bytes 0` |
 | `retain_expiry_interval` | off | 60 minutes: retained messages whose MQTT 5 expiry has passed are removed from memory and storage | none; delivery is identical, only `$SYS/broker/retained messages/count` drops sooner |
-| `retain_max_age` | kept until replaced or cleared | 90 days for retained messages without an MQTT 5 expiry, subject to the conditions below | `retain_max_age never` |
+| Message lifetime | no broker-wide ceiling | 90 days from publication for all messages | no opt-out |
+| `retain_max_age` | kept until replaced, cleared or expired | 90 days; a shorter value limits retained replay further | `never` or `0` disables only this additional limit |
 | `auto_recover` | (no such option) | true when the configuration allows it (`cluster_state_format 2` and a `cluster_peer` line for this node); see [automatic recovery](cluster.md#automatic-recovery) and the persistence row below | `auto_recover false` |
 
 For a session saved to `.mqx` while its client is still connected, MQExtended calculates the expiry deadline from the save time and applies `persistent_client_expiration`. Mosquitto's autosave writer does not apply the server cap to these sessions. This does not expire live connections: after a crash the last save may predate the actual disconnect, and downtime counts toward the saved deadline. A session already offline keeps its existing deadline, or stays unlimited if it had none. Restarting does not start a new clock for a native snapshot, even an older one with no recorded deadline. This does not change [Mosquitto imports](migration.md#5-carry-state-over) or cap outgoing bridges' local sessions.
 
-The retained sweep removes a message without an MQTT 5 expiry once 90 days have passed since its last publish and the publisher has no session: no connected client and no stored persistent session with that client id. Topics starting with `$SYS` are unaffected. The sweep runs hourly by default. Set `retain_max_age` to a duration such as `30d`, using the same units as `persistent_client_expiration`, or to `never` (also `0`) to turn the age limit off.
+The earlier deadline wins. For example, an MQTT 5 message with a one-day expiry lasts at most one day; a one-year expiry or no expiry lasts at most 90 days. This applies to retained values (including `$SYS`), queued deliveries and unacknowledged payloads, even if the publisher stays connected or a persistent subscriber keeps reconnecting. A reconnect, QoS retry or broker restart does not renew a stored message. A new publication replacing a retained value starts a new lifetime. If you need a retained setting to remain available, republish it before it expires.
 
-For a one-time configuration publish that should outlive those 90 days, set its own MQTT 5 expiry instead of disabling cleanup for the whole broker. For example, `mosquitto_pub -V 5 -r -t devices/defaults -m enabled -D publish message-expiry-interval 31536000` keeps that value for one year unless replaced or cleared. A publish through MQTT 3 has no per-message expiry.
+Session expiry is independent: if a subscriber's session expires after 30 days offline, its queue goes with it. If the session survives, each queued message still has its original deadline. Use `retain_max_age 30d`, for example, to shorten retained replay without changing ordinary queues. Expiry stops delivery at the deadline. Periodic cleanup frees idle payloads; snapshots and WAL compaction reclaim disk space separately.
 
 With `queue_qos0_messages true`, queued QoS 0 messages count against `max_queued_messages` and `max_queued_bytes` like QoS 1 and 2. Mosquitto counts only QoS 1 and 2 (`database.c: db__ready_for_queue`), so an offline client that only receives QoS 0 can queue without limit there.
 

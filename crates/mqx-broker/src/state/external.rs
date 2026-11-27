@@ -399,7 +399,12 @@ impl PendingDelivery {
         }
     }
 
-    fn needed(&self, acl: Acls<'_>, session: &Session, config: &BrokerConfig) -> Vec<VerdictKey> {
+    pub(super) fn needed(
+        &self,
+        acl: Acls<'_>,
+        session: &Session,
+        config: &BrokerConfig,
+    ) -> Vec<VerdictKey> {
         let message = &self.packet.message;
         let decision = if message.expired(acl.context.now) {
             AclDecision::Deny
@@ -547,6 +552,7 @@ impl State {
                         path,
                         *subscribed_at,
                         matches!(operation, Operation::SubscribeDollarRoot(..)),
+                        self.config.retain_max_age,
                         |message| {
                             let read = if session.internal_bridge.is_some() {
                                 AclDecision::Allow
@@ -605,6 +611,25 @@ impl State {
             });
         }
         requests
+    }
+
+    pub(super) fn expire_parked_wills(&mut self, now: Duration, effects: &mut Vec<Effect>) {
+        let advance = self
+            .pending_wills
+            .front()
+            .is_some_and(|will| will.expired(now));
+        self.pending_wills.retain_mut(|will| {
+            // Legacy Raft snapshots did not record when the Will first awaited a verdict.
+            will.published_at.get_or_insert(now);
+            !will.expired(now)
+        });
+        self.pending_will_expiry = self.pending_wills.iter().map(PendingWill::deadline).min();
+        if advance && let Some(next) = self.pending_wills.front() {
+            effects.push(Effect::NeedVerdicts {
+                target: VerdictTarget::Will,
+                keys: needed(next.check(self.acl_at(VerdictContext::new(now)))),
+            });
+        }
     }
 
     pub(crate) fn pending_verdicts(&self, now: Duration) -> Vec<(VerdictTarget, Vec<VerdictKey>)> {
@@ -691,6 +716,7 @@ impl State {
                     );
                 }
             }
+            self.queue_expiry.update(session);
             false
         });
         let mut advanced = false;
@@ -715,6 +741,9 @@ impl State {
                     effects,
                 );
             }
+        }
+        if self.pending_wills.is_empty() {
+            self.pending_will_expiry = None;
         }
     }
 }

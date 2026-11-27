@@ -96,10 +96,10 @@ pub(super) fn read(
                     let session = session(&mut state, &mut sessions, client, security_id(0));
                     match entry {
                         Some(mut entry) => {
-                            entry.message = message;
+                            entry.message = Some(message);
                             session.outgoing.push(entry);
                         }
-                        None => session.incoming.extend(mid.map(|mid| (mid, message))),
+                        None => session.incoming.extend(mid.map(|mid| (mid, Some(message)))),
                     }
                 }
             }
@@ -361,6 +361,7 @@ impl Record {
                 retain,
                 properties,
                 expires,
+                broker_expires: None,
             },
         ))
     }
@@ -400,7 +401,7 @@ impl Record {
         };
         let packet_id = PacketId::new(mid);
         let outgoing = (direction == 1).then_some(PersistentOutgoing {
-            message: 0,
+            message: None,
             id: packet_id,
             qos,
             retain,
@@ -547,7 +548,7 @@ mod tests {
             chunk(&mut db, version, 1, &config);
             let mut base = store.to_vec();
             if version == 5 {
-                base.extend([0; 8]);
+                base.extend(120i64.to_ne_bytes());
                 base.extend(3u32.to_be_bytes());
                 base.extend(b"\0\x01\0\x01\0\0\0\x01\0\0\x01\x01");
                 base.extend(b"stmsg");
@@ -591,7 +592,7 @@ mod tests {
             };
             chunk(&mut db, version, 5, sub);
             chunk(&mut db, version, 101, b"unknown");
-            let state = read(&db[..], |_| 1).unwrap();
+            let mut state = read(&db[..], |_| 1).unwrap();
             assert_eq!(state.messages[0].payload, b"msg"[..]);
             assert_eq!(state.retained, [0]);
             let session = &state.sessions[0];
@@ -601,6 +602,16 @@ mod tests {
             assert!(session.outgoing[0].queued);
             assert_eq!(session.subscriptions[0].filter.as_ref(), "t");
             assert_eq!(session.subscriptions[0].no_local, version == 5);
+            let mqtt_deadline = (version == 5).then(|| Duration::from_secs(120));
+            assert_eq!(state.messages[0].expires, mqtt_deadline);
+            assert!(state.needs_message_age_upgrade());
+            let imported_at = Duration::from_secs(100);
+            state.cap_message_ages(imported_at);
+            assert_eq!(state.messages[0].expires, mqtt_deadline);
+            assert_eq!(
+                state.messages[0].broker_expires,
+                Some(imported_at + crate::inbox::MAX_MESSAGE_AGE)
+            );
             assert!(read(&db[..db.len() - 1], |_| 1).is_err());
         }
     }

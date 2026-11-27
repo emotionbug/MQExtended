@@ -359,8 +359,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                                     if delivery.qos == QoS::AtLeastOnce));
                         match wire.delivery(outbound, listener.mount_point.as_deref(), broker.now())
                         {
-                            Ok(Some(id)) => {
-                                if let Err(error) = session.ack(id, Ack::Dropped).await {
+                            Ok(Some((id, reason))) => {
+                                if let Err(error) = session.ack(id, reason).await {
                                     break Err(error);
                                 }
                             }
@@ -1434,18 +1434,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         outbound: Outbound,
         mount_point: Option<&str>,
         now: Duration,
-    ) -> Result<Option<mqx_codec::PacketId>, BrokerError> {
-        let Outbound::Publish { delivery, id, dup } = outbound else {
-            let Outbound::Release(id) = outbound else {
-                unreachable!()
-            };
-            if self.v5.is_some() {
-                self.output_v5(&Packet5::PubRel(v5::publish_ack(id, R::SUCCESS)))?;
-            } else {
-                self.output(&Packet::PubRel(id))?;
+    ) -> Result<Option<(mqx_codec::PacketId, Ack)>, BrokerError> {
+        let (delivery, id, dup) = match outbound {
+            Outbound::Publish { delivery, id, dup } => (delivery, id, dup),
+            Outbound::Expired(id) => return Ok(id.map(|id| (id, Ack::Expired))),
+            Outbound::Release(id) => {
+                if self.v5.is_some() {
+                    self.output_v5(&Packet5::PubRel(v5::publish_ack(id, R::SUCCESS)))?;
+                } else {
+                    self.output(&Packet::PubRel(id))?;
+                }
+                return Ok(None);
             }
-            return Ok(None);
         };
+        // A reserved packet may have waited for a blocked socket past its deadline.
+        if delivery.message.expired(now) {
+            return Ok(id.map(|id| (id, Ack::Expired)));
+        }
+        let oversized = || id.map(|id| (id, Ack::Dropped));
         // lib/send_publish.c: send__publish strips the destination
         // listener's mount point by length before writing to the wire.
         let Some(topic) = delivery
@@ -1469,7 +1475,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             let minimum =
                 5 + topic.len() + 2 * usize::from(id.is_some()) + delivery.message.payload.len();
             if !v5.fits(minimum) {
-                return Ok(id);
+                return Ok(oversized());
             }
             let expiry = delivery.message.expires.and_then(|at| {
                 let seconds = at.as_secs().checked_sub(now.as_secs())? as u32;
@@ -1505,13 +1511,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 payload: delivery.message.payload.clone(),
             });
             match codec5::encode(&packet, &mut self.output) {
-                Err(codec5::EncodeError::PacketTooLarge) => return Ok(id),
+                Err(codec5::EncodeError::PacketTooLarge) => return Ok(oversized()),
                 Err(error) => return Err(error.into()),
                 Ok(()) => {}
             }
             if !v5.fits(self.output.len()) {
                 self.output.clear();
-                return Ok(id);
+                return Ok(oversized());
             }
             self.enqueue(self.output.len());
         } else {
@@ -1540,9 +1546,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         if self.v5.is_some() || !self.input.is_empty() || self.output.len() >= MAX_BYTES {
             return Ok(());
         }
+        let now = self.broker.now();
         let fits = |delivery: &Delivery, room| {
             // At most 5 fixed-header bytes, two topic-length bytes and a MID.
-            delivery.message.topic.len() + delivery.message.payload.len() + 9 <= room
+            !delivery.message.expired(now)
+                && delivery.message.topic.len() + delivery.message.payload.len() + 9 <= room
         };
         let mut inbox = live.inbox.as_ref().map(|inbox| inbox.lock().unwrap());
         if inbox.is_none() && !self.broker.is_clustered() {
@@ -1551,7 +1559,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         for _ in 1..16 {
             let room = MAX_BYTES - self.output.len();
             let packet = if let Some(inbox) = &mut inbox {
-                inbox.reserve_ready_qos1(|delivery| fits(delivery, room))
+                inbox.reserve_ready_qos1(now, |delivery| fits(delivery, room))
             } else {
                 live.pop_reserved_if(|packet| {
                     matches!(packet, Outbound::Publish { delivery, .. }
@@ -1559,7 +1567,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 })?
             };
             let Some(packet) = packet else { break };
-            let dropped = self.delivery(packet, mount, Duration::ZERO)?;
+            let dropped = self.delivery(packet, mount, now)?;
             debug_assert!(dropped.is_none());
         }
         Ok(())
@@ -1661,11 +1669,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 _ = timeout(expires), if waiting_for_input => return Ok((1, Step::End(End::Timeout))),
                 reply = &mut request => {
                     let (count, step) = reply?;
-                    if let Some(dropped) = dropped
+                    if let Some((id, reason)) = dropped
                         && matches!(step, Step::Continue)
                         && !live.taken.load(Ordering::Acquire)
                     {
-                        let step = session.ack(dropped, Ack::Dropped).await?;
+                        let step = session.ack(id, reason).await?;
                         return Ok((count, step));
                     }
                     return Ok((count, step));

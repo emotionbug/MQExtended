@@ -3,6 +3,7 @@
 mod mosquitto;
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, BufReader, BufWriter, Read, Write},
     path::Path,
@@ -44,7 +45,8 @@ pub(crate) struct PersistentSession {
     pub(crate) bridge: Option<BridgeState>,
     pub(crate) subscriptions: Vec<PersistentSubscription>,
     pub(crate) outgoing: Vec<PersistentOutgoing>,
-    pub(crate) incoming: Vec<(PacketId, usize)>,
+    // An inbound QoS 2 packet ID can outlive its payload.
+    pub(crate) incoming: Vec<(PacketId, Option<usize>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +61,8 @@ pub(crate) struct PersistentSubscription {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistentOutgoing {
-    pub(crate) message: usize,
+    // Only a QoS 2 release may keep its packet ID without a message.
+    pub(crate) message: Option<usize>,
     pub(crate) id: Option<PacketId>,
     pub(crate) qos: QoS,
     pub(crate) retain: bool,
@@ -131,6 +134,35 @@ impl PersistentState {
                 .iter()
                 .map(|s| s.incoming.len() + s.outgoing.len())
                 .sum(),
+        }
+    }
+
+    /// Older snapshots lack a broker deadline and must be replaced before serving.
+    pub fn needs_message_age_upgrade(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.broker_expires.is_none())
+    }
+
+    pub(crate) fn cap_message_ages(&mut self, now: Duration) {
+        let mut stored_by_message = HashMap::<usize, Duration>::new();
+        for &(position, at) in &self.retained_store_times {
+            let index = self.retained[position];
+            if self.messages[index].broker_expires.is_none() {
+                stored_by_message
+                    .entry(index)
+                    .and_modify(|oldest| *oldest = (*oldest).min(at))
+                    .or_insert(at);
+            }
+        }
+        // Mosquitto does not record a publication time. Old native snapshots
+        // may have a retained store time; otherwise use the first restore.
+        // Do this before sharing the Arcs with the retained tree or inboxes.
+        for (index, message) in self.messages.iter_mut().enumerate() {
+            if message.broker_expires.is_none() {
+                let published_at = stored_by_message.get(&index).copied().unwrap_or(now);
+                Arc::make_mut(message).cap_age(published_at);
+            }
         }
     }
 
@@ -224,9 +256,10 @@ impl PersistentState {
                 session
                     .incoming
                     .iter()
-                    .any(|&(_, message)| !exists(message))
+                    .any(|&(_, message)| message.is_some_and(|index| !exists(index)))
                     || session.outgoing.iter().any(|entry| {
-                        !exists(entry.message)
+                        entry.message.is_some_and(|index| !exists(index))
+                            || (entry.message.is_none() && !entry.release)
                             || (entry.qos != QoS::AtMostOnce && entry.id.is_none())
                             || (entry.release
                                 && (entry.qos != QoS::ExactlyOnce || entry.id.is_none()))
@@ -278,6 +311,112 @@ fn invalid(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Er
 mod tests {
     use super::*;
     use std::fs;
+
+    use crate::{BrokerConfig, inbox::MAX_MESSAGE_AGE, state::State};
+
+    #[test]
+    fn native_message_deadlines_survive_restart_without_refreshing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.mqx");
+        let known = Duration::from_secs(100);
+        let first_restore = Duration::from_secs(200);
+        let short = first_restore + Duration::from_secs(10);
+        let stamped = known + MAX_MESSAGE_AGE + Duration::from_secs(10);
+        let fallback = first_restore + MAX_MESSAGE_AGE;
+        let publisher = |id: &str| Publisher {
+            id: id.into(),
+            username: None,
+            security: 1,
+            dynamic_security: None,
+            external: None,
+        };
+        let message = |topic: &str, expires, broker_expires| {
+            Arc::new(Message {
+                source: publisher("source"),
+                topic: topic.into(),
+                payload: Bytes::from_static(b"payload"),
+                qos: QoS::ExactlyOnce,
+                retain: true,
+                properties: Vec::new(),
+                expires,
+                broker_expires,
+            })
+        };
+        let session = |id| PersistentSession {
+            publisher: publisher(id),
+            last_mid: 5,
+            expiry_interval: None,
+            expires: None,
+            bridge: None,
+            subscriptions: Vec::new(),
+            outgoing: (0..4)
+                .map(|message| PersistentOutgoing {
+                    message: Some(message),
+                    id: PacketId::new(message as u16 + 1),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    dup: false,
+                    release: false,
+                    queued: true,
+                    identifier: 0,
+                })
+                .collect(),
+            incoming: vec![(PacketId::new(5).unwrap(), Some(0))],
+        };
+        let legacy = PersistentState {
+            messages: vec![
+                message("dated", None, None),
+                message("undated", Some(fallback + MAX_MESSAGE_AGE), None),
+                message("short", Some(short), None),
+                message("stamped", None, Some(stamped)),
+            ],
+            retained: vec![0, 1, 2, 3],
+            retained_store_times: vec![(0, known), (3, first_restore)],
+            sessions: vec![session("a"), session("b")],
+            ..PersistentState::default()
+        };
+        legacy.write_snapshot(&path).unwrap();
+        let read = || PersistentState::read_snapshot(&path).unwrap().unwrap();
+        let restore = |now| {
+            let mut state = State::new(Arc::new(BrokerConfig::default()));
+            assert!(state.restore_persistence(read(), now));
+            state
+        };
+        assert!(read().needs_message_age_upgrade());
+        let first = restore(first_restore);
+        let upgraded = first.persistent_snapshot(first_restore);
+        assert_eq!(upgraded.counts().client_messages, 10);
+        let deadlines: HashMap<_, _> = upgraded
+            .messages
+            .iter()
+            .map(|msg| (msg.topic.as_ref(), (msg.expires, msg.broker_expires)))
+            .collect();
+        assert_eq!(
+            deadlines,
+            HashMap::from([
+                ("dated", (None, Some(known + MAX_MESSAGE_AGE))),
+                ("undated", (Some(fallback), Some(fallback))),
+                ("short", (Some(short), Some(fallback))),
+                ("stamped", (None, Some(stamped))),
+            ])
+        );
+        upgraded.write_snapshot(&path).unwrap();
+        assert!(!read().needs_message_age_upgrade());
+        for (now, messages, references) in [
+            (short + Duration::from_secs(1), 3, 8),
+            (known + MAX_MESSAGE_AGE, 2, 6),
+            (stamped, 1, 4),
+            (fallback, 0, 2),
+        ] {
+            // Compare saving aged state with restoring the untouched file.
+            for state in [&first, &restore(now)] {
+                let counts = state.persistent_snapshot(now).counts();
+                assert_eq!(counts.messages, messages);
+                assert_eq!(counts.retained, messages);
+                assert_eq!(counts.client_messages, references);
+            }
+        }
+    }
 
     #[test]
     fn snapshot_save_recovers_only_its_fixed_staging_path() {

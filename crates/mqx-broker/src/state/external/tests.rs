@@ -634,4 +634,10 @@ fn parked_wills_and_delivery_survive_raft_snapshot_but_not_standalone_persistenc
     resolve_for(&mut state, VerdictTarget::Will, vec![first]);
     assert!(state.pending_wills.is_empty());
     assert_eq!(state.retained.count(), 1);
+
+    state.restore(&snapshot).unwrap();
+    let deadline = NOW + crate::inbox::MAX_MESSAGE_AGE;
+    state.apply(Command::Expire(deadline));
+    assert!(state.pending_wills.is_empty());
+    assert_eq!(state.retained.count(), 0);
 }

@@ -25,6 +25,8 @@ pub(crate) struct Publisher {
     pub(crate) external: Option<(u32, mqx_auth::external::Binding)>,
 }
 
+pub(crate) const MAX_MESSAGE_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Message {
     pub(crate) source: Publisher,
@@ -36,10 +38,29 @@ pub(crate) struct Message {
     pub(crate) properties: Vec<PublishProperty>,
     #[serde(default)]
     pub(crate) expires: Option<Duration>,
+    /// Absolute broker deadline, independent of whether the publisher sent an MQTT 5 property.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) broker_expires: Option<Duration>,
 }
 
 impl Message {
     pub(crate) const CERTIFICATE_PREFIX: &str = "$sparkplug/certificates/";
+
+    pub(crate) fn cap_age(&mut self, published_at: Duration) {
+        let cap = published_at.saturating_add(MAX_MESSAGE_AGE);
+        let cap = self
+            .broker_expires
+            .map_or(cap, |previous| previous.min(cap));
+        self.broker_expires = Some(cap);
+        if let Some(expiry) = &mut self.expires {
+            *expiry = (*expiry).min(cap);
+        }
+    }
+
+    pub(crate) fn published(mut self, now: Duration) -> Arc<Self> {
+        self.cap_age(now);
+        Arc::new(self)
+    }
 
     pub(crate) fn sparkplug_certificate(&self, retain: bool) -> Arc<Self> {
         let mut topic = String::with_capacity(Self::CERTIFICATE_PREFIX.len() + self.topic.len());
@@ -58,8 +79,9 @@ impl Message {
             qos: self.qos,
             retain,
             properties: self.properties.clone(),
-            // property__process_publish removes expiry from callback properties.
-            expires: None,
+            // The retained BIRTH copy must not outlive a shorter source expiry.
+            expires: self.expires,
+            broker_expires: self.broker_expires,
         })
     }
 
@@ -69,9 +91,15 @@ impl Message {
             .then(|| now.saturating_add(Duration::from_secs(u64::from(interval))))
     }
 
+    pub(crate) fn broker_expired(&self, now: Duration) -> bool {
+        self.broker_expires.is_some_and(|at| now >= at)
+    }
+
     pub(crate) fn expired(&self, now: Duration) -> bool {
-        self.expires
-            .is_some_and(|expiry| now.as_secs() > expiry.as_secs())
+        self.broker_expired(now)
+            || self
+                .expires
+                .is_some_and(|expiry| now.as_secs() > expiry.as_secs())
     }
 }
 
@@ -134,6 +162,7 @@ pub(crate) enum Outbound {
         dup: bool,
     },
     Release(PacketId),
+    Expired(Option<PacketId>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,13 +172,17 @@ pub(crate) enum Ack {
     Completed,
     Rejected,
     Dropped,
+    Expired,
 }
 
 impl Ack {
     // database.c: db__message_delete_outgoing counts normal acknowledgements
     // and the negative PUBREC path, but not discards for an oversized packet.
     pub(crate) fn counts_for_persistence(self) -> bool {
-        matches!(self, Self::Acknowledged | Self::Completed | Self::Rejected)
+        matches!(
+            self,
+            Self::Acknowledged | Self::Completed | Self::Rejected | Self::Expired
+        )
     }
 }
 
@@ -164,10 +197,30 @@ enum Phase {
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Outgoing {
-    delivery: Delivery,
+    // An expired packet that was already sent still owns its MID and credit.
+    delivery: Option<Delivery>,
     id: Option<PacketId>,
     dup: bool,
     phase: Phase,
+}
+
+impl Outgoing {
+    fn qos(&self) -> QoS {
+        self.delivery.as_ref().map_or_else(
+            || {
+                if self.phase == Phase::AwaitAck {
+                    QoS::AtLeastOnce
+                } else {
+                    QoS::ExactlyOnce
+                }
+            },
+            |delivery| delivery.qos,
+        )
+    }
+
+    fn is_release(&self) -> bool {
+        matches!(self.phase, Phase::Release | Phase::AwaitComp)
+    }
 }
 
 // Match the legacy socket's write coalescing budget; the in-flight window
@@ -179,6 +232,8 @@ const REPLAY_BATCH_BYTES: usize = 16 * 1024;
 pub(crate) struct OutboundPrefix {
     next_unsent: usize,
     ids: Vec<PacketId>,
+    #[serde(default)]
+    now: Duration,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,19 +245,22 @@ struct Counters {
 }
 
 impl Counters {
-    fn change(&mut self, delivery: &Delivery, add: bool) {
-        let bytes = delivery.message.payload.len();
+    fn change(&mut self, entry: &Outgoing, add: bool) {
+        let bytes = entry
+            .delivery
+            .as_ref()
+            .map_or(0, |delivery| delivery.message.payload.len());
         if add {
             self.count += 1;
             self.bytes += bytes;
-            if delivery.qos != QoS::AtMostOnce {
+            if entry.qos() != QoS::AtMostOnce {
                 self.qos_count += 1;
                 self.qos_bytes += bytes;
             }
         } else {
             self.count -= 1;
             self.bytes -= bytes;
-            if delivery.qos != QoS::AtMostOnce {
+            if entry.qos() != QoS::AtMostOnce {
                 self.qos_count -= 1;
                 self.qos_bytes -= bytes;
             }
@@ -227,13 +285,17 @@ pub(crate) struct Inbox {
     pub(crate) receive_maximum: Option<u16>,
     #[serde(default)]
     send_used: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub(crate) bridge_receive_maximum: Option<u16>,
+    #[serde(default)]
+    payloadless: usize,
+    #[serde(default)]
+    expiry: Option<Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Incoming {
-    message: Arc<Message>,
+    message: Option<Arc<Message>>,
     repeated: bool,
 }
 
@@ -259,32 +321,71 @@ pub(crate) enum Receive {
     Duplicate,
 }
 
+pub(crate) fn schedule_queue_expiry(expiry: &mut Option<Duration>, message: &Message) {
+    // Coalesce busy queues to at most one replicated sweep per hour. Legacy
+    // snapshots without a clock need an initial, replicated time anchor.
+    let at = if let Some(at) = message.broker_expires {
+        let at = message.expires.map_or(at, |mqtt| {
+            at.min(Duration::from_secs(mqtt.as_secs().saturating_add(1)))
+        });
+        const HOUR: u64 = 3600;
+        let elapsed = Duration::new(at.as_secs() % HOUR, at.subsec_nanos());
+        if elapsed.is_zero() {
+            at
+        } else {
+            at.saturating_add(Duration::from_secs(HOUR) - elapsed)
+        }
+    } else {
+        Duration::ZERO
+    };
+    *expiry = Some(expiry.map_or(at, |previous| previous.min(at)));
+}
+
+pub(crate) fn expire_queued_message(message: &mut Arc<Message>, now: Duration) -> bool {
+    if message.broker_expires.is_none() {
+        Arc::make_mut(message).cap_age(now);
+    }
+    message.expired(now)
+}
+
 impl Inbox {
     pub(crate) fn persist_into(
         &self,
         entry: &mut PersistentSession,
+        now: Duration,
         mut intern: impl FnMut(&Arc<Message>) -> usize,
     ) {
         entry.last_mid = self.last_mid;
-        entry.incoming.extend(
-            self.incoming
-                .iter()
-                .map(|(&id, message)| (id, intern(&message.message))),
-        );
+        entry
+            .incoming
+            .extend(self.incoming.iter().map(|(&id, entry)| {
+                let message = entry
+                    .message
+                    .as_ref()
+                    .filter(|message| !message.expired(now));
+                (id, message.map(&mut intern))
+            }));
         entry.outgoing.extend(
             self.in_flight
                 .iter()
                 .map(|entry| (entry, false))
                 .chain(self.queued.iter().map(|entry| (entry, true)))
-                .map(|(entry, queued)| PersistentOutgoing {
-                    message: intern(&entry.delivery.message),
-                    id: entry.id,
-                    qos: entry.delivery.qos,
-                    retain: entry.delivery.retain,
-                    dup: entry.dup,
-                    release: matches!(entry.phase, Phase::Release | Phase::AwaitComp),
-                    queued,
-                    identifier: entry.delivery.subscription_identifier,
+                .filter_map(|(entry, queued)| {
+                    let delivery = entry.delivery.as_ref().filter(|d| !d.message.expired(now));
+                    let release = entry.is_release();
+                    if delivery.is_none() && !release {
+                        return None;
+                    }
+                    Some(PersistentOutgoing {
+                        message: delivery.map(|delivery| intern(&delivery.message)),
+                        id: entry.id,
+                        qos: entry.qos(),
+                        retain: delivery.is_some_and(|delivery| delivery.retain),
+                        dup: entry.dup,
+                        release,
+                        queued,
+                        identifier: delivery.map_or(0, |delivery| delivery.subscription_identifier),
+                    })
                 }),
         );
     }
@@ -300,31 +401,43 @@ impl Inbox {
             ..Self::default()
         };
         for (id, index) in std::mem::take(&mut entry.incoming) {
-            let message = &messages[index];
-            if !message.expired(now)
-                && let std::collections::btree_map::Entry::Vacant(slot) = inbox.incoming.entry(id)
-            {
-                inbox.incoming_bytes += message.payload.len();
+            if let std::collections::btree_map::Entry::Vacant(slot) = inbox.incoming.entry(id) {
+                let message = index
+                    .map(|index| &messages[index])
+                    .filter(|message| !message.expired(now))
+                    .cloned();
+                if let Some(message) = &message {
+                    inbox.incoming_bytes += message.payload.len();
+                } else {
+                    inbox.payloadless += 1;
+                }
                 slot.insert(Incoming {
-                    message: message.clone(),
+                    message,
                     repeated: false,
                 });
             }
         }
         inbox.incoming_slots = inbox.incoming.len().min(config.max_inflight_messages);
         for msg in std::mem::take(&mut entry.outgoing) {
-            let message = &messages[msg.message];
-            if message.expired(now) {
-                continue;
-            }
-            let outgoing = Outgoing {
-                delivery: Delivery {
+            let delivery = msg
+                .message
+                .map(|index| &messages[index])
+                .filter(|message| !message.expired(now))
+                .map(|message| Delivery {
                     message: message.clone(),
                     qos: msg.qos,
                     retain: msg.retain,
                     dedup_id: None,
                     subscription_identifier: msg.identifier,
-                },
+                });
+            if delivery.is_none() {
+                if !msg.release {
+                    continue;
+                }
+                inbox.payloadless += 1;
+            }
+            let outgoing = Outgoing {
+                delivery,
                 id: msg.id,
                 dup: msg.dup,
                 phase: if msg.release {
@@ -339,34 +452,137 @@ impl Inbox {
                 || (msg.qos != QoS::AtMostOnce
                     && !below(inbox.flight_stats.qos_count, config.max_inflight_messages))
             {
-                inbox.queue_stats.change(&outgoing.delivery, true);
+                inbox.queue_stats.change(&outgoing, true);
                 inbox.queued.push_back(outgoing);
             } else {
                 inbox.push_flight(outgoing);
             }
         }
+        inbox.rebuild_expiry();
         inbox
     }
 
     pub(crate) fn visit_messages(&self, mut visit: impl FnMut(&Arc<Message>)) {
         for entry in self.in_flight.iter().chain(&self.queued) {
-            visit(&entry.delivery.message);
+            if let Some(delivery) = &entry.delivery {
+                visit(&delivery.message);
+            }
         }
-        for entry in self.incoming.values() {
-            visit(&entry.message);
+        for message in self
+            .incoming
+            .values()
+            .filter_map(|entry| entry.message.as_ref())
+        {
+            visit(message);
         }
     }
 
+    pub(crate) fn restore_expiry(&mut self) {
+        if self.expiry.is_none() {
+            self.rebuild_expiry();
+        }
+    }
+
+    fn rebuild_expiry(&mut self) {
+        let mut expiry = None;
+        self.visit_messages(|message| schedule_queue_expiry(&mut expiry, message));
+        self.expiry = expiry;
+    }
+
+    pub(crate) fn next_expiry(&self) -> Option<Duration> {
+        (self.in_flight.len() + self.queued.len() + self.incoming.len() > self.payloadless)
+            .then_some(self.expiry)
+            .flatten()
+    }
+
+    pub(crate) fn expire(&mut self, now: Duration) -> u64 {
+        let mut expired = 0;
+        let mut expiry = None;
+        let mut index = 0;
+        let next_unsent = self.next_unsent;
+        self.in_flight.retain_mut(|entry| {
+            let reserved = index < next_unsent;
+            index += 1;
+            let Some(delivery) = entry.delivery.as_mut() else {
+                return true;
+            };
+            if !expire_queued_message(&mut delivery.message, now) {
+                schedule_queue_expiry(&mut expiry, &delivery.message);
+                return true;
+            }
+            let hard_expiry = delivery.message.broker_expired(now);
+            expired += 1;
+            self.flight_stats.change(entry, false);
+            if entry.is_release() || hard_expiry && entry.phase != Phase::Publish {
+                // Keep the wire handshake (including its send credit) and
+                // the position of any already-issued reservation.
+                entry.delivery = None;
+                self.payloadless += 1;
+                self.flight_stats.change(entry, true);
+                return true;
+            }
+            if reserved {
+                self.next_unsent -= 1;
+            }
+            if entry.qos() != QoS::AtMostOnce {
+                self.send_used = self.send_used.saturating_sub(1);
+            }
+            false
+        });
+        self.queued.retain_mut(|entry| {
+            let Some(delivery) = entry.delivery.as_mut() else {
+                return true;
+            };
+            if !expire_queued_message(&mut delivery.message, now) {
+                schedule_queue_expiry(&mut expiry, &delivery.message);
+                return true;
+            }
+            expired += 1;
+            self.queue_stats.change(entry, false);
+            if entry.is_release() {
+                entry.delivery = None;
+                self.payloadless += 1;
+                self.queue_stats.change(entry, true);
+                true
+            } else {
+                false
+            }
+        });
+        for entry in self.incoming.values_mut() {
+            let Some(message) = &mut entry.message else {
+                continue;
+            };
+            if expire_queued_message(message, now) {
+                expired += 1;
+                self.incoming_bytes -= message.payload.len();
+                self.payloadless += 1;
+                entry.message = None;
+            } else {
+                schedule_queue_expiry(&mut expiry, message);
+            }
+        }
+        self.expiry = expiry;
+        expired
+    }
+
     pub(crate) fn visit_acl_topics(&self, now: Duration, mut visit: impl FnMut(&str, bool)) {
-        for entry in self.in_flight.iter().chain(&self.queued) {
-            let message = &entry.delivery.message;
+        for message in self
+            .in_flight
+            .iter()
+            .chain(&self.queued)
+            .filter_map(|entry| Some(&entry.delivery.as_ref()?.message))
+        {
             if !message.expired(now) {
                 visit(&message.topic, false);
             }
         }
-        for entry in self.incoming.values() {
-            if !entry.message.expired(now) {
-                visit(&entry.message.topic, true);
+        for message in self
+            .incoming
+            .values()
+            .filter_map(|entry| entry.message.as_ref())
+        {
+            if !message.expired(now) {
+                visit(&message.topic, true);
             }
         }
     }
@@ -442,8 +658,12 @@ impl Inbox {
         if delivery.qos as u8 > max_qos as u8 {
             delivery.qos = max_qos;
         }
+        if self.next_expiry().is_none() {
+            self.expiry = None;
+        }
+        schedule_queue_expiry(&mut self.expiry, &delivery.message);
         let entry = Outgoing {
-            delivery,
+            delivery: Some(delivery),
             id,
             dup: false,
             phase: Phase::Publish,
@@ -452,7 +672,7 @@ impl Inbox {
             self.push_flight(entry);
             Offer::Ready
         } else {
-            self.queue_stats.change(&entry.delivery, true);
+            self.queue_stats.change(&entry, true);
             self.queued.push_back(entry);
             Offer::Queued
         }
@@ -493,12 +713,12 @@ impl Inbox {
     }
 
     fn push_flight(&mut self, entry: Outgoing) {
-        if entry.delivery.qos != QoS::AtMostOnce
+        if entry.qos() != QoS::AtMostOnce
             && let Some(max) = self.receive_maximum
         {
             self.send_used = (self.send_used + 1).min(usize::from(max));
         }
-        self.flight_stats.change(&entry.delivery, true);
+        self.flight_stats.change(&entry, true);
         self.in_flight.push_back(entry);
     }
 
@@ -521,10 +741,10 @@ impl Inbox {
         while self
             .queued
             .front()
-            .is_some_and(|entry| self.flight_available(entry.delivery.qos, config))
+            .is_some_and(|entry| self.flight_available(entry.qos(), config))
         {
             let entry = self.queued.pop_front().unwrap();
-            self.queue_stats.change(&entry.delivery, false);
+            self.queue_stats.change(&entry, false);
             self.push_flight(entry);
         }
     }
@@ -537,7 +757,7 @@ impl Inbox {
             || self
                 .queued
                 .front()
-                .is_some_and(|entry| self.flight_available(entry.delivery.qos, config))
+                .is_some_and(|entry| self.flight_available(entry.qos(), config))
     }
 
     pub(crate) fn has_reserved(&self) -> bool {
@@ -546,14 +766,16 @@ impl Inbox {
 
     pub(crate) fn reserve_ready_qos1(
         &mut self,
+        now: Duration,
         fits: impl FnOnce(&Delivery) -> bool,
     ) -> Option<Outbound> {
         let entry = self.in_flight.get_mut(self.next_unsent)?;
-        // An ACK has no timestamp. Expiring messages use the timed path.
+        let delivery = entry.delivery.as_ref()?;
         if entry.phase != Phase::Publish
-            || entry.delivery.qos != QoS::AtLeastOnce
-            || entry.delivery.message.expires.is_some()
-            || !fits(&entry.delivery)
+            || delivery.qos != QoS::AtLeastOnce
+            || delivery.message.expires.is_some()
+            || delivery.message.broker_expired(now)
+            || !fits(delivery)
         {
             return None;
         }
@@ -561,17 +783,19 @@ impl Inbox {
         Some(reserve_publish(entry))
     }
 
-    fn replay_prefix_ids(&self) -> impl Iterator<Item = PacketId> + '_ {
+    fn replay_prefix_ids(&self, now: Duration) -> impl Iterator<Item = PacketId> + '_ {
         let mut room = REPLAY_BATCH_BYTES;
         self.in_flight
             .iter()
             .skip(self.next_unsent)
             .take(REPLAY_BATCH_PACKETS)
             .map_while(move |entry| {
-                let message = &entry.delivery.message;
+                let delivery = entry.delivery.as_ref()?;
+                let message = &delivery.message;
                 if entry.phase != Phase::Publish
-                    || entry.delivery.qos != QoS::AtLeastOnce
+                    || delivery.qos != QoS::AtLeastOnce
                     || message.expires.is_some()
+                    || message.broker_expired(now)
                     || message.topic.starts_with(crate::control::PREFIX)
                 {
                     return None;
@@ -584,8 +808,8 @@ impl Inbox {
             })
     }
 
-    pub(crate) fn outbound_prefix(&self) -> Option<OutboundPrefix> {
-        let mut ready = self.replay_prefix_ids();
+    pub(crate) fn outbound_prefix(&self, now: Duration) -> Option<OutboundPrefix> {
+        let mut ready = self.replay_prefix_ids(now);
         let first = ready.next()?;
         let second = ready.next()?;
         let mut ids = Vec::with_capacity(REPLAY_BATCH_PACKETS);
@@ -594,6 +818,7 @@ impl Inbox {
         Some(OutboundPrefix {
             next_unsent: self.next_unsent,
             ids,
+            now,
         })
     }
 
@@ -610,7 +835,10 @@ impl Inbox {
         // prefix before committing any attempt; never skip or promote here.
         if self.next_unsent != prefix.next_unsent
             || !(2..=REPLAY_BATCH_PACKETS).contains(&count)
-            || !self.replay_prefix_ids().take(count).eq(prefix.ids)
+            || !self
+                .replay_prefix_ids(prefix.now)
+                .take(count)
+                .eq(prefix.ids)
         {
             return false;
         }
@@ -628,9 +856,11 @@ impl Inbox {
         self.receive_maximum.is_some()
             && self.next_unsent == 1
             && self.in_flight.get(1).is_some_and(|entry| {
-                entry.phase == Phase::Publish && entry.delivery.qos == QoS::AtMostOnce
+                entry.phase == Phase::Publish && entry.qos() == QoS::AtMostOnce
             })
-            && self.in_flight[0].delivery.message.expired(now)
+            && self.in_flight[0].delivery.as_ref().is_some_and(|delivery| {
+                delivery.message.expired(now) && !delivery.message.broker_expired(now)
+            })
     }
 
     pub(crate) fn expire_before_qos0(&mut self, now: Duration) {
@@ -650,8 +880,13 @@ impl Inbox {
             // database.c: db__message_write_inflight_out uses a strict comparison.
             // Equality still permits delivery without a Message Expiry property.
             let entry = self.in_flight.get_mut(self.next_unsent)?;
-            if entry.delivery.message.expired(now) {
-                if entry.delivery.qos != QoS::AtMostOnce {
+            if entry.phase == Phase::Publish
+                && entry
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.message.expired(now))
+            {
+                if entry.qos() != QoS::AtMostOnce {
                     self.send_used = self.send_used.saturating_sub(1);
                 }
                 self.remove_flight(self.next_unsent);
@@ -659,10 +894,10 @@ impl Inbox {
                 continue;
             }
             match entry.phase {
-                Phase::Publish if entry.delivery.qos == QoS::AtMostOnce => {
+                Phase::Publish if entry.qos() == QoS::AtMostOnce => {
                     let entry = self.remove_flight(self.next_unsent);
                     return Some(Outbound::Publish {
-                        delivery: entry.delivery,
+                        delivery: entry.delivery.unwrap(),
                         id: None,
                         dup: false,
                     });
@@ -711,11 +946,12 @@ impl Inbox {
             .take(self.next_unsent.saturating_sub(pending_writes))
             .zip(ids)
             .take_while(|(entry, id)| {
-                let topic = &entry.delivery.message.topic;
                 entry.phase == Phase::AwaitAck
                     && entry.id == Some(**id)
-                    && mount_len < topic.len()
-                    && topic.is_char_boundary(mount_len)
+                    && entry.delivery.as_ref().is_some_and(|delivery| {
+                        let topic = &delivery.message.topic;
+                        mount_len < topic.len() && topic.is_char_boundary(mount_len)
+                    })
             })
             .count()
     }
@@ -734,13 +970,29 @@ impl Inbox {
             self.send_used = self.send_used.saturating_sub(1);
         }
         if let Some(index) = self.in_flight.iter().position(|entry| entry.id == Some(id)) {
+            // The local expiration notice can outlive the reservation (for
+            // example, across a bridge transport reset). It cannot expire
+            // an unattempted packet that happens to have the same MID.
+            if kind == Ack::Expired
+                && (index >= self.next_unsent
+                    || !matches!(
+                        self.in_flight[index].phase,
+                        Phase::AwaitAck | Phase::AwaitRec
+                    ))
+            {
+                return true;
+            }
             if !ack_entry(&mut self.in_flight[index], kind) {
                 return false;
+            }
+            if kind == Ack::Expired {
+                self.send_used = self.send_used.saturating_sub(1);
             }
             if kind != Ack::Received {
                 self.remove_flight(index);
             }
-        } else if (queued_pubrec || kind != Ack::Received)
+        } else if kind != Ack::Expired
+            && (queued_pubrec || kind != Ack::Received)
             && let Some(index) = self.queued.iter().position(|entry| entry.id == Some(id))
         {
             // handle_pubrec.c: handle__pubrec calls db__message_update_outgoing
@@ -751,7 +1003,7 @@ impl Inbox {
             }
             if kind != Ack::Received {
                 let entry = self.queued.remove(index).unwrap();
-                self.queue_stats.change(&entry.delivery, false);
+                self.remove_queued_stats(&entry);
             }
         }
         if kind != Ack::Received {
@@ -765,13 +1017,28 @@ impl Inbox {
         if index < self.next_unsent {
             self.next_unsent -= 1;
         }
-        self.flight_stats.change(&entry.delivery, false);
+        self.payloadless -= usize::from(entry.delivery.is_none());
+        self.flight_stats.change(&entry, false);
         entry
+    }
+
+    fn remove_queued_stats(&mut self, entry: &Outgoing) {
+        self.payloadless -= usize::from(entry.delivery.is_none());
+        self.queue_stats.change(entry, false);
     }
 
     pub(crate) fn reset_outbound(&mut self) {
         self.dropped = false;
         self.next_unsent = 0;
+        self.in_flight.retain(|entry| {
+            if entry.delivery.is_none() && !entry.is_release() {
+                self.payloadless -= 1;
+                self.flight_stats.change(entry, false);
+                false
+            } else {
+                true
+            }
+        });
         for entry in &mut self.in_flight {
             entry.phase = if matches!(entry.phase, Phase::AwaitComp | Phase::Release) {
                 Phase::Release
@@ -785,6 +1052,12 @@ impl Inbox {
     pub(crate) fn bridge_reset(&mut self, clean_outgoing: bool, clean_incoming: bool) {
         self.reset_outbound();
         if clean_outgoing {
+            self.payloadless -= self
+                .in_flight
+                .iter()
+                .chain(&self.queued)
+                .filter(|entry| entry.delivery.is_none())
+                .count();
             self.in_flight.clear();
             self.queued.clear();
             self.flight_stats = Counters::default();
@@ -793,9 +1066,17 @@ impl Inbox {
             self.send_used = 0;
         }
         if clean_incoming {
+            self.payloadless -= self
+                .incoming
+                .values()
+                .filter(|entry| entry.message.is_none())
+                .count();
             self.incoming.clear();
             self.incoming_bytes = 0;
             self.incoming_slots = 0;
+        }
+        if self.next_expiry().is_none() {
+            self.expiry = None;
         }
     }
 
@@ -807,31 +1088,39 @@ impl Inbox {
         config: &BrokerConfig,
         now: Duration,
     ) {
+        self.expire(now);
         self.reset_outbound();
         if self.receive_maximum.is_none() {
             self.promote(config);
         }
         self.in_flight.retain(|entry| {
-            let allowed = !entry.delivery.message.expired(now)
-                && allowed(&entry.delivery.message.topic, false);
+            let allowed = entry
+                .delivery
+                .as_ref()
+                .is_none_or(|delivery| allowed(&delivery.message.topic, false));
             if !allowed {
-                self.flight_stats.change(&entry.delivery, false);
+                self.flight_stats.change(entry, false);
             }
             allowed
         });
         self.queued.retain(|entry| {
-            let allowed = !entry.delivery.message.expired(now)
-                && allowed(&entry.delivery.message.topic, false);
+            let allowed = entry
+                .delivery
+                .as_ref()
+                .is_none_or(|delivery| allowed(&delivery.message.topic, false));
             if !allowed {
-                self.queue_stats.change(&entry.delivery, false);
+                self.queue_stats.change(entry, false);
             }
             allowed
         });
         self.incoming_slots = self.incoming.len().min(self.incoming_maximum(config));
         self.incoming.retain(|_, entry| {
-            let allowed = !entry.message.expired(now) && allowed(&entry.message.topic, true);
+            let Some(message) = &entry.message else {
+                return true;
+            };
+            let allowed = allowed(&message.topic, true);
             if !allowed {
-                self.incoming_bytes -= entry.message.payload.len();
+                self.incoming_bytes -= message.payload.len();
             }
             allowed
         });
@@ -843,6 +1132,7 @@ impl Inbox {
             self.incoming_slots = self.incoming.len().min(self.incoming_maximum(config));
             self.promote(config);
         }
+        self.rebuild_expiry();
     }
 
     // src/handle_connack.c: handle__connack_properties recomputes the send
@@ -865,11 +1155,14 @@ impl Inbox {
         message: Arc<Message>,
         config: &BrokerConfig,
     ) -> Receive {
+        // A payload-free entry still represents a pending QoS 2 exchange.
+        // Reusing its MID cannot turn a retransmission into a new message.
         if let Some(previous) = self.incoming.get_mut(&id) {
-            if previous.message.qos == message.qos
-                && previous.message.topic == message.topic
-                && previous.message.payload == message.payload
-            {
+            if previous.message.as_ref().is_none_or(|previous| {
+                previous.qos == message.qos
+                    && previous.topic == message.topic
+                    && previous.payload == message.payload
+            }) {
                 return if std::mem::replace(&mut previous.repeated, true) {
                     Receive::Duplicate
                 } else {
@@ -883,10 +1176,14 @@ impl Inbox {
                 self.incoming_slots += 1;
             }
             self.incoming_bytes += message.payload.len();
+            if self.next_expiry().is_none() {
+                self.expiry = None;
+            }
+            schedule_queue_expiry(&mut self.expiry, &message);
             self.incoming.insert(
                 id,
                 Incoming {
-                    message,
+                    message: Some(message),
                     repeated: false,
                 },
             );
@@ -936,8 +1233,12 @@ impl Inbox {
 
     fn remove_incoming(&mut self, id: PacketId) -> Option<Arc<Message>> {
         let entry = self.incoming.remove(&id)?;
-        self.incoming_bytes -= entry.message.payload.len();
-        Some(entry.message)
+        if let Some(message) = &entry.message {
+            self.incoming_bytes -= message.payload.len();
+        } else {
+            self.payloadless -= 1;
+        }
+        entry.message
     }
 }
 
@@ -947,14 +1248,14 @@ fn below(value: usize, limit: usize) -> bool {
 
 fn reserve_publish(entry: &mut Outgoing) -> Outbound {
     let packet = Outbound::Publish {
-        delivery: entry.delivery.clone(),
+        delivery: entry.delivery.as_ref().unwrap().clone(),
         id: entry.id,
         dup: entry.dup,
     };
     // database.c: db__message_write_inflight_out_single marks the attempt
     // before any retry; reconnect preserves DUP.
     entry.dup = true;
-    entry.phase = if entry.delivery.qos == QoS::AtLeastOnce {
+    entry.phase = if entry.qos() == QoS::AtLeastOnce {
         Phase::AwaitAck
     } else {
         Phase::AwaitRec
@@ -964,14 +1265,15 @@ fn reserve_publish(entry: &mut Outgoing) -> Outbound {
 
 fn ack_entry(entry: &mut Outgoing, kind: Ack) -> bool {
     match kind {
-        Ack::Received if entry.delivery.qos == QoS::ExactlyOnce => {
+        Ack::Received if entry.qos() == QoS::ExactlyOnce => {
             entry.phase = Phase::AwaitComp;
             true
         }
-        Ack::Acknowledged => entry.delivery.qos == QoS::AtLeastOnce,
-        Ack::Completed => entry.delivery.qos == QoS::ExactlyOnce && entry.phase == Phase::AwaitComp,
-        Ack::Rejected => entry.delivery.qos == QoS::ExactlyOnce && entry.phase == Phase::AwaitRec,
+        Ack::Acknowledged => entry.qos() == QoS::AtLeastOnce,
+        Ack::Completed => entry.qos() == QoS::ExactlyOnce && entry.phase == Phase::AwaitComp,
+        Ack::Rejected => entry.qos() == QoS::ExactlyOnce && entry.phase == Phase::AwaitRec,
         Ack::Dropped => true,
+        Ack::Expired => matches!(entry.phase, Phase::AwaitAck | Phase::AwaitRec),
         Ack::Received => false,
     }
 }
@@ -996,6 +1298,7 @@ mod tests {
                 retain: false,
                 properties: Vec::new(),
                 expires: None,
+                broker_expires: None,
             }),
             qos,
             retain: false,
@@ -1036,17 +1339,19 @@ mod tests {
                 0 => {}
                 1 => barrier.phase = Phase::Release,
                 2 => {
-                    Arc::get_mut(&mut barrier.delivery.message).unwrap().expires =
-                        Some(Duration::from_secs(1));
+                    Arc::get_mut(&mut barrier.delivery.as_mut().unwrap().message)
+                        .unwrap()
+                        .expires = Some(Duration::from_secs(1));
                 }
                 3 => barrier.id = None,
                 _ => {
-                    Arc::get_mut(&mut barrier.delivery.message).unwrap().topic =
-                        "$CONTROL/test".into();
+                    Arc::get_mut(&mut barrier.delivery.as_mut().unwrap().message)
+                        .unwrap()
+                        .topic = "$CONTROL/test".into();
                 }
             }
 
-            let prefix = inbox.outbound_prefix().unwrap();
+            let prefix = inbox.outbound_prefix(Duration::ZERO).unwrap();
             assert_eq!(prefix.ids.len(), 2);
             assert_eq!(
                 inbox.offer(
@@ -1068,7 +1373,7 @@ mod tests {
                 ));
             }
             assert_eq!(inbox.next_unsent, 2);
-            assert!(inbox.outbound_prefix().is_none());
+            assert!(inbox.outbound_prefix(Duration::ZERO).is_none());
             assert!(!inbox.in_flight[3].dup);
         }
     }
@@ -1089,11 +1394,11 @@ mod tests {
                     Offer::Ready
                 );
             }
-            let planned = inbox.outbound_prefix().unwrap();
+            let planned = inbox.outbound_prefix(Duration::ZERO).unwrap();
             if acknowledged {
                 assert!(inbox.ack(PacketId::new(2).unwrap(), Ack::Acknowledged, &config));
             } else {
-                assert!(inbox.reserve_ready_qos1(|_| true).is_some());
+                assert!(inbox.reserve_ready_qos1(Duration::ZERO, |_| true).is_some());
             }
             assert!(!inbox.reserve_outbound_prefix(planned, |_| panic!("stale reservation")));
             assert_publish_id(&mut inbox, &config, if acknowledged { 1 } else { 2 });
@@ -1116,7 +1421,7 @@ mod tests {
             );
         }
         assert_eq!(
-            inbox.outbound_prefix().unwrap().ids.len(),
+            inbox.outbound_prefix(Duration::ZERO).unwrap().ids.len(),
             REPLAY_BATCH_PACKETS
         );
 
@@ -1132,7 +1437,7 @@ mod tests {
                 Offer::Ready
             );
         }
-        assert!(inbox.outbound_prefix().is_none());
+        assert!(inbox.outbound_prefix(Duration::ZERO).is_none());
     }
 
     // util_mosq.c: mosquitto__mid_generate skips zero at wraparound.
@@ -1329,7 +1634,7 @@ mod tests {
             outgoing: Vec::new(),
             incoming: Vec::new(),
         };
-        inbox.persist_into(&mut persisted, |_| 0);
+        inbox.persist_into(&mut persisted, Duration::ZERO, |_| 0);
         let restored = Inbox::restore_persisted(
             &mut persisted,
             std::slice::from_ref(&message.message),
@@ -1350,6 +1655,104 @@ mod tests {
                 inbox.offer(qos1.clone(), false, QoS::ExactlyOnce, &config),
                 Offer::Queued
             );
+        }
+    }
+
+    #[test]
+    fn native_restart_resumes_expired_qos2_handshakes_without_payload() {
+        use crate::persistence::PersistentState;
+
+        let config = BrokerConfig {
+            max_inflight_messages: 1,
+            ..BrokerConfig::default()
+        };
+        let deadline = Duration::from_secs(10);
+        let mut expiring = delivery(b"expired", QoS::ExactlyOnce);
+        Arc::make_mut(&mut expiring.message).broker_expires = Some(deadline);
+        let mut next = delivery(b"next", QoS::AtLeastOnce);
+        Arc::make_mut(&mut next.message).broker_expires = Some(deadline + Duration::from_secs(1));
+        let release_id = PacketId::new(1).unwrap();
+        let incoming_id = PacketId::new(10).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handshakes.mqx");
+
+        for (save_at, swept) in [(Duration::ZERO, false), (deadline, false), (deadline, true)] {
+            let mut inbox = Inbox::default();
+            assert_eq!(
+                inbox.offer(expiring.clone(), true, QoS::ExactlyOnce, &config),
+                Offer::Ready
+            );
+            assert_publish_id(&mut inbox, &config, 1);
+            assert!(inbox.ack(release_id, Ack::Received, &config));
+            assert_eq!(
+                inbox.offer(next.clone(), true, QoS::ExactlyOnce, &config),
+                Offer::Queued
+            );
+            assert!(matches!(
+                inbox.receive(incoming_id, expiring.message.clone(), &config),
+                Receive::Accepted
+            ));
+            if swept {
+                assert_eq!(inbox.expire(deadline), 2);
+            }
+
+            let mut image = PersistentState::default();
+            let mut session = PersistentSession {
+                publisher: expiring.message.source.clone(),
+                last_mid: 0,
+                expiry_interval: None,
+                expires: None,
+                bridge: None,
+                subscriptions: Vec::new(),
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+            };
+            inbox.persist_into(&mut session, save_at, |message| {
+                if let Some(index) = image
+                    .messages
+                    .iter()
+                    .position(|other| Arc::ptr_eq(other, message))
+                {
+                    return index;
+                }
+                let index = image.messages.len();
+                image.messages.push(message.clone());
+                index
+            });
+            image.sessions.push(session);
+            assert_eq!(
+                image.counts().messages,
+                if save_at < deadline { 2 } else { 1 }
+            );
+            image.write_snapshot(&path).unwrap();
+            let mut image = PersistentState::read_snapshot(&path).unwrap().unwrap();
+            let mut restored = Inbox::restore_persisted(
+                &mut image.sessions[0],
+                &image.messages,
+                &config,
+                deadline,
+            );
+
+            assert_eq!(
+                restored.next_outbound(&config, deadline),
+                Some(Outbound::Release(release_id))
+            );
+            assert!(restored.next_outbound(&config, deadline).is_none());
+            assert!(restored.ack(release_id, Ack::Completed, &config));
+            assert!(matches!(
+                restored.next_outbound(&config, deadline),
+                Some(Outbound::Publish { delivery, .. }) if delivery.message.payload == b"next"[..]
+            ));
+
+            assert!(
+                !restored.simple_qos1(),
+                "expired inbound MID is still reserved"
+            );
+            assert!(
+                restored.release(incoming_id).is_none(),
+                "no expired payload to route"
+            );
+            assert!(restored.simple_qos1());
         }
     }
 }

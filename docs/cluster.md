@@ -181,9 +181,9 @@ The broker bounds that state by default, unlike Mosquitto ([defaults](mosquitto-
 
 - A persistent session whose client stays away for 30 days is removed (`persistent_client_expiration`). Until then its offline queue holds at most 1,000 messages and 16 MiB (`max_queued_messages`, `max_queued_bytes`); later messages are dropped as for any full queue.
 - With `queue_qos0_messages true`, queued QoS 0 messages count against the same limits.
-- The retained sweep removes messages whose MQTT 5 expiry has passed (`retain_expiry_interval`) and applies the [age limit](mosquitto-compatibility.md#defaults) to messages without an expiry (`retain_max_age`). Their topic levels stay, as in Mosquitto.
+- The [90-day message lifetime](mosquitto-compatibility.md#defaults) applies whether a publisher or subscriber has a session or not. You can shorten retained replay with `retain_max_age`.
 
-Change these in `mosquitto.conf`, or with `brokerOptions` in the Helm chart.
+Set configurable limits in `mosquitto.conf`, or with `brokerOptions` in the Helm chart.
 
 With automatic recovery, `discarded/` keeps the most recently discarded state, including `discarded/interrupted-switch/`. The node expires it after 7 days even with the reserve disabled; delete it sooner if you don't need it.
 
@@ -241,14 +241,11 @@ Do not enable `mosquitto_sparkplug_aware` until every node runs a build that sup
 
 Enable `auth-plug` or `go-auth` only once every node runs a build that supports it. Their ACL checks write `Authorize` and `ResolveVerdicts` entries, and the sessions of their clients carry verdicts and waiting deliveries that an older build cannot replay. Every node applies those entries through its own copy of the plugin, so add, remove or reconfigure a plugin with the whole cluster stopped. A node without the plugin would decide differently from the others. Existing log entries are not reinterpreted when you enable one.
 
-Releases before this one never expire persistent sessions, cap offline queues in bytes, or sweep retained messages by default; this release does ([defaults](mosquitto-compatibility.md#defaults)). Every node applies those limits to the same log entries, so nodes with different values keep different state. When upgrading from an earlier release:
+Use a cold upgrade when crossing the introduction of the 90-day message ceiling. Old nodes may retain and deliver a payload that new nodes discard on the same log entry. No configuration setting makes this safe during a rolling upgrade. Drain client and bridge traffic, stop all nodes, back up the cluster, then upgrade every voter and learner before restoring traffic.
 
-1. As each node gets the new binary, add `persistent_client_expiration never`, `retain_max_age never`, `max_queued_bytes 0` and `auto_recover false` to its file, unless the file already sets them. The upgraded nodes then decide exactly as the old ones did.
-2. Once every node runs the new binary, remove those lines. Send SIGHUP to one node to commit the new session expiry and retained age limits everywhere at the same log index, then restart the nodes one at a time for the queue limit and automatic recovery.
+Only sessions that disconnect after enabling the 30-day session limit get a new disconnect deadline. The message lifetime is independent of that setting.
 
-Only sessions that disconnect after the switch get the 30-day expiry; sessions already offline expire when they next disconnect. Expired retained messages leave a node's memory at different times while the defaults differ; clients see no difference. If `queue_qos0_messages` is on, upgrade with client traffic drained: queued QoS 0 messages now count against the queue limits, and no setting reproduces the earlier accounting.
-
-Keep `auto_recover` off until every node runs a build that supports it (step 1 above). Its branch identity files use a format an older build refuses to start with. When upgrading from a build that stores unbounded recovery history, finish upgrading every node before the 513th fork of a branch. If already past that point, use a cold upgrade. Do not downgrade a node after its history has been compacted.
+Keep `auto_recover` off until every node runs a build that supports it. Its branch identity files use a format an older build refuses to start with. When upgrading from a build that stores unbounded recovery history, finish upgrading every node before the 513th fork of a branch. If already past that point, use a cold upgrade. Do not downgrade a node after its history has been compacted.
 
 ## What clients observe when a node fails
 

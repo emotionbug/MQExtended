@@ -118,7 +118,7 @@ impl State {
         // each replica delivers only its own transport effects, and a lost
         // proposal reply cannot cause the origin to publish it a second time.
         self.publish_with_verdicts(
-            Arc::new(Message {
+            Message {
                 source: Publisher {
                     id: Arc::from(""),
                     username: None,
@@ -132,7 +132,9 @@ impl State {
                 retain: false,
                 properties: Vec::new(),
                 expires: None,
-            }),
+                broker_expires: None,
+            }
+            .published(now),
             VerdictContext::new(now),
             effects,
         );

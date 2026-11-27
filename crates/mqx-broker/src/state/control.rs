@@ -101,7 +101,7 @@ impl State {
         }
 
         let message = |topic: Box<str>, payload| {
-            Arc::new(Message {
+            Message {
                 source: Publisher {
                     id: Arc::from(""),
                     username: None,
@@ -115,7 +115,9 @@ impl State {
                 retain: false,
                 properties: Vec::new(),
                 expires: None,
-            })
+                broker_expires: None,
+            }
+            .published(now)
         };
         match result {
             // control_common.c: mosquitto_control_send_response uses a normal
@@ -139,6 +141,7 @@ impl State {
                     topic.push_str(SUFFIX);
                     DeliverySink {
                         config: &self.config,
+                        queue_expiry: &mut self.queue_expiry,
                         pending_sessions: &mut self.pending_sessions,
                         effects,
                         counters: &mut self.sys_counters,

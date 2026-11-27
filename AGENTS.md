@@ -64,7 +64,7 @@ Build the Mosquitto reference first; see [docs/development.md](docs/development.
 
 ## Critical rules
 
-- **Mosquitto 2.1.4 behaviour is the contract, not the MQTT spec.** When they disagree, match Mosquitto and cite the source (`file.c` + function) in a comment. Read [docs/mosquitto-compatibility.md](docs/mosquitto-compatibility.md) before changing anything a client can observe. The exceptions are the [defaults](docs/mosquitto-compatibility.md#defaults) chosen so the broker runs unattended; each one keeps a documented setting that restores Mosquitto's behaviour.
+- **Mosquitto 2.1.4 behaviour is the contract, not the MQTT spec.** When they disagree, match Mosquitto and cite the source (`file.c` + function) in a comment. Read [docs/mosquitto-compatibility.md](docs/mosquitto-compatibility.md) before changing anything a client can observe. The [defaults](docs/mosquitto-compatibility.md#defaults) document deliberate exceptions and whether an operator can override them.
 - **Prove parity with Mosquitto's own artefacts.** Prefer test vectors extracted from Mosquitto's test suite, hashes from `mosquitto_passwd`, and differential runs against the real binaries over hand-written expectations.
 - **Clients cannot be changed.** A fix that requires a client setting, reconnect logic or protocol version change is not a fix.
 - **Run scoped checks.** Test the crate you changed; run the workspace suite before a milestone commit, not after every edit.

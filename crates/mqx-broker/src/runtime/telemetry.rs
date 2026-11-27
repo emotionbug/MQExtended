@@ -125,6 +125,7 @@ impl Broker {
         let local = local.as_mut().unwrap();
         local.update_security(None);
         let mut effects = Vec::new();
+        let old_expiry = local.state.next_expiry();
         local.state.sample_sys(
             Tick {
                 wall,
@@ -142,7 +143,11 @@ impl Broker {
             &mut effects,
             |store| collect_transient(live, store),
         );
+        let reschedule = old_expiry != local.state.next_expiry();
         runtime.dispatch(effects, &self.0.config.load(), Owner::LOCAL, None);
+        if reschedule {
+            self.schedule_local_expiry(&mut runtime);
+        }
     }
 
     pub(super) fn sample_node(&self, owner: Owner) -> NodeSample {

@@ -55,7 +55,9 @@ impl State {
         // persist_write.c: persist__retain_save omits $SYS retained values
         // but persist__client_messages_save keeps queued $SYS publications.
         self.retained.for_each_stored(|message, stored_at| {
-            if !message.topic.starts_with("$SYS") {
+            if !message.topic.starts_with("$SYS")
+                && !Retained::expired(message, stored_at, now, self.config.retain_max_age)
+            {
                 if let Some(stored_at) = stored_at {
                     output
                         .retained_store_times
@@ -123,16 +125,21 @@ impl State {
                 outgoing: Vec::new(),
                 incoming: Vec::new(),
             };
-            inbox.persist_into(&mut entry, &mut intern);
+            inbox.persist_into(&mut entry, now, &mut intern);
             output.sessions.push(entry);
         }
         output
     }
 
-    pub(crate) fn restore_persistence(&mut self, input: PersistentState, now: Duration) -> bool {
+    pub(crate) fn restore_persistence(
+        &mut self,
+        mut input: PersistentState,
+        now: Duration,
+    ) -> bool {
         if self.last_epoch != 0 {
             return false;
         }
+        input.cap_message_ages(now);
         // The epoch is a replicated, durable one-time gate, even for an empty image.
         self.last_epoch += 1;
         let PersistentState {
@@ -149,7 +156,7 @@ impl State {
                 .map(|(_, stored_at)| stored_at)
                 .or(from_mosquitto.then_some(now));
             let message = &messages[index];
-            if !message.expired(now) {
+            if !Retained::expired(message, stored_at, now, self.config.retain_max_age) {
                 self.store_retained(message, now, stored_at);
             }
         }
@@ -221,6 +228,7 @@ impl State {
             self.restore_subscription(id, entry);
         }
         self.rebuild_bridge_index();
+        self.rebuild_queue_expiry();
         true
     }
 

@@ -313,45 +313,56 @@ impl BridgeSession {
         mqtt5: bool,
     ) -> Result<Option<mqx_codec::v5::Packet>, BrokerError> {
         use mqx_codec::v5::{Packet, PublishAck};
-        let Some(packet) = self.broker.next_outbound(&self.live).await? else {
-            return Ok(None);
-        };
-        Ok(Some(match packet {
-            Outbound::Release(packet_id) => Packet::PubRel(PublishAck {
-                packet_id,
-                reason: R::SUCCESS,
-                properties: Vec::new(),
-            }),
-            Outbound::Publish { delivery, id, dup } => {
-                let message = &delivery.message;
-                let mut properties = if mqtt5 {
-                    message
-                        .properties
-                        .iter()
-                        .map(PublishProperty::wire)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if mqtt5 && let Some(expires) = message.expires {
-                    let ttl = expires
-                        .as_secs()
-                        .saturating_sub(self.broker.now().as_secs());
-                    if ttl != 0 {
-                        properties.push(Property::MessageExpiryInterval(ttl as u32));
-                    }
+        let (delivery, id, dup, now) = loop {
+            let Some(packet) = self.broker.next_outbound(&self.live).await? else {
+                return Ok(None);
+            };
+            let expired = match packet {
+                Outbound::Expired(id) => id,
+                Outbound::Release(packet_id) => {
+                    return Ok(Some(Packet::PubRel(PublishAck {
+                        packet_id,
+                        reason: R::SUCCESS,
+                        properties: Vec::new(),
+                    })));
                 }
-                Packet::Publish(Publish5 {
-                    dup,
-                    qos: delivery.qos,
-                    retain: delivery.retain,
-                    topic: message.topic.to_string(),
-                    packet_id: id,
-                    properties,
-                    payload: message.payload.clone(),
-                })
+                Outbound::Publish { delivery, id, dup } => {
+                    let now = self.broker.now();
+                    if !delivery.message.expired(now) {
+                        break (delivery, id, dup, now);
+                    }
+                    id
+                }
+            };
+            if let Some(id) = expired {
+                self.apply(Operation::Ack(id, Ack::Expired)).await?;
             }
-        }))
+        };
+        let message = &delivery.message;
+        let mut properties = if mqtt5 {
+            message
+                .properties
+                .iter()
+                .map(PublishProperty::wire)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if mqtt5 && let Some(expires) = message.expires {
+            let ttl = expires.as_secs().saturating_sub(now.as_secs());
+            if ttl != 0 {
+                properties.push(Property::MessageExpiryInterval(ttl as u32));
+            }
+        }
+        Ok(Some(Packet::Publish(Publish5 {
+            dup,
+            qos: delivery.qos,
+            retain: delivery.retain,
+            topic: message.topic.to_string(),
+            packet_id: id,
+            properties,
+            payload: message.payload.clone(),
+        })))
     }
 
     pub async fn receive(&self, packet: Publish5) -> Result<R, BrokerError> {

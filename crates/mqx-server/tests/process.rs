@@ -810,6 +810,39 @@ async fn persistence_retries_failed_change_save_without_more_client_traffic() {
 }
 
 #[tokio::test]
+async fn persistence_upgrades_legacy_native_message_ages_before_ready() {
+    use mqx_broker::PersistentState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+    let address = listen_address();
+    let old_source = dir.path().join("seed.db");
+    let native = dir.path().join("mosquitto.db.mqx");
+    fs::write(&old_source, mosquitto_v2_retained_database()).unwrap();
+    let old_image = PersistentState::read_mosquitto(&old_source, |_| 1)
+        .unwrap()
+        .unwrap();
+    assert!(old_image.needs_message_age_upgrade());
+    old_image.write_snapshot(&native).unwrap();
+    let old_inode = fs::metadata(&native).unwrap().ino();
+
+    let mut command = persistence_command(dir.path(), address, "autosave_interval 0");
+    let mut child = command.spawn().unwrap();
+    ready(&notify).await;
+    child.kill().await.unwrap();
+    let upgraded = PersistentState::read_snapshot(&native).unwrap().unwrap();
+    assert!(!upgraded.needs_message_age_upgrade());
+    assert_eq!(upgraded.counts().retained, 1);
+    let upgraded_inode = fs::metadata(&native).unwrap().ino();
+    assert_ne!(old_inode, upgraded_inode);
+
+    let mut child = command.spawn().unwrap();
+    ready(&notify).await;
+    child.kill().await.unwrap();
+    assert_eq!(fs::metadata(&native).unwrap().ino(), upgraded_inode);
+}
+
+#[tokio::test]
 async fn persistence_failed_final_save_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
     let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
@@ -1394,14 +1427,7 @@ async fn corrupt_persistence_database_exits_with_the_reference_status() {
     }
 }
 
-#[tokio::test]
-async fn auto_recover_does_not_reimport_stale_state_after_a_crash() {
-    let dir = tempfile::tempdir().unwrap();
-    let legacy = dir.path().join("mosquitto.db");
-    let native = dir.path().join("mosquitto.db.mqx");
-    let discarded = dir.path().join("mosquitto.db.mqx.discarded");
-
-    // A Mosquitto v2 database with one retained message.
+fn mosquitto_v2_retained_database() -> Vec<u8> {
     let mut original = b"\0\xb5\0mosquitto db\0\0\0\0\0\0\0\x02".to_vec();
     let id = 1u64.to_ne_bytes();
     let message = [
@@ -1414,6 +1440,17 @@ async fn auto_recover_does_not_reimport_stale_state_after_a_crash() {
         original.extend(u32::try_from(contents.len()).unwrap().to_be_bytes());
         original.extend_from_slice(contents);
     }
+    original
+}
+
+#[tokio::test]
+async fn auto_recover_does_not_reimport_stale_state_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("mosquitto.db");
+    let native = dir.path().join("mosquitto.db.mqx");
+    let discarded = dir.path().join("mosquitto.db.mqx.discarded");
+
+    let original = mosquitto_v2_retained_database();
     fs::write(&legacy, &original).unwrap();
     assert_eq!(
         mqx_broker::PersistentState::read_mosquitto(&legacy, |_| 1)

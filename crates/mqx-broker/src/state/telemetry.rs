@@ -101,7 +101,8 @@ impl State {
             return;
         }
         let startup = startup && self.sys.wall.is_none();
-        let time = Duration::from_secs(now);
+        // Standalone `now` is boot time for uptime metrics, not a publication timestamp.
+        let time = Duration::from_secs(wall);
         let mut sampler = std::mem::take(&mut self.sys);
         if startup {
             self.publish_system(
@@ -156,7 +157,7 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         self.publish(
-            Arc::new(Message {
+            Message {
                 source: Publisher {
                     id: Arc::from(""),
                     username: None,
@@ -170,7 +171,9 @@ impl State {
                 retain: expires.is_none() && self.config.retain_available,
                 properties: Vec::new(),
                 expires,
-            }),
+                broker_expires: None,
+            }
+            .published(now),
             now,
             effects,
         );

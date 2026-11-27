@@ -59,10 +59,19 @@ impl Persistence {
         {
             Load::Restored(image) => {
                 let counts = image.counts();
+                let upgrade = image.needs_message_age_upgrade();
                 broker
                     .restore_persistence(image)
                     .await
                     .map_err(ServerError::Cluster)?;
+                if upgrade {
+                    // Persist the first restore's age anchors before serving.
+                    // Waiting for autosave would let each crash reset them.
+                    let (_, state) = broker
+                        .persistence_snapshot(false)
+                        .expect("standalone broker");
+                    write_snapshot(native, state).await?;
+                }
                 log_restored(counts);
                 return Ok(());
             }

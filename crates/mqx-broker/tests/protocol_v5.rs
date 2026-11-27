@@ -406,6 +406,52 @@ async fn publication_properties_preserve_order_and_expiry_decrements_offline() {
     sink.silent().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn delayed_pubrel_and_session_resume_do_not_restart_the_message_lifetime() {
+    const DAY: u32 = 86_400;
+    let broker = broker(BrokerConfig::default());
+    let settings = Connect {
+        clean_start: false,
+        properties: vec![P::SessionExpiryInterval(u32::MAX)],
+        ..request("sink")
+    };
+    let mut sink = connected(&broker, settings.clone(), false).await;
+    sink.subscribe(sub("updates", Q1), vec![]).await;
+    sink.disconnect(R::SUCCESS, vec![]).await;
+    let mut sender = connected(&broker, request("sender"), false).await;
+    sender
+        .send(Packet::Publish(Publish {
+            retain: true,
+            properties: vec![P::MessageExpiryInterval(365 * DAY)],
+            ..publish("updates", b"old", Q2, 1)
+        }))
+        .await;
+    sender.expect(Packet::PubRec(ack(1, R::SUCCESS))).await;
+
+    advance(Duration::from_secs(u64::from(89 * DAY))).await;
+    sender.send(Packet::PubRel(ack(1, R::SUCCESS))).await;
+    sender.expect(Packet::PubComp(ack(1, R::SUCCESS))).await;
+    let mut sink = connected(&broker, settings.clone(), true).await;
+    sink.expect(Packet::Publish(Publish {
+        properties: vec![P::MessageExpiryInterval(DAY)],
+        ..publish("updates", b"old", Q1, 1)
+    }))
+    .await;
+    // Leave the delivered packet unacknowledged.
+    sink.disconnect(R::SUCCESS, vec![]).await;
+    let fresh = publish("updates", b"new", Q1, 2);
+    sender.send(Packet::Publish(fresh.clone())).await;
+    sender.expect(Packet::PubAck(ack(2, R::SUCCESS))).await;
+
+    advance(Duration::from_secs(u64::from(DAY))).await;
+    let mut sink = connected(&broker, settings, true).await;
+    sink.expect(Packet::Publish(fresh)).await;
+    sink.send(Packet::PubAck(ack(2, R::SUCCESS))).await;
+    sink.subscribe(sub("updates", Q1), vec![]).await;
+    sink.send(Packet::PingReq).await;
+    sink.expect(Packet::PingResp).await;
+}
+
 // retain.c: retain__search's level-zero `/#` fallback is different for
 // dollar-prefixed roots, which have no leading empty hierarchy component.
 #[tokio::test(start_paused = true)]

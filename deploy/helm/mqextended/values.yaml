@@ -15,10 +15,8 @@ rollout:
 qos1ReplayBatch: {}
 # Disable Nagle on accepted TCP connections. Small frames may use more packets.
 setTcpNoDelay: false
-# Broker options for the global section of mosquitto.conf, overriding the
-# broker's defaults. Example: {persistent_client_expiration: never,
-# max_queued_bytes: 0, retain_max_age: never} restores Mosquitto's behaviour
-# for sessions, queues and retained messages without an expiry.
+# Global mosquitto.conf overrides, e.g. {retain_max_age: 30d} for shorter
+# retained replay. No setting extends the broker's 90-day message lifetime.
 brokerOptions: {}
 
 image:

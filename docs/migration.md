@@ -12,7 +12,7 @@ mqextended --test-config -c /etc/mosquitto/mosquitto.conf
 
 It parses `mosquitto.conf` with Mosquitto's rules and fails on any directive it does not implement, naming the directive; the list is in [Mosquitto compatibility](mosquitto-compatibility.md#unsupported-directives). Like Mosquitto's `--test-config`, it does not open `password_file` or `acl_file`; start the broker once to load those. Both files load unchanged.
 
-A file that leaves a setting out gets MQExtended's [defaults](mosquitto-compatibility.md#defaults). Persistent sessions and retained messages have age limits, each client's offline queue is capped at 16 MiB, and a damaged state file is set aside instead of stopping the broker. If a client relies on Mosquitto's behaviour, for example a device that stays offline for months and expects its subscriptions and queued messages back, add the lines from the last column of that table.
+A file that leaves a setting out gets MQExtended's [defaults](mosquitto-compatibility.md#defaults). Check the 30-day offline session expiry and the 16 MiB per-client queue limit if devices stay away for months. Keeping a session longer preserves its subscriptions, not messages past their 90-day lifetime.
 
 ## 2. Find out what your Mosquitto version is
 
@@ -58,6 +58,8 @@ Then restart Mosquitto once in a quiet period and watch two things:
 ## 5. Carry state over
 
 With `persistence true`, MQExtended reads Mosquitto's own `mosquitto.db` on its first start and imports retained messages, persistent sessions with their subscriptions, and queued and in-flight messages. It never writes that file: its own state goes to the same path with `.mqx` appended, and from then on that file wins.
+
+For legacy messages without a publication timestamp, the broker uses the saved retained store time if available, otherwise the first import or upgrade time. An existing earlier MQTT expiry still wins. The native snapshot records the deadline so restarting does not grant another 90 days.
 
 - **Standalone:** stop Mosquitto (it saves the database on a clean stop), then start MQExtended with the same configuration.
 - **Cluster:** give only the node with the lowest id `persistence true` and the Mosquitto `persistence_location`/`persistence_file` on its first start. It imports through the replicated log before it accepts clients, so every node gets the same state. On the other nodes, and after bootstrap, `persistence true` changes nothing; cluster state is always durable. The same node imports `dynamic-security.json` if you use [dynamic security](dynamic-security.md#in-a-cluster).
