@@ -162,7 +162,9 @@ fn persistent_fanout_keeps_each_subscribers_send_state_after_kill() {
 #[test]
 #[ignore = "requires cluster-enabled mqextended"]
 fn dead_node_lease_publishes_will_once_to_each_survivor() {
-    let mut h = start_cluster(config(ANONYMOUS));
+    let mut h = start_cluster(config(
+        "allow_anonymous true\ncluster_lease_interval 200\ncluster_lease_timeout 2000",
+    ));
     let h = &mut h;
     let topic = "failover/will";
     let first = on(h, 1, options("first-watcher"), false);
@@ -256,7 +258,7 @@ fn retained_messages_and_subscriptions_survive_node_loss() {
 #[ignore = "requires cluster-enabled mqextended"]
 fn a_suspended_voter_does_not_delay_suback_after_lease_expiry() {
     let h = &mut start_cluster(config(
-        "allow_anonymous true\ncluster_request_timeout 20000",
+        "allow_anonymous true\ncluster_lease_interval 200\ncluster_lease_timeout 2000\ncluster_request_timeout 20000",
     ));
     let leader = h.wait_for_leader(ELECTION).unwrap();
     let mut followers = (1..=3).filter(|&node| node != leader);
@@ -446,7 +448,7 @@ const STATUS_POLL: Duration = Duration::from_millis(20);
 
 fn recovery_cluster(nodes: usize, enabled: bool) -> Harness {
     let mut conf = format!(
-        "{ANONYMOUS}\ncluster_state_format 2\ncluster_lease_timeout {LEASE_MS}\ncluster_request_timeout {}\nauto_recover {enabled}\n",
+        "{ANONYMOUS}\ncluster_state_format 2\ncluster_lease_interval 200\ncluster_lease_timeout {LEASE_MS}\ncluster_request_timeout {}\nauto_recover {enabled}\n",
         REQUEST.as_millis()
     );
     if enabled {

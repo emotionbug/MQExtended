@@ -36,11 +36,13 @@ impl ClusterFixture {
             );
             config.storage_reserve = Some(0);
             config.set_packet_limit(packet_limit).unwrap();
-            config.heartbeat_interval = Duration::from_millis(25);
-            config.election_timeout_min = Duration::from_millis(100);
-            config.election_timeout_max = Duration::from_millis(175);
-            config.lease_interval = Duration::from_millis(40);
-            config.lease_timeout = Duration::from_millis(240);
+            // Leave room for parallel WAL syncs and for survivors to renew
+            // their leases after an election, while keeping failover bounded.
+            config.heartbeat_interval = Duration::from_millis(35);
+            config.election_timeout_min = Duration::from_millis(140);
+            config.election_timeout_max = Duration::from_millis(260);
+            config.lease_interval = Duration::from_millis(70);
+            config.lease_timeout = Duration::from_millis(700);
             config.request_timeout = Duration::from_secs(2);
             config
         };
@@ -58,8 +60,29 @@ impl ClusterFixture {
         )
         .unwrap();
         drop(startup);
+        let brokers = [a, b, c];
+        let [a, b, c] = brokers
+            .each_ref()
+            .map(|broker| broker.cluster_membership().unwrap());
+        // Like the server, start with a valid quorum-backed lease on every
+        // voter. The first voter to become ready may lapse before the last.
+        timeout(Duration::from_secs(6), async {
+            loop {
+                tokio::try_join!(a.wait_serving(), b.wait_serving(), c.wait_serving())?;
+                if [&a, &b, &c]
+                    .iter()
+                    .all(|node| node.lease_valid_until().is_some())
+                {
+                    return Ok::<_, mqx_cluster::ClusterError>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cluster voters did not become ready")
+        .expect("cluster voter stopped before becoming ready");
         Self {
-            brokers: [a, b, c],
+            brokers,
             _storage: storage,
         }
     }

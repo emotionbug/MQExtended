@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use super::*;
 
@@ -118,11 +119,15 @@ fn only_the_raft_leader_publishes_each_sys_tick() {
         subscribe(&mut harness, peer, 1, &[("$SYS/broker/uptime", Q0)]);
         peers.push(peer);
     }
-    for peer in peers {
+    // Three 1s ticks, plus peer sampling (500ms) and one Raft proposal
+    // deadline (5s). All three subscribers share the same observation window.
+    let deadline = Instant::now() + Duration::from_secs(9);
+    for (offset, peer) in peers.into_iter().enumerate() {
         let mut last = None;
         let mut live = 0;
         while live != 3 {
-            match read(&mut harness, peer, RESPONSE) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match read(&mut harness, peer, remaining) {
                 Reading::Received {
                     packet: Packet::Publish(publish),
                     ..
@@ -145,7 +150,10 @@ fn only_the_raft_leader_publishes_each_sys_tick() {
                     }
                     last = Some(seconds);
                 }
-                other => panic!("unexpected cluster $SYS packet: {other:?}"),
+                other => panic!(
+                    "node {} after {live} live $SYS ticks: {other:?}",
+                    offset + 1
+                ),
             }
         }
     }

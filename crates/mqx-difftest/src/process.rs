@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,29 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 // Don't let two tests choose the same released port before either child binds.
 static STARTUP_LOCK: Mutex<()> = Mutex::new(());
+
+// These clusters all fsync to the same test disk. Bound live clusters, not
+// libtest threads: reference and standalone comparisons can still run freely.
+static LIVE_CLUSTERS: Mutex<usize> = Mutex::new(0);
+static CLUSTER_FINISHED: Condvar = Condvar::new();
+
+struct ClusterSlot;
+
+impl ClusterSlot {
+    fn acquire() -> Self {
+        let live = LIVE_CLUSTERS.lock().unwrap();
+        let mut live = CLUSTER_FINISHED.wait_while(live, |n| *n >= 2).unwrap();
+        *live += 1;
+        Self
+    }
+}
+
+impl Drop for ClusterSlot {
+    fn drop(&mut self) {
+        *LIVE_CLUSTERS.lock().unwrap() -= 1;
+        CLUSTER_FINISHED.notify_one();
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Placement {
@@ -383,6 +406,8 @@ pub(super) struct Brokers {
     bin: PathBuf,
     nodes: Vec<BrokerProcess>,
     placement: Placement,
+    // Drop after `nodes` so all child processes have been reaped first.
+    _cluster_slot: Option<ClusterSlot>,
 }
 
 impl Brokers {
@@ -406,6 +431,7 @@ impl Brokers {
         if let Placement::Node(index) = placement {
             check_index(index, size)?;
         }
+        let cluster_slot = cluster.map(|_| ClusterSlot::acquire());
         let dirs = (0..size)
             .map(|_| {
                 let dir = tempfile::tempdir()?;
@@ -452,6 +478,7 @@ impl Brokers {
             bin,
             nodes: Vec::with_capacity(size),
             placement,
+            _cluster_slot: cluster_slot,
         };
         let mut mesh = mesh.into_iter();
         for (mut node, listener, readiness_listener) in nodes {
@@ -745,21 +772,14 @@ fn node_config(
     for (offset, addr) in mesh.iter().enumerate() {
         writeln!(conf, "cluster_peer {} {addr}", offset + 1).unwrap();
     }
+    // Use production election and lease settings unless a fault scenario
+    // explicitly needs shorter failure detection.
     conf.push_str(concat!(
         "cluster_data_dir raft-data\n",
         // Parallel scenarios share one disk; a 1 GiB reserve per node would fill it.
         "cluster_storage_reserve 0\n",
         "cluster_insecure_plaintext true\n",
-        "cluster_heartbeat_interval 30\n",
-        "cluster_election_timeout 150 300\n",
-        "cluster_lease_interval 200\n",
     ));
-    if !common
-        .lines()
-        .any(|line| line.split_ascii_whitespace().next() == Some("cluster_lease_timeout"))
-    {
-        conf.push_str("cluster_lease_timeout 2000\n");
-    }
     if let Some((addr, mode)) = readiness {
         // Keep the scenario listener's security intact on both probe modes.
         writeln!(
@@ -882,10 +902,6 @@ mod tests {
                         "cluster_data_dir raft-data\n",
                         "cluster_storage_reserve 0\n",
                         "cluster_insecure_plaintext true\n",
-                        "cluster_heartbeat_interval 30\n",
-                        "cluster_election_timeout 150 300\n",
-                        "cluster_lease_interval 200\n",
-                        "cluster_lease_timeout 2000\n",
                         "listener {} 127.0.0.1\n",
                         "listener_allow_anonymous true\n",
                     ),

@@ -3,10 +3,12 @@ use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::Instant;
 
-use super::sessions::persistent;
+use super::sessions::{persistent, with_will};
 use super::*;
 
 const RELOAD_NODE: usize = 1;
+// A SIGHUP can take a replicated write deadline followed by local apply.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(11);
 
 fn observer_node(h: &Harness) -> usize {
     match h.node_addr(2) {
@@ -41,10 +43,10 @@ fn probe_connack(addr: SocketAddr, connect: &[u8], timeout: Duration) -> io::Res
 
 #[track_caller]
 fn reload(h: &mut Harness, observer: usize, conf: &str) {
-    // SIGHUP has no completion ACK (signals.c: signal__flag_check). Probe the
-    // same live configuration through CONNECT (handle_connect.c: check_clientid_prefixes)
-    // on both the signalled node and the observer. Use sockets outside Harness
-    // so the timing and number of retries do not affect either transcript.
+    // SIGHUP has no completion ACK (signals.c: signal__flag_check). Probe
+    // client ID rejection on both nodes without adding to either transcript.
+    // Both brokers check the prefix before will__read rejects a $CONTROL/
+    // will, so even a pre-reload probe never creates a replicated session.
     h.reload_node(
         RELOAD_NODE,
         &format!("{ANONYMOUS}\nclientid_prefixes reload-\n{conf}"),
@@ -52,15 +54,20 @@ fn reload(h: &mut Harness, observer: usize, conf: &str) {
     .unwrap();
     let mut connect = BytesMut::new();
     encode(
-        &Packet::Connect(options("outside-prefix-probe")),
+        &Packet::Connect(with_will("outside-prefix-probe", "$CONTROL/reload-probe")),
         &mut connect,
     )
     .unwrap();
+    let deadline = Instant::now() + RELOAD_TIMEOUT;
     for node in RELOAD_NODE..=observer {
         let addr = h.node_addr(node).unwrap();
-        let deadline = Instant::now() + RESPONSE;
         loop {
-            let observed = probe_connack(addr, &connect, Duration::from_millis(250));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let observed = probe_connack(
+                addr,
+                &connect,
+                remaining.clamp(Duration::from_millis(1), Duration::from_millis(250)),
+            );
             if matches!(observed, Ok([0x20, 2, 0, 5])) {
                 break;
             }
@@ -177,18 +184,25 @@ fn session_expiry_changes_at_disconnect(h: &mut Harness) {
 #[ignore = "requires standalone and clustered mqextended brokers"]
 fn session_expiry_never_applies_on_reload_at_next_disconnect() {
     const CONF: &str = "allow_anonymous true\npersistent_client_expiration 1s";
+    let finite = persistent("reload-finite");
+    let durable = persistent("reload-durable");
     let mut standalone = Harness::start(BrokerKind::MqExtended, config(CONF)).unwrap();
     let mut cluster = start_cluster(config(CONF));
     for h in [&mut standalone, &mut cluster] {
         let observer = observer_node(h);
-        let c = connect_on(h, observer, persistent("reload-durable"), false);
+        let c = connect_on(h, observer, finite.clone(), false);
+        disconnect(h, c);
+        let c = connect_on(h, observer, durable.clone(), false);
         reload(h, observer, "persistent_client_expiration never");
         disconnect(h, c);
     }
+    // Cross the old deadline without reconnecting (which would change it).
+    // The pre-reload disconnect proves the finite expiry still takes effect.
     thread::sleep(Duration::from_secs(3));
     for h in [&mut standalone, &mut cluster] {
         let node = observer_node(h);
-        connect_on(h, node, persistent("reload-durable"), true);
+        connect_on(h, node, finite.clone(), false);
+        connect_on(h, node, durable.clone(), true);
     }
 }
 
