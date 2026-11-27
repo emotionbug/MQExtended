@@ -15,8 +15,10 @@ use tokio::{
 // src/mosquitto.c: main then exits with status 1.
 pub(super) const RESTORE_FAILED: &str = "Unable to restore persistent database";
 pub(super) const IMPORT_FAILED: &str = "Unable to import Mosquitto persistence database";
+const SAVE_FAILED: &str = "Error during saving in-memory database";
 
 const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const AUTOSAVE_RETRY_MAX: Duration = Duration::from_secs(60);
 const ARCHIVE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub(super) struct Persistence {
@@ -121,24 +123,25 @@ impl Persistence {
             // Check the original path, even if reload selects an alias.
             let blocked = blocked.clone();
             let destination = path.clone();
-            let cleared = file_job(RESTORE_FAILED, blocked.clone(), move || {
-                let recovered = match read_for_recovery(&blocked, PersistentState::read_snapshot) {
-                    // A valid replacement belongs to the operator. We never
-                    // loaded it and cannot safely overwrite it with live state.
-                    Ok(image) => image.is_none(),
-                    Err(error) if is_corruption(&error) => discard_database(&blocked).is_ok(),
+            file_job(SAVE_FAILED, blocked.clone(), move || {
+                match read_for_recovery(&blocked, PersistentState::read_snapshot) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "refusing to overwrite a valid replacement snapshot that was not loaded",
+                        ));
+                    }
+                    Err(error) if is_corruption(&error) => discard_database(&blocked)?,
                     Err(error) => return Err(error),
-                };
-                Ok(
-                    recovered
-                        && (destination == blocked || database_metadata(&destination).is_ok()),
-                )
+                }
+                if destination != blocked {
+                    database_metadata(&destination)?;
+                }
+                Ok(())
             })
             .await
             .inspect_err(|error| tracing::error!("{error}"))?;
-            if !cleared {
-                return Ok(None);
-            }
             *writer = None;
         }
         let Some((changes, state)) = broker.persistence_snapshot(shutdown) else {
@@ -155,6 +158,7 @@ impl Persistence {
         let mut last_backup = Instant::now();
         let mut last_changes = 0;
         let mut retry_at = None;
+        let mut retry_delay = AUTOSAVE_RETRY_DELAY;
         let mut changes = None;
         loop {
             let (threshold, by_changes, enabled) = {
@@ -173,6 +177,8 @@ impl Persistence {
                 _ = stop.changed() => return,
                 result = config.changed() => {
                     if result.is_err() { return }
+                    retry_at = None;
+                    retry_delay = AUTOSAVE_RETRY_DELAY;
                 }
                 () = async {
                     if !enabled || threshold == 0 {
@@ -199,11 +205,13 @@ impl Persistence {
                             // src/loop.c: only automatic backups reset the count.
                             last_changes = count;
                             retry_at = None;
+                            retry_delay = AUTOSAVE_RETRY_DELAY;
                         }
                         Ok(None) | Err(_) if by_changes => {
                             // The threshold is still met. Back off without waiting
                             // for new MQTT traffic or blocking reload/shutdown.
-                            retry_at = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                            retry_at = Some(Instant::now() + retry_delay);
+                            retry_delay = (retry_delay * 2).min(AUTOSAVE_RETRY_MAX);
                         }
                         _ => {}
                     }
@@ -430,11 +438,9 @@ fn database_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
 async fn write_snapshot(path: PathBuf, state: PersistentState) -> Result<(), ServerError> {
     // src/persist_write.c: persist__backup logs before opening the file.
     tracing::info!("Saving in-memory database to {}.", path.display());
-    file_job(
-        "Error during saving in-memory database",
-        path.clone(),
-        move || state.write_snapshot(&path),
-    )
+    file_job(SAVE_FAILED, path.clone(), move || {
+        state.write_snapshot(&path)
+    })
     .await
 }
 

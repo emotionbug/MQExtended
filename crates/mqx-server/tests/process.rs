@@ -5,7 +5,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -55,9 +55,13 @@ async fn eventually(mut condition: impl FnMut() -> bool) {
     .expect("the broker did not reach the expected state");
 }
 
-async fn stop(child: &mut Child) {
+async fn terminate(child: &mut Child) -> ExitStatus {
     kill(id(child), Signal::SIGTERM).unwrap();
-    let status = timeout(WAIT, child.wait()).await.unwrap().unwrap();
+    timeout(WAIT, child.wait()).await.unwrap().unwrap()
+}
+
+async fn stop(child: &mut Child) {
+    let status = terminate(child).await;
     assert!(status.success(), "broker exited with {status}");
 }
 
@@ -815,8 +819,7 @@ async fn persistence_failed_final_save_exits_nonzero() {
     ready(&notify).await;
     let snapshot = dir.path().join("mosquitto.db.mqx");
     fs::create_dir(&snapshot).unwrap();
-    kill(id(&child), Signal::SIGTERM).unwrap();
-    let status = timeout(WAIT, child.wait()).await.unwrap().unwrap();
+    let status = terminate(&mut child).await;
     assert!(matches!(status.code(), Some(code) if code != 0), "{status}");
     let log = fs::read_to_string(dir.path().join("broker.log")).unwrap();
     let (_, after_termination) = log.split_once(TERMINATING).unwrap();
@@ -1510,7 +1513,8 @@ async fn auto_recover_does_not_discard_a_valid_replacement() {
         .unwrap();
     let replacement = fs::read(&native).unwrap();
     fs::remove_dir(&discarded).unwrap();
-    stop(&mut child).await;
+    let status = terminate(&mut child).await;
+    assert!(matches!(status.code(), Some(code) if code != 0), "{status}");
     assert_eq!(fs::read(&native).unwrap(), replacement);
     assert!(!discarded.exists());
 }
@@ -1655,7 +1659,12 @@ async fn auto_recover_leaves_non_regular_persistence_paths_in_place() {
             .spawn()
             .unwrap();
             ready(&notify).await;
-            stop(&mut child).await;
+            let status = terminate(&mut child).await;
+            if file == "mosquitto.db.mqx" {
+                assert!(matches!(status.code(), Some(code) if code != 0), "{status}");
+            } else {
+                assert!(status.success(), "{status}");
+            }
             if is_symlink {
                 assert_eq!(fs::read_link(&path).unwrap(), target);
                 assert_eq!(fs::read(&target).unwrap(), b"original target");
