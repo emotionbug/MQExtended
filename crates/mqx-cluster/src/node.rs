@@ -50,7 +50,9 @@ use crate::transport::{
     write_control,
 };
 use crate::wal::{Wal, WalMetrics};
-use crate::{ClusterConfig, ClusterError, Mesh, NodeEvent, NodeStatus, StateMachine, version};
+use crate::{
+    ClusterConfig, ClusterError, Mesh, NodeEvent, NodeStatus, SnapshotPolicy, StateMachine, version,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_WINDOW: usize = 256;
@@ -136,6 +138,7 @@ struct Core<S: StateMachine> {
     raft: Raft<Types, Store<S>>,
     store: Store<S>,
     storage: Arc<StorageMetrics>,
+    adaptive_snapshots: bool,
     mesh: Mesh,
     requested: watch::Sender<Option<Desired>>,
     serving: watch::Sender<Serving>,
@@ -202,6 +205,7 @@ impl<S: StateMachine> Cluster<S> {
             request_timeout,
             snapshot_timeout,
             max_snapshot_size,
+            snapshot_policy,
             max_command_size,
             max_append_size,
             max_mesh_size,
@@ -379,6 +383,7 @@ impl<S: StateMachine> Cluster<S> {
             raft,
             store,
             storage: storage.metrics(),
+            adaptive_snapshots: matches!(snapshot_policy, SnapshotPolicy::Adaptive),
             mesh: Mesh::new(endpoint, request_timeout),
             requested: watch::channel(requested).0,
             serving: watch::channel(Serving::Waiting).0,
@@ -1985,6 +1990,9 @@ impl<S: StateMachine> Core<S> {
                 } else if applied.is_some_and(|id| id.index >= index) {
                     let _ = trigger.snapshot().await;
                 }
+            } else if self.adaptive_snapshots && self.store.snapshot_backlog_ready() {
+                // Normal compaction keeps the configured catch-up tail.
+                let _ = self.raft.trigger().snapshot().await;
             }
             tokio::select! {
                 biased;
@@ -2745,7 +2753,7 @@ fn check_vote_sender(vote: VoteOf<Types>, from: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClusterSecurity, SnapshotPolicy};
+    use crate::ClusterSecurity;
     use openraft::alias::EntryOf;
     use openraft::storage::{RaftLogStorage, RaftStateMachine};
 

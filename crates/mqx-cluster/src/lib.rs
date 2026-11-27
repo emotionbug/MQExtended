@@ -24,14 +24,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use lease::{NodeEvent, NodeStatus};
 pub use membership::{MemberRole, MemberStatus, MembershipControl, MembershipStatus};
 pub use node::{Cluster, ClusterMetrics};
-pub use openraft::SnapshotPolicy;
 pub use survivor::{SurvivorEvent, SurvivorReason};
 pub use transport::Mesh;
 pub use wal::WalMetrics;
@@ -53,6 +52,22 @@ pub const DEFAULT_MAX_MESH_SIZE: usize = DEFAULT_MAX_COMMAND_SIZE;
 
 const MAX_PACKET_SIZE: usize = 268_435_460; // MQTT Remaining Length plus fixed header.
 const PACKET_ENVELOPE: usize = 64 * 1024;
+
+// Bound replay of lease renewals and other cheap entries without rewriting a
+// large snapshot every few thousand control entries on an idle cluster.
+const ADAPTIVE_SNAPSHOT_MAX_LOGS: u64 = 50_000;
+
+/// When to compact the applied Raft log during normal operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotPolicy {
+    /// Compact after this many additional log entries, regardless of size.
+    LogsSinceLast(u64),
+    /// Do not schedule periodic compaction. Recovery and low-space compaction
+    /// can still take snapshots.
+    Never,
+    /// Compact on application byte backlog, with a hard replay entry limit.
+    Adaptive,
+}
 
 /// Transport security for the peer listener and all outgoing Raft and mesh RPCs.
 #[derive(Clone, Debug)]
@@ -200,7 +215,7 @@ impl ClusterConfig {
             max_command_size: DEFAULT_MAX_COMMAND_SIZE,
             max_append_size: DEFAULT_MAX_APPEND_SIZE,
             max_mesh_size: DEFAULT_MAX_MESH_SIZE,
-            snapshot_policy: SnapshotPolicy::LogsSinceLast(5000),
+            snapshot_policy: SnapshotPolicy::Adaptive,
             snapshot_log_retention: 1000,
         }
     }
@@ -332,7 +347,13 @@ impl ClusterConfig {
             // Replication and local disk may advance concurrently; Raft still
             // gates acknowledgments on the logged durable I/O frontier.
             broadcast_submitted_on_append: Some(true),
-            snapshot_policy: self.snapshot_policy.clone(),
+            snapshot_policy: match self.snapshot_policy {
+                SnapshotPolicy::Adaptive => {
+                    openraft::SnapshotPolicy::LogsSinceLast(ADAPTIVE_SNAPSHOT_MAX_LOGS)
+                }
+                SnapshotPolicy::LogsSinceLast(n) => openraft::SnapshotPolicy::LogsSinceLast(n),
+                SnapshotPolicy::Never => openraft::SnapshotPolicy::Never,
+            },
             max_in_snapshot_log_to_keep: self.snapshot_log_retention,
             purge_batch_size: 1,
             enable_pre_vote: Some(true),

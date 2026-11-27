@@ -219,6 +219,49 @@ async fn event(
     .expect("expected liveness transition")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adaptive_snapshot_counts_replayed_writes_and_restores_the_compacted_state() {
+    let root = tempfile::tempdir().unwrap();
+    let address = peer_address();
+    let mut cfg = ClusterConfig::new(
+        1,
+        address,
+        BTreeMap::from([(1, address)]),
+        root.path().join("1"),
+        ClusterSecurity::InsecurePlaintext,
+    );
+    cfg.storage_reserve = Some(0);
+    cfg.snapshot_log_retention = 0;
+    // Overwrite one key: recovery work grows, but live state stays small.
+    let payload = "x".repeat(1024 * 1024);
+    let node = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
+    for _ in 0..16 {
+        put(&node, "key", &payload).await;
+    }
+    assert!(node.metrics().snapshot_index.is_none());
+    node.shutdown().await.unwrap();
+
+    let node = Cluster::start(cfg.clone(), Kv::default()).await.unwrap();
+    let mut last = 0;
+    for _ in 0..16 {
+        last = put(&node, "key", &payload).await.index;
+    }
+    // Neither process wrote 32 MiB on its own. The snapshot and purge must
+    // account for the first process's WAL tail replayed at startup.
+    until(|| node.metrics().purged_index.filter(|index| *index >= last)).await;
+    let tail = put(&node, "key", "after compaction").await;
+    node.shutdown().await.unwrap();
+
+    let node = Cluster::start(cfg, Kv::default()).await.unwrap();
+    node.read(|kv| {
+        assert_eq!(kv.restored, 1);
+        assert_eq!(kv.durable.values["key"], "after compaction");
+        assert_eq!(kv.durable.writes.len(), 33);
+        assert!(kv.applied_here.contains(&tail.index));
+    });
+    node.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn versioned_reader_restores_legacy_snapshot_and_versioned_wal_tail() {
     let root = tempfile::tempdir().unwrap();

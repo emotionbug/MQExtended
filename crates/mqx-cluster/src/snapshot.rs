@@ -31,6 +31,10 @@ pub(crate) const SNAPSHOT_FILE: &str = "snapshot.mpk";
 pub(crate) const RETIRED_FILE: &str = "removed";
 const TEMP_FILE_PREFIX: &str = ".mqx-stage-";
 const TEMP_FILE_RANDOM_LEN: usize = 6;
+// Budget at least two WAL chunks, and amortize rewriting large snapshots
+// without making the replay budget unbounded as snapshots grow.
+const MIN_SNAPSHOT_BACKLOG: u64 = 32 * 1024 * 1024;
+const MAX_SNAPSHOT_BACKLOG: u64 = 256 * 1024 * 1024;
 
 pub(crate) type Snapshot = SnapshotOf<Types, SnapshotData>;
 pub(crate) type SnapshotMeta = SnapshotMetaOf<Types>;
@@ -49,6 +53,7 @@ pub(crate) struct Applied<S> {
     pub(crate) desired: Desired,
     retired: BTreeSet<u64>,
     last_applied: Option<LogId>,
+    app_bytes_since_snapshot: u64,
     pub(crate) membership: StoredMembership,
     sealed: bool,
 }
@@ -89,6 +94,7 @@ impl<S: StateMachine> Store<S> {
             desired: Desired::default(),
             retired: BTreeSet::new(),
             last_applied: None,
+            app_bytes_since_snapshot: 0,
             membership: StoredMembership::default(),
             sealed: false,
         };
@@ -144,6 +150,18 @@ impl<S: StateMachine> Store<S> {
 
     pub(crate) fn expire(&self, stamp: Stamp, timeout_ms: u64) -> Vec<crate::lease::LeaseCommand> {
         self.state.read().unwrap().leases.expired(stamp, timeout_ms)
+    }
+
+    pub(crate) fn snapshot_backlog_ready(&self) -> bool {
+        // This is polled by the storage monitor. Let a build or install finish
+        // before rechecking its new baseline, and don't wait on the apply lock.
+        let Ok(current) = self.snapshot.try_lock() else {
+            return false;
+        };
+        let size = current.as_ref().map_or(0, |s| s.snapshot.size());
+        self.state
+            .try_read()
+            .is_ok_and(|state| state.app_bytes_since_snapshot >= snapshot_backlog_budget(size))
     }
 
     pub(crate) fn last_applied(&self) -> Option<LogId> {
@@ -301,6 +319,7 @@ impl<S: StateMachine> Applied<S> {
         self.desired = control.desired;
         self.retired = control.retired;
         self.last_applied = meta.last_log_id;
+        self.app_bytes_since_snapshot = 0;
         self.membership = meta.last_membership.clone();
         Ok(())
     }
@@ -339,6 +358,9 @@ impl<S: StateMachine> Applied<S> {
                 let response = self
                     .app
                     .apply_with_retired(log_id.index, command, &self.retired);
+                self.app_bytes_since_snapshot = self
+                    .app_bytes_since_snapshot
+                    .saturating_add(body.len() as u64);
                 if respond {
                     encode(&response)
                         .map(|bytes| Some(bytes.into()))
@@ -465,7 +487,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
         let mut current = self.snapshot.clone().lock_owned().await;
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            let (meta, leases, app) = {
+            let (meta, leases, app_bytes, app) = {
                 let state = store.state.read().unwrap();
                 let meta = SnapshotMeta {
                     last_log_id: state.last_applied,
@@ -488,6 +510,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
                             retired: &state.retired,
                         })?
                     }),
+                    state.app_bytes_since_snapshot,
                     state.app.snapshot(),
                 )
             };
@@ -502,6 +525,10 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
                 (store.format, S::WRITE_VERSION),
             )?;
             let snapshot = Snapshot { meta, snapshot };
+            // Subtract only the bytes captured under the read lock. Applying
+            // can proceed during disk writes, but installs and other builds
+            // can't move the baseline until we release the publication lock.
+            store.state.write().unwrap().app_bytes_since_snapshot -= app_bytes;
             *current = Some(snapshot.clone());
             store.record_snapshot_size(snapshot.snapshot.size());
             Ok(snapshot)
@@ -509,6 +536,10 @@ impl<S: StateMachine> RaftSnapshotBuilder<Types> for Store<S> {
         .await
         .map_err(io::Error::other)?
     }
+}
+
+fn snapshot_backlog_budget(snapshot_size: u64) -> u64 {
+    snapshot_size.clamp(MIN_SNAPSHOT_BACKLOG, MAX_SNAPSHOT_BACKLOG)
 }
 
 impl<S> Store<S> {
@@ -657,6 +688,24 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn snapshot_backlog_budget_scales_between_bounded_limits() {
+        assert_eq!(snapshot_backlog_budget(0), MIN_SNAPSHOT_BACKLOG);
+        assert_eq!(
+            snapshot_backlog_budget(MIN_SNAPSHOT_BACKLOG - 1),
+            MIN_SNAPSHOT_BACKLOG
+        );
+        assert_eq!(
+            snapshot_backlog_budget(MIN_SNAPSHOT_BACKLOG + 1),
+            MIN_SNAPSHOT_BACKLOG + 1
+        );
+        assert_eq!(
+            snapshot_backlog_budget(MAX_SNAPSHOT_BACKLOG - 1),
+            MAX_SNAPSHOT_BACKLOG - 1
+        );
+        assert_eq!(snapshot_backlog_budget(u64::MAX), MAX_SNAPSHOT_BACKLOG);
+    }
+
+    #[test]
     fn staging_cleanup_removes_only_exact_regular_tempfiles() {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
@@ -745,6 +794,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.snapshot_size(), 0);
+        let body = version::encode(&(), 1, true).unwrap();
+        let log_id = |index| {
+            LogId::new(
+                Leadership {
+                    term: 1,
+                    node_id: 1,
+                },
+                index,
+            )
+        };
+        let entry = |index| EntryOf::<Types> {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(Command::App(body.clone())),
+        };
+        store.replay_for_fork(vec![entry(0)]).unwrap();
+
+        // Hold the disk fence so another entry can apply after capture but
+        // before the detached builder publishes its snapshot.
+        let (release_disk, wait_disk) = mpsc::channel();
+        let disk_locked = Arc::new(tokio::sync::Notify::new());
+        let disk_job = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let disk_locked = disk_locked.clone();
+            move || {
+                let _disk = store.lock_disk().unwrap();
+                disk_locked.notify_one();
+                wait_disk.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        });
+        disk_locked.notified().await;
+
         let mut builder = store.clone();
         let job = tokio::spawn(async move { builder.build_snapshot().await });
         // This task must still run on a single worker while encoding is paused.
@@ -752,10 +832,28 @@ mod tests {
         job.abort();
         assert!(job.await.unwrap_err().is_cancelled());
         release.send(()).unwrap();
+        let tail = entry(1);
+        let control = EntryOf::<Types> {
+            log_id: log_id(2),
+            payload: EntryPayload::Blank,
+        };
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            move || store.replay_for_fork(vec![tail, control]).unwrap()
+        })
+        .await
+        .unwrap();
+        release_disk.send(()).unwrap();
+        disk_job.await.unwrap();
+
         let cached = store.get_current_snapshot().await.unwrap().unwrap();
         let (meta, disk) =
             SnapshotData::open(File::open(dir.path().join(SNAPSHOT_FILE)).unwrap()).unwrap();
         assert_eq!(cached.meta, meta);
+        assert_eq!(meta.last_log_id, Some(log_id(0)));
+        let state = store.state.read().unwrap();
+        assert_eq!(state.last_applied, Some(log_id(2)));
+        assert_eq!(state.app_bytes_since_snapshot, body.len() as u64);
         assert_eq!(store.snapshot_size(), disk.size());
         assert_eq!(cached.snapshot.application().unwrap(), [42]);
         assert_eq!(disk.application().unwrap(), [42]);
