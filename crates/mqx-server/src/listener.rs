@@ -90,7 +90,7 @@ pub struct Server {
     watchdog: Option<Duration>,
 }
 
-/// Non-terminating Unix process signals dispatched by the listener loop.
+/// Non-terminating events dispatched by the listener loop.
 pub enum BrokerSignal {
     Reload,
     Backup,
@@ -98,6 +98,8 @@ pub enum BrokerSignal {
     Rotate,
     /// The service manager's watchdog period elapsed; see [`Server::with_watchdog`].
     Watchdog,
+    /// Check for stable changes to password and ACL files.
+    PolicyCheck,
 }
 
 struct BoundListener {
@@ -678,14 +680,11 @@ impl Server {
             }
         }
 
-        // MQExtended deviation: Mosquitto src/signals.c calls
-        // listeners__reload_all_certificates only on SIGHUP.
-        let mut certificate_ticks = (!certificates.fingerprints.is_empty()).then(|| {
-            let period = Duration::from_secs(10);
-            let mut ticks = tokio::time::interval_at(Instant::now() + period, period);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticks
-        });
+        // MQExtended deviation: Mosquitto src/signals.c: signal__flag_check
+        // refreshes certificates and file policies only on SIGHUP.
+        let period = Duration::from_secs(10);
+        let refresh_tick = tokio::time::sleep(period);
+        tokio::pin!(refresh_tick);
 
         tokio::pin!(stop);
         let result = loop {
@@ -716,16 +715,15 @@ impl Server {
                     }
                     certificates.certificate_files_changed();
                 }
-                _ = async {
-                    match &mut certificate_ticks {
-                        Some(ticks) => ticks.tick().await,
-                        None => pending().await,
-                    }
-                } => {
-                    if certificates.certificate_files_changed() {
+                () = &mut refresh_tick => {
+                    if !certificates.fingerprints.is_empty() && certificates.certificate_files_changed() {
                         tracing::info!("Listener certificate files changed; reloading certificates.");
                         certificates.refresh(None);
                     }
+                    auxiliary(BrokerSignal::PolicyCheck).await;
+                    // Keep a full interval between policy observations even
+                    // when a scheduled check is delayed by another reload.
+                    refresh_tick.as_mut().reset(Instant::now() + period);
                 }
             }
         };

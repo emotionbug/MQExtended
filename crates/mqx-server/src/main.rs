@@ -28,7 +28,7 @@ use mqx_server::{
     init_logging, parse_command_line_port, startup_log,
 };
 
-use file_security::SecurityHandles;
+use file_security::{PolicyWatch, SecurityHandles};
 use persistence::Persistence;
 use process::{PidFile, StartupError, TERMINATING};
 
@@ -525,6 +525,7 @@ async fn serve_broker(
             .listeners
             .iter()
             .any(|listener| listener.security.file_plugins.paths() != (None, None));
+    let policy_watch = std::cell::RefCell::new(PolicyWatch::new(&config));
     let security = Arc::new(SecurityHandles::new(&config, external)?);
     let listener_policies = |config: &ServerConfig| -> Vec<Arc<ListenerPolicy>> {
         config
@@ -715,6 +716,24 @@ async fn serve_broker(
     let http = Arc::new(HttpApi::new(&config, &server));
     let http_inventory = http.clone();
     let reload_policies = policies.clone();
+    let reload_security = |fresh: &ServerConfig| {
+        security.reload(fresh, || {
+            *reload_policies.write().unwrap_or_else(|e| e.into_inner()) = listener_policies(fresh);
+            // Updating a credential handle wakes existing connections;
+            // publish the validated inventory before the first wakeup.
+            http_inventory.reload_access(&config, fresh);
+        })
+    };
+    let register_security = async || {
+        if membership
+            .as_ref()
+            .is_none_or(|membership| membership.is_serving())
+            && registered.load(Ordering::Acquire)
+        {
+            security.register(&broker).await?;
+        }
+        Ok::<_, ServerError>(())
+    };
     let serve = server
         .with_broker_observation(broker.clone())
         .with_watchdog(process::watchdog())
@@ -778,18 +797,10 @@ async fn serve_broker(
                             }
                             // signals.c: reload configuration before opening credential files.
                             certificates.refresh(Some(&fresh));
-                            security.reload(&fresh, || {
-                                *reload_policies.write().unwrap_or_else(|e| e.into_inner()) =
-                                    listener_policies(&fresh);
-                                // Updating a credential handle wakes existing connections;
-                                // publish the validated inventory before the first wakeup.
-                                http_inventory.reload_access(&config, &fresh);
-                            })?;
-                            if membership.as_ref().is_none_or(|membership| membership.is_serving())
-                                && registered.load(Ordering::Acquire)
-                            {
-                                security.register(&broker).await?;
-                            }
+                            let watch = PolicyWatch::new(&fresh);
+                            reload_security(&fresh)?;
+                            policy_watch.replace(watch);
+                            register_security().await?;
                             cli.override_log_types(&mut fresh.log);
                             broker.set_connection_messages(fresh.log.connection_messages);
                             logging.reload(&fresh.log);
@@ -827,13 +838,15 @@ async fn serve_broker(
                                 logging.reload(&old.log);
                                 // signals.c still calls plugin reload callbacks
                                 // when the configuration reread fails.
-                                has_plugin_files.then(|| security.reload(old, || {})).transpose()
+                                if has_plugin_files {
+                                    let watch = PolicyWatch::new(old);
+                                    security.reload(old, || {})?;
+                                    policy_watch.replace(watch);
+                                }
+                                has_plugin_files
                             };
-                            if reload?.is_some()
-                                && membership.as_ref().is_none_or(|membership| membership.is_serving())
-                                && registered.load(Ordering::Acquire)
-                            {
-                                security.register(&broker).await?;
+                            if reload {
+                                register_security().await?;
                             }
                         }
                     }
@@ -866,6 +879,22 @@ async fn serve_broker(
                     logging.reload(&live.as_ref().unwrap_or(&config).log);
                 }
                 BrokerSignal::Watchdog => process::notify_watchdog(),
+                BrokerSignal::PolicyCheck => {
+                    if policy_watch.borrow_mut().stable_change() {
+                        tracing::info!("Password or ACL file changed; reloading policies.");
+                        let result = {
+                            let live = live_config.borrow();
+                            reload_security(live.as_ref().unwrap_or(&config))
+                        };
+                        // Unlike an explicit SIGHUP, a bad replacement must
+                        // not shut down the broker or displace a working policy.
+                        if let Err(error) = result {
+                            tracing::error!("Automatic policy reload failed: {error}");
+                        } else if let Err(error) = register_security().await {
+                            tracing::error!("Unable to register reloaded policies: {error}");
+                        }
+                    }
+                }
                 BrokerSignal::Reload => unreachable!("handled by the listener"),
             },
             || broker.shutdown(),

@@ -83,27 +83,4 @@ data:
       peer {{ $id }} {{ include "mqextended.voterName" (list $.Release.Name $id) | quote }}
       {{- end }}
     } > "$config"
-    {{- if or $auth.passwordFile $auth.aclFile }}
-
-    # Kubernetes swaps Secret generations atomically. Like Mosquitto, the
-    # broker rereads password and ACL files on SIGHUP. After exec it keeps
-    # this shell's PID.
-    auth_digest() {
-      cd /etc/mqextended/auth/..data &&
-        cksum{{ if $auth.passwordFile }} password_file{{ end }}{{ if $auth.aclFile }} acl_file{{ end }}
-    }
-    broker=$$
-    last=$(auth_digest)
-    (
-      trap - INT TERM
-      while sleep 10; do
-        now=$(auth_digest) || continue
-        if [ "$now" != "$last" ]; then
-          echo "Password or ACL Secret changed; reloading" >&2
-          kill -HUP "$broker" || exit 0
-          last=$now
-        fi
-      done
-    ) &
-    {{- end }}
     exec mqextended -c "$config"

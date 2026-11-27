@@ -1,14 +1,93 @@
 use std::{
-    collections::BTreeMap,
-    fs::OpenOptions,
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use mqx_auth::{AclFileError, PasswordFile, PasswordFileError, external::ExternalSecurity};
 use mqx_broker::{Broker, SecurityHandle};
 use mqx_server::{ServerConfig, ServerError};
+
+pub(super) struct PolicyWatch {
+    files: Vec<WatchedPolicy>,
+}
+
+struct WatchedPolicy {
+    path: PathBuf,
+    observed: Option<Fingerprint>,
+    attempted: Option<Fingerprint>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl Fingerprint {
+    fn read(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        // Follow symlinks so an atomic Kubernetes ..data swap is visible.
+        let metadata = fs::metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+}
+
+impl PolicyWatch {
+    /// Snapshot before opening the files so a racing replacement isn't missed.
+    pub(super) fn new(config: &ServerConfig) -> Self {
+        let mut paths = BTreeSet::new();
+        for listener in &config.listeners {
+            let (password, acl) = config.credential_paths_for(listener);
+            paths.extend([password, acl].into_iter().flatten());
+        }
+        let files = paths
+            .into_iter()
+            .map(|path| {
+                let observed = Fingerprint::read(path);
+                WatchedPolicy {
+                    path: path.to_owned(),
+                    observed,
+                    attempted: observed,
+                }
+            })
+            .collect();
+        Self { files }
+    }
+
+    pub(super) fn stable_change(&mut self) -> bool {
+        let mut changed = false;
+        let mut stable = true;
+        for file in &mut self.files {
+            let current = Fingerprint::read(&file.path);
+            stable &= file.observed == current;
+            changed |= file.attempted != current;
+            file.observed = current;
+        }
+        if changed && stable {
+            // Reload the whole set together. After a failure, retry only
+            // when the set changes rather than logging the same error again.
+            for file in &mut self.files {
+                file.attempted = file.observed;
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
 
 pub(super) struct SecurityHandles {
     groups: Vec<PolicyGroup>,

@@ -348,6 +348,90 @@ async fn invalid_credentials_on_sighup_stop_the_broker() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn password_file_reloads_without_sighup_and_keeps_last_valid_policy() {
+    use std::{fs, net::TcpListener, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpStream, UnixDatagram},
+        time::{sleep, timeout},
+    };
+
+    const ACCEPT: [u8; 4] = [0x20, 2, 0, 0];
+    const NEXT: &[u8] = b"\x10\x1b\x00\x04MQTT\x04\xc2\x00\x3c\x00\x03dev\x00\x04next\x00\x04test";
+    // Mosquitto test/broker/09-pwfile-parse-invalid.py: password "test".
+    const HASH: &str = "$6$njERlZMi/7DzNB9E$iiavfuXvUm8iyDZArTy7smTxh07GXXOrOsqxfW6gkOYVXHGk+W+i/8d3xDxrMwEPygEBhoA8A/gjQC0N2M4Lkw==";
+    let pin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = pin.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("broker.conf");
+    let rules = dir.path().join("passwd");
+    let replacement = dir.path().join("replacement");
+    let log = dir.path().join("broker.log");
+    let notify_path = dir.path().join("notify");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    fs::write(&rules, format!("test:{HASH}\n")).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "user root\nlistener {} 127.0.0.1\nallow_anonymous false\npassword_file {}\nlog_type information\nlog_type error\nlog_dest file {}\nconnection_messages false\n",
+            addr.port(),
+            rules.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    drop(pin);
+    let mut child = tokio::process::Command::new(BIN)
+        .arg("-c")
+        .arg(&config)
+        .env("NOTIFY_SOCKET", &notify_path)
+        .env("TOKIO_WORKER_THREADS", "2")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_ready(&notify).await;
+
+    let connect = async || {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(NEXT).await.unwrap();
+        let mut ack = [0; 4];
+        stream.read_exact(&mut ack).await.unwrap();
+        ack
+    };
+    assert_ne!(
+        timeout(Duration::from_secs(5), connect()).await.unwrap(),
+        ACCEPT
+    );
+    fs::write(&replacement, format!("test:{HASH}\nnext:{HASH}\n")).unwrap();
+    fs::rename(&replacement, &rules).unwrap();
+    timeout(Duration::from_secs(30), async {
+        while connect().await != ACCEPT {
+            sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("new credentials were not loaded");
+
+    fs::write(&rules, "test:bad\n").unwrap();
+    timeout(Duration::from_secs(25), async {
+        while !fs::read_to_string(&log)
+            .unwrap()
+            .contains("Automatic policy reload failed: Unable to load password_file")
+        {
+            sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the broker did not attempt to load the invalid password file");
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        timeout(Duration::from_secs(5), connect()).await.unwrap(),
+        ACCEPT
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn configured_single_voter_creates_raft_storage_and_restores_an_mqtt_session() {
     use nix::{
         sys::signal::{Signal, kill},
