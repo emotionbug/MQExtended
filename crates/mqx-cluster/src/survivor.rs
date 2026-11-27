@@ -737,7 +737,7 @@ mod tests {
         fs::create_dir(marker).unwrap();
         assert_eq!(
             join_complete(root, Some(9)).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
+            io::ErrorKind::InvalidInput
         );
     }
 
